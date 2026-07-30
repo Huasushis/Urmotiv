@@ -132,6 +132,7 @@ export function AdminPage({ session }: { session: SessionUser }) {
 
 type ReviewDraft = {
   ruleId: string;
+  pluginVersion: string;
   settings: ReviewPolicyView["settings"];
   revision: number;
 };
@@ -139,6 +140,7 @@ type ReviewDraft = {
 function reviewDraftFrom(view: ReviewPolicyView): ReviewDraft {
   return {
     ruleId: view.selectedRuleId,
+    pluginVersion: view.selectedPluginVersion,
     settings: { ...view.settings },
     revision: view.revision
   };
@@ -180,7 +182,7 @@ function ReviewPolicySection() {
     }
   });
 
-  if (policy.isError) {
+  if (policy.isError && policy.data === undefined) {
     return (
       <div className="plain-panel admin-load-error" role="alert">
         <AlertTriangle size={20} aria-hidden="true" />
@@ -205,17 +207,20 @@ function ReviewPolicySection() {
     );
   }
 
-  const selectedRule = policy.data.availableRules.find((rule) => rule.id === draft.ruleId);
+  const selectedRule = policy.data.availableRules.find(
+    (rule) => rule.id === draft.ruleId && rule.pluginVersion === draft.pluginVersion
+  );
   const currentRuleIsAvailable = selectedRule !== undefined;
   const hasChanges =
     draft.ruleId !== policy.data.selectedRuleId ||
+    draft.pluginVersion !== policy.data.selectedPluginVersion ||
     !sameSettings(draft.settings, policy.data.settings);
 
   const reload = async () => {
     setReloading(true);
     try {
       const result = await policy.refetch();
-      if (result.data !== undefined) {
+      if (result.isSuccess && result.data !== undefined) {
         setDraft(reviewDraftFrom(result.data));
         setConflict(false);
         save.reset();
@@ -265,6 +270,7 @@ function ReviewPolicySection() {
                   }
                   setDraft({
                     ruleId: rule.id,
+                    pluginVersion: rule.pluginVersion,
                     settings:
                       rule.id === policy.data.selectedRuleId
                         ? { ...policy.data.settings }
@@ -380,7 +386,7 @@ function PluginSection({ onOpenReviewPolicy }: { onOpenReviewPolicy?: (() => voi
     );
   }
 
-  if (plugins.isError || plugins.data === undefined) {
+  if (plugins.data === undefined) {
     return (
       <div className="plain-panel admin-load-error" role="alert">
         <AlertTriangle size={20} aria-hidden="true" />
@@ -413,7 +419,9 @@ function PluginSection({ onOpenReviewPolicy }: { onOpenReviewPolicy?: (() => voi
   };
   const reloadPlugin = async (pluginId: string): Promise<AdminPlugin | undefined> => {
     const result = await plugins.refetch();
-    return result.data?.items.find((plugin) => plugin.id === pluginId);
+    return result.isSuccess
+      ? result.data?.items.find((plugin) => plugin.id === pluginId)
+      : undefined;
   };
 
   return (

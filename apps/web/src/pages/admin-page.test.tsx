@@ -17,6 +17,7 @@ vi.mock("../lib/api", async (importOriginal) => {
 });
 
 import { AdminPage } from "./admin-page";
+import { ApiError } from "../lib/api";
 
 const reviewPolicy: ReviewPolicyView = {
   selectedRuleId: "org.ustc.urmotiv.review-default.count",
@@ -126,6 +127,41 @@ async function waitFor(assertion: () => void): Promise<void> {
   throw latestError;
 }
 
+function buttonWithText(view: HTMLElement, text: string): HTMLButtonElement {
+  const button = [...view.querySelectorAll<HTMLButtonElement>("button")]
+    .find((candidate) => candidate.textContent?.includes(text));
+  if (button === undefined) {
+    throw new Error(`找不到按钮：${text}`);
+  }
+  return button;
+}
+
+async function changeValue(
+  element: HTMLInputElement | HTMLSelectElement,
+  value: string
+): Promise<void> {
+  await act(async () => {
+    const prototype = element instanceof HTMLSelectElement
+      ? HTMLSelectElement.prototype
+      : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+    if (setter === undefined) {
+      throw new Error("测试环境无法修改输入值");
+    }
+    setter.call(element, value);
+    element.dispatchEvent(new Event(
+      element instanceof HTMLSelectElement ? "change" : "input",
+      { bubbles: true }
+    ));
+  });
+}
+
+async function click(button: HTMLButtonElement): Promise<void> {
+  await act(async () => {
+    button.click();
+  });
+}
+
 afterEach(() => {
   if (root !== undefined) {
     act(() => root?.unmount());
@@ -182,5 +218,89 @@ describe("管理页面", () => {
     expect(view.textContent).not.toContain("完整密钥内容");
     expect(view.textContent).not.toContain(plugin.apiVersion);
     expect(view.textContent).not.toContain(plugin.source);
+  });
+
+  it("同一审核规则升级后允许管理员重新确认当前版本", async () => {
+    const upgradedPolicy: ReviewPolicyView = {
+      ...reviewPolicy,
+      selectedPluginVersion: "1.0.0",
+      settings: {},
+      selectedRuleAvailable: false,
+      availableRules: [{
+        ...reviewPolicy.availableRules[0]!,
+        pluginVersion: "1.1.0",
+        settingsSchema: null
+      }]
+    };
+    api.getReviewPolicy.mockResolvedValue(upgradedPolicy);
+    api.updateReviewPolicy.mockResolvedValue({
+      ...upgradedPolicy,
+      selectedPluginVersion: "1.1.0",
+      selectedRuleAvailable: true
+    });
+    const view = mount(
+      <AdminPage session={session({ canManageReviewPolicy: true })} />
+    );
+
+    await waitFor(() => expect(view.textContent).toContain("当前保存的规则已经不可用"));
+    const select = view.querySelector<HTMLSelectElement>("select");
+    expect(select).not.toBeNull();
+    expect(select?.value).toBe("");
+
+    await changeValue(select!, reviewPolicy.selectedRuleId);
+    const save = buttonWithText(view, "保存审核规则");
+    await waitFor(() => expect(save.disabled).toBe(false));
+    await click(save);
+
+    await waitFor(() => expect(api.updateReviewPolicy).toHaveBeenCalledWith({
+      ruleId: reviewPolicy.selectedRuleId,
+      settings: {},
+      expectedRevision: reviewPolicy.revision
+    }));
+  });
+
+  it("审核规则冲突后重新读取失败时保留尚未保存的输入", async () => {
+    api.getReviewPolicy
+      .mockResolvedValueOnce(reviewPolicy)
+      .mockRejectedValueOnce(new Error("重新读取失败"));
+    api.updateReviewPolicy.mockRejectedValue(new ApiError("版本冲突", 409));
+    const view = mount(
+      <AdminPage session={session({ canManageReviewPolicy: true })} />
+    );
+
+    await waitFor(() => expect(view.textContent).toContain("多数意见"));
+    const input = view.querySelector<HTMLInputElement>('input[type="number"]');
+    expect(input).not.toBeNull();
+    await changeValue(input!, "3");
+    await click(buttonWithText(view, "保存审核规则"));
+    await waitFor(() => expect(view.textContent).toContain("其他人已经修改了审核规则"));
+
+    await click(buttonWithText(view, "放弃本页输入并重新读取"));
+    await waitFor(() => expect(api.getReviewPolicy).toHaveBeenCalledTimes(2));
+    expect(input?.value).toBe("3");
+    expect(view.textContent).toContain("其他人已经修改了审核规则");
+    expect(view.textContent).not.toContain("审核规则暂时无法读取");
+  });
+
+  it("插件冲突后重新读取失败时保留密钥输入和编辑器", async () => {
+    api.listAdminPlugins
+      .mockResolvedValueOnce({ items: [plugin] })
+      .mockRejectedValueOnce(new Error("重新读取失败"));
+    api.updateAdminPlugin.mockRejectedValue(new ApiError("版本冲突", 409));
+    const view = mount(<AdminPage session={session({ canManagePlugins: true })} />);
+
+    await waitFor(() => expect(view.textContent).toContain("AI 审题服务"));
+    const secret = view.querySelector<HTMLInputElement>('input[type="password"]');
+    expect(secret).not.toBeNull();
+    await changeValue(secret!, "temporary-secret");
+    await click(buttonWithText(view, "保存插件设置"));
+    await waitFor(() => expect(view.textContent).toContain("其他人已经修改了这个插件"));
+
+    await click(buttonWithText(view, "放弃本页输入并重新读取"));
+    await waitFor(() => expect(api.listAdminPlugins).toHaveBeenCalledTimes(2));
+    expect(secret?.value).toBe("temporary-secret");
+    expect(view.textContent).toContain("AI 审题服务");
+    expect(view.textContent).toContain("其他人已经修改了这个插件");
+    expect(view.textContent).not.toContain("插件设置暂时无法读取");
   });
 });

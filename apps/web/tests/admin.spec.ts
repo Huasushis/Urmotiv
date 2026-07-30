@@ -232,3 +232,20 @@ test("手机视口中的插件设置没有横向溢出", async ({ page }, testIn
   expect(overflow).toBeLessThanOrEqual(1);
   await page.screenshot({ path: testInfo.outputPath("admin-plugins-mobile.png"), fullPage: true });
 });
+
+test("手机视口中的审核规则没有横向溢出", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chromium", "只检查手机布局");
+  await page.route("**/api/v1/review-policy", async (route) => {
+    await fulfillJson(route, reviewPolicy);
+  });
+
+  await loginAs(page, /组长/);
+  await page.goto("/admin");
+  await expect(page.getByRole("heading", { name: "审核规则" })).toBeVisible();
+
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath("admin-review-mobile.png"), fullPage: true });
+});

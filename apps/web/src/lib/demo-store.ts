@@ -304,7 +304,7 @@ export async function getDemoSession(): Promise<SessionResponse> {
       isRoot: false,
       permissions: [
         ...(canManageReviewPolicy ? ["problem.status.change"] : []),
-        ...(canManagePlugins ? ["system.manage", "plugin.manage"] : [])
+        ...(canManagePlugins ? ["plugin.manage"] : [])
       ],
       canManageReviewPolicy,
       canManagePlugins

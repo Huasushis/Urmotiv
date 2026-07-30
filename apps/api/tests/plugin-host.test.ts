@@ -360,14 +360,13 @@ describe("插件宿主", () => {
     await expect(host.listEnabledBeforeSubmitCheckIds()).rejects.toThrow("database unavailable");
   });
 
-  it("管理接口同时要求插件管理和系统管理，明确拒绝仍然优先", async () => {
+  it("管理接口要求插件管理权限，明确拒绝仍然优先", async () => {
     const manager = {
       id: "901", nickname: "系统管理员", accountType: "human" as const, disabled: false,
       roles: [], isRoot: false,
       grants: [
         { permission: "auth.login", effect: "allow" as const, scope: "global" as const },
-        { permission: "plugin.manage", effect: "allow" as const, scope: "global" as const },
-        { permission: "system.manage", effect: "allow" as const, scope: "global" as const }
+        { permission: "plugin.manage", effect: "allow" as const, scope: "global" as const }
       ]
     };
     const denied = {

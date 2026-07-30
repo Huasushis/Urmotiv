@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
 import { createDemoUsers, demoTags } from "../src/demo-data";
+import type { StoredUser } from "../src/domain";
 import { InMemoryDataStore } from "../src/repository";
 
 const origin = "http://localhost:5173";
@@ -14,8 +15,7 @@ afterEach(async () => {
   await Promise.all(openApps.splice(0).map(async (app) => app.close()));
 });
 
-async function makeApp(): Promise<FastifyInstance> {
-  const users = createDemoUsers();
+async function makeApp(users: StoredUser[] = createDemoUsers()): Promise<FastifyInstance> {
   const app = await createApp({
     store: new InMemoryDataStore(users, demoTags),
     demoAuthEnabled: true,
@@ -131,5 +131,59 @@ describe("审核规则 HTTP 接口", () => {
     });
     expect(write.body).not.toContain(defaultReviewRuleId);
     expect(write.body).not.toContain(settingsFieldName);
+  });
+
+  it("无权账号提交畸形正文时先按权限拒绝，不返回字段结构", async () => {
+    const demoUsers = createDemoUsers();
+    const reviewer = demoUsers.find((user) => user.id === "reviewer");
+    const leader = demoUsers.find((user) => user.id === "leader");
+    if (reviewer === undefined || leader === undefined) {
+      throw new Error("测试账号缺失");
+    }
+    const explicitlyDenied: StoredUser = {
+      ...leader,
+      id: "review-policy-denied",
+      nickname: "明确拒绝账号",
+      grants: [
+        ...leader.grants,
+        {
+          permission: "problem.status.change",
+          effect: "deny",
+          scope: "global"
+        }
+      ]
+    };
+    const robot: StoredUser = {
+      ...leader,
+      id: "review-policy-robot",
+      nickname: "机器人账号",
+      accountType: "robot"
+    };
+    const blockedUsers = [reviewer, explicitlyDenied, robot];
+    const app = await makeApp(blockedUsers);
+
+    for (const user of blockedUsers) {
+      const cookie = await login(app, user.id);
+      const response = await app.inject({
+        method: "PATCH",
+        url: "/api/v1/review-policy",
+        headers: { cookie, origin },
+        payload: {
+          ruleId: 7,
+          settings: "不应进入正文校验",
+          expectedRevision: "invalid"
+        }
+      });
+
+      expect(response.statusCode, user.id).toBe(403);
+      expect(response.headers["cache-control"], user.id).toBe(privateCacheControl);
+      expect(response.json(), user.id).toMatchObject({
+        error: { code: "FORBIDDEN", message: "你没有执行此操作的权限。" }
+      });
+      expect(response.body, user.id).not.toContain("ruleId");
+      expect(response.body, user.id).not.toContain("expectedRevision");
+      expect(response.body, user.id).not.toContain(defaultReviewRuleId);
+      expect(response.body, user.id).not.toContain(settingsFieldName);
+    }
   });
 });

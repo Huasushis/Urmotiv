@@ -19,8 +19,17 @@ export class ReviewPolicyService {
     private readonly now: () => Date = () => new Date()
   ) {}
 
+  public assertCanManage(user: StoredUser): void {
+    if (
+      user.accountType !== "human" ||
+      !hasPermission(user, "problem.status.change", {}, this.now())
+    ) {
+      throw forbidden();
+    }
+  }
+
   public async get(user: StoredUser): Promise<ReviewPolicyView> {
-    this.requireManager(user);
+    this.assertCanManage(user);
     const [policy, availableRules] = await Promise.all([
       this.store.getReviewPolicy(),
       this.decisions.listAvailableRules()
@@ -42,7 +51,7 @@ export class ReviewPolicyService {
     input: UpdateReviewPolicyInput,
     requestId: string
   ): Promise<ReviewPolicyView> {
-    this.requireManager(user);
+    this.assertCanManage(user);
     let prepared: StoredReviewRule;
     try {
       prepared = await this.decisions.prepareRule(input.ruleId, input.settings);
@@ -69,12 +78,4 @@ export class ReviewPolicyService {
     return this.get(user);
   }
 
-  private requireManager(user: StoredUser): void {
-    if (
-      user.accountType !== "human" ||
-      !hasPermission(user, "problem.status.change", {}, this.now())
-    ) {
-      throw forbidden();
-    }
-  }
 }

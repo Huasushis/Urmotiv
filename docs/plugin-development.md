@@ -433,7 +433,7 @@ plugins.md 第 4.5 节和第 7 节分别提到"插件可注册自己的后台任
    对象，字段包括 `type`/`properties`/`required`/`additionalProperties`/`minimum`/`maximum`/
    `minLength`/`maxLength`/`format`/`enum`/`default` 等，由 `plugin-host.ts` 内部的 `jsonSchemaSchema`
    校验其自身结构）。
-2. 管理员（需要同时具备核心权限 `plugin.manage` 和 `system.manage`，任一被明确拒绝就整体拒绝，见
+2. 管理员（需要具备核心权限 `plugin.manage`；明确拒绝始终优先，见
    `apps/api/src/app.ts` 的 `requirePluginManager`）调用
    `PATCH /api/v1/admin/plugins/:pluginId`，body 里带 `settings` 字段。
 3. `TrustedPluginHost.update()` 用你给的 JSON Schema 对提交的对象做服务端校验（`applySchema` 函数）：
@@ -445,8 +445,9 @@ plugins.md 第 4.5 节和第 7 节分别提到"插件可注册自己的后台任
    代码通常会再用自己的 Zod schema `.parse()` 一遍，拿到强类型的值（JSON Schema 是"给管理端看的、比较
    宽松的"校验，Zod schema 才是你代码里真正依赖的、更严格的类型来源，两次校验各司其职，不是重复劳动）。
 
-**现状说明**：第 3 步的服务端校验是真的在跑；但"管理员在页面上填一个自动生成的表单"这一步（plugins.md
-第 7 节说的"核心据此生成输入框"）目前没有对应前端代码，管理员今天只能直接传 JSON。
+**现状说明**：管理页会根据这份结构自动生成常用的文字、数字、开关和下拉输入框，服务端仍会在保存时
+重新校验。数组字段目前只显示为不可在页面修改；需要数组设置的插件应先提供专门界面，或由管理员直接调用
+接口提交，不能把未校验的文本当作数组保存。
 
 **一个容易忽略的坑**：如果你的 JSON Schema 没有显式写 `"additionalProperties": false`，`applySchema`
 遇到未声明的字段不会报错，而是原样透传保存（不做任何类型检查）。`review-default` 和 `anklang` 的
@@ -602,8 +603,8 @@ type BeforeSubmitResult =
 
 另外提一句区分：上面这些是**插件自己声明、保护插件自己资源**的权限；插件管理接口本身
 （`GET`/`PATCH /api/v1/admin/plugins/...`）受的是**核心权限**保护，`apps/api/src/app.ts` 的
-`requirePluginManager` 要求同时具备 `plugin.manage` 和 `system.manage`，两者中只要有一个被明确拒绝，
-就算另一个是允许的也整体拒绝——这是"明确拒绝优先"在两个权限同时校验时的真实体现。
+`requirePluginManager` 要求具备 `plugin.manage`；如果同一权限同时存在允许和明确拒绝，仍按明确拒绝处理。
+`system.manage` 用于修改站点、认证和存储等系统设置，不是插件管理的附加条件。
 
 ## 10. 数据库使用
 
@@ -629,10 +630,10 @@ plugins.md 第 5 节给出的原则是：插件如果要保存数据，必须用
 | --- | --- |
 | 清单和设置数据结构测试 | `plugins/review-default/test/review-rule.test.ts` 的 `describe("plugin files")`：直接读 `urmotiv-plugin.json` 和 `settings.schema.json`，断言 `pluginManifestSchema.parse(manifest).apiVersion === "1"`、默认值和文档一致。 |
 | 主程序接口版本兼容测试 | 同上，`apiVersion` 断言；`apps/api/tests/plugin-host.test.ts` 也会在构造 `TrustedPluginHost` 时校验清单，版本不兼容会在启动阶段直接抛错。 |
-| 权限拒绝、机器人固定限制和字段冻结测试 | `apps/api/tests/plugin-host.test.ts`：拒绝外部来源、拒绝与核心权限同名、拒绝越界注册钩子、插件未启用时 `requestScope`/`runBeforeSubmit` 全部拒绝、管理接口要求 `plugin.manage` 与 `system.manage` 同时允许（deny 优先）。字段冻结相关的越权测试见 [permissions.md](permissions.md) 第 7 节的清单，插件不能让这些测试变松。 |
+| 权限拒绝、机器人固定限制和字段冻结测试 | `apps/api/tests/plugin-host.test.ts` 与 `apps/api/tests/plugin-admin-http.test.ts`：拒绝外部来源、拒绝与核心权限同名、拒绝越界注册钩子、插件未启用时 `requestScope`/`runBeforeSubmit` 全部拒绝，并验证管理接口只接受具备 `plugin.manage` 的人类账号且明确拒绝优先。字段冻结相关的越权测试见 [permissions.md](permissions.md) 第 7 节的清单，插件不能让这些测试变松。 |
 | 超时、取消、返回畸形数据和外部服务不可用测试 | `packages/plugin-sdk/test/registry.test.ts` 的"treats malformed output as a failed required check"；`plugins/anklang/test/anklang.test.ts` 用 `vi.fn` 模拟 fetch，测试内容摘要不匹配、返回体超限、命中缓存时不发请求、`blockWhenRecommended` 时响应体不泄露候选详情。 |
 | 数据库迁移升级与回退说明 | 本仓库目前没有任何插件带 `migrations/` 目录（第 10 节已说明现状），暂无可参考的真实例子；如果你的插件确实需要迁移，请遵守 plugins.md 第 3 节"数据库迁移只在管理员确认的升级步骤执行，不在普通请求中自动执行"。 |
-| 若有界面，桌面和手机截图检查 | 本仓库目前没有插件自带前端界面（第 6.4 节已说明现状）。项目里其他功能的 Playwright 截图约定（桌面 1440×960 Chromium + 手机 Pixel 7，`apps/web/tests/*.spec.ts`）可以作为将来插件界面测试的格式参考。 |
+| 若有界面，桌面和手机截图检查 | 插件统一管理页的保存、冲突处理、密钥不回显和手机布局见 `apps/web/tests/admin.spec.ts`；插件若再提供自己的业务页面，也应按同样的桌面与手机视口补测试。 |
 | 若为格式适配器，按题目包规范提供安全与往返测试 | `plugins/hydro-format/test/adapter.test.ts` + `fixtures.ts`；总体测试清单见 [problem-package.md](problem-package.md) 第 9 节。 |
 | README，说明作用、数据流向、权限、设置、失败影响和卸载结果 | `plugins/review-default/README.md`、`plugins/anklang/README.md`——两份都是按这个提纲写的，直接参考格式。 |
 

@@ -85,10 +85,7 @@ afterEach(async () => {
 
 describe("插件管理 HTTP 接口", () => {
   it("列表与单项修改响应均禁止缓存", async () => {
-    const manager = createUser("plugin-manager", "human", [
-      grant("plugin.manage"),
-      grant("system.manage")
-    ]);
+    const manager = createUser("plugin-manager", "human", [grant("plugin.manage")]);
     const app = await createApp({
       store: new InMemoryDataStore([manager], demoTags),
       demoAuthEnabled: true,
@@ -194,14 +191,12 @@ describe("插件管理 HTTP 接口", () => {
     });
   });
 
-  it("明确拒绝、单项权限和机器人固定限制都不能读取或修改插件", async () => {
+  it("缺少插件管理权限、明确拒绝和机器人固定限制都不能读取或修改插件", async () => {
     const blockedUsers = [
       createUser("explicitly-denied", "human", [
         grant("plugin.manage"),
-        grant("system.manage"),
         grant("plugin.manage", "deny")
       ]),
-      createUser("plugin-only", "human", [grant("plugin.manage")]),
       createUser("system-only", "human", [grant("system.manage")]),
       createUser("robot-with-both", "robot", [
         grant("plugin.manage"),

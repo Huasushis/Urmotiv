@@ -85,10 +85,7 @@ describe("会话中的管理能力", () => {
     const reviewManager = createUser("review-manager", "human", [
       grant("problem.status.change")
     ]);
-    const pluginManager = createUser("plugin-manager", "human", [
-      grant("plugin.manage"),
-      grant("system.manage")
-    ]);
+    const pluginManager = createUser("plugin-manager", "human", [grant("plugin.manage")]);
     const app = await makeApp([reviewManager, pluginManager]);
 
     await expect(readSession(app, reviewManager.id)).resolves.toMatchObject({
@@ -120,8 +117,7 @@ describe("会话中的管理能力", () => {
       grant("problem.status.change"),
       grant("problem.status.change", { effect: "deny" }),
       grant("plugin.manage"),
-      grant("system.manage"),
-      grant("system.manage", { effect: "deny" })
+      grant("plugin.manage", { effect: "deny" })
     ]);
     const app = await makeApp([deniedUser]);
 
