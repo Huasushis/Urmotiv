@@ -17,14 +17,16 @@ import {
 import {
   canonicalProblemSchema,
   readZipArchive,
+  UnsafeArchiveError,
   urmotivNativeAdapter,
   writeZipArchive,
-  type CanonicalProblem
+  type CanonicalProblem,
+  type GeneratedArchive
 } from "@urmotiv/problem-package";
 import { LocalFileStorage } from "@urmotiv/storage";
 import { sql } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import { DatabaseContestStore } from "../src/database-contest-store";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo";
@@ -42,7 +44,10 @@ import {
 } from "../src/problem-package-runtime";
 import { ProblemFileStore } from "../src/problem-file-store";
 import { ProblemService } from "../src/service";
-import { TransferService } from "../src/transfer-service";
+import {
+  maximumProblemPackageArchiveBytes,
+  TransferService
+} from "../src/transfer-service";
 
 const localOrigin = "http://localhost:5173";
 const statementText = "导入题面：给定整数 n，输出 n。";
@@ -52,8 +57,18 @@ const silentLogger: JobLogger = { write: () => undefined };
 
 interface TransferTestContext {
   readonly app: FastifyInstance;
+  readonly artifacts: StorageExportArtifactWriter;
   readonly database: LocalDatabaseHandle;
+  readonly metadata: ProblemFileStore;
+  readonly storage: LocalFileStorage;
+  readonly store: DatabaseDataStore;
+  readonly transfer: TransferService;
   readonly worker: JobWorker;
+}
+
+interface TransferTestAppOptions {
+  readonly multiProblemOuterArchiveMaxBytes?: number;
+  readonly problemPackageArchiveMaxBytes?: number;
 }
 
 const openApps: FastifyInstance[] = [];
@@ -71,7 +86,9 @@ afterEach(async () => {
   await rm(temporaryDirectory, { recursive: true, force: true });
 });
 
-async function makeTransferApp(): Promise<TransferTestContext> {
+async function makeTransferApp(
+  options: TransferTestAppOptions = {}
+): Promise<TransferTestContext> {
   const database = createLocalDatabase({
     dataDirectory: join(temporaryDirectory, `database-${randomUUID()}`)
   });
@@ -91,6 +108,14 @@ async function makeTransferApp(): Promise<TransferTestContext> {
   const queue = new LocalJobQueue();
   const coordinator = new ProblemPackageJobCoordinator(jobStore, queue);
   const exportReader = new DatabaseFixedRevisionExportReader({ database, metadata, storage });
+  const artifacts = new StorageExportArtifactWriter({
+    database,
+    metadata,
+    storage,
+    ...(options.multiProblemOuterArchiveMaxBytes === undefined
+      ? {}
+      : { multiProblemOuterArchiveMaxBytes: options.multiProblemOuterArchiveMaxBytes })
+  });
   const worker = new JobWorker(queue, { workerId: "test-worker", logger: silentLogger });
   registerProblemPackageHandlers(worker, {
     import: {
@@ -105,7 +130,7 @@ async function makeTransferApp(): Promise<TransferTestContext> {
         getUser: (userId) => store.getUser(userId),
         service
       }),
-      artifacts: new StorageExportArtifactWriter({ database, metadata, storage })
+      artifacts
     }
   });
   const transfer = new TransferService({
@@ -114,7 +139,10 @@ async function makeTransferApp(): Promise<TransferTestContext> {
     storage,
     jobs: jobStore,
     coordinator,
-    exportReader
+    exportReader,
+    ...(options.problemPackageArchiveMaxBytes === undefined
+      ? {}
+      : { maximumArchiveBytes: options.problemPackageArchiveMaxBytes })
   });
 
   const app = await createApp({
@@ -127,7 +155,16 @@ async function makeTransferApp(): Promise<TransferTestContext> {
     transfer
   });
   openApps.push(app);
-  return { app, database, worker };
+  return {
+    app,
+    artifacts,
+    database,
+    metadata,
+    storage,
+    store,
+    transfer,
+    worker
+  };
 }
 
 async function login(app: FastifyInstance, userId: string): Promise<string> {
@@ -186,6 +223,27 @@ async function nativeZipOf(problem: CanonicalProblem): Promise<Uint8Array> {
     exportedAt: "2026-07-26T00:00:00.000Z"
   });
   return writeZipArchive(generated.files);
+}
+
+function syntheticGeneratedArchive(
+  fileName: string,
+  includeNestedArchive: boolean
+): GeneratedArchive {
+  const encoder = new TextEncoder();
+  return {
+    mediaType: "application/vnd.urmotiv.problem+zip",
+    fileName,
+    files: includeNestedArchive
+      ? [
+          {
+            path: "attachments/nested.zip",
+            content: writeZipArchive([
+              { path: "marker.txt", content: encoder.encode("nested marker") }
+            ])
+          }
+        ]
+      : [{ path: "marker.txt", content: encoder.encode("plain marker") }]
+  };
 }
 
 async function uploadPackage(
@@ -441,6 +499,278 @@ describe("题目包导入", () => {
     );
     expect(truncated.statusCode).toBe(422);
   });
+
+  it("题目包上传在达到配置上限后立即拒绝", async () => {
+    const { app, store, transfer } = await makeTransferApp({
+      problemPackageArchiveMaxBytes: 64
+    });
+    const leader = await login(app, databaseDemoUserIds.leader);
+
+    const rejected = await uploadPackage(
+      app,
+      leader,
+      new Uint8Array(65),
+      "private-title.zip"
+    );
+
+    expect(rejected.statusCode).toBe(413);
+    expect(rejected.json()).toEqual({
+      error: expect.objectContaining({
+        code: "FILE_TOO_LARGE"
+      })
+    });
+    expect(rejected.body).not.toContain("private-title.zip");
+    expect(rejected.body).not.toContain("content-length");
+
+    const leaderUser = await store.getUser(databaseDemoUserIds.leader);
+    if (leaderUser === undefined) {
+      throw new Error("The seeded leader account is missing.");
+    }
+    let requestedAnotherChunk = false;
+    async function* oversizedChunks(): AsyncGenerator<Uint8Array> {
+      yield new Uint8Array(40);
+      yield new Uint8Array(25);
+      requestedAnotherChunk = true;
+      yield new Uint8Array(1);
+    }
+
+    await expect(
+      transfer.uploadPackage(leaderUser, "stream.zip", oversizedChunks())
+    ).rejects.toMatchObject({
+      statusCode: 413,
+      code: "FILE_TOO_LARGE"
+    });
+    expect(requestedAnotherChunk).toBe(false);
+  });
+
+  it("后台导入不会按异常登记大小读取旧题目包", async () => {
+    const { app, database, metadata, storage } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const uploaded = await uploadPackage(
+      app,
+      leader,
+      await nativeZipOf(fixtureProblem())
+    );
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+
+    await database.execute(sql`
+      UPDATE stored_files
+      SET byte_size = ${BigInt(maximumProblemPackageArchiveBytes + 1)}
+      WHERE id = ${upload.fileId}::uuid
+    `);
+
+    const archive = await new StorageVerifiedImportArchiveReader(metadata, storage).read({
+      sourceFileId: upload.fileId,
+      expectedDigest: upload.sha256,
+      signal: new AbortController().signal
+    });
+    expect(archive).toBeUndefined();
+  });
+});
+
+describe("题目包导出", () => {
+  it("多题导出只在外层包明确允许嵌套题目包", async () => {
+    const { app, worker } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const firstProblemId = await importFixtureProblem(app, worker, leader);
+    const secondProblem = canonicalProblemSchema.parse({
+      ...fixtureProblem(),
+      title: "导入的第二道演示题目",
+      content: {
+        ...fixtureProblem().content,
+        basicStatement: "第二道合成题面：给定整数 m，输出 m。"
+      }
+    });
+    const secondProblemId = await importFixtureProblem(
+      app,
+      worker,
+      leader,
+      secondProblem
+    );
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "urmotiv",
+        problems: [firstProblemId, secondProblemId].map((problemId) => ({
+          problemId,
+          includeFileCategories: ["testdata"]
+        })),
+        idempotencyKey: "export-two-problems-1"
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const exportJobId = (created.json() as { id: string }).id;
+    expect(await worker.runOnce()).toBe(true);
+
+    const status = await app.inject({
+      method: "GET",
+      url: `/api/v1/transfer/exports/${exportJobId}`,
+      headers: { cookie: leader }
+    });
+    expect(status.statusCode).toBe(200);
+    expect(status.json()).toEqual(
+      expect.objectContaining({
+        state: "succeeded",
+        resultReady: true,
+        failure: null
+      })
+    );
+
+    const downloaded = await app.inject({
+      method: "GET",
+      url: `/api/v1/transfer/exports/${exportJobId}/download`,
+      headers: { cookie: leader }
+    });
+    expect(downloaded.statusCode).toBe(200);
+    const downloadedBytes = new Uint8Array(downloaded.rawPayload);
+    expect(() => readZipArchive(downloadedBytes)).toThrow(UnsafeArchiveError);
+
+    const outer = readZipArchive(downloadedBytes, {
+      allowNestedArchives: true
+    });
+    const packageEntries = outer
+      .list()
+      .filter((entry) => entry.kind === "file" && entry.path.endsWith(".zip"));
+    expect(packageEntries).toHaveLength(2);
+
+    const titles: string[] = [];
+    for (const entry of packageEntries) {
+      const innerBytes = outer.read(entry.path);
+      expect(innerBytes).toBeDefined();
+      if (innerBytes === undefined) {
+        continue;
+      }
+      const imported = await urmotivNativeAdapter.import(
+        readZipArchive(innerBytes),
+        { conflictAction: "create" }
+      );
+      titles.push(imported.title);
+    }
+    expect(titles.sort()).toEqual(
+      ["导入的演示题目", "导入的第二道演示题目"].sort()
+    );
+  });
+
+  it("单题导出不会放宽内层嵌套压缩包限制", async () => {
+    const { artifacts } = await makeTransferApp();
+
+    await expect(
+      artifacts.write({
+        exportJobId: randomUUID(),
+        requestedByUserId: databaseDemoUserIds.leader,
+        targetFormat: "urmotiv",
+        archives: [syntheticGeneratedArchive("single.zip", true)],
+        signal: new AbortController().signal
+      })
+    ).rejects.toMatchObject({
+      name: "UnsafeArchiveError",
+      issues: [
+        expect.objectContaining({
+          code: "nested_archive",
+          path: "attachments/nested.zip"
+        })
+      ]
+    });
+  });
+
+  it("多题导出的每个内层题目包仍拒绝嵌套压缩包", async () => {
+    const { artifacts } = await makeTransferApp();
+
+    await expect(
+      artifacts.write({
+        exportJobId: randomUUID(),
+        requestedByUserId: databaseDemoUserIds.leader,
+        targetFormat: "urmotiv",
+        archives: [
+          syntheticGeneratedArchive("first.zip", false),
+          syntheticGeneratedArchive("second.zip", true)
+        ],
+        signal: new AbortController().signal
+      })
+    ).rejects.toMatchObject({
+      name: "UnsafeArchiveError",
+      issues: [
+        expect.objectContaining({
+          code: "nested_archive",
+          path: "attachments/nested.zip"
+        })
+      ]
+    });
+  });
+
+  it("多题导出明确拒绝超过外层包容量上限的内容", async () => {
+    const archives = [
+      syntheticGeneratedArchive("first.zip", false),
+      syntheticGeneratedArchive("second.zip", false)
+    ];
+    const innerPackageBytes = archives.reduce(
+      (total, archive) => total + writeZipArchive(archive.files).byteLength,
+      0
+    );
+    const { artifacts } = await makeTransferApp({
+      multiProblemOuterArchiveMaxBytes: innerPackageBytes - 1
+    });
+
+    await expect(
+      artifacts.write({
+        exportJobId: randomUUID(),
+        requestedByUserId: databaseDemoUserIds.leader,
+        targetFormat: "urmotiv",
+        archives,
+        signal: new AbortController().signal
+      })
+    ).rejects.toMatchObject({
+      name: "UnsafeArchiveError",
+      issues: [
+        expect.objectContaining({
+          code: "archive_too_large"
+        })
+      ]
+    });
+  });
+
+  it("多题导出达到内层包累计上限后立即停止且不写出半成品", async () => {
+    const first = syntheticGeneratedArchive("first.zip", false);
+    const second = syntheticGeneratedArchive("second.zip", false);
+    const firstBytes = writeZipArchive(first.files).byteLength;
+    const secondBytes = writeZipArchive(second.files).byteLength;
+    let thirdFilesRead = 0;
+    const third: GeneratedArchive = {
+      mediaType: "application/vnd.urmotiv.problem+zip",
+      fileName: "third.zip",
+      get files() {
+        thirdFilesRead += 1;
+        return syntheticGeneratedArchive("unused.zip", false).files;
+      }
+    };
+    const { artifacts, storage } = await makeTransferApp({
+      multiProblemOuterArchiveMaxBytes: firstBytes + secondBytes - 1
+    });
+    const stage = vi.spyOn(storage, "stage");
+
+    await expect(
+      artifacts.write({
+        exportJobId: randomUUID(),
+        requestedByUserId: databaseDemoUserIds.leader,
+        targetFormat: "urmotiv",
+        archives: [first, second, third],
+        signal: new AbortController().signal
+      })
+    ).rejects.toMatchObject({
+      name: "UnsafeArchiveError",
+      issues: [
+        expect.objectContaining({
+          code: "archive_too_large"
+        })
+      ]
+    });
+    expect(thirdFilesRead).toBe(0);
+    expect(stage).not.toHaveBeenCalled();
+  });
 });
 
 describe("题目包导出权限", () => {
@@ -530,9 +860,10 @@ describe("题目包导出权限", () => {
 async function importFixtureProblem(
   app: FastifyInstance,
   worker: JobWorker,
-  cookie: string
+  cookie: string,
+  problem: CanonicalProblem = fixtureProblem()
 ): Promise<string> {
-  const zipBytes = await nativeZipOf(fixtureProblem());
+  const zipBytes = await nativeZipOf(problem);
   const uploaded = await uploadPackage(app, cookie, zipBytes);
   const upload = uploaded.json() as { fileId: string; sha256: string };
   const created = await app.inject({

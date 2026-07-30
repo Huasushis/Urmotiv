@@ -27,6 +27,7 @@ export interface ArchiveSummary {
 }
 
 export interface ArchiveSafetyLimits {
+  readonly maxArchiveBytes: number;
   readonly maxEntries: number;
   readonly maxPathDepth: number;
   readonly maxPathLength: number;
@@ -37,11 +38,17 @@ export interface ArchiveSafetyLimits {
 }
 
 export const defaultArchiveSafetyLimits: ArchiveSafetyLimits = {
+  // 当前实现全程在内存中处理：最多同时保留 128 MiB 原始包、128 MiB 解压结果
+  // 和 SafeArchive 的 128 MiB 防御性副本；若解压结果尚未回收时调用 list()，
+  // 还会再复制最多 128 MiB，峰值约 512 MiB，另有解压库与运行时开销。
+  // 这些是当前实现的默认保护值，不是题目包格式的大小上限。受信任且隔离运行的
+  // 任务可以显式调整，但必须同时预留内存并限制并发数量。
+  maxArchiveBytes: 128 * 1024 * 1024,
   maxEntries: 10_000,
   maxPathDepth: 16,
   maxPathLength: 240,
   maxSingleFileBytes: 128 * 1024 * 1024,
-  maxTotalUncompressedBytes: 1024 * 1024 * 1024,
+  maxTotalUncompressedBytes: 128 * 1024 * 1024,
   maxCompressionRatio: 200,
   allowNestedArchives: false
 };
@@ -174,7 +181,7 @@ export function validateArchiveMetadata(
     });
     // The archive is already rejected, so keep the failure preview bounded too.
     return {
-      summary: summarizeArchive(entries.slice(0, limits.maxEntries)),
+      summary: summarizeArchive(safeEntriesForSummary(entries, limits, limits.maxEntries)),
       issues,
       isSafe: false
     };
@@ -184,11 +191,13 @@ export function validateArchiveMetadata(
   const foldedPaths = new Map<string, string>();
   const filePaths = new Set<string>();
   const parentPaths = new Set<string>();
+  const safeSummaryEntries: ArchiveEntrySummary[] = [];
   let totalUncompressed = 0;
   let totalCompressed = 0;
 
   for (const entry of entries) {
-    if (typeof entry.path !== "string") {
+    const rawPath = entry.path;
+    if (typeof rawPath !== "string") {
       issues.push({
         severity: "error",
         code: "invalid_path",
@@ -196,28 +205,31 @@ export function validateArchiveMetadata(
       });
       continue;
     }
-    const path = pathForValidation(entry);
+    const path = pathForValidation(entry, rawPath);
+
+    if (
+      !hasSafeArchivePath(path, limits)
+    ) {
+      issues.push({
+        severity: "error",
+        code: "invalid_path",
+        message: "压缩包包含不安全的文件路径。"
+      });
+      continue;
+    }
+    safeSummaryEntries.push({
+      path: rawPath,
+      kind: entry.kind,
+      compressedSize: entry.compressedSize,
+      uncompressedSize: entry.uncompressedSize
+    });
 
     if (!hasValidSizes(entry)) {
       issues.push({
         severity: "error",
         code: "invalid_size",
-        path: entry.path,
+        path,
         message: "压缩包中的文件大小信息不合法。"
-      });
-      continue;
-    }
-
-    if (
-      !isSafeArchivePath(path) ||
-      path.length > limits.maxPathLength ||
-      path.split("/").length > limits.maxPathDepth
-    ) {
-      issues.push({
-        severity: "error",
-        code: "invalid_path",
-        path: entry.path,
-        message: "压缩包包含不安全的文件路径。"
       });
       continue;
     }
@@ -226,7 +238,7 @@ export function validateArchiveMetadata(
       issues.push({
         severity: "error",
         code: "unsupported_entry_type",
-        path: entry.path,
+        path,
         message: "压缩包只允许普通文件，不能包含链接、设备或其他特殊文件。"
       });
       continue;
@@ -330,7 +342,7 @@ export function validateArchiveMetadata(
     });
   }
 
-  const summary = summarizeArchive(entries);
+  const summary = summarizeArchive(safeSummaryEntries);
   return { summary, issues, isSafe: !issues.some((issue) => issue.severity === "error") };
 }
 
@@ -381,7 +393,7 @@ export function createSafeArchive(
       });
       continue;
     }
-    if (!limits.allowNestedArchives && looksLikeZip(entry.content)) {
+    if (!limits.allowNestedArchives && looksLikeZipArchive(entry.content)) {
       issues.push({
         severity: "error",
         code: "nested_archive",
@@ -396,7 +408,8 @@ export function createSafeArchive(
       kind: "file",
       compressedSize: entry.compressedSize,
       uncompressedSize: entry.uncompressedSize,
-      content: new Uint8Array(entry.content)
+      // SafeArchive makes the single defensive copy that detaches caller-owned bytes.
+      content: entry.content
     });
   }
 
@@ -407,11 +420,44 @@ export function createSafeArchive(
   return new SafeArchive(safeEntries, safeArchiveConstructorToken);
 }
 
-function pathForValidation(entry: ArchiveEntrySummary): string {
-  if (entry.kind === "directory" && entry.path.endsWith("/")) {
-    return entry.path.slice(0, -1);
+function safeEntriesForSummary(
+  entries: readonly ArchiveEntrySummary[],
+  limits: ArchiveSafetyLimits,
+  maximumEntries: number
+): ArchiveEntrySummary[] {
+  const safeEntries: ArchiveEntrySummary[] = [];
+  const end = Math.min(entries.length, maximumEntries);
+  for (let index = 0; index < end; index += 1) {
+    const entry = entries[index];
+    const rawPath = entry?.path;
+    if (entry === undefined || typeof rawPath !== "string") {
+      continue;
+    }
+    if (hasSafeArchivePath(pathForValidation(entry, rawPath), limits)) {
+      safeEntries.push({
+        path: rawPath,
+        kind: entry.kind,
+        compressedSize: entry.compressedSize,
+        uncompressedSize: entry.uncompressedSize
+      });
+    }
   }
-  return entry.path;
+  return safeEntries;
+}
+
+function hasSafeArchivePath(path: string, limits: ArchiveSafetyLimits): boolean {
+  return (
+    isSafeArchivePath(path) &&
+    path.length <= limits.maxPathLength &&
+    path.split("/").length <= limits.maxPathDepth
+  );
+}
+
+function pathForValidation(entry: ArchiveEntrySummary, rawPath = entry.path): string {
+  if (entry.kind === "directory" && rawPath.endsWith("/")) {
+    return rawPath.slice(0, -1);
+  }
+  return rawPath;
 }
 
 function parentArchivePaths(path: string): readonly string[] {
@@ -432,27 +478,53 @@ function hasValidSizes(entry: ArchiveEntrySummary): boolean {
   );
 }
 
-function looksLikeZip(content: Uint8Array): boolean {
-  return (
+const zipEndRecordSignature = 0x06054b50;
+
+/**
+ * 只检查 ZIP 的常见开头标记和结束记录，不解压内容。结束记录即使前后还有
+ * 其他字节也保守地视为 ZIP；这样也会拒绝带启动程序前缀、尾随数据、分卷、
+ * ZIP64、加密目录或损坏目录的可疑嵌套包。
+ */
+export function looksLikeZipArchive(content: Uint8Array): boolean {
+  if (
     content.byteLength >= 4 &&
     content[0] === 0x50 &&
     content[1] === 0x4b &&
     ((content[2] === 0x03 && content[3] === 0x04) ||
       (content[2] === 0x05 && content[3] === 0x06) ||
       (content[2] === 0x07 && content[3] === 0x08))
-  );
+  ) {
+    return true;
+  }
+  if (content.byteLength < 22) {
+    return false;
+  }
+
+  const view = new DataView(content.buffer, content.byteOffset, content.byteLength);
+  for (let offset = content.byteLength - 22; offset >= 0; offset -= 1) {
+    if (view.getUint32(offset, true) !== zipEndRecordSignature) {
+      continue;
+    }
+    const commentLength = view.getUint16(offset + 20, true);
+    if (offset + 22 + commentLength <= content.byteLength) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function resolveSafetyLimits(suppliedLimits: Partial<ArchiveSafetyLimits>): ArchiveSafetyLimits {
   const limits: ArchiveSafetyLimits = { ...defaultArchiveSafetyLimits, ...suppliedLimits };
   const positiveIntegers: readonly (keyof Pick<
     ArchiveSafetyLimits,
+    | "maxArchiveBytes"
     | "maxEntries"
     | "maxPathDepth"
     | "maxPathLength"
     | "maxSingleFileBytes"
     | "maxTotalUncompressedBytes"
   >)[] = [
+    "maxArchiveBytes",
     "maxEntries",
     "maxPathDepth",
     "maxPathLength",

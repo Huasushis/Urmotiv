@@ -28,6 +28,7 @@ import {
 import {
   UnsafeArchiveError,
   canonicalProblemSchema,
+  defaultArchiveSafetyLimits,
   readZipArchive,
   type ProblemFormatAdapter,
   type SafeArchive
@@ -45,7 +46,8 @@ import type { ProblemService } from "./service";
  * 题面、文件内容或存储位置。
  */
 
-const maximumUploadBytes = 512 * 1024 * 1024;
+export const maximumProblemPackageArchiveBytes =
+  defaultArchiveSafetyLimits.maxArchiveBytes;
 const defaultUploadTimeToLiveMs = 24 * 60 * 60 * 1_000;
 
 const internalPackageCategories: ReadonlySet<PackageFileCategory> = new Set([
@@ -65,6 +67,11 @@ export interface TransferServiceDependencies {
   readonly coordinator: ProblemPackageJobCoordinator;
   readonly exportReader: FixedRevisionExportReader;
   readonly adapters?: ReadonlyMap<string, ProblemFormatAdapter>;
+  /**
+   * 题目包原始 ZIP 的上限。生产环境默认 128 MiB；测试和内存较小的部署可以调低，
+   * 但不能调高。
+   */
+  readonly maximumArchiveBytes?: number;
   readonly uploadTimeToLiveMs?: number;
   readonly now?: () => Date;
 }
@@ -77,10 +84,22 @@ export class TransferService {
   readonly #coordinator: ProblemPackageJobCoordinator;
   readonly #exportReader: FixedRevisionExportReader;
   readonly #adapters: ReadonlyMap<string, ProblemFormatAdapter>;
+  public readonly maximumArchiveBytes: number;
   readonly #uploadTimeToLiveMs: number;
   readonly #now: () => Date;
 
   public constructor(dependencies: TransferServiceDependencies) {
+    const archiveLimit =
+      dependencies.maximumArchiveBytes ?? maximumProblemPackageArchiveBytes;
+    if (
+      !Number.isSafeInteger(archiveLimit) ||
+      archiveLimit <= 0 ||
+      archiveLimit > maximumProblemPackageArchiveBytes
+    ) {
+      throw new TypeError(
+        `题目包上限必须是 1 到 ${maximumProblemPackageArchiveBytes} 之间的整数。`
+      );
+    }
     this.#service = dependencies.service;
     this.#metadata = dependencies.metadata;
     this.#storage = dependencies.storage;
@@ -88,6 +107,7 @@ export class TransferService {
     this.#coordinator = dependencies.coordinator;
     this.#exportReader = dependencies.exportReader;
     this.#adapters = dependencies.adapters ?? builtinProblemPackageAdapters;
+    this.maximumArchiveBytes = archiveLimit;
     this.#uploadTimeToLiveMs = dependencies.uploadTimeToLiveMs ?? defaultUploadTimeToLiveMs;
     this.#now = dependencies.now ?? (() => new Date());
   }
@@ -103,7 +123,7 @@ export class TransferService {
   ): Promise<PackageUploadResponse> {
     this.#requireImportPermission(user);
     const originalName = fileOriginalNameSchema.parse(rawOriginalName);
-    const bytes = await collectUploadBytes(content);
+    const bytes = await collectBytes(content, this.maximumArchiveBytes);
     const archive = readArchiveOrReject(bytes);
 
     const staged = await this.#storage.stage({
@@ -504,9 +524,16 @@ export class TransferService {
     readonly byteSize: number;
     readonly sha256: string;
   }): Promise<SafeArchive> {
+    if (
+      !Number.isSafeInteger(record.byteSize) ||
+      record.byteSize < 0 ||
+      record.byteSize > this.maximumArchiveBytes
+    ) {
+      throw new ApiError(413, "FILE_TOO_LARGE", "题目包超过允许的大小限制。");
+    }
     const stream = await this.#storage.open({ id: record.id, storageKey: record.storageKey });
-    const bytes = await collectBytes(stream, record.byteSize);
-    if (sha256Hex(bytes) !== record.sha256) {
+    const bytes = await collectBytes(stream, this.maximumArchiveBytes);
+    if (bytes.byteLength !== record.byteSize || sha256Hex(bytes) !== record.sha256) {
       throw notFound();
     }
     return readArchiveOrReject(bytes);
@@ -585,10 +612,6 @@ function readArchiveOrReject(bytes: Uint8Array): SafeArchive {
     }
     throw error;
   }
-}
-
-async function collectUploadBytes(content: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
-  return collectBytes(content, maximumUploadBytes);
 }
 
 async function collectBytes(

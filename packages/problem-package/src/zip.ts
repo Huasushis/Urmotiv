@@ -3,6 +3,8 @@ import {
   SafeArchive,
   UnsafeArchiveError,
   createSafeArchive,
+  defaultArchiveSafetyLimits,
+  looksLikeZipArchive,
   validateArchiveMetadata,
   type ArchiveEntryKind,
   type ArchiveEntrySummary,
@@ -10,6 +12,7 @@ import {
   type ArchiveSourceEntry
 } from "./archive";
 import type { GeneratedArchiveFile } from "./adapter";
+import { isSafeArchivePath } from "./schema";
 
 /**
  * 这里只使用 Node 自带的 zlib：解析压缩包目录由本文件完成，因此可以在解压任何数据前
@@ -20,6 +23,10 @@ import type { GeneratedArchiveFile } from "./adapter";
 const endOfCentralDirectorySignature = 0x06054b50;
 const centralDirectoryEntrySignature = 0x02014b50;
 const localFileHeaderSignature = 0x04034b50;
+const dataDescriptorSignature = 0x08074b50;
+const encryptedFlagMask = 0x2041;
+const commonSupportedFlagMask = 0x0808;
+const deflateOptionFlagMask = 0x0006;
 /** EOCD 固定 22 字节，注释最长 65535 字节，所以只需要向前扫描这么多。 */
 const maximumEndRecordScanBytes = 22 + 65_535;
 const zip64MarkerU16 = 0xffff;
@@ -36,7 +43,9 @@ interface EndOfCentralDirectory {
 
 interface CentralDirectoryEntry {
   readonly path: string;
+  readonly nameBytes: Uint8Array;
   readonly kind: ArchiveEntryKind;
+  readonly flags: number;
   readonly compressionMethod: number;
   readonly crc32: number;
   readonly compressedSize: number;
@@ -44,8 +53,22 @@ interface CentralDirectoryEntry {
   readonly localHeaderOffset: number;
 }
 
+interface LocalFileRecord {
+  readonly entry: CentralDirectoryEntry;
+  readonly dataStart: number;
+  readonly dataEnd: number;
+  readonly recordEnd: number;
+}
+
 function rejected(
-  code: "not_a_zip_archive" | "unsupported_archive_feature" | "size_mismatch",
+  code:
+    | "archive_too_large"
+    | "invalid_path"
+    | "nested_archive"
+    | "not_a_zip_archive"
+    | "size_mismatch"
+    | "too_many_entries"
+    | "unsupported_archive_feature",
   message: string,
   path?: string
 ): UnsafeArchiveError {
@@ -54,14 +77,32 @@ function rejected(
   ]);
 }
 
+function resolveArchiveLimits(limits: Partial<ArchiveSafetyLimits>): ArchiveSafetyLimits {
+  const resolved: ArchiveSafetyLimits = {
+    ...defaultArchiveSafetyLimits,
+    ...limits
+  };
+  // Reuse the common validation without parsing or allocating archive entries.
+  validateArchiveMetadata([], resolved);
+  return resolved;
+}
+
 /** 把整个 ZIP 字节读成经过全部安全检查的内存包。 */
 export function readZipArchive(
   bytes: Uint8Array,
   limits: Partial<ArchiveSafetyLimits> = {}
 ): SafeArchive {
+  const resolvedLimits = resolveArchiveLimits(limits);
+  if (bytes.byteLength > resolvedLimits.maxArchiveBytes) {
+    throw rejected("archive_too_large", "压缩包原始大小超过限制。");
+  }
+
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const endRecord = findEndOfCentralDirectory(bytes, view);
-  const entries = parseCentralDirectory(bytes, view, endRecord);
+  if (endRecord.entryCount > resolvedLimits.maxEntries) {
+    throw rejected("too_many_entries", "压缩包中的条目数量超过限制，目录也计入数量。");
+  }
+  const entries = parseCentralDirectory(bytes, view, endRecord, resolvedLimits);
 
   const summaries: ArchiveEntrySummary[] = entries.map((entry) => ({
     path: entry.path,
@@ -69,37 +110,72 @@ export function readZipArchive(
     compressedSize: entry.compressedSize,
     uncompressedSize: entry.uncompressedSize
   }));
-  const metadata = validateArchiveMetadata(summaries, limits);
+  const metadata = validateArchiveMetadata(summaries, resolvedLimits);
   if (!metadata.isSafe) {
     throw new UnsafeArchiveError(metadata.issues);
   }
+  const localRecords = validateLocalFileRecords(bytes, view, entries, endRecord);
 
   const sources: ArchiveSourceEntry[] = [];
   for (const [index, entry] of entries.entries()) {
     const summary = summaries[index];
+    const localRecord = localRecords[index];
     if (summary === undefined) {
       throw rejected("not_a_zip_archive", "压缩包目录读取不完整。");
+    }
+    if (localRecord === undefined) {
+      throw rejected("not_a_zip_archive", "压缩包数据读取不完整。");
     }
     if (entry.kind !== "file") {
       sources.push(summary);
       continue;
     }
-    sources.push({ ...summary, content: extractFileContent(bytes, view, entry) });
+    sources.push({ ...summary, content: extractFileContent(bytes, entry, localRecord) });
   }
 
-  return createSafeArchive(sources, limits);
+  return createSafeArchive(sources, resolvedLimits);
 }
 
-/** 把已经过路径检查的文件列表打成一个 ZIP。 */
-export function writeZipArchive(files: readonly GeneratedArchiveFile[]): Uint8Array {
+/**
+ * 把已经过路径检查的文件列表打成一个 ZIP。读取和写出可共用同一组安全限制；
+ * 多题导出外层包需要嵌套单题 ZIP 时，读取外层包也必须显式允许嵌套包。
+ */
+export function writeZipArchive(
+  files: readonly GeneratedArchiveFile[],
+  limits: Partial<ArchiveSafetyLimits> = {}
+): Uint8Array {
+  const resolvedLimits = resolveArchiveLimits(limits);
+  if (files.length > resolvedLimits.maxEntries) {
+    throw rejected("too_many_entries", "生成的压缩包条目数量超过限制。");
+  }
   if (files.length >= zip64MarkerU16) {
     throw new Error("生成的压缩包条目数量超出支持范围。");
+  }
+
+  const inputSummaries: ArchiveEntrySummary[] = files.map((file) => ({
+    path: file.path,
+    kind: "file",
+    compressedSize: file.content.byteLength,
+    uncompressedSize: file.content.byteLength
+  }));
+  const inputMetadata = validateArchiveMetadata(inputSummaries, resolvedLimits);
+  if (!inputMetadata.isSafe) {
+    throw new UnsafeArchiveError(inputMetadata.issues);
+  }
+  if (!resolvedLimits.allowNestedArchives) {
+    for (const file of files) {
+      if (looksLikeZipArchive(file.content)) {
+        throw rejected("nested_archive", "生成的压缩包不能包含嵌套压缩包。", file.path);
+      }
+    }
   }
 
   const encoder = new TextEncoder();
   const localParts: Uint8Array[] = [];
   const centralParts: Uint8Array[] = [];
+  const outputSummaries: ArchiveEntrySummary[] = [];
   let localOffset = 0;
+  let centralSize = 0;
 
   for (const file of files) {
     const nameBytes = encoder.encode(file.path);
@@ -108,8 +184,11 @@ export function writeZipArchive(files: readonly GeneratedArchiveFile[]): Uint8Ar
     }
     const content = file.content;
     const deflated = deflateRawSync(content);
-    const useStore = deflated.byteLength >= content.byteLength;
-    const stored = useStore ? content : new Uint8Array(deflated);
+    const deflatedRatio = content.byteLength / Math.max(1, deflated.byteLength);
+    const useStore =
+      deflated.byteLength >= content.byteLength ||
+      deflatedRatio > resolvedLimits.maxCompressionRatio;
+    const stored = useStore ? content : deflated;
     const method = useStore ? 0 : 8;
     const checksum = crc32(content) >>> 0;
     if (
@@ -156,12 +235,27 @@ export function writeZipArchive(files: readonly GeneratedArchiveFile[]): Uint8Ar
     centralView.setUint32(42, localOffset, true);
     centralHeader.set(nameBytes, 46);
 
+    const nextLocalOffset = localOffset + localHeader.byteLength + stored.byteLength;
+    const nextCentralSize = centralSize + centralHeader.byteLength;
+    if (nextLocalOffset + nextCentralSize + 22 > resolvedLimits.maxArchiveBytes) {
+      throw rejected("archive_too_large", "生成的压缩包原始大小超过限制。");
+    }
     localParts.push(localHeader, stored);
     centralParts.push(centralHeader);
-    localOffset += localHeader.byteLength + stored.byteLength;
+    outputSummaries.push({
+      path: file.path,
+      kind: "file",
+      compressedSize: stored.byteLength,
+      uncompressedSize: content.byteLength
+    });
+    localOffset = nextLocalOffset;
+    centralSize = nextCentralSize;
   }
 
-  const centralSize = centralParts.reduce((total, part) => total + part.byteLength, 0);
+  const outputMetadata = validateArchiveMetadata(outputSummaries, resolvedLimits);
+  if (!outputMetadata.isSafe) {
+    throw new UnsafeArchiveError(outputMetadata.issues);
+  }
   if (localOffset >= zip64MarkerU32 || centralSize >= zip64MarkerU32) {
     throw new Error("生成的压缩包超出支持的大小范围。");
   }
@@ -177,6 +271,9 @@ export function writeZipArchive(files: readonly GeneratedArchiveFile[]): Uint8Ar
   endView.setUint16(20, 0, true);
 
   const totalLength = localOffset + centralSize + endRecord.byteLength;
+  if (totalLength > resolvedLimits.maxArchiveBytes) {
+    throw rejected("archive_too_large", "生成的压缩包原始大小超过限制。");
+  }
   const archive = new Uint8Array(totalLength);
   let cursor = 0;
   for (const part of [...localParts, ...centralParts, endRecord]) {
@@ -233,7 +330,8 @@ function findEndOfCentralDirectory(bytes: Uint8Array, view: DataView): EndOfCent
 function parseCentralDirectory(
   bytes: Uint8Array,
   view: DataView,
-  endRecord: EndOfCentralDirectory
+  endRecord: EndOfCentralDirectory,
+  limits: ArchiveSafetyLimits
 ): CentralDirectoryEntry[] {
   const utf8 = new TextDecoder("utf-8", { fatal: true });
   const entries: CentralDirectoryEntry[] = [];
@@ -260,8 +358,14 @@ function parseCentralDirectory(
     const externalAttributes = view.getUint32(cursor + 38, true);
     const localHeaderOffset = view.getUint32(cursor + 42, true);
 
-    if ((flags & 0x0001) !== 0 || (flags & 0x0040) !== 0) {
+    if ((flags & encryptedFlagMask) !== 0) {
       throw rejected("unsupported_archive_feature", "不支持加密的压缩包。");
+    }
+    const supportedFlags =
+      commonSupportedFlagMask |
+      (compressionMethod === 8 ? deflateOptionFlagMask : 0);
+    if ((flags & ~supportedFlags) !== 0) {
+      throw rejected("unsupported_archive_feature", "压缩包使用了不支持的功能标志。");
     }
     if (diskStart !== 0) {
       throw rejected("unsupported_archive_feature", "不支持分卷压缩包。");
@@ -275,17 +379,37 @@ function parseCentralDirectory(
     }
 
     const nameStart = cursor + 46;
-    if (nameStart + nameLength > directoryEnd) {
+    const entryEnd = nameStart + nameLength + extraLength + commentLength;
+    if (entryEnd > directoryEnd) {
       throw rejected("not_a_zip_archive", "压缩包目录不完整，文件可能已损坏。");
     }
+    const nameBytes = bytes.subarray(nameStart, nameStart + nameLength);
     let path: string;
     try {
-      path = utf8.decode(bytes.subarray(nameStart, nameStart + nameLength));
+      path = utf8.decode(nameBytes);
     } catch {
       throw rejected("not_a_zip_archive", "压缩包中的文件名不是有效的 UTF-8 文本。");
     }
 
     const kind = entryKindOf(path, externalAttributes);
+    const pathForSafety =
+      kind === "directory" && path.endsWith("/") ? path.slice(0, -1) : path;
+    if (
+      !isSafeArchivePath(pathForSafety) ||
+      pathForSafety.length > limits.maxPathLength ||
+      pathForSafety.split("/").length > limits.maxPathDepth
+    ) {
+      throw rejected("invalid_path", "压缩包包含不安全的文件路径。");
+    }
+    if ((flags & 0x0800) === 0 && nameBytes.some((byte) => byte >= 0x80)) {
+      throw rejected(
+        "unsupported_archive_feature",
+        "压缩包中的非 ASCII 文件名没有声明 UTF-8 编码。"
+      );
+    }
+    if (kind === "directory" && (compressedSize !== 0 || uncompressedSize !== 0)) {
+      throw rejected("size_mismatch", "压缩包中的目录不能声明文件内容。", path);
+    }
     if (kind === "file" && compressionMethod !== 0 && compressionMethod !== 8) {
       throw rejected(
         "unsupported_archive_feature",
@@ -296,14 +420,20 @@ function parseCentralDirectory(
 
     entries.push({
       path,
+      nameBytes: new Uint8Array(nameBytes),
       kind,
+      flags,
       compressionMethod,
       crc32: checksum,
       compressedSize,
       uncompressedSize,
       localHeaderOffset
     });
-    cursor = nameStart + nameLength + extraLength + commentLength;
+    cursor = entryEnd;
+  }
+
+  if (cursor !== directoryEnd) {
+    throw rejected("not_a_zip_archive", "压缩包目录长度与记录不一致，文件可能已损坏。");
   }
 
   return entries;
@@ -324,37 +454,186 @@ function entryKindOf(path: string, externalAttributes: number): ArchiveEntryKind
   return "file";
 }
 
-function extractFileContent(
+function validateLocalFileRecords(
   bytes: Uint8Array,
   view: DataView,
+  entries: readonly CentralDirectoryEntry[],
+  endRecord: EndOfCentralDirectory
+): LocalFileRecord[] {
+  const utf8 = new TextDecoder("utf-8", { fatal: true });
+  const records = entries.map((entry): LocalFileRecord => {
+    const headerOffset = entry.localHeaderOffset;
+    if (headerOffset + 30 > endRecord.centralDirectoryOffset) {
+      throw rejected(
+        "not_a_zip_archive",
+        "压缩包数据越过目录边界，文件可能已损坏。",
+        entry.path
+      );
+    }
+    if (view.getUint32(headerOffset, true) !== localFileHeaderSignature) {
+      throw rejected(
+        "not_a_zip_archive",
+        "压缩包数据位置不正确，文件可能已损坏。",
+        entry.path
+      );
+    }
+
+    const flags = view.getUint16(headerOffset + 6, true);
+    const compressionMethod = view.getUint16(headerOffset + 8, true);
+    const checksum = view.getUint32(headerOffset + 14, true);
+    const compressedSize = view.getUint32(headerOffset + 18, true);
+    const uncompressedSize = view.getUint32(headerOffset + 22, true);
+    const nameLength = view.getUint16(headerOffset + 26, true);
+    const extraLength = view.getUint16(headerOffset + 28, true);
+    const nameStart = headerOffset + 30;
+    const dataStart = nameStart + nameLength + extraLength;
+    const dataEnd = dataStart + entry.compressedSize;
+    if (
+      dataStart > endRecord.centralDirectoryOffset ||
+      dataEnd > endRecord.centralDirectoryOffset
+    ) {
+      throw rejected(
+        "not_a_zip_archive",
+        "压缩包数据越过目录边界，文件可能已损坏。",
+        entry.path
+      );
+    }
+
+    const localNameBytes = bytes.subarray(nameStart, nameStart + nameLength);
+    let localPath: string;
+    try {
+      localPath = utf8.decode(localNameBytes);
+    } catch {
+      throw rejected(
+        "not_a_zip_archive",
+        "压缩包本地记录中的文件名不是有效的 UTF-8 文本。",
+        entry.path
+      );
+    }
+    if (
+      localPath !== entry.path ||
+      !equalBytes(localNameBytes, entry.nameBytes) ||
+      flags !== entry.flags ||
+      compressionMethod !== entry.compressionMethod
+    ) {
+      throw rejected(
+        "not_a_zip_archive",
+        "压缩包本地记录与目录记录不一致，文件可能已损坏。",
+        entry.path
+      );
+    }
+
+    const usesDataDescriptor = (entry.flags & 0x0008) !== 0;
+    const localSizesAreEmpty =
+      checksum === 0 && compressedSize === 0 && uncompressedSize === 0;
+    const localSizesMatch =
+      checksum === entry.crc32 &&
+      compressedSize === entry.compressedSize &&
+      uncompressedSize === entry.uncompressedSize;
+    if (usesDataDescriptor ? !localSizesAreEmpty && !localSizesMatch : !localSizesMatch) {
+      throw rejected(
+        "not_a_zip_archive",
+        "压缩包本地记录与目录记录不一致，文件可能已损坏。",
+        entry.path
+      );
+    }
+
+    const recordEnd = usesDataDescriptor
+      ? validateDataDescriptor(view, dataEnd, endRecord.centralDirectoryOffset, entry)
+      : dataEnd;
+    return { entry, dataStart, dataEnd, recordEnd };
+  });
+
+  const ordered = [...records].sort(
+    (left, right) => left.entry.localHeaderOffset - right.entry.localHeaderOffset
+  );
+  for (let index = 1; index < ordered.length; index += 1) {
+    const previous = ordered[index - 1];
+    const current = ordered[index];
+    if (
+      previous !== undefined &&
+      current !== undefined &&
+      current.entry.localHeaderOffset < previous.recordEnd
+    ) {
+      throw rejected(
+        "not_a_zip_archive",
+        "压缩包中的文件区段相互重叠，文件可能已损坏。",
+        current.entry.path
+      );
+    }
+  }
+  return records;
+}
+
+function validateDataDescriptor(
+  view: DataView,
+  descriptorStart: number,
+  centralDirectoryOffset: number,
   entry: CentralDirectoryEntry
-): Uint8Array {
-  const headerOffset = entry.localHeaderOffset;
-  if (headerOffset + 30 > bytes.byteLength) {
-    throw rejected("not_a_zip_archive", "压缩包数据不完整，文件可能已损坏。", entry.path);
-  }
-  if (view.getUint32(headerOffset, true) !== localFileHeaderSignature) {
-    throw rejected("not_a_zip_archive", "压缩包数据位置不正确，文件可能已损坏。", entry.path);
-  }
-  const nameLength = view.getUint16(headerOffset + 26, true);
-  const extraLength = view.getUint16(headerOffset + 28, true);
-  const dataStart = headerOffset + 30 + nameLength + extraLength;
-  const dataEnd = dataStart + entry.compressedSize;
-  if (dataEnd > bytes.byteLength) {
-    throw rejected("not_a_zip_archive", "压缩包数据不完整，文件可能已损坏。", entry.path);
+): number {
+  if (descriptorStart + 12 > centralDirectoryOffset) {
+    throw rejected(
+      "not_a_zip_archive",
+      "压缩包的数据描述区缺失或被截断。",
+      entry.path
+    );
   }
 
-  const compressed = bytes.subarray(dataStart, dataEnd);
+  if (
+    view.getUint32(descriptorStart, true) === dataDescriptorSignature &&
+    descriptorStart + 16 <= centralDirectoryOffset &&
+    dataDescriptorMatches(view, descriptorStart + 4, entry)
+  ) {
+    return descriptorStart + 16;
+  }
+  if (dataDescriptorMatches(view, descriptorStart, entry)) {
+    return descriptorStart + 12;
+  }
+  throw rejected(
+    "size_mismatch",
+    "压缩包的数据描述区与目录记录不一致。",
+    entry.path
+  );
+}
+
+function dataDescriptorMatches(
+  view: DataView,
+  valuesOffset: number,
+  entry: CentralDirectoryEntry
+): boolean {
+  return (
+    view.getUint32(valuesOffset, true) === entry.crc32 &&
+    view.getUint32(valuesOffset + 4, true) === entry.compressedSize &&
+    view.getUint32(valuesOffset + 8, true) === entry.uncompressedSize
+  );
+}
+
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) {
+    return false;
+  }
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function extractFileContent(
+  bytes: Uint8Array,
+  entry: CentralDirectoryEntry,
+  record: LocalFileRecord
+): Uint8Array {
+  const compressed = bytes.subarray(record.dataStart, record.dataEnd);
   let content: Uint8Array;
   if (entry.compressionMethod === 0) {
-    content = new Uint8Array(compressed);
+    content = compressed;
   } else {
     try {
-      content = new Uint8Array(
-        inflateRawSync(compressed, {
-          maxOutputLength: Math.max(1, entry.uncompressedSize)
-        })
-      );
+      content = inflateRawSync(compressed, {
+        maxOutputLength: Math.max(1, entry.uncompressedSize)
+      });
     } catch {
       throw rejected(
         "size_mismatch",

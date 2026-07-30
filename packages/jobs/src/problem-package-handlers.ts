@@ -6,6 +6,7 @@ import {
   UnsafeArchiveError,
   canonicalProblemSchema,
   createSafeArchive,
+  defaultArchiveSafetyLimits,
   urmotivNativeAdapter,
   type CanonicalFile,
   type CanonicalProblem,
@@ -32,6 +33,9 @@ export const builtinProblemPackageAdapters: ReadonlyMap<string, ProblemFormatAda
   [urmotivNativeAdapter.id, urmotivNativeAdapter],
   [hydroProblemFormatAdapter.id, hydroProblemFormatAdapter]
 ]);
+
+const maximumInMemoryExportBytes =
+  defaultArchiveSafetyLimits.maxTotalUncompressedBytes;
 
 /**
  * The API-side source implementation has already checked the original ZIP
@@ -72,6 +76,8 @@ export interface ProblemPackageImportHandlerDependencies {
 export interface ExportProblemFileDescriptor {
   readonly path: string;
   readonly category: ProblemPackageFileCategory;
+  /** 已保存文件的字节数；用于在读取文件内容前检查一次导出的总量。 */
+  readonly byteSize: number;
 }
 
 export interface ExportProblemRevision {
@@ -128,6 +134,11 @@ export interface ProblemPackageExportHandlerDependencies {
   readonly authorization: ExportReadAuthorization;
   readonly artifacts: ExportArtifactWriter;
   readonly adapters?: ReadonlyMap<string, ProblemFormatAdapter>;
+  /**
+   * 一次任务所选原文件的总量与已生成文件的总量分别使用这个上限。
+   * 生产环境固定不超过 128 MiB；自动化测试可以传入更小的值验证失败路径。
+   */
+  readonly maxInMemoryBytes?: number;
 }
 
 export function createProblemPackageImportHandler(
@@ -204,6 +215,17 @@ export function createProblemPackageExportHandler(
   dependencies: ProblemPackageExportHandlerDependencies
 ): JobHandler {
   const adapters = dependencies.adapters ?? builtinProblemPackageAdapters;
+  const maxInMemoryBytes =
+    dependencies.maxInMemoryBytes ?? maximumInMemoryExportBytes;
+  if (
+    !Number.isSafeInteger(maxInMemoryBytes) ||
+    maxInMemoryBytes <= 0 ||
+    maxInMemoryBytes > maximumInMemoryExportBytes
+  ) {
+    throw new TypeError(
+      `一次导出的内容上限必须是 1 到 ${maximumInMemoryExportBytes} 之间的整数。`
+    );
+  }
   return async (payload, context) => {
     const { exportJobId } = problemExportJobPayloadSchema.parse(payload);
     let job: ProblemPackageExportJob | undefined;
@@ -226,7 +248,15 @@ export function createProblemPackageExportHandler(
         throw new PackageTaskError("format_unavailable");
       }
 
+      await precheckSelectedExportFiles(
+        dependencies,
+        job,
+        maxInMemoryBytes,
+        context.signal
+      );
+
       const generated: GeneratedArchive[] = [];
+      let generatedBytes = 0;
       for (const [position, selection] of job.problems.entries()) {
         assertActive(context.signal);
         await context.putItemReport({ itemId: String(position), state: "running" });
@@ -245,7 +275,7 @@ export function createProblemPackageExportHandler(
         }
         await dependencies.jobs.updateExportJob(
           exportJobId,
-          Math.max(5, Math.floor((position * 60) / job.problems.length)),
+          Math.max(5, Math.floor((position * 70) / job.problems.length)),
           report("reading", position, 0)
         );
 
@@ -271,7 +301,8 @@ export function createProblemPackageExportHandler(
           if (
             file === undefined ||
             file.path !== descriptor.path ||
-            file.category !== descriptor.category
+            file.category !== descriptor.category ||
+            file.content.byteLength !== descriptor.byteSize
           ) {
             throw new PackageTaskError("export_file_missing");
           }
@@ -291,6 +322,11 @@ export function createProblemPackageExportHandler(
         }
         assertActive(context.signal);
         const archive = await adapter.export(canonical, options);
+        generatedBytes = countGeneratedArchiveBytes(
+          archive,
+          generatedBytes,
+          maxInMemoryBytes
+        );
         generated.push(validateGeneratedArchive(archive));
         await context.putItemReport({ itemId: String(position), state: "succeeded" });
       }
@@ -326,6 +362,84 @@ export function createProblemPackageExportHandler(
       throw new PermanentJobError(failure.code, failure.message);
     }
   };
+}
+
+async function precheckSelectedExportFiles(
+  dependencies: Pick<
+    ProblemPackageExportHandlerDependencies,
+    "source" | "authorization"
+  >,
+  job: ProblemPackageExportJob,
+  maximumBytes: number,
+  signal: AbortSignal
+): Promise<void> {
+  let selectedBytes = 0;
+  let exceedsLimit = false;
+  let invalidSize = false;
+
+  for (const selection of job.problems) {
+    assertActive(signal);
+    const allowedProblem = await dependencies.authorization.canReadProblem({
+      requestedByUserId: job.requestedByUserId,
+      selection,
+      signal
+    });
+    if (!allowedProblem) {
+      throw new PackageTaskError("export_access_revoked");
+    }
+
+    const revision = await dependencies.source.readRevision({ selection, signal });
+    if (revision === undefined) {
+      throw new PackageTaskError("export_source_missing");
+    }
+
+    const selected = new Set(selection.includedFileCategories);
+    for (const descriptor of revision.files) {
+      if (!selected.has(descriptor.category)) continue;
+      assertActive(signal);
+      const allowedFile = await dependencies.authorization.canReadFile({
+        requestedByUserId: job.requestedByUserId,
+        selection,
+        file: descriptor,
+        signal
+      });
+      if (!allowedFile) {
+        throw new PackageTaskError("export_access_revoked");
+      }
+
+      if (!Number.isSafeInteger(descriptor.byteSize) || descriptor.byteSize < 0) {
+        invalidSize = true;
+        continue;
+      }
+      if (exceedsLimit || descriptor.byteSize > maximumBytes - selectedBytes) {
+        exceedsLimit = true;
+        continue;
+      }
+      selectedBytes += descriptor.byteSize;
+    }
+  }
+
+  if (invalidSize) {
+    throw new PackageTaskError("export_source_missing");
+  }
+  if (exceedsLimit) {
+    throw new PackageTaskError("export_too_large");
+  }
+}
+
+function countGeneratedArchiveBytes(
+  archive: GeneratedArchive,
+  currentBytes: number,
+  maximumBytes: number
+): number {
+  let total = currentBytes;
+  for (const file of archive.files) {
+    if (file.content.byteLength > maximumBytes - total) {
+      throw new PackageTaskError("export_too_large");
+    }
+    total += file.content.byteLength;
+  }
+  return total;
 }
 
 /** Registers both fixed payload handlers on the worker before its registry locks. */
@@ -370,7 +484,11 @@ export class InMemoryFixedRevisionExportReader implements FixedRevisionExportRea
     this.#revisions.set(key, {
       revision: {
         document: copyDocument(parsed),
-        files: parsed.files.map((file) => ({ path: file.path, category: file.category }))
+        files: parsed.files.map((file) => ({
+          path: file.path,
+          category: file.category,
+          byteSize: file.content.byteLength
+        }))
       },
       files: new Map(parsed.files.map((file) => [file.path, copyFile(file)]))
     });
@@ -547,7 +665,14 @@ function classifyImportFailure(error: unknown, signal: AbortSignal): ProblemPack
 function classifyExportFailure(error: unknown, signal: AbortSignal): ProblemPackageFailureCode {
   if (signal.aborted) return "cancelled";
   if (error instanceof PackageTaskError) return error.code;
-  if (error instanceof UnsafeArchiveError || error instanceof ProblemPackageError) return "export_not_confirmed";
+  if (error instanceof UnsafeArchiveError) {
+    return error.issues.some(
+      (issue) => issue.code === "archive_too_large" || issue.code === "file_too_large"
+    )
+      ? "export_too_large"
+      : "export_not_confirmed";
+  }
+  if (error instanceof ProblemPackageError) return "export_not_confirmed";
   return "export_write_failed";
 }
 

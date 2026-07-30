@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import {
   createSafeArchive,
   canonicalProblemSchema,
+  UnsafeArchiveError,
   urmotivNativeAdapter,
-  type CanonicalProblem
+  type CanonicalProblem,
+  type ProblemFormatAdapter
 } from "@urmotiv/problem-package";
 import {
   problemPackageExportJobSchema,
@@ -572,7 +574,8 @@ describe("题目包导出任务处理器", () => {
         }
       },
       authorization: { canReadProblem: async () => true, canReadFile: async () => false },
-      artifacts: new InMemoryExportArtifactWriter()
+      artifacts: new InMemoryExportArtifactWriter(),
+      maxInMemoryBytes: 1
     });
 
     await expect(handler({ exportJobId: job.id }, makeContext())).rejects.toMatchObject({
@@ -581,6 +584,242 @@ describe("题目包导出任务处理器", () => {
     expect(readFiles).toEqual([]);
     expect(store.exports.get(job.id)?.failure).toEqual(
       safeProblemPackageFailure("export_access_revoked")
+    );
+  });
+
+  it("多题所选文件总量超限时不读取任何文件内容", async () => {
+    const selections = [
+      {
+        problemId: "10",
+        revisionId: randomUUID(),
+        includedFileCategories: ["testdata" as const]
+      },
+      {
+        problemId: "11",
+        revisionId: randomUUID(),
+        includedFileCategories: ["testdata" as const]
+      }
+    ];
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedExport({ problems: selections });
+    const source = new InMemoryFixedRevisionExportReader();
+    for (const selection of job.problems) {
+      source.put(selection, fixtureProblem());
+    }
+    const readFiles: string[] = [];
+    const authorizedProblems: string[] = [];
+    const authorizedFiles: string[] = [];
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source: {
+        readRevision: (input) => source.readRevision(input),
+        readFile: async (input) => {
+          readFiles.push(input.file.path);
+          return source.readFile(input);
+        }
+      },
+      authorization: {
+        canReadProblem: async ({ selection }) => {
+          authorizedProblems.push(selection.problemId);
+          return true;
+        },
+        canReadFile: async ({ selection }) => {
+          authorizedFiles.push(selection.problemId);
+          return true;
+        }
+      },
+      artifacts: new InMemoryExportArtifactWriter(),
+      maxInMemoryBytes: 7
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).rejects.toMatchObject({
+      code: "export_too_large"
+    });
+    expect(readFiles).toEqual([]);
+    expect(new Set(authorizedProblems)).toEqual(new Set(["10", "11"]));
+    expect(new Set(authorizedFiles)).toEqual(new Set(["10", "11"]));
+    expect(store.exports.get(job.id)?.failure).toEqual(
+      safeProblemPackageFailure("export_too_large")
+    );
+  });
+
+  it("前面已知超限时仍先检查后续题目的读取权限", async () => {
+    const selections = [
+      {
+        problemId: "10",
+        revisionId: randomUUID(),
+        includedFileCategories: ["testdata" as const]
+      },
+      {
+        problemId: "11",
+        revisionId: randomUUID(),
+        includedFileCategories: ["testdata" as const]
+      }
+    ];
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedExport({ problems: selections });
+    const firstSelection = job.problems[0];
+    if (firstSelection === undefined) {
+      throw new Error("The seeded export task has no first selection.");
+    }
+    const source = new InMemoryFixedRevisionExportReader();
+    source.put(firstSelection, fixtureProblem());
+    const checkedProblems: string[] = [];
+    const readFiles: string[] = [];
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source: {
+        readRevision: (input) => source.readRevision(input),
+        readFile: async (input) => {
+          readFiles.push(input.file.path);
+          return source.readFile(input);
+        }
+      },
+      authorization: {
+        canReadProblem: async ({ selection }) => {
+          checkedProblems.push(selection.problemId);
+          return selection.problemId !== "11";
+        },
+        canReadFile: async () => true
+      },
+      artifacts: new InMemoryExportArtifactWriter(),
+      maxInMemoryBytes: 1
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).rejects.toMatchObject({
+      code: "export_access_revoked"
+    });
+    expect(checkedProblems).toEqual(["10", "11"]);
+    expect(readFiles).toEqual([]);
+    expect(store.exports.get(job.id)?.failure).toEqual(
+      safeProblemPackageFailure("export_access_revoked")
+    );
+  });
+
+  it("生成内容总量超限时停止后续题目且不写入导出包", async () => {
+    const selections = ["10", "11", "12"].map((problemId) => ({
+      problemId,
+      revisionId: randomUUID(),
+      includedFileCategories: ["testdata" as const]
+    }));
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedExport({ problems: selections });
+    const source = new InMemoryFixedRevisionExportReader();
+    for (const [index, selection] of job.problems.entries()) {
+      const problem = fixtureProblem();
+      source.put(
+        selection,
+        canonicalProblemSchema.parse({
+          ...problem,
+          title: `Generated ${index + 1}`,
+          files: problem.files.map((file) => ({
+            ...file,
+            content: new Uint8Array([index + 1])
+          }))
+        })
+      );
+    }
+
+    const authorizedProblems = new Set<string>();
+    const authorizedFiles = new Set<string>();
+    const exportedTitles: string[] = [];
+    let exportStarted = false;
+    let artifactWrites = 0;
+    const adapter: ProblemFormatAdapter = {
+      id: "urmotiv",
+      displayName: "测试格式",
+      version: "1.0.0",
+      detect: async () => ({ confidence: 0, reason: "测试未使用" }),
+      inspect: async () => {
+        throw new Error("The export test must not inspect an archive.");
+      },
+      import: async () => {
+        throw new Error("The export test must not import an archive.");
+      },
+      validateExport: async () => ({
+        targetFormat: "urmotiv",
+        canExport: true,
+        items: []
+      }),
+      export: async (problem) => {
+        exportStarted = true;
+        exportedTitles.push(problem.title);
+        return {
+          mediaType: "application/zip",
+          fileName: "problem.zip",
+          files: [{ path: "payload.bin", content: new Uint8Array(4) }]
+        };
+      }
+    };
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source,
+      authorization: {
+        canReadProblem: async ({ selection }) => {
+          if (!exportStarted) authorizedProblems.add(selection.problemId);
+          return true;
+        },
+        canReadFile: async ({ selection }) => {
+          if (!exportStarted) authorizedFiles.add(selection.problemId);
+          return true;
+        }
+      },
+      artifacts: {
+        write: async () => {
+          artifactWrites += 1;
+          return {
+            fileId: randomUUID(),
+            expiresAt: "2026-07-27T00:00:00.000Z"
+          };
+        }
+      },
+      adapters: new Map([["urmotiv", adapter]]),
+      maxInMemoryBytes: 7
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).rejects.toMatchObject({
+      code: "export_too_large"
+    });
+    expect(authorizedProblems).toEqual(new Set(["10", "11", "12"]));
+    expect(authorizedFiles).toEqual(new Set(["10", "11", "12"]));
+    expect(exportedTitles).toEqual(["Generated 1", "Generated 2"]);
+    expect(artifactWrites).toBe(0);
+    expect(store.exports.get(job.id)?.failure).toEqual(
+      safeProblemPackageFailure("export_too_large")
+    );
+  });
+
+  it("压缩包目录开销导致超限时提示分批导出", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedExport();
+    const selection = job.problems[0];
+    if (selection === undefined) {
+      throw new Error("The seeded export task has no selection.");
+    }
+    const source = new InMemoryFixedRevisionExportReader();
+    source.put(selection, fixtureProblem());
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source,
+      authorization: allowAll(),
+      artifacts: {
+        write: async () => {
+          throw new UnsafeArchiveError([
+            {
+              severity: "error",
+              code: "archive_too_large",
+              message: "压缩包超过当前大小限制。"
+            }
+          ]);
+        }
+      }
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).rejects.toMatchObject({
+      code: "export_too_large"
+    });
+    expect(store.exports.get(job.id)?.failure).toEqual(
+      safeProblemPackageFailure("export_too_large")
     );
   });
 

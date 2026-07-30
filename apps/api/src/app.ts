@@ -92,7 +92,7 @@ import { ReviewPolicyService } from "./review-policy-service";
 const sessionCookieName = "urmotiv_session";
 const sessionLifetimeSeconds = 60 * 60 * 12;
 const emailVerificationLifetimeSeconds = 30 * 60;
-const uploadRouteBodyLimitBytes = 512 * 1024 * 1024;
+const problemFileUploadRouteBodyLimitBytes = 512 * 1024 * 1024;
 const problemIdSchema = z.string().refine(
   (value) => /^(0|[1-9]\d*)$/.test(value) || z.string().uuid().safeParse(value).success
 );
@@ -245,6 +245,17 @@ function contentDispositionFor(originalName: string): string {
 
 function isByteStream(value: unknown): value is AsyncIterable<Uint8Array> {
   return typeof value === "object" && value !== null && Symbol.asyncIterator in value;
+}
+
+function requestContentLengthExceeds(
+  request: FastifyRequest,
+  maximumBytes: number
+): boolean {
+  const rawLength = request.headers["content-length"];
+  if (typeof rawLength !== "string" || !/^\d+$/.test(rawLength)) {
+    return false;
+  }
+  return BigInt(rawLength) > BigInt(maximumBytes);
 }
 
 /**
@@ -1160,7 +1171,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
     app.put(
       "/api/v1/problems/:problemId/files",
-      { bodyLimit: uploadRouteBodyLimitBytes },
+      { bodyLimit: problemFileUploadRouteBodyLimitBytes },
       async (request) => {
         const user = await requireUser(request);
         const input = uploadProblemFileQuerySchema.parse(request.query);
@@ -1204,9 +1215,12 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   if (transfer !== undefined) {
     app.post(
       "/api/v1/transfer/uploads",
-      { bodyLimit: uploadRouteBodyLimitBytes },
+      { bodyLimit: transfer.maximumArchiveBytes },
       async (request) => {
         const user = await requireUser(request);
+        if (requestContentLengthExceeds(request, transfer.maximumArchiveBytes)) {
+          throw new ApiError(413, "FILE_TOO_LARGE", "题目包超过允许的大小限制。");
+        }
         const query = z
           .object({ originalName: fileOriginalNameSchema })
           .parse(request.query);

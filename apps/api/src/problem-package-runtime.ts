@@ -17,9 +17,12 @@ import type {
 } from "@urmotiv/jobs";
 import {
   SafeArchive,
+  UnsafeArchiveError,
   canonicalProblemSchema,
+  defaultArchiveSafetyLimits,
   readZipArchive,
   writeZipArchive,
+  type ArchiveSafetyLimits,
   type CanonicalFile,
   type CanonicalFileCategory,
   type CanonicalProblem,
@@ -69,6 +72,9 @@ const internalCanonicalCategories: ReadonlySet<CanonicalFileCategory> = new Set(
   "standard_solution",
   "internal_attachment"
 ]);
+
+const multiProblemOuterArchiveMaxBytes =
+  defaultArchiveSafetyLimits.maxArchiveBytes;
 
 function toProblemCategory(category: CanonicalFileCategory): ProblemFileCategory {
   const mapped = canonicalToProblemCategory[category];
@@ -187,14 +193,21 @@ export class StorageVerifiedImportArchiveReader implements VerifiedImportArchive
     if (
       record === undefined ||
       record.purpose !== "import_input" ||
-      record.sha256 !== input.expectedDigest
+      record.sha256 !== input.expectedDigest ||
+      !Number.isSafeInteger(record.byteSize) ||
+      record.byteSize < 0 ||
+      record.byteSize > defaultArchiveSafetyLimits.maxArchiveBytes
     ) {
       return undefined;
     }
 
     const stream = await this.storage.open({ id: record.id, storageKey: record.storageKey });
-    const bytes = await collectBytes(stream, record.byteSize, input.signal);
-    if (sha256Hex(bytes) !== input.expectedDigest) {
+    const bytes = await collectBytes(
+      stream,
+      defaultArchiveSafetyLimits.maxArchiveBytes,
+      input.signal
+    );
+    if (bytes.byteLength !== record.byteSize || sha256Hex(bytes) !== input.expectedDigest) {
       return undefined;
     }
     return readZipArchive(bytes);
@@ -565,7 +578,8 @@ export class DatabaseFixedRevisionExportReader implements FixedRevisionExportRea
       document,
       files: fileRecords.map((record) => ({
         path: record.logicalPath,
-        category: toCanonicalCategory(record.category)
+        category: toCanonicalCategory(record.category),
+        byteSize: record.byteSize
       }))
     };
   }
@@ -581,13 +595,17 @@ export class DatabaseFixedRevisionExportReader implements FixedRevisionExportRea
     const record = records.find(
       (candidate) =>
         candidate.logicalPath === input.file.path &&
-        toCanonicalCategory(candidate.category) === input.file.category
+        toCanonicalCategory(candidate.category) === input.file.category &&
+        candidate.byteSize === input.file.byteSize
     );
     if (record === undefined) {
       return undefined;
     }
     const stream = await storage.open({ id: record.id, storageKey: record.storageKey });
     const content = await collectBytes(stream, record.byteSize, input.signal);
+    if (content.byteLength !== record.byteSize) {
+      return undefined;
+    }
     return { path: input.file.path, category: input.file.category, content };
   }
 }
@@ -602,6 +620,11 @@ export interface StorageExportArtifactWriterDependencies {
   readonly database: DatabaseHandle;
   readonly metadata: ProblemFileStore;
   readonly storage: FileStorage;
+  /**
+   * 多题导出外层包可以使用更小的内存上限，但不能超过固定的 128 MiB。
+   * 主要供内存较小的部署和自动化测试使用。
+   */
+  readonly multiProblemOuterArchiveMaxBytes?: number;
   /** 导出结果的保存时长，超过后不能再下载。默认 72 小时。 */
   readonly resultTimeToLiveMs?: number;
   readonly now?: () => Date;
@@ -615,13 +638,35 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
   readonly #database: DatabaseHandle;
   readonly #metadata: ProblemFileStore;
   readonly #storage: FileStorage;
+  readonly #multiProblemOuterArchiveMaxBytes: number;
+  readonly #multiProblemOuterArchiveLimits: Partial<ArchiveSafetyLimits>;
   readonly #timeToLiveMs: number;
   readonly #now: () => Date;
 
   public constructor(dependencies: StorageExportArtifactWriterDependencies) {
+    const outerMaxBytes =
+      dependencies.multiProblemOuterArchiveMaxBytes ?? multiProblemOuterArchiveMaxBytes;
+    if (
+      !Number.isSafeInteger(outerMaxBytes) ||
+      outerMaxBytes <= 0 ||
+      outerMaxBytes > multiProblemOuterArchiveMaxBytes
+    ) {
+      throw new TypeError(
+        `多题导出外层包上限必须是 1 到 ${multiProblemOuterArchiveMaxBytes} 之间的整数。`
+      );
+    }
     this.#database = dependencies.database;
     this.#metadata = dependencies.metadata;
     this.#storage = dependencies.storage;
+    this.#multiProblemOuterArchiveMaxBytes = outerMaxBytes;
+    this.#multiProblemOuterArchiveLimits = {
+      // 单个内层题目包和所有内层包的总量使用同一个上限，避免更小的
+      // 单文件限制让本来可以单独导出的题目无法参加多题导出。
+      maxArchiveBytes: outerMaxBytes,
+      maxSingleFileBytes: outerMaxBytes,
+      maxTotalUncompressedBytes: outerMaxBytes,
+      allowNestedArchives: true
+    };
     this.#timeToLiveMs = dependencies.resultTimeToLiveMs ?? 72 * 60 * 60 * 1_000;
     this.#now = dependencies.now ?? (() => new Date());
   }
@@ -646,16 +691,33 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
       bytes = writeZipArchive(first.files);
     } else {
       const usedNames = new Set<string>();
-      const wrapped = input.archives.map((archive, index) => {
+      const wrapped: Array<{ readonly path: string; readonly content: Uint8Array }> = [];
+      let innerPackageBytes = 0;
+      for (const [index, archive] of input.archives.entries()) {
+        assertActive(input.signal);
         let name = safeArtifactName(archive.fileName);
         if (usedNames.has(name)) {
           name = `${index + 1}-${name}`;
         }
         usedNames.add(name);
-        return { path: name, content: writeZipArchive(archive.files) };
-      });
+        const content = writeZipArchive(archive.files);
+        if (
+          content.byteLength >
+          this.#multiProblemOuterArchiveMaxBytes - innerPackageBytes
+        ) {
+          throw new UnsafeArchiveError([
+            {
+              severity: "error",
+              code: "archive_too_large",
+              message: "多题导出外层包超过允许的大小限制。"
+            }
+          ]);
+        }
+        innerPackageBytes += content.byteLength;
+        wrapped.push({ path: name, content });
+      }
       fileName = `urmotiv-export-${input.targetFormat}.zip`;
-      bytes = writeZipArchive(wrapped);
+      bytes = writeZipArchive(wrapped, this.#multiProblemOuterArchiveLimits);
     }
 
     assertActive(input.signal);
