@@ -1,0 +1,175 @@
+name: urmotiv
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?请在私有环境文件中设置 POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在私有环境文件中设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?请在私有环境文件中设置 POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?请在私有环境文件中设置 MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?请在私有环境文件中设置 MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?请在私有环境文件中设置 MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?请在私有环境文件中设置 MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:?请在私有环境文件中设置 S3_BUCKET}
+    entrypoint: ["/bin/sh", "-ec"]
+    command: >-
+      mc alias set urmotiv http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD";
+      mc mb --ignore-existing "urmotiv/$$S3_BUCKET";
+      mc anonymous set none "urmotiv/$$S3_BUCKET"
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: "no"
+    environment: &app-environment
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      JOB_REDIS_PREFIX: ${JOB_REDIS_PREFIX:-urmotiv:jobs}
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:?请在私有环境文件中设置 S3_BUCKET}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:?请在私有环境文件中设置 MINIO_ROOT_USER}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?请在私有环境文件中设置 MINIO_ROOT_PASSWORD}
+      S3_FORCE_PATH_STYLE: "true"
+      URMOTIV_WEB_ORIGIN: ${URMOTIV_WEB_ORIGIN:?请在私有环境文件中设置 URMOTIV_WEB_ORIGIN}
+      SESSION_SECRET: ${SESSION_SECRET:?请在私有环境文件中设置 SESSION_SECRET}
+      URMOTIV_PLUGIN_SECRET_KEY: ${URMOTIV_PLUGIN_SECRET_KEY:?请在私有环境文件中设置 URMOTIV_PLUGIN_SECRET_KEY}
+      URMOTIV_EMAIL_LOGIN_ENABLED: ${URMOTIV_EMAIL_LOGIN_ENABLED:-true}
+      URMOTIV_EMAIL_REGISTRATION_ENABLED: ${URMOTIV_EMAIL_REGISTRATION_ENABLED:-false}
+      URMOTIV_CAS_ENABLED: ${URMOTIV_CAS_ENABLED:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["pnpm", "--filter", "@urmotiv/api", "migrate"]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    environment: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/v1/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    environment: *app-environment
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${URMOTIV_HTTP_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/api/v1/health | grep -q 'ok'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Fermata 是独立仓库的 AI 审核实验服务：用机器人令牌领取、续租并提交审题任务，
+  # 不直接连接 Postgres、Redis 或 MinIO。它与主应用之间通过管理后台的
+  # “Fermata 审核服务管理”插件设置（baseUrl、超时）对接，不经过环境变量。
+  # 默认不随 `docker compose up` 启动；需要显式启用对应 profile，例如
+  # `docker compose --profile fermata up -d` 或设置环境变量 COMPOSE_PROFILES=fermata。
+  # 下面的 build 假定 Fermata 与本仓库以同级目录检出（.../Fermata 与 .../Urmotiv 同级）；
+  # 如果服务器上的实际路径不同，或改为拉取已发布镜像，把 build 换成
+  # image: <镜像仓库>/fermata:<tag>。
+  fermata:
+    build:
+      context: ../Fermata
+    restart: unless-stopped
+    profiles: ["fermata"]
+    env_file:
+      # 与 urmotiv.env 分开存放：Fermata 自己的模型 / 服务凭据不进入主应用的环境文件，
+      # 按同样的约定放在私有目录，例如 /home/ubuntu/urmotiv-codex/private/fermata.env。
+      - ../private/fermata.env
+    ports:
+      - "127.0.0.1:8720:8720"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      # 镜像基于 node:24-alpine（没有 curl），用 Node 自带的 fetch 探测无鉴权的 /healthz。
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8720/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:

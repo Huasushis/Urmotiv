@@ -1,0 +1,48 @@
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+/private/
+
+# Private problem material. These paths must never be committed.
+USTC题目列表.xlsx
+*.xlsx
+*.xls
+hist_problem/
+private_data/
+problem_data/
+problem-data/
+imports/
+exports/
+uploads/
+storage/
+!packages/storage/
+!packages/storage/**
+var/
+.data/
+
+# JavaScript and TypeScript
+node_modules/
+.pnpm-store/
+dist/
+build/
+coverage/
+.turbo/
+.vite/
+*.tsbuildinfo
+
+# Tests and local tooling
+playwright-report/
+test-results/
+.eslintcache
+*.log
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

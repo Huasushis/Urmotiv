@@ -1,0 +1,27 @@
+{
+  "name": "urmotiv",
+  "version": "0.1.0",
+  "private": true,
+  "description": "题库与命题协作系统",
+  "license": "MIT",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter @urmotiv/api --filter @urmotiv/web dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "test:e2e": "pnpm --filter @urmotiv/web test:e2e",
+    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "format": "biome format --write .",
+    "format:check": "biome format ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "latest",
+    "@types/node": "latest",
+    "typescript": "latest",
+    "vitest": "latest"
+  }
+}

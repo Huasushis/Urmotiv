@@ -1,0 +1,9 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "types": ["vite/client", "vitest/globals", "node"]
+  },
+  "include": ["src", "tests", "vite.config.ts", "vitest.config.ts", "playwright.config.ts"]
+}

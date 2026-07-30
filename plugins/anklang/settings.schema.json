@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["baseUrl"],
+  "properties": {
+    "baseUrl": {
+      "type": "string",
+      "format": "uri",
+      "title": "Anklang 服务地址",
+      "description": "Urmotiv 调用 Anklang 的 HTTP 或 HTTPS 地址。认证令牌不保存在这个字段中。"
+    },
+    "timeoutMs": {
+      "type": "integer",
+      "minimum": 1000,
+      "maximum": 120000,
+      "default": 30000,
+      "title": "最长等待时间（毫秒）"
+    },
+    "failureBehavior": {
+      "type": "string",
+      "enum": ["block", "continue"],
+      "default": "block",
+      "title": "服务不可用时",
+      "description": "阻止提交表示必须完成查重；继续提交表示记录失败后仍可进入审核。"
+    },
+    "blockWhenRecommended": {
+      "type": "boolean",
+      "default": true,
+      "title": "服务建议拦截时阻止提交"
+    },
+    "minimumSimilarityToShow": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.3,
+      "title": "候选题显示下限"
+    },
+    "cacheMinutes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10080,
+      "default": 1440,
+      "title": "相同内容复用时间（分钟）"
+    }
+  }
+}

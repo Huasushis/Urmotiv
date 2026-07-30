@@ -1,0 +1,36 @@
+{
+  "name": "@urmotiv/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "migrate": "tsx src/migrate.ts",
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fastify/cookie": "latest",
+    "@fastify/cors": "latest",
+    "@urmotiv/auth": "workspace:*",
+    "@urmotiv/contracts": "workspace:*",
+    "@urmotiv/database": "workspace:*",
+    "@urmotiv/jobs": "workspace:*",
+    "@urmotiv/plugin-anklang": "workspace:*",
+    "@urmotiv/plugin-review-default": "workspace:*",
+    "@urmotiv/plugin-sdk": "workspace:*",
+    "@urmotiv/problem-package": "workspace:*",
+    "@urmotiv/storage": "workspace:*",
+    "drizzle-orm": "latest",
+    "fastify": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "tsx": "latest",
+    "typescript": "latest",
+    "vitest": "latest"
+  }
+}

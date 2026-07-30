@@ -1,0 +1,380 @@
+import {
+  adminPluginListResponseSchema,
+  adminPluginResponseSchema,
+  contestListResponseSchema,
+  contestSchema,
+  emailVerificationPendingResponseSchema,
+  exportJobViewSchema,
+  exportPreviewResponseSchema,
+  importJobViewSchema,
+  importPreviewResponseSchema,
+  packageUploadResponseSchema,
+  problemListResponseSchema,
+  problemAccessListResponseSchema,
+  problemSchema,
+  reviewItemListResponseSchema,
+  reviewPolicyViewSchema,
+  reviewRoundSummarySchema,
+  sessionResponseSchema,
+  similarityCheckResponseSchema,
+  okResponseSchema,
+  tagSchema,
+  type AdminPlugin,
+  type AdminPluginListResponse,
+  type CreateProblemInput,
+  type CreateContestInput,
+  type CreateExportJobRequest,
+  type CreateImportJobRequest,
+  type Contest,
+  type ContestListResponse,
+  type ExportJobView,
+  type ExportPreviewRequest,
+  type ExportPreviewResponse,
+  type ImportJobView,
+  type ImportPreviewRequest,
+  type ImportPreviewResponse,
+  type PackageUploadResponse,
+  type Problem,
+  type ProblemListQuery,
+  type ProblemListResponse,
+  type ReviewInput,
+  type ReviewPolicyView,
+  type ReviewItemListResponse,
+  type ReviewRoundSummary,
+  type SessionResponse,
+  type SimilarityCheckResponse,
+  type UpdateContestInput,
+  type UpdatePluginRequest,
+  type UpdateReviewPolicyInput,
+  type UpdateProblemInput
+} from "@urmotiv/contracts";
+import { z } from "zod";
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly requestId: string | undefined;
+  readonly fieldErrors: Record<string, string[]> | undefined;
+
+  constructor(
+    message: string,
+    status: number,
+    options: { requestId?: string; fieldErrors?: Record<string, string[]> } = {}
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.requestId = options.requestId;
+    this.fieldErrors = options.fieldErrors;
+  }
+}
+
+const tagsResponseSchema = z.object({ items: z.array(tagSchema) });
+
+function apiBaseUrl(): string {
+  const configured = import.meta.env.VITE_API_BASE_URL?.trim();
+  return (configured || "/api/v1").replace(/\/$/, "");
+}
+
+function demoFallbackEnabled(): boolean {
+  return import.meta.env.VITE_DEMO_FALLBACK === "true";
+}
+
+type RuntimeSchema<T> = {
+  safeParse(value: unknown): { success: true; data: T } | { success: false };
+};
+
+async function request<T>(path: string, init: RequestInit, schema: RuntimeSchema<T>): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}${path}`, {
+      credentials: "include",
+      ...init,
+      headers: {
+        Accept: "application/json",
+        ...init.headers
+      }
+    });
+  } catch {
+    throw new ApiError("无法连接到服务端。请确认 SSH 转发和服务状态。", 0);
+  }
+
+  const body = (await response.json().catch(() => null)) as unknown;
+  if (!response.ok) {
+    const error = z
+      .object({
+        error: z.object({
+          message: z.string().default("请求失败"),
+          requestId: z.string().optional(),
+          fieldErrors: z.record(z.string(), z.array(z.string())).optional()
+        })
+      })
+      .safeParse(body);
+    if (error.success) {
+      throw new ApiError(error.data.error.message, response.status, {
+        ...(error.data.error.requestId ? { requestId: error.data.error.requestId } : {}),
+        ...(error.data.error.fieldErrors ? { fieldErrors: error.data.error.fieldErrors } : {})
+      });
+    }
+    throw new ApiError("请求失败，请稍后重试。", response.status);
+  }
+
+  const parsed = schema.safeParse(body);
+  if (!parsed.success) {
+    throw new ApiError("服务端返回的数据格式不符合约定。", 502);
+  }
+  return parsed.data;
+}
+
+function json(body: unknown): RequestInit {
+  return {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  };
+}
+
+async function fallback<T>(requestFn: () => Promise<T>, demoFn: () => Promise<T>): Promise<T> {
+  if (demoFallbackEnabled()) {
+    return demoFn();
+  }
+  return requestFn();
+}
+
+export function getSession(): Promise<SessionResponse> {
+  return fallback(
+    () => request("/session", { method: "GET" }, sessionResponseSchema),
+    async () => (await import("./demo-store")).getDemoSession()
+  );
+}
+
+export function demoLogin(userId: string): Promise<SessionResponse> {
+  return fallback(
+    () => request("/auth/demo-login", json({ userId }), sessionResponseSchema),
+    async () => (await import("./demo-store")).demoLogin(userId)
+  );
+}
+
+export function emailLogin(input: { email: string; password: string }): Promise<SessionResponse> {
+  return request("/auth/email-login", json(input), sessionResponseSchema);
+}
+
+export function emailRegister(input: {
+  email: string;
+  password: string;
+  nickname: string;
+}): Promise<{ ok: true; verificationPending: true }> {
+  return request("/auth/email-register", json(input), emailVerificationPendingResponseSchema);
+}
+
+export function resendEmailVerification(email: string): Promise<{ ok: true; verificationPending: true }> {
+  return request("/auth/email-verification/resend", json({ email }), emailVerificationPendingResponseSchema);
+}
+
+export function verifyEmail(token: string): Promise<{ ok: true }> {
+  return request("/auth/email-verification/verify", json({ token }), okResponseSchema);
+}
+
+export function logout(): Promise<{ ok: true }> {
+  return request("/auth/logout", json({}), okResponseSchema);
+}
+
+export function listAdminPlugins(): Promise<AdminPluginListResponse> {
+  return request("/admin/plugins", { method: "GET" }, adminPluginListResponseSchema);
+}
+
+export async function updateAdminPlugin(
+  pluginId: string,
+  input: UpdatePluginRequest
+): Promise<AdminPlugin> {
+  const response = await request(
+    `/admin/plugins/${encodeURIComponent(pluginId)}`,
+    { ...json(input), method: "PATCH" },
+    adminPluginResponseSchema
+  );
+  return response.item;
+}
+
+export function getReviewPolicy(): Promise<ReviewPolicyView> {
+  return request("/review-policy", { method: "GET" }, reviewPolicyViewSchema);
+}
+
+export function updateReviewPolicy(input: UpdateReviewPolicyInput): Promise<ReviewPolicyView> {
+  return request(
+    "/review-policy",
+    { ...json(input), method: "PATCH" },
+    reviewPolicyViewSchema
+  );
+}
+
+export function casStartUrl(returnPath: string): string {
+  const parameters = new URLSearchParams({ returnPath });
+  return `${apiBaseUrl()}/auth/cas/start?${parameters.toString()}`;
+}
+
+export function listTags() {
+  return fallback(
+    () => request("/tags", { method: "GET" }, tagsResponseSchema),
+    async () => (await import("./demo-store")).listDemoTags()
+  );
+}
+
+export function listProblems(query: ProblemListQuery): Promise<ProblemListResponse> {
+  const parameters = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== "") {
+      parameters.set(key, String(value));
+    }
+  }
+  const suffix = parameters.toString();
+  return fallback(
+    () => request(`/problems${suffix ? `?${suffix}` : ""}`, { method: "GET" }, problemListResponseSchema),
+    async () => (await import("./demo-store")).listDemoProblems(query)
+  );
+}
+
+export function getProblem(id: string): Promise<Problem> {
+  return fallback(
+    () => request(`/problems/${encodeURIComponent(id)}`, { method: "GET" }, problemSchema),
+    async () => (await import("./demo-store")).getDemoProblem(id)
+  );
+}
+
+export function createProblem(input: CreateProblemInput): Promise<Problem> {
+  return fallback(
+    () => request("/problems", json(input), problemSchema),
+    async () => (await import("./demo-store")).createDemoProblem(input)
+  );
+}
+
+export function updateProblem(id: string, input: UpdateProblemInput): Promise<Problem> {
+  return fallback(
+    () =>
+      request(
+        `/problems/${encodeURIComponent(id)}`,
+        { ...json(input), method: "PATCH" },
+        problemSchema
+      ),
+    async () => (await import("./demo-store")).updateDemoProblem(id, input)
+  );
+}
+
+export function submitProblem(id: string, expectedRevision: number): Promise<Problem> {
+  return fallback(
+    () => request(`/problems/${encodeURIComponent(id)}/submit`, json({ expectedRevision }), problemSchema),
+    async () => (await import("./demo-store")).submitDemoProblem(id, expectedRevision)
+  );
+}
+
+export function withdrawProblem(id: string, expectedRevision: number, reason = ""): Promise<Problem> {
+  return fallback(
+    () =>
+      request(
+        `/problems/${encodeURIComponent(id)}/withdraw`,
+        json({ expectedRevision, reason }),
+        problemSchema
+      ),
+    async () => (await import("./demo-store")).withdrawDemoProblem(id, expectedRevision)
+  );
+}
+
+export function listReviews(id: string): Promise<ReviewRoundSummary> {
+  return fallback(
+    () => request(`/problems/${encodeURIComponent(id)}/reviews`, { method: "GET" }, reviewRoundSummarySchema),
+    async () => (await import("./demo-store")).listDemoReviews(id)
+  );
+}
+
+export function createReview(id: string, input: ReviewInput): Promise<ReviewRoundSummary> {
+  return fallback(
+    () => request(`/problems/${encodeURIComponent(id)}/reviews`, json(input), reviewRoundSummarySchema),
+    async () => (await import("./demo-store")).createDemoReview(id, input)
+  );
+}
+
+export function listReviewItems(id: string): Promise<ReviewItemListResponse> {
+  return request(
+    `/problems/${encodeURIComponent(id)}/review-items`,
+    { method: "GET" },
+    reviewItemListResponseSchema
+  );
+}
+
+export function runSimilarityCheck(id: string): Promise<SimilarityCheckResponse> {
+  return request(`/problems/${encodeURIComponent(id)}/similarity-check`, json({}), similarityCheckResponseSchema);
+}
+
+export function recordProblemActivity(id: string, activeSeconds: number): Promise<{ ok: true }> {
+  return request(
+    `/problems/${encodeURIComponent(id)}/access-heartbeat`,
+    json({ activeSeconds }),
+    okResponseSchema
+  );
+}
+
+export function listProblemAccess(id: string) {
+  return request(
+    `/problems/${encodeURIComponent(id)}/access`,
+    { method: "GET" },
+    problemAccessListResponseSchema
+  );
+}
+
+export function listContests(): Promise<ContestListResponse> {
+  return request("/contests", { method: "GET" }, contestListResponseSchema);
+}
+
+export function getContest(id: string): Promise<Contest> {
+  return request(`/contests/${encodeURIComponent(id)}`, { method: "GET" }, contestSchema);
+}
+
+export function createContest(input: CreateContestInput): Promise<Contest> {
+  return request("/contests", json(input), contestSchema);
+}
+
+export function updateContest(id: string, input: UpdateContestInput): Promise<Contest> {
+  return request(
+    `/contests/${encodeURIComponent(id)}`,
+    { ...json(input), method: "PATCH" },
+    contestSchema
+  );
+}
+
+export function uploadProblemPackage(file: File): Promise<PackageUploadResponse> {
+  return request(
+    `/transfer/uploads?originalName=${encodeURIComponent(file.name)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: file
+    },
+    packageUploadResponseSchema
+  );
+}
+
+export function previewImport(input: ImportPreviewRequest): Promise<ImportPreviewResponse> {
+  return request("/transfer/imports/preview", json(input), importPreviewResponseSchema);
+}
+
+export function createImportJob(input: CreateImportJobRequest): Promise<ImportJobView> {
+  return request("/transfer/imports", json(input), importJobViewSchema);
+}
+
+export function getImportJob(jobId: string): Promise<ImportJobView> {
+  return request(`/transfer/imports/${encodeURIComponent(jobId)}`, { method: "GET" }, importJobViewSchema);
+}
+
+export function previewExport(input: ExportPreviewRequest): Promise<ExportPreviewResponse> {
+  return request("/transfer/exports/preview", json(input), exportPreviewResponseSchema);
+}
+
+export function createExportJob(input: CreateExportJobRequest): Promise<ExportJobView> {
+  return request("/transfer/exports", json(input), exportJobViewSchema);
+}
+
+export function getExportJob(jobId: string): Promise<ExportJobView> {
+  return request(`/transfer/exports/${encodeURIComponent(jobId)}`, { method: "GET" }, exportJobViewSchema);
+}
+
+export function exportDownloadUrl(jobId: string): string {
+  return `${apiBaseUrl()}/transfer/exports/${encodeURIComponent(jobId)}/download`;
+}

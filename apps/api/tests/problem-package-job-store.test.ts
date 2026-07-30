@@ -1,0 +1,398 @@
+import { randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  createLocalDatabase,
+  type LocalDatabaseHandle,
+  migrateDatabase,
+  seedCoreDatabase
+} from "@urmotiv/database";
+import type { CreateStoredFileInput } from "@urmotiv/contracts";
+import {
+  LocalJobQueue,
+  problemImportJobType,
+  type CreateProblemPackageExportJob,
+  type CreateProblemPackageImportJob
+} from "@urmotiv/jobs";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo";
+import { DatabaseDataStore } from "../src/database-store";
+import type { StoredProblem } from "../src/domain";
+import { createProblemVisibility } from "../src/permissions";
+import { ProblemFileStore } from "../src/problem-file-store";
+import {
+  DatabaseProblemPackageJobStore,
+  ProblemPackageJobCoordinator
+} from "../src/problem-package-job-store";
+
+const createdAt = "2026-07-26T00:00:00.000Z";
+const statementText = "A statement that must never enter a task record.";
+const openDatabases = new Set<LocalDatabaseHandle>();
+
+let temporaryDirectory = "";
+
+beforeEach(async () => {
+  temporaryDirectory = await mkdtemp(join(tmpdir(), "urmotiv-package-jobs-"));
+});
+
+afterEach(async () => {
+  await Promise.all([...openDatabases].map((database) => database.close()));
+  openDatabases.clear();
+  await rm(temporaryDirectory, { recursive: true, force: true });
+});
+
+async function openDatabase(): Promise<LocalDatabaseHandle> {
+  const database = createLocalDatabase({ dataDirectory: join(temporaryDirectory, randomUUID()) });
+  openDatabases.add(database);
+  await migrateDatabase(database);
+  await seedCoreDatabase(database);
+  await seedDatabaseDemoData(database);
+  return database;
+}
+
+function storedFileInput(purpose: CreateStoredFileInput["purpose"]): CreateStoredFileInput {
+  const id = randomUUID();
+  return {
+    id,
+    purpose,
+    storageKey: `package-jobs/${id}`,
+    originalName: "package.zip",
+    mediaType: "application/zip",
+    byteSize: 16,
+    sha256: "b".repeat(64),
+    createdByUserId: databaseDemoUserIds.author
+  };
+}
+
+function importRequest(
+  sourceFileId: string,
+  overrides: Partial<CreateProblemPackageImportJob> = {}
+): CreateProblemPackageImportJob {
+  return {
+    requestedByUserId: databaseDemoUserIds.author,
+    sourceFileId,
+    inputDigest: "b".repeat(64),
+    selectedFormat: "urmotiv",
+    choices: { conflictAction: "create" },
+    itemCount: 1,
+    idempotencyKey: "import-request-1",
+    ...overrides
+  };
+}
+
+function makeProblem(): StoredProblem {
+  return {
+    id: randomUUID(),
+    title: "Package job fixture",
+    type: "traditional",
+    tagIds: ["algorithm.implementation"],
+    codeforcesDifficulty: 1200,
+    thinkingLevel: 2,
+    codingLevel: 2,
+    content: {
+      basicStatement: statementText,
+      basicSolution: "A fixture solution.",
+      background: "",
+      statement: "",
+      inputFormat: "",
+      outputFormat: "",
+      constraints: "",
+      solution: "",
+      hints: ""
+    },
+    samples: [],
+    judgeConfig: null,
+    status: "draft",
+    ownerId: databaseDemoUserIds.author,
+    revision: 1,
+    reviewRound: 0,
+    createdAt,
+    updatedAt: createdAt
+  };
+}
+
+async function createProblemWithRevision(
+  database: LocalDatabaseHandle
+): Promise<{ problemId: string; revisionId: string }> {
+  const store = new DatabaseDataStore(database);
+  const author = await store.getUser(databaseDemoUserIds.author);
+  if (author === undefined) {
+    throw new Error("The fixture author was not seeded.");
+  }
+  const created = await store.createProblem(makeProblem());
+  const visible = await store.findVisibleProblem(created.id, createProblemVisibility(author));
+  if (visible?.revisionId === undefined) {
+    throw new Error("The fixture problem has no revision identifier.");
+  }
+  return { problemId: created.id, revisionId: visible.revisionId };
+}
+
+function exportRequest(
+  problemId: string,
+  revisionId: string,
+  overrides: Partial<CreateProblemPackageExportJob> = {}
+): CreateProblemPackageExportJob {
+  return {
+    requestedByUserId: databaseDemoUserIds.author,
+    targetFormat: "urmotiv",
+    options: {},
+    lossSummary: {
+      targetFormat: "urmotiv",
+      canExport: true,
+      errorCount: 0,
+      choiceCount: 0,
+      warningCount: 0,
+      infoCount: 0
+    },
+    problems: [{ problemId, revisionId, includedFileCategories: ["testdata"] }],
+    idempotencyKey: "export-request-1",
+    ...overrides
+  };
+}
+
+describe("数据库题目包任务存储", () => {
+  it("创建导入任务并对同一请求编号保持幂等", async () => {
+    const database = await openDatabase();
+    const files = new ProblemFileStore(database);
+    const source = await files.createStoredFile(storedFileInput("import_input"));
+    const store = new DatabaseProblemPackageJobStore(database);
+
+    const first = await store.createImportJob(importRequest(source.id));
+    expect(first).toEqual(
+      expect.objectContaining({
+        state: "queued",
+        progressPercent: 0,
+        report: expect.objectContaining({ phase: "queued", completedItems: 0 }),
+        failure: null
+      })
+    );
+    expect(await store.getImportItems(first.id)).toEqual([
+      expect.objectContaining({ position: 0, state: "queued", importedProblemId: null })
+    ]);
+
+    const repeated = await store.createImportJob(importRequest(source.id));
+    expect(repeated.id).toBe(first.id);
+
+    await expect(
+      store.createImportJob(
+        importRequest(source.id, { choices: { conflictAction: "update", targetProblemId: "1" } })
+      )
+    ).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+  });
+
+  it("导入源文件缺失、用途不符或摘要不同时拒绝创建", async () => {
+    const database = await openDatabase();
+    const files = new ProblemFileStore(database);
+    const store = new DatabaseProblemPackageJobStore(database);
+
+    await expect(store.createImportJob(importRequest(randomUUID()))).rejects.toMatchObject({
+      code: "INPUT_FILE_NOT_FOUND"
+    });
+
+    const wrongPurpose = await files.createStoredFile(storedFileInput("problem"));
+    await expect(store.createImportJob(importRequest(wrongPurpose.id))).rejects.toMatchObject({
+      code: "INPUT_FILE_NOT_FOUND"
+    });
+
+    const source = await files.createStoredFile(storedFileInput("import_input"));
+    await expect(
+      store.createImportJob(importRequest(source.id, { inputDigest: "c".repeat(64) }))
+    ).rejects.toMatchObject({ code: "INPUT_FILE_NOT_FOUND" });
+  });
+
+  it("导入任务按状态机运行且完成后拒绝再次更新", async () => {
+    const database = await openDatabase();
+    const files = new ProblemFileStore(database);
+    const source = await files.createStoredFile(storedFileInput("import_input"));
+    const store = new DatabaseProblemPackageJobStore(database);
+    const { problemId: importedProblemId } = await createProblemWithRevision(database);
+    const job = await store.createImportJob(importRequest(source.id));
+
+    await expect(
+      store.completeImportJob(job.id, {
+        version: 1,
+        phase: "completed",
+        completedItems: 1,
+        failedItems: 0,
+        skippedItems: 0
+      })
+    ).rejects.toMatchObject({ code: "INVALID_STATE" });
+
+    const started = await store.startImportJob(job.id);
+    expect(started).toEqual(
+      expect.objectContaining({ state: "running", report: expect.objectContaining({ phase: "reading" }) })
+    );
+
+    await store.updateImportJob(job.id, 40, {
+      version: 1,
+      phase: "converting",
+      completedItems: 0,
+      failedItems: 0,
+      skippedItems: 0
+    });
+    await expect(
+      store.updateImportJob(job.id, 30, {
+        version: 1,
+        phase: "converting",
+        completedItems: 0,
+        failedItems: 0,
+        skippedItems: 0
+      })
+    ).rejects.toMatchObject({ code: "INVALID_STATE" });
+
+    await store.recordImportItem(job.id, 0, { state: "succeeded", importedProblemId });
+    await store.completeImportJob(job.id, {
+      version: 1,
+      phase: "completed",
+      completedItems: 1,
+      failedItems: 0,
+      skippedItems: 0
+    });
+
+    const finished = await store.getImportJob(job.id);
+    expect(finished).toEqual(
+      expect.objectContaining({
+        state: "succeeded",
+        progressPercent: 100,
+        report: expect.objectContaining({ phase: "completed", completedItems: 1 })
+      })
+    );
+    expect(await store.getImportItems(job.id)).toEqual([
+      expect.objectContaining({ state: "succeeded", importedProblemId })
+    ]);
+
+    await expect(
+      store.updateImportJob(job.id, 90, {
+        version: 1,
+        phase: "writing",
+        completedItems: 1,
+        failedItems: 0,
+        skippedItems: 0
+      })
+    ).rejects.toMatchObject({ code: "INVALID_STATE" });
+  });
+
+  it("失败的导入任务只保留固定文案", async () => {
+    const database = await openDatabase();
+    const files = new ProblemFileStore(database);
+    const source = await files.createStoredFile(storedFileInput("import_input"));
+    const store = new DatabaseProblemPackageJobStore(database);
+    const job = await store.createImportJob(importRequest(source.id));
+    await store.startImportJob(job.id);
+    await store.recordImportItem(job.id, 0, { state: "failed", failureCode: "import_invalid" });
+    await store.failImportJob(job.id, "import_invalid", {
+      version: 1,
+      phase: "failed",
+      completedItems: 0,
+      failedItems: 1,
+      skippedItems: 0
+    });
+
+    const failed = await store.getImportJob(job.id);
+    expect(failed).toEqual(
+      expect.objectContaining({
+        state: "failed",
+        failure: { code: "import_invalid", message: "题目包内容不符合所选格式。" }
+      })
+    );
+    expect(JSON.stringify(failed)).not.toContain(statementText);
+  });
+
+  it("导出任务要求固定版本存在并在完成时保存结果文件", async () => {
+    const database = await openDatabase();
+    const files = new ProblemFileStore(database);
+    const store = new DatabaseProblemPackageJobStore(database);
+    const { problemId, revisionId } = await createProblemWithRevision(database);
+
+    await expect(
+      store.createExportJob(exportRequest(problemId, randomUUID()))
+    ).rejects.toMatchObject({ code: "FIXED_REVISION_NOT_FOUND" });
+
+    const job = await store.createExportJob(exportRequest(problemId, revisionId));
+    expect(job).toEqual(
+      expect.objectContaining({
+        state: "queued",
+        problems: [
+          expect.objectContaining({ problemId, revisionId, includedFileCategories: ["testdata"] })
+        ]
+      })
+    );
+
+    await store.startExportJob(job.id);
+    await store.updateExportJob(job.id, 50, {
+      version: 1,
+      phase: "converting",
+      completedItems: 0,
+      failedItems: 0,
+      skippedItems: 0
+    });
+
+    const result = await files.createStoredFile({
+      ...storedFileInput("export_output"),
+      sha256: "d".repeat(64)
+    });
+    await store.completeExportJob(job.id, {
+      resultFileId: result.id,
+      resultExpiresAt: "2026-07-27T00:00:00.000Z",
+      outputFileCount: 6
+    });
+
+    const finished = await store.getExportJob(job.id);
+    expect(finished).toEqual(
+      expect.objectContaining({
+        state: "succeeded",
+        progressPercent: 100,
+        resultFileId: result.id,
+        resultExpiresAt: "2026-07-27T00:00:00.000Z",
+        report: expect.objectContaining({ phase: "completed", outputFileCount: 6 })
+      })
+    );
+    expect(JSON.stringify(finished)).not.toContain(statementText);
+  });
+
+  it("导出任务失败时不保留结果文件", async () => {
+    const database = await openDatabase();
+    const store = new DatabaseProblemPackageJobStore(database);
+    const { problemId, revisionId } = await createProblemWithRevision(database);
+    const job = await store.createExportJob(exportRequest(problemId, revisionId));
+    await store.startExportJob(job.id);
+    await store.failExportJob(job.id, "export_access_revoked");
+
+    expect(await store.getExportJob(job.id)).toEqual(
+      expect.objectContaining({
+        state: "failed",
+        resultFileId: null,
+        failure: {
+          code: "export_access_revoked",
+          message: "当前已没有导出所需的题目或文件权限。"
+        }
+      })
+    );
+  });
+});
+
+describe("题目包任务协调器", () => {
+  it("先保存任务快照，再入队且队列里只有任务编号", async () => {
+    const database = await openDatabase();
+    const files = new ProblemFileStore(database);
+    const source = await files.createStoredFile(storedFileInput("import_input"));
+    const store = new DatabaseProblemPackageJobStore(database);
+    const queue = new LocalJobQueue();
+    const coordinator = new ProblemPackageJobCoordinator(store, queue);
+
+    const job = await coordinator.createImportJob(importRequest(source.id));
+    const queued = await queue.leaseNext({ workerId: "test-worker", leaseMs: 1_000 });
+    expect(queued).toEqual(
+      expect.objectContaining({
+        type: problemImportJobType,
+        payload: { importJobId: job.id }
+      })
+    );
+    expect(JSON.stringify(queued)).not.toContain(statementText);
+
+    const repeated = await coordinator.createImportJob(importRequest(source.id));
+    expect(repeated.id).toBe(job.id);
+    expect(await queue.leaseNext({ workerId: "test-worker", leaseMs: 1_000 })).toBeUndefined();
+  });
+});

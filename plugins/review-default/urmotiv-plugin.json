@@ -1,0 +1,9 @@
+{
+  "id": "org.ustc.urmotiv.review-default",
+  "name": "默认审核人数规则",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "serverEntry": "dist/index.js",
+  "permissions": [],
+  "settingsSchema": "settings.schema.json"
+}

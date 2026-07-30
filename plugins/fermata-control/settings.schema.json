@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["baseUrl"],
+  "properties": {
+    "baseUrl": {
+      "type": "string",
+      "format": "uri",
+      "title": "Fermata 服务地址",
+      "description": "Fermata 在服务器内提供的 HTTP 或 HTTPS 地址。管理令牌单独保存在密钥存储中。"
+    },
+    "timeoutMs": {
+      "type": "integer",
+      "minimum": 1000,
+      "maximum": 30000,
+      "default": 5000,
+      "title": "最长等待时间（毫秒）"
+    }
+  }
+}
