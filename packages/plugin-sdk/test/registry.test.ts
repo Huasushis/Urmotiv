@@ -102,6 +102,41 @@ describe("PluginRegistry", () => {
     ).toThrow(PluginRegistryError);
   });
 
+  it("keeps a format adapter's declared input kind and rejects unknown values", () => {
+    const adapter = {
+      id: "org.example.format",
+      displayName: "示例格式",
+      version: "1.0.0",
+      inputKind: "single_file" as const,
+      detect: async () => ({ confidence: 0, reason: "测试" }),
+      inspect: async () => ({
+        formatId: "org.example.format",
+        problemCount: 0,
+        files: [],
+        issues: []
+      }),
+      import: async () => null as never,
+      validateExport: async () => ({
+        targetFormat: "org.example.format",
+        canExport: true,
+        items: []
+      }),
+      export: async () => null as never
+    };
+    const registry = new PluginRegistry();
+    registry.registerProblemFormatAdapter(adapter);
+    registry.lock();
+    expect(registry.getProblemFormatAdapter(adapter.id).inputKind).toBe("single_file");
+
+    const invalid = new PluginRegistry();
+    expect(() =>
+      invalid.registerProblemFormatAdapter({
+        ...adapter,
+        inputKind: "unknown" as never
+      })
+    ).toThrow();
+  });
+
   it("rejects plugin permissions that conflict with core permissions", () => {
     const registry = new PluginRegistry();
     expect(() =>

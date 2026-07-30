@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -21,7 +21,10 @@ import {
   urmotivNativeAdapter,
   writeZipArchive,
   type CanonicalProblem,
-  type GeneratedArchive
+  type GeneratedArchive,
+  type GeneratedSingleFileArchive,
+  type GeneratedZipArchive,
+  type ProblemFormatAdapter
 } from "@urmotiv/problem-package";
 import { LocalFileStorage } from "@urmotiv/storage";
 import { sql } from "drizzle-orm";
@@ -59,14 +62,17 @@ interface TransferTestContext {
   readonly app: FastifyInstance;
   readonly artifacts: StorageExportArtifactWriter;
   readonly database: LocalDatabaseHandle;
+  readonly jobs: DatabaseProblemPackageJobStore;
   readonly metadata: ProblemFileStore;
   readonly storage: LocalFileStorage;
+  readonly storageRoot: string;
   readonly store: DatabaseDataStore;
   readonly transfer: TransferService;
   readonly worker: JobWorker;
 }
 
 interface TransferTestAppOptions {
+  readonly adapters?: ReadonlyMap<string, ProblemFormatAdapter>;
   readonly multiProblemOuterArchiveMaxBytes?: number;
   readonly problemPackageArchiveMaxBytes?: number;
 }
@@ -97,8 +103,9 @@ async function makeTransferApp(
   await seedCoreDatabase(database);
   await seedDatabaseDemoData(database);
 
+  const storageRoot = join(temporaryDirectory, `storage-${randomUUID()}`);
   const storage = new LocalFileStorage({
-    rootDirectory: join(temporaryDirectory, `storage-${randomUUID()}`),
+    rootDirectory: storageRoot,
     limits: { maxBytes: 64 * 1024 * 1024 }
   });
   const store = new DatabaseDataStore(database);
@@ -140,6 +147,7 @@ async function makeTransferApp(
     jobs: jobStore,
     coordinator,
     exportReader,
+    ...(options.adapters === undefined ? {} : { adapters: options.adapters }),
     ...(options.problemPackageArchiveMaxBytes === undefined
       ? {}
       : { maximumArchiveBytes: options.problemPackageArchiveMaxBytes })
@@ -159,8 +167,10 @@ async function makeTransferApp(
     app,
     artifacts,
     database,
+    jobs: jobStore,
     metadata,
     storage,
+    storageRoot,
     store,
     transfer,
     worker
@@ -222,15 +232,19 @@ async function nativeZipOf(problem: CanonicalProblem): Promise<Uint8Array> {
   const generated = await urmotivNativeAdapter.export(problem, {
     exportedAt: "2026-07-26T00:00:00.000Z"
   });
+  if (generated.kind !== "zip") {
+    throw new Error("Urmotiv 原生题目包必须导出为 ZIP。");
+  }
   return writeZipArchive(generated.files);
 }
 
 function syntheticGeneratedArchive(
   fileName: string,
   includeNestedArchive: boolean
-): GeneratedArchive {
+): GeneratedZipArchive {
   const encoder = new TextEncoder();
   return {
+    kind: "zip",
     mediaType: "application/vnd.urmotiv.problem+zip",
     fileName,
     files: includeNestedArchive
@@ -243,6 +257,52 @@ function syntheticGeneratedArchive(
           }
         ]
       : [{ path: "marker.txt", content: encoder.encode("plain marker") }]
+  };
+}
+
+function syntheticGeneratedSingleFile(
+  fileName: string,
+  text: string,
+  mediaType = "application/fps+xml"
+): GeneratedSingleFileArchive {
+  return {
+    kind: "single_file",
+    mediaType,
+    fileName,
+    content: new TextEncoder().encode(text)
+  };
+}
+
+async function collectStoredBytes(
+  metadata: ProblemFileStore,
+  storage: LocalFileStorage,
+  fileId: string
+): Promise<{
+  readonly originalName: string;
+  readonly mediaType: string;
+  readonly content: Uint8Array;
+}> {
+  const record = await metadata.findStoredFile(fileId);
+  if (record === undefined) {
+    throw new Error("测试导出文件不存在。");
+  }
+  const chunks: Uint8Array[] = [];
+  let byteSize = 0;
+  const stream = await storage.open({ id: record.id, storageKey: record.storageKey });
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+    byteSize += chunk.byteLength;
+  }
+  const content = new Uint8Array(byteSize);
+  let offset = 0;
+  for (const chunk of chunks) {
+    content.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return {
+    originalName: record.originalName,
+    mediaType: record.mediaType,
+    content
   };
 }
 
@@ -478,6 +538,126 @@ describe("题目包导入", () => {
     expect(foreignJob.statusCode).toBe(404);
   });
 
+  it("上传接口明确接受原始 XML，并让 ZIP 适配器拒绝错误的文件种类", async () => {
+    const { app, metadata } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const xml = new TextEncoder().encode(
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?><fps version=\"1.2\" />"
+    );
+
+    const uploaded = await uploadPackage(app, leader, xml, "problem.xml");
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as {
+      fileId: string;
+      sha256: string;
+      detected: unknown[];
+    };
+    expect(upload).toEqual(
+      expect.objectContaining({
+        detected: []
+      })
+    );
+    expect(await metadata.findStoredFile(upload.fileId)).toEqual(
+      expect.objectContaining({
+        originalName: "problem.xml",
+        mediaType: "application/xml"
+      })
+    );
+
+    const previewed = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports/preview",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: { fileId: upload.fileId, formatId: "urmotiv" }
+    });
+    expect(previewed.statusCode).toBe(422);
+    expect(previewed.json()).toEqual(
+      expect.objectContaining({
+        error: expect.objectContaining({ code: "FORMAT_INPUT_MISMATCH" })
+      })
+    );
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: upload.fileId,
+        sha256: upload.sha256,
+        formatId: "urmotiv",
+        idempotencyKey: "wrong-input-kind"
+      }
+    });
+    expect(created.statusCode).toBe(422);
+    expect(created.json()).toEqual(
+      expect.objectContaining({
+        error: expect.objectContaining({ code: "FORMAT_INPUT_MISMATCH" })
+      })
+    );
+
+    const legacyZipName = await uploadPackage(
+      app,
+      leader,
+      await nativeZipOf(fixtureProblem()),
+      "legacy-package.data"
+    );
+    expect(legacyZipName.statusCode).toBe(200);
+    expect(legacyZipName.json()).toEqual(
+      expect.objectContaining({ detected: expect.any(Array) })
+    );
+  });
+
+  it("一个格式识别失败不会让其他格式或已保存的上传失效", async () => {
+    const brokenAdapter: ProblemFormatAdapter = {
+      ...urmotivNativeAdapter,
+      id: "broken-detect",
+      displayName: "异常格式",
+      detect: async () => {
+        throw new Error("private-adapter-detail");
+      }
+    };
+    const malformedAdapter: ProblemFormatAdapter = {
+      ...urmotivNativeAdapter,
+      id: "malformed-detect",
+      displayName: "无效识别结果",
+      detect: async () => null as never
+    };
+    const extraAdapters: ProblemFormatAdapter[] = Array.from(
+      { length: 21 },
+      (_, index) => ({
+        ...urmotivNativeAdapter,
+        id: `extra-detect-${index}`,
+        displayName: `额外格式 ${index}`,
+        detect: async () => ({ confidence: 0.5, reason: "测试识别结果上限。" })
+      })
+    );
+    const adapters = new Map<string, ProblemFormatAdapter>([
+      [urmotivNativeAdapter.id, urmotivNativeAdapter],
+      [brokenAdapter.id, brokenAdapter],
+      [malformedAdapter.id, malformedAdapter],
+      ...extraAdapters.map((adapter) => [adapter.id, adapter] as const)
+    ]);
+    const { app, metadata } = await makeTransferApp({ adapters });
+    const leader = await login(app, databaseDemoUserIds.leader);
+
+    const uploaded = await uploadPackage(
+      app,
+      leader,
+      await nativeZipOf(fixtureProblem())
+    );
+    expect(uploaded.statusCode).toBe(200);
+    const body = uploaded.json() as {
+      fileId: string;
+      detected: Array<{ formatId: string }>;
+    };
+    expect(body.detected.map((item) => item.formatId)).toContain("urmotiv");
+    expect(body.detected.map((item) => item.formatId)).not.toContain("broken-detect");
+    expect(body.detected.map((item) => item.formatId)).not.toContain("malformed-detect");
+    expect(body.detected).toHaveLength(20);
+    expect(uploaded.body).not.toContain("private-adapter-detail");
+    expect(await metadata.findStoredFile(body.fileId)).toBeDefined();
+  });
+
   it("拒绝不安全的压缩包并保持存储干净", async () => {
     const { app } = await makeTransferApp();
     const leader = await login(app, databaseDemoUserIds.leader);
@@ -491,10 +671,35 @@ describe("题目包导入", () => {
     expect(hostile.statusCode).toBe(422);
     expect(hostile.body).toContain("不安全");
 
+    const validZip = await nativeZipOf(fixtureProblem());
+    const disguisedZip = await uploadPackage(
+      app,
+      leader,
+      validZip,
+      "looks-like-xml.xml"
+    );
+    expect(disguisedZip.statusCode).toBe(422);
+
+    const disguisedXml = await uploadPackage(
+      app,
+      leader,
+      new TextEncoder().encode("<?xml version=\"1.0\"?><fps />"),
+      "looks-like-zip.zip"
+    );
+    expect(disguisedXml.statusCode).toBe(422);
+
+    const otherType = await uploadPackage(
+      app,
+      leader,
+      new TextEncoder().encode("plain text"),
+      "plain.txt"
+    );
+    expect(otherType.statusCode).toBe(422);
+
     const truncated = await uploadPackage(
       app,
       leader,
-      new TextEncoder().encode("not a zip at all"),
+      validZip.subarray(0, validZip.byteLength - 20),
       "broken.zip"
     );
     expect(truncated.statusCode).toBe(422);
@@ -567,9 +772,163 @@ describe("题目包导入", () => {
     });
     expect(archive).toBeUndefined();
   });
+
+  it("预览和后台读取都会拒绝同长度但摘要已经变化的文件", async () => {
+    const { app, metadata, storage, storageRoot } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const original = await nativeZipOf(fixtureProblem());
+    const uploaded = await uploadPackage(app, leader, original);
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+
+    const changed = new Uint8Array(original);
+    const changedIndex = Math.floor(changed.byteLength / 2);
+    changed[changedIndex] = (changed[changedIndex] ?? 0) ^ 0x01;
+    await writeFile(join(storageRoot, "objects", upload.fileId), changed);
+
+    const previewed = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports/preview",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: { fileId: upload.fileId, formatId: "urmotiv" }
+    });
+    expect(previewed.statusCode).toBe(404);
+    expect(previewed.body).not.toContain("objects");
+
+    const reread = await new StorageVerifiedImportArchiveReader(metadata, storage).read({
+      sourceFileId: upload.fileId,
+      expectedDigest: upload.sha256,
+      signal: new AbortController().signal
+    });
+    expect(reread).toBeUndefined();
+  });
 });
 
 describe("题目包导出", () => {
+  it("单题原始 XML 直接保存并保留适配器给出的文件类型", async () => {
+    const { artifacts, metadata, storage } = await makeTransferApp();
+    const xml = "<?xml version=\"1.0\"?><fps version=\"1.2\" />";
+    const written = await artifacts.write({
+      exportJobId: randomUUID(),
+      requestedByUserId: databaseDemoUserIds.leader,
+      targetFormat: "fps",
+      archives: [
+        syntheticGeneratedSingleFile(
+          "problem.xml",
+          xml,
+          "application/vnd.fps+xml"
+        )
+      ],
+      signal: new AbortController().signal
+    });
+
+    const stored = await collectStoredBytes(metadata, storage, written.fileId);
+    expect(stored.originalName).toBe("problem.xml");
+    expect(stored.mediaType).toBe("application/vnd.fps+xml");
+    expect(new TextDecoder().decode(stored.content)).toBe(xml);
+    expect(() => readZipArchive(stored.content)).toThrow(UnsafeArchiveError);
+  });
+
+  it("原始单文件的扩展名或内容不符时不会写出产物", async () => {
+    const { artifacts, storage } = await makeTransferApp();
+    const stage = vi.spyOn(storage, "stage");
+    const write = (archive: GeneratedSingleFileArchive) =>
+      artifacts.write({
+        exportJobId: randomUUID(),
+        requestedByUserId: databaseDemoUserIds.leader,
+        targetFormat: "fps",
+        archives: [archive],
+        signal: new AbortController().signal
+      });
+
+    await expect(
+      write(
+        syntheticGeneratedSingleFile(
+          "problem.txt",
+          "<?xml version=\"1.0\"?><fps />"
+        )
+      )
+    ).rejects.toMatchObject({
+      name: "UnsafeArchiveError",
+      issues: [expect.objectContaining({ code: "unsupported_input_type" })]
+    });
+    await expect(
+      write({
+        kind: "single_file",
+        mediaType: "application/fps+xml",
+        fileName: "problem.xml",
+        content: writeZipArchive([
+          { path: "problem.xml", content: new TextEncoder().encode("<fps />") }
+        ])
+      })
+    ).rejects.toMatchObject({
+      name: "UnsafeArchiveError",
+      issues: [expect.objectContaining({ code: "input_type_mismatch" })]
+    });
+    expect(stage).not.toHaveBeenCalled();
+  });
+
+  it("多题原始 XML 直接作为外层 ZIP 的普通文件保存", async () => {
+    const { artifacts, metadata, storage } = await makeTransferApp();
+    const first = syntheticGeneratedSingleFile(
+      "first.xml",
+      "<?xml version=\"1.0\"?><fps id=\"first\" />"
+    );
+    const second = syntheticGeneratedSingleFile(
+      "second.xml",
+      "<?xml version=\"1.0\"?><fps id=\"second\" />"
+    );
+    const written = await artifacts.write({
+      exportJobId: randomUUID(),
+      requestedByUserId: databaseDemoUserIds.leader,
+      targetFormat: "fps",
+      archives: [first, second],
+      signal: new AbortController().signal
+    });
+
+    const stored = await collectStoredBytes(metadata, storage, written.fileId);
+    expect(stored.mediaType).toBe("application/zip");
+    const outer = readZipArchive(stored.content);
+    expect(outer.list().map((entry) => entry.path)).toEqual(["first.xml", "second.xml"]);
+    expect(outer.read("first.xml")).toEqual(first.content);
+    expect(outer.read("second.xml")).toEqual(second.content);
+  });
+
+  it("多题导出拒绝混合输出和重名的原始 XML", async () => {
+    const { artifacts } = await makeTransferApp();
+    const single = syntheticGeneratedSingleFile(
+      "same.xml",
+      "<?xml version=\"1.0\"?><fps />"
+    );
+    const write = (archives: readonly GeneratedArchive[]) =>
+      artifacts.write({
+        exportJobId: randomUUID(),
+        requestedByUserId: databaseDemoUserIds.leader,
+        targetFormat: "mixed",
+        archives,
+        signal: new AbortController().signal
+      });
+
+    await expect(
+      write([single, syntheticGeneratedArchive("problem.zip", false)])
+    ).rejects.toMatchObject({
+      name: "UnsafeArchiveError",
+      issues: [expect.objectContaining({ code: "unsupported_archive_feature" })]
+    });
+    await expect(
+      write([
+        single,
+        syntheticGeneratedSingleFile(
+          "SAME.XML",
+          "<?xml version=\"1.0\"?><fps id=\"second\" />"
+        )
+      ])
+    ).rejects.toMatchObject({
+      name: "UnsafeArchiveError",
+      issues: [expect.objectContaining({ code: "duplicate_path" })]
+    });
+  });
+
   it("多题导出只在外层包明确允许嵌套题目包", async () => {
     const { app, worker } = await makeTransferApp();
     const leader = await login(app, databaseDemoUserIds.leader);
@@ -739,7 +1098,8 @@ describe("题目包导出", () => {
     const firstBytes = writeZipArchive(first.files).byteLength;
     const secondBytes = writeZipArchive(second.files).byteLength;
     let thirdFilesRead = 0;
-    const third: GeneratedArchive = {
+    const third: GeneratedZipArchive = {
+      kind: "zip",
       mediaType: "application/vnd.urmotiv.problem+zip",
       fileName: "third.zip",
       get files() {
@@ -854,6 +1214,51 @@ describe("题目包导出权限", () => {
       headers: { cookie: leader }
     });
     expect(blockedDownload.statusCode).toBe(404);
+  });
+
+  it("下载前会分别拒绝导出文件的摘要变化和实际大小变化", async () => {
+    const { app, jobs, metadata, storageRoot, worker } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const importedProblemId = await importFixtureProblem(app, worker, leader);
+    const exportJobId = await createExportJob(
+      app,
+      leader,
+      importedProblemId,
+      "export-tampered-result"
+    );
+    expect(await worker.runOnce()).toBe(true);
+
+    const job = await jobs.getExportJob(exportJobId);
+    if (job?.resultFileId === null || job?.resultFileId === undefined) {
+      throw new Error("导出任务没有生成结果文件。");
+    }
+    const record = await metadata.findStoredFile(job.resultFileId);
+    if (record === undefined) {
+      throw new Error("导出结果的文件记录不存在。");
+    }
+    const changed = new Uint8Array(record.byteSize);
+    changed.fill(0x41);
+    await writeFile(join(storageRoot, "objects", record.id), changed);
+
+    const downloaded = await app.inject({
+      method: "GET",
+      url: `/api/v1/transfer/exports/${exportJobId}/download`,
+      headers: { cookie: leader }
+    });
+    expect(downloaded.statusCode).toBe(404);
+    expect(downloaded.body).not.toContain(record.originalName);
+
+    await writeFile(
+      join(storageRoot, "objects", record.id),
+      changed.subarray(0, changed.byteLength - 1)
+    );
+    const truncated = await app.inject({
+      method: "GET",
+      url: `/api/v1/transfer/exports/${exportJobId}/download`,
+      headers: { cookie: leader }
+    });
+    expect(truncated.statusCode).toBe(404);
+    expect(truncated.body).not.toContain(record.originalName);
   });
 });
 

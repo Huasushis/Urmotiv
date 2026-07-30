@@ -159,6 +159,7 @@ export class PluginRegistry {
     this.ensureOwnedRegistration(id);
     z.string().trim().min(1).max(120).parse(adapter.displayName);
     z.string().trim().min(1).max(80).parse(adapter.version);
+    const inputKind = z.enum(["zip", "single_file"]).parse(adapter.inputKind ?? "zip");
     ensureFunction(adapter.detect, "题目包格式必须提供识别函数。");
     ensureFunction(adapter.inspect, "题目包格式必须提供预览函数。");
     ensureFunction(adapter.import, "题目包格式必须提供导入函数。");
@@ -173,6 +174,7 @@ export class PluginRegistry {
         id,
         displayName: adapter.displayName,
         version: adapter.version,
+        inputKind,
         detect: adapter.detect.bind(adapter),
         inspect: adapter.inspect.bind(adapter),
         import: adapter.import.bind(adapter),

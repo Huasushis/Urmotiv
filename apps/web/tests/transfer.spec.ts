@@ -34,6 +34,9 @@ async function nativePackageZip(title: string): Promise<Buffer> {
   const generated = await urmotivNativeAdapter.export(problem, {
     exportedAt: "2026-07-26T00:00:00.000Z"
   });
+  if (generated.kind !== "zip") {
+    throw new Error("原生题目包必须导出为 ZIP。");
+  }
   return Buffer.from(writeZipArchive(generated.files));
 }
 
@@ -87,7 +90,7 @@ test("组长创建导出任务后出现有效的下载入口", async ({ page }, 
       fileId: upload.fileId,
       sha256: upload.sha256,
       formatId: "urmotiv",
-      idempotencyKey: `e2e-import-${testInfo.project.name}-${upload.sha256.slice(0, 12)}`
+      idempotencyKey: `e2e-import-${testInfo.project.name}-${upload.fileId}`
     }
   });
   expect(importResponse.ok()).toBe(true);

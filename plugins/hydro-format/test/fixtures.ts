@@ -76,6 +76,9 @@ export function fixtureWithMissingOutput(): SafeArchive {
 }
 
 export function archiveFromGenerated(archive: GeneratedArchive): SafeArchive {
+  if (archive.kind !== "zip") {
+    throw new Error("这个测试夹具只接受 ZIP 格式的导出结果。");
+  }
   return createSafeArchive(
     archive.files.map((file) => ({
       path: file.path,

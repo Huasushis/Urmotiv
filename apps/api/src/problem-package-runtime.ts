@@ -16,17 +16,20 @@ import type {
   VerifiedImportArchiveReader
 } from "@urmotiv/jobs";
 import {
-  SafeArchive,
   UnsafeArchiveError,
   canonicalProblemSchema,
   defaultArchiveSafetyLimits,
-  readZipArchive,
+  readProblemPackageInput,
+  singleFileProblemPackagePath,
   writeZipArchive,
   type ArchiveSafetyLimits,
   type CanonicalFile,
   type CanonicalFileCategory,
   type CanonicalProblem,
-  type GeneratedArchive
+  type GeneratedArchive,
+  type GeneratedSingleFileArchive,
+  type GeneratedZipArchive,
+  type SafeProblemPackageInput
 } from "@urmotiv/problem-package";
 import { StorageError, type FileStorage, type StagedFile, type StoredFile } from "@urmotiv/storage";
 import { sql } from "drizzle-orm";
@@ -174,8 +177,8 @@ async function collectBytes(
 }
 
 /**
- * 按登记的元数据读取导入压缩包。用途、摘要或字节内容任何一项对不上都按“不存在”
- * 返回，随后由 ZIP 读取器完成全部文件安全检查。
+ * 按登记的元数据读取导入文件。用途、摘要或字节内容任何一项对不上都按“不存在”
+ * 返回，随后由与上传接口相同的读取函数完成 ZIP 或单个 XML 的安全检查。
  */
 export class StorageVerifiedImportArchiveReader implements VerifiedImportArchiveReader {
   public constructor(
@@ -187,7 +190,7 @@ export class StorageVerifiedImportArchiveReader implements VerifiedImportArchive
     readonly sourceFileId: string;
     readonly expectedDigest: string;
     readonly signal: AbortSignal;
-  }): Promise<SafeArchive | undefined> {
+  }): Promise<SafeProblemPackageInput | undefined> {
     assertActive(input.signal);
     const record = await this.metadata.findStoredFile(input.sourceFileId);
     if (
@@ -210,7 +213,11 @@ export class StorageVerifiedImportArchiveReader implements VerifiedImportArchive
     if (bytes.byteLength !== record.byteSize || sha256Hex(bytes) !== input.expectedDigest) {
       return undefined;
     }
-    return readZipArchive(bytes);
+    const packageInput = readProblemPackageInput({
+      originalName: record.originalName,
+      content: bytes
+    });
+    return packageInput.mediaType === record.mediaType ? packageInput : undefined;
   }
 }
 
@@ -631,8 +638,9 @@ export interface StorageExportArtifactWriterDependencies {
 }
 
 /**
- * 把生成的题目包写入私有对象存储：单题直接保存该题的 ZIP，多题时把每题的 ZIP 放进
- * 一个外层 ZIP。返回的只有文件编号和过期时间，下载接口自行完成权限检查。
+ * 把生成的题目包写入私有对象存储：单题 ZIP 仍按原方式打包，单个原始 XML
+ * 直接保存；多题只接受同一种输出，再把每道题的 ZIP 或 XML 放进一个外层 ZIP。
+ * 返回的只有文件编号和过期时间，下载接口自行完成权限检查。
  */
 export class StorageExportArtifactWriter implements ExportArtifactWriter {
   readonly #database: DatabaseHandle;
@@ -684,46 +692,88 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
     }
 
     let fileName: string;
+    let mediaType: string;
     let bytes: Uint8Array;
     const first = input.archives[0];
     if (input.archives.length === 1 && first !== undefined) {
-      fileName = safeArtifactName(first.fileName);
-      bytes = writeZipArchive(first.files);
+      const outputKind = requireGeneratedOutputKind(first);
+      if (outputKind === "zip") {
+        fileName = safeZipArtifactName(first.fileName);
+        mediaType = "application/zip";
+        bytes = writeZipArchive((first as GeneratedZipArchive).files);
+      } else {
+        const singleFile = validateGeneratedSingleFile(first as GeneratedSingleFileArchive);
+        fileName = singleFile.fileName;
+        mediaType = first.mediaType;
+        bytes = singleFile.content;
+      }
     } else {
+      const outputKind = requireUniformOutputKind(input.archives);
       const usedNames = new Set<string>();
       const wrapped: Array<{ readonly path: string; readonly content: Uint8Array }> = [];
       let innerPackageBytes = 0;
       for (const [index, archive] of input.archives.entries()) {
         assertActive(input.signal);
-        let name = safeArtifactName(archive.fileName);
-        if (usedNames.has(name)) {
-          name = `${index + 1}-${name}`;
+        const archiveKind = requireGeneratedOutputKind(archive);
+        const singleArchive =
+          archiveKind === "single_file"
+            ? (archive as GeneratedSingleFileArchive)
+            : undefined;
+        if (
+          singleArchive !== undefined &&
+          singleArchive.content.byteLength >
+            this.#multiProblemOuterArchiveMaxBytes - innerPackageBytes
+        ) {
+          throwOuterArchiveTooLarge();
         }
-        usedNames.add(name);
-        const content = writeZipArchive(archive.files);
+        const singleFile =
+          singleArchive === undefined
+            ? undefined
+            : validateGeneratedSingleFile(singleArchive);
+        let name =
+          archiveKind === "zip"
+            ? safeZipArtifactName((archive as GeneratedZipArchive).fileName)
+            : singleFile?.fileName;
+        if (name === undefined) {
+          throw new Error("单文件导出没有生成文件名。");
+        }
+        let foldedName = name.normalize("NFC").toLowerCase();
+        if (usedNames.has(foldedName) && outputKind === "zip") {
+          name = `${index + 1}-${name}`;
+          foldedName = name.normalize("NFC").toLowerCase();
+        }
+        if (usedNames.has(foldedName)) {
+          throwDuplicateOutputName();
+        }
+        usedNames.add(foldedName);
+        const content =
+          archiveKind === "zip"
+            ? writeZipArchive((archive as GeneratedZipArchive).files)
+            : singleFile?.content;
+        if (content === undefined) {
+          throw new Error("单文件导出没有生成文件内容。");
+        }
         if (
           content.byteLength >
           this.#multiProblemOuterArchiveMaxBytes - innerPackageBytes
         ) {
-          throw new UnsafeArchiveError([
-            {
-              severity: "error",
-              code: "archive_too_large",
-              message: "多题导出外层包超过允许的大小限制。"
-            }
-          ]);
+          throwOuterArchiveTooLarge();
         }
         innerPackageBytes += content.byteLength;
         wrapped.push({ path: name, content });
       }
       fileName = `urmotiv-export-${input.targetFormat}.zip`;
-      bytes = writeZipArchive(wrapped, this.#multiProblemOuterArchiveLimits);
+      mediaType = "application/zip";
+      bytes = writeZipArchive(wrapped, {
+        ...this.#multiProblemOuterArchiveLimits,
+        allowNestedArchives: outputKind === "zip"
+      });
     }
 
     assertActive(input.signal);
     const staged = await this.#storage.stage({
       originalName: fileName,
-      mediaType: "application/zip",
+      mediaType,
       content: singleChunk(bytes)
     });
     let stored: StoredFile;
@@ -741,7 +791,7 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
         purpose: "export_output",
         storageKey: stored.storageKey,
         originalName: fileName,
-        mediaType: "application/zip",
+        mediaType,
         byteSize: stored.byteSize,
         sha256: stored.sha256,
         createdByUserId: input.requestedByUserId,
@@ -774,8 +824,126 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
   }
 }
 
-function safeArtifactName(name: string): string {
+function safeZipArtifactName(name: string): string {
   const trimmed = name.trim().replace(/[\u0000-\u001f\u007f/\\]/gu, "_");
   const bounded = trimmed.length === 0 ? "problem.zip" : trimmed.slice(0, 120);
   return bounded.toLowerCase().endsWith(".zip") ? bounded : `${bounded}.zip`;
+}
+
+function safeSingleFileArtifactName(name: string): string {
+  const trimmed = name.trim();
+  if (
+    trimmed.length === 0 ||
+    trimmed.length > 120 ||
+    trimmed === "." ||
+    trimmed === ".." ||
+    /[\u0000-\u001f\u007f/\\]/u.test(trimmed)
+  ) {
+    throw new UnsafeArchiveError([
+      {
+        severity: "error",
+        code: "invalid_path",
+        message: "单文件导出的文件名不安全。"
+      }
+    ]);
+  }
+  if (!trimmed.toLowerCase().endsWith(".xml")) {
+    throw new UnsafeArchiveError([
+      {
+        severity: "error",
+        code: "unsupported_input_type",
+        message: "单文件导出目前只接受 .xml 文件。"
+      }
+    ]);
+  }
+  return trimmed;
+}
+
+function validateGeneratedSingleFile(
+  archive: GeneratedSingleFileArchive
+): { readonly fileName: string; readonly content: Uint8Array } {
+  const fileName = safeSingleFileArtifactName(archive.fileName);
+  const checked = readProblemPackageInput({
+    originalName: fileName,
+    content: archive.content
+  });
+  const content = checked.archive.read(singleFileProblemPackagePath);
+  if (checked.kind !== "single_file" || content === undefined) {
+    throw new UnsafeArchiveError([
+      {
+        severity: "error",
+        code: "not_an_xml_file",
+        message: "单文件导出没有产生可识别的 XML 文件。"
+      }
+    ]);
+  }
+  return { fileName, content };
+}
+
+function requireUniformOutputKind(
+  archives: readonly GeneratedArchive[]
+): "zip" | "single_file" {
+  const first = archives[0];
+  if (first === undefined) {
+    throw new Error("导出任务没有产生任何题目包。");
+  }
+  const firstKind = requireGeneratedOutputKind(first);
+  if (archives.some((archive) => requireGeneratedOutputKind(archive) !== firstKind)) {
+    throw new UnsafeArchiveError([
+      {
+        severity: "error",
+        code: "unsupported_archive_feature",
+        message: "一次多题导出不能混合 ZIP 和单个 XML 文件。"
+      }
+    ]);
+  }
+  return firstKind;
+}
+
+function requireGeneratedOutputKind(
+  archive: GeneratedArchive
+): "zip" | "single_file" {
+  const legacyCandidate = archive as {
+    readonly kind?: unknown;
+    readonly files?: unknown;
+    readonly content?: unknown;
+  };
+  const kind = legacyCandidate.kind;
+  if (
+    kind === undefined &&
+    Array.isArray(legacyCandidate.files) &&
+    legacyCandidate.content === undefined
+  ) {
+    return "zip";
+  }
+  if (kind !== "zip" && kind !== "single_file") {
+    throw new UnsafeArchiveError([
+      {
+        severity: "error",
+        code: "unsupported_archive_feature",
+        message: "格式适配器没有说明导出结果是 ZIP 还是单个 XML 文件。"
+      }
+    ]);
+  }
+  return kind;
+}
+
+function throwDuplicateOutputName(): never {
+  throw new UnsafeArchiveError([
+    {
+      severity: "error",
+      code: "duplicate_path",
+      message: "多题导出中有重名文件。"
+    }
+  ]);
+}
+
+function throwOuterArchiveTooLarge(): never {
+  throw new UnsafeArchiveError([
+    {
+      severity: "error",
+      code: "archive_too_large",
+      message: "多题导出外层包超过允许的大小限制。"
+    }
+  ]);
 }

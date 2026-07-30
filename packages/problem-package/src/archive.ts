@@ -73,6 +73,9 @@ export interface ArchiveIssue {
     | "nested_archive"
     | "empty_file"
     | "not_a_zip_archive"
+    | "not_an_xml_file"
+    | "unsupported_input_type"
+    | "input_type_mismatch"
     | "unsupported_archive_feature";
   readonly path?: string;
   readonly message: string;

@@ -386,6 +386,9 @@ export async function packageApprovedCandidates(
       const generated = await urmotivNativeAdapter.export(approved.record.problem, {
         exportedAt: options.exportedAt ?? new Date().toISOString()
       });
+      if (generated.kind !== "zip") {
+        throw new Error("Urmotiv 原生题目包没有生成 ZIP。");
+      }
       const archive = writeZipArchive(generated.files);
       const packageSha256 = sha256Hex(archive);
       await writeNewPrivateFile(

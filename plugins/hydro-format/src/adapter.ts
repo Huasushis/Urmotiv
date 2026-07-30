@@ -104,6 +104,7 @@ export const hydroProblemFormatAdapter: ProblemFormatAdapter = {
   id: hydroAdapterId,
   displayName: "Hydro 题目包",
   version: hydroAdapterVersion,
+  inputKind: "zip",
 
   async detect(input: ArchiveSummary): Promise<DetectionResult> {
     const manifests = findManifestPaths(input.entries.map((entry) => entry.path));
@@ -318,6 +319,7 @@ export const hydroProblemFormatAdapter: ProblemFormatAdapter = {
     );
 
     return {
+      kind: "zip",
       mediaType: hydroProblemMediaType,
       fileName: "hydro-problem.zip",
       files

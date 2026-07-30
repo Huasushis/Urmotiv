@@ -67,6 +67,9 @@ describe("Hydro 题目包格式适配器", () => {
       conflictAction: "create"
     });
 
+    if (generated.kind !== "zip") {
+      throw new Error("Hydro 题目包必须导出为 ZIP。");
+    }
     expect(generated.files.map((file) => file.path)).toEqual([
       "fixture/additional_file/readme.txt",
       "fixture/problem.md",

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import {
   fileOriginalNameSchema,
+  packageDetectionSchema,
   type CreateExportJobRequest,
   type CreateImportJobRequest,
   type ExportJobView,
@@ -29,9 +30,10 @@ import {
   UnsafeArchiveError,
   canonicalProblemSchema,
   defaultArchiveSafetyLimits,
-  readZipArchive,
+  inputKindForProblemFormatAdapter,
+  readProblemPackageInput,
   type ProblemFormatAdapter,
-  type SafeArchive
+  type SafeProblemPackageInput
 } from "@urmotiv/problem-package";
 import type { FileStorage, StoredFile } from "@urmotiv/storage";
 import { ApiError, conflict, forbidden, notFound } from "./errors";
@@ -68,7 +70,7 @@ export interface TransferServiceDependencies {
   readonly exportReader: FixedRevisionExportReader;
   readonly adapters?: ReadonlyMap<string, ProblemFormatAdapter>;
   /**
-   * 题目包原始 ZIP 的上限。生产环境默认 128 MiB；测试和内存较小的部署可以调低，
+   * 题目包原始文件的上限。生产环境默认 128 MiB；测试和内存较小的部署可以调低，
    * 但不能调高。
    */
   readonly maximumArchiveBytes?: number;
@@ -113,7 +115,7 @@ export class TransferService {
   }
 
   /**
-   * 上传一个题目包。压缩包必须先通过全部文件安全检查，然后才登记为短期保存的导入
+   * 上传一个题目包。ZIP 或单个 XML 必须先通过对应的文件安全检查，然后才登记为短期保存的导入
    * 输入文件。返回内容包含各已启用格式的识别建议，最终格式仍由用户确认。
    */
   public async uploadPackage(
@@ -124,11 +126,13 @@ export class TransferService {
     this.#requireImportPermission(user);
     const originalName = fileOriginalNameSchema.parse(rawOriginalName);
     const bytes = await collectBytes(content, this.maximumArchiveBytes);
-    const archive = readArchiveOrReject(bytes);
+    const packageInput = readPackageInputOrReject(originalName, bytes, {
+      maxArchiveBytes: this.maximumArchiveBytes
+    });
 
     const staged = await this.#storage.stage({
       originalName,
-      mediaType: "application/zip",
+      mediaType: packageInput.mediaType,
       content: singleChunk(bytes)
     });
     let stored: StoredFile;
@@ -146,7 +150,7 @@ export class TransferService {
         purpose: "import_input",
         storageKey: stored.storageKey,
         originalName,
-        mediaType: "application/zip",
+        mediaType: packageInput.mediaType,
         byteSize: stored.byteSize,
         sha256: stored.sha256,
         createdByUserId: user.id,
@@ -159,17 +163,28 @@ export class TransferService {
 
     const detected = [] as PackageUploadResponse["detected"];
     for (const adapter of this.#adapters.values()) {
-      const result = await adapter.detect(archive.summary);
-      if (result.confidence > 0) {
-        detected.push({
+      try {
+        if (inputKindForProblemFormatAdapter(adapter) !== packageInput.kind) {
+          continue;
+        }
+        const result = await adapter.detect(packageInput.archive.summary);
+        const parsed = packageDetectionSchema.safeParse({
           formatId: adapter.id,
           displayName: adapter.displayName,
           confidence: result.confidence,
           reason: result.reason
         });
+        if (parsed.success && parsed.data.confidence > 0) {
+          detected.push(parsed.data);
+        }
+      } catch {
+        // One broken optional format must not hide an otherwise valid upload
+        // after the file has already been safely stored.
+        continue;
       }
     }
     detected.sort((left, right) => right.confidence - left.confidence);
+    detected.splice(20);
 
     return {
       fileId: stored.id,
@@ -187,8 +202,9 @@ export class TransferService {
     this.#requireImportPermission(user);
     const record = await this.#requireOwnImportInput(user, input.fileId);
     const adapter = this.#requireAdapter(input.formatId);
-    const archive = await this.#readStoredArchive(record);
-    const preview = await adapter.inspect(archive);
+    const packageInput = await this.#readStoredPackageInput(record);
+    this.#requireMatchingInputKind(adapter, packageInput);
+    const preview = await adapter.inspect(packageInput.archive);
     return {
       formatId: adapter.id,
       problemCount: Math.min(preview.problemCount, 1_000),
@@ -208,7 +224,9 @@ export class TransferService {
     if (record.sha256 !== input.sha256) {
       throw conflict("上传的文件已改变，请重新上传后再试。");
     }
-    this.#requireAdapter(input.formatId);
+    const adapter = this.#requireAdapter(input.formatId);
+    const packageInput = await this.#readStoredPackageInput(record);
+    this.#requireMatchingInputKind(adapter, packageInput);
 
     try {
       const job = await this.#coordinator.createImportJob({
@@ -358,15 +376,34 @@ export class TransferService {
     }
 
     const record = await this.#metadata.findStoredFile(job.resultFileId);
-    if (record === undefined || record.purpose !== "export_output") {
+    if (
+      record === undefined ||
+      record.purpose !== "export_output" ||
+      record.createdByUserId !== user.id ||
+      !Number.isSafeInteger(record.byteSize) ||
+      record.byteSize < 0 ||
+      record.byteSize > maximumProblemPackageArchiveBytes
+    ) {
       throw notFound();
     }
-    const stream = await this.#storage.open({ id: record.id, storageKey: record.storageKey });
+    let bytes: Uint8Array;
+    try {
+      const stream = await this.#storage.open({
+        id: record.id,
+        storageKey: record.storageKey
+      });
+      bytes = await collectBytes(stream, maximumProblemPackageArchiveBytes);
+    } catch {
+      throw notFound();
+    }
+    if (bytes.byteLength !== record.byteSize || sha256Hex(bytes) !== record.sha256) {
+      throw notFound();
+    }
     return {
       fileName: record.originalName,
       mediaType: record.mediaType,
       byteSize: record.byteSize,
-      stream
+      stream: singleChunk(bytes)
     };
   }
 
@@ -506,6 +543,19 @@ export class TransferService {
     return adapter;
   }
 
+  #requireMatchingInputKind(
+    adapter: ProblemFormatAdapter,
+    packageInput: SafeProblemPackageInput
+  ): void {
+    if (inputKindForProblemFormatAdapter(adapter) !== packageInput.kind) {
+      throw new ApiError(
+        422,
+        "FORMAT_INPUT_MISMATCH",
+        "所选题目格式不能读取这种文件。"
+      );
+    }
+  }
+
   async #requireOwnImportInput(user: StoredUser, fileId: string) {
     const record = await this.#metadata.findStoredFile(fileId);
     if (
@@ -518,12 +568,14 @@ export class TransferService {
     return record;
   }
 
-  async #readStoredArchive(record: {
+  async #readStoredPackageInput(record: {
     readonly id: string;
     readonly storageKey: string;
+    readonly originalName: string;
+    readonly mediaType: string;
     readonly byteSize: number;
     readonly sha256: string;
-  }): Promise<SafeArchive> {
+  }): Promise<SafeProblemPackageInput> {
     if (
       !Number.isSafeInteger(record.byteSize) ||
       record.byteSize < 0 ||
@@ -536,7 +588,13 @@ export class TransferService {
     if (bytes.byteLength !== record.byteSize || sha256Hex(bytes) !== record.sha256) {
       throw notFound();
     }
-    return readArchiveOrReject(bytes);
+    const packageInput = readPackageInputOrReject(record.originalName, bytes, {
+      maxArchiveBytes: this.maximumArchiveBytes
+    });
+    if (packageInput.mediaType !== record.mediaType) {
+      throw notFound();
+    }
+    return packageInput;
   }
 
   #toExportJobView(job: ProblemPackageExportJob): ExportJobView {
@@ -597,9 +655,13 @@ function translateJobStoreError(error: unknown): unknown {
   return error;
 }
 
-function readArchiveOrReject(bytes: Uint8Array): SafeArchive {
+function readPackageInputOrReject(
+  originalName: string,
+  bytes: Uint8Array,
+  limits: { readonly maxArchiveBytes: number }
+): SafeProblemPackageInput {
   try {
-    return readZipArchive(bytes);
+    return readProblemPackageInput({ originalName, content: bytes }, limits);
   } catch (error) {
     if (error instanceof UnsafeArchiveError) {
       const messages = error.issues.slice(0, 3).map((issue) => issue.message);

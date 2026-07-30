@@ -382,6 +382,7 @@ interface ProblemFormatAdapter {
   id: string;
   displayName: string;
   version: string;
+  inputKind?: "zip" | "single_file";
   detect(input: ArchiveSummary): Promise<DetectionResult>;
   inspect(input: SafeArchive): Promise<ImportPreview>;
   import(input: SafeArchive, choices: ImportChoices): Promise<CanonicalProblem>;
@@ -390,13 +391,22 @@ interface ProblemFormatAdapter {
 }
 ```
 
+`inputKind` 说明导入文件是 ZIP，还是一个未经压缩的原始文件。旧插件没有填写时按 ZIP 处理；
+原始单文件插件必须明确填写 `single_file`，当前只接受 `.xml`。核心会在识别、预览和后台导入时
+重复核对，插件不能把 ZIP 内的同名文件当成原始 XML。
+
+`GeneratedArchive` 也要明确填写 `kind`。ZIP 结果使用 `kind: "zip"` 和 `files`；
+原始 XML 使用 `kind: "single_file"` 和 `content`。单题原始 XML 会直接下载，多题时作为外层 ZIP
+里的普通文件，不能与 ZIP 结果混在同一次导出中。已经安装的第一版插件若只返回 `files`，
+运行时仍按 ZIP 处理；新代码应明确填写，避免含义不清。
+
 注册方式一样：
 
 ```ts
 registry.registerProblemFormatAdapter(myFormatAdapter);
 ```
 
-`registerProblemFormatAdapter` 会校验 `id`/`displayName`/`version`，并确认 `detect`/`inspect`/`import`/
+`registerProblemFormatAdapter` 会校验 `id`/`displayName`/`version`/`inputKind`，并确认 `detect`/`inspect`/`import`/
 `validateExport`/`export` 都是函数。但格式适配器几乎不可能只靠 `@urmotiv/plugin-sdk` 写完——
 `ArchiveSummary`/`SafeArchive`/`CanonicalProblem`/`LossReport` 这些类型和构造它们要用到的运行时校验都在
 `@urmotiv/problem-package` 包里，你的插件需要直接依赖它（`plugins/hydro-format/package.json` 就同时依赖

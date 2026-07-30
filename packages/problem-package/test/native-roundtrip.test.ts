@@ -93,6 +93,9 @@ describe("Urmotiv native problem package", () => {
     });
 
     expect(imported).toEqual(completeProblem);
+    if (first.kind !== "zip" || second.kind !== "zip") {
+      throw new Error("原生题目包必须导出为 ZIP。");
+    }
     expect(second.files).toEqual(first.files);
   });
 
@@ -120,6 +123,9 @@ describe("Urmotiv native problem package", () => {
     const generated = await urmotivNativeAdapter.export(completeProblem, {
       exportedAt: "2026-07-25T00:00:00.000Z"
     });
+    if (generated.kind !== "zip") {
+      throw new Error("原生题目包必须导出为 ZIP。");
+    }
     const changedFiles = generated.files.map((file) =>
       file.path === "content/statement.md"
         ? { ...file, content: encoder.encode("内容被替换") }
@@ -135,6 +141,9 @@ describe("Urmotiv native problem package", () => {
 });
 
 function toSafeArchive(archive: GeneratedArchive) {
+  if (archive.kind !== "zip") {
+    throw new Error("原生题目包必须导出为 ZIP。");
+  }
   return createSafeArchive(
     archive.files.map((file) => ({
       path: file.path,

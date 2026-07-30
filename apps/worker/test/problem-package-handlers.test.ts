@@ -2,10 +2,13 @@ import { randomUUID } from "node:crypto";
 import {
   createSafeArchive,
   canonicalProblemSchema,
+  readProblemPackageInput,
+  singleFileProblemPackagePath,
   UnsafeArchiveError,
   urmotivNativeAdapter,
   type CanonicalProblem,
-  type ProblemFormatAdapter
+  type ProblemFormatAdapter,
+  type SafeProblemPackageInput
 } from "@urmotiv/problem-package";
 import {
   problemPackageExportJobSchema,
@@ -326,9 +329,15 @@ function fixtureProblem(): CanonicalProblem {
   });
 }
 
-async function nativeArchiveOf(problem: CanonicalProblem) {
+async function nativeArchiveOf(problem: CanonicalProblem): Promise<SafeProblemPackageInput> {
   const generated = await urmotivNativeAdapter.export(problem, { exportedAt: fixedNow });
-  return createSafeArchive(
+  if (generated.kind !== "zip") {
+    throw new Error("Urmotiv 原生题目包必须导出为 ZIP。");
+  }
+  return {
+    kind: "zip",
+    mediaType: "application/zip",
+    archive: createSafeArchive(
     generated.files.map((file) => ({
       path: file.path,
       kind: "file" as const,
@@ -336,7 +345,8 @@ async function nativeArchiveOf(problem: CanonicalProblem) {
       uncompressedSize: file.content.byteLength,
       content: file.content
     }))
-  );
+    )
+  };
 }
 
 function allowAll(): ExportReadAuthorization {
@@ -427,6 +437,95 @@ describe("题目包导入任务处理器", () => {
     expect(store.imports.get(job.id)?.failure).toEqual(
       safeProblemPackageFailure("format_unavailable")
     );
+  });
+
+  it("后台不会把原始 XML 交给默认的 ZIP 适配器", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedImport();
+    const reader = new InMemoryVerifiedImportArchiveReader();
+    reader.put(
+      job.sourceFileId,
+      job.inputDigest,
+      readProblemPackageInput({
+        originalName: "problem.xml",
+        content: new TextEncoder().encode("<?xml version=\"1.0\"?><fps />")
+      })
+    );
+    let writes = 0;
+    const handler = createProblemPackageImportHandler({
+      jobs: store,
+      archives: reader,
+      writer: {
+        write: async () => {
+          writes += 1;
+          return { problemId: "42" };
+        }
+      }
+    });
+
+    await expect(handler({ importJobId: job.id }, makeContext())).rejects.toMatchObject({
+      code: "format_unavailable"
+    });
+    expect(writes).toBe(0);
+  });
+
+  it("单文件适配器会收到固定名称的原始 XML 并完成导入", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedImport({ selectedFormat: "single.test" });
+    const reader = new InMemoryVerifiedImportArchiveReader();
+    reader.put(
+      job.sourceFileId,
+      job.inputDigest,
+      readProblemPackageInput({
+        originalName: "可能带题目名称.xml",
+        content: new TextEncoder().encode("<?xml version=\"1.0\"?><fps />")
+      })
+    );
+    const seenPaths: string[][] = [];
+    const adapter: ProblemFormatAdapter = {
+      id: "single.test",
+      displayName: "单文件测试格式",
+      version: "1.0.0",
+      inputKind: "single_file",
+      detect: async () => ({ confidence: 1, reason: "测试" }),
+      inspect: async () => ({
+        formatId: "single.test",
+        problemCount: 1,
+        files: [],
+        issues: []
+      }),
+      import: async (archive) => {
+        seenPaths.push(archive.list().map((entry) => entry.path));
+        expect(archive.read(singleFileProblemPackagePath)).toBeDefined();
+        return fixtureProblem();
+      },
+      validateExport: async () => ({
+        targetFormat: "single.test",
+        canExport: true,
+        items: []
+      }),
+      export: async () => {
+        throw new Error("这个测试不会导出文件。");
+      }
+    };
+    const writes: string[] = [];
+    const handler = createProblemPackageImportHandler({
+      jobs: store,
+      archives: reader,
+      writer: {
+        write: async (input) => {
+          writes.push(input.problem.title);
+          return { problemId: "42" };
+        }
+      },
+      adapters: new Map([[adapter.id, adapter]])
+    });
+
+    await expect(handler({ importJobId: job.id }, makeContext())).resolves.toEqual({
+      result: { importedProblemCount: 1, failedProblemCount: 0 }
+    });
+    expect(seenPaths).toEqual([[singleFileProblemPackagePath]]);
+    expect(writes).toEqual(["Handler fixture"]);
   });
 
   it("写入失败时任务记录只保留固定文案，不包含题面或内部错误", async () => {
@@ -524,6 +623,122 @@ describe("题目包导出任务处理器", () => {
     expect(outcome).toEqual({ result: { resultFileId: finished?.resultFileId } });
     const artifact = artifacts.get(finished?.resultFileId ?? "");
     expect(artifact?.archives).toHaveLength(1);
+  });
+
+  it("原始 XML 产物按一个文件计数并保持字节不变", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedExport({ targetFormat: "single.test" });
+    const selection = job.problems[0];
+    if (selection === undefined) {
+      throw new Error("测试导出任务没有题目选择。");
+    }
+    const source = new InMemoryFixedRevisionExportReader();
+    source.put(selection, fixtureProblem());
+    const artifacts = new InMemoryExportArtifactWriter();
+    const xml = new TextEncoder().encode("<?xml version=\"1.0\"?><fps />");
+    const adapter: ProblemFormatAdapter = {
+      id: "single.test",
+      displayName: "单文件测试格式",
+      version: "1.0.0",
+      inputKind: "single_file",
+      detect: async () => ({ confidence: 0, reason: "这个测试不识别导入文件。" }),
+      inspect: async () => {
+        throw new Error("这个测试不会预览导入文件。");
+      },
+      import: async () => {
+        throw new Error("这个测试不会导入文件。");
+      },
+      validateExport: async () => ({
+        targetFormat: "single.test",
+        canExport: true,
+        items: []
+      }),
+      export: async () => ({
+        kind: "single_file",
+        mediaType: "application/fps+xml",
+        fileName: "problem.xml",
+        content: xml
+      })
+    };
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source,
+      authorization: allowAll(),
+      artifacts,
+      adapters: new Map([[adapter.id, adapter]])
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).resolves.toEqual({
+      result: { resultFileId: expect.any(String) }
+    });
+    const finished = store.exports.get(job.id);
+    expect(finished?.report.outputFileCount).toBe(1);
+    const artifact = artifacts.get(finished?.resultFileId ?? "");
+    const generated = artifact?.archives[0];
+    expect(generated?.kind).toBe("single_file");
+    if (generated?.kind !== "single_file") {
+      throw new Error("导出结果不是预期的原始 XML。");
+    }
+    expect(generated.mediaType).toBe("application/fps+xml");
+    expect(generated.content).toEqual(xml);
+  });
+
+  it("继续接受插件接口第一版省略 kind 的 ZIP 导出结果", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedExport({ targetFormat: "legacy.zip" });
+    const selection = job.problems[0];
+    if (selection === undefined) {
+      throw new Error("测试导出任务没有题目选择。");
+    }
+    const source = new InMemoryFixedRevisionExportReader();
+    source.put(selection, fixtureProblem());
+    const artifacts = new InMemoryExportArtifactWriter();
+    const legacyAdapter: ProblemFormatAdapter = {
+      id: "legacy.zip",
+      displayName: "旧版 ZIP 测试格式",
+      version: "1.0.0",
+      detect: async () => ({ confidence: 0, reason: "这个测试不识别导入文件。" }),
+      inspect: async () => {
+        throw new Error("这个测试不会预览导入文件。");
+      },
+      import: async () => {
+        throw new Error("这个测试不会导入文件。");
+      },
+      validateExport: async () => ({
+        targetFormat: "legacy.zip",
+        canExport: true,
+        items: []
+      }),
+      export: async () => ({
+        mediaType: "application/zip",
+        fileName: "problem.zip",
+        files: [
+          {
+            path: "payload.txt",
+            content: new TextEncoder().encode("legacy")
+          }
+        ]
+      })
+    };
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source,
+      authorization: allowAll(),
+      artifacts,
+      adapters: new Map([[legacyAdapter.id, legacyAdapter]])
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).resolves.toEqual({
+      result: { resultFileId: expect.any(String) }
+    });
+    const finished = store.exports.get(job.id);
+    const generated = artifacts.get(finished?.resultFileId ?? "")?.archives[0];
+    expect(generated).toEqual(
+      expect.objectContaining({
+        kind: "zip",
+        fileName: "problem.zip"
+      })
+    );
   });
 
   it("题目读取权限被撤销时立即失败", async () => {
@@ -745,6 +960,7 @@ describe("题目包导出任务处理器", () => {
         exportStarted = true;
         exportedTitles.push(problem.title);
         return {
+          kind: "zip",
           mediaType: "application/zip",
           fileName: "problem.zip",
           files: [{ path: "payload.bin", content: new Uint8Array(4) }]

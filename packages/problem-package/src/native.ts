@@ -109,6 +109,7 @@ export const urmotivNativeAdapter: ProblemFormatAdapter = {
   id: nativeAdapterId,
   displayName: "Urmotiv 原生题目包",
   version: "1.0.0",
+  inputKind: "zip",
 
   async detect(input: ArchiveSummary): Promise<DetectionResult> {
     const paths = new Set(input.entries.map((entry) => entry.path));
@@ -271,6 +272,7 @@ export const urmotivNativeAdapter: ProblemFormatAdapter = {
     );
 
     return {
+      kind: "zip",
       mediaType: nativeProblemMediaType,
       fileName: "urmotiv-problem.zip",
       files: generatedFiles

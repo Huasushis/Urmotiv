@@ -7,12 +7,18 @@ import {
   canonicalProblemSchema,
   createSafeArchive,
   defaultArchiveSafetyLimits,
+  inputKindForProblemFormatAdapter,
+  readProblemPackageInput,
+  singleFileProblemPackagePath,
   urmotivNativeAdapter,
   type CanonicalFile,
   type CanonicalProblem,
   type GeneratedArchive,
+  type GeneratedSingleFileArchive,
+  type GeneratedZipArchive,
   type ImportChoices,
-  type ProblemFormatAdapter
+  type ProblemFormatAdapter,
+  type SafeProblemPackageInput
 } from "@urmotiv/problem-package";
 import { hydroProblemFormatAdapter } from "@urmotiv/plugin-hydro-format";
 import { problemExportJobPayloadSchema, problemImportJobPayloadSchema, type JsonValue } from "./types";
@@ -38,16 +44,16 @@ const maximumInMemoryExportBytes =
   defaultArchiveSafetyLimits.maxTotalUncompressedBytes;
 
 /**
- * The API-side source implementation has already checked the original ZIP
- * metadata and its digest. This handler accepts only SafeArchive, so it never
- * extracts a user-provided archive into the worker file system.
+ * The API-side source implementation checks the original file and its digest
+ * again. The returned object keeps ZIP and a raw XML file distinct while both
+ * expose only a SafeArchive to the selected adapter.
  */
 export interface VerifiedImportArchiveReader {
   read(input: {
     readonly sourceFileId: string;
     readonly expectedDigest: string;
     readonly signal: AbortSignal;
-  }): Promise<SafeArchive | undefined>;
+  }): Promise<SafeProblemPackageInput | undefined>;
 }
 
 /**
@@ -164,12 +170,16 @@ export function createProblemPackageImportHandler(
 
       assertActive(context.signal);
       await context.putItemReport({ itemId: "0", state: "running" });
-      const archive = await dependencies.archives.read({
+      const packageInput = await dependencies.archives.read({
         sourceFileId: job.sourceFileId,
         expectedDigest: job.inputDigest,
         signal: context.signal
       });
-      if (!(archive instanceof SafeArchive)) {
+      if (
+        packageInput === undefined ||
+        !(packageInput.archive instanceof SafeArchive) ||
+        (packageInput.kind !== "zip" && packageInput.kind !== "single_file")
+      ) {
         throw new PackageTaskError("source_digest_mismatch");
       }
 
@@ -177,9 +187,15 @@ export function createProblemPackageImportHandler(
       if (adapter === undefined) {
         throw new PackageTaskError("format_unavailable");
       }
+      if (inputKindForProblemFormatAdapter(adapter) !== packageInput.kind) {
+        throw new PackageTaskError("format_unavailable");
+      }
       await dependencies.jobs.updateImportJob(importJobId, 30, report("converting", 0, 0));
       assertActive(context.signal);
-      const problem = await adapter.import(archive, toAdapterImportChoices(job.choices));
+      const problem = await adapter.import(
+        packageInput.archive,
+        toAdapterImportChoices(job.choices)
+      );
       assertActive(context.signal);
 
       await dependencies.jobs.updateImportJob(importJobId, 60, report("writing", 0, 0));
@@ -348,7 +364,14 @@ export function createProblemPackageExportHandler(
       await dependencies.jobs.completeExportJob(exportJobId, {
         resultFileId: artifactFileId,
         resultExpiresAt: validDateTime(written.expiresAt),
-        outputFileCount: generated.reduce((sum, archive) => sum + archive.files.length, 0)
+        outputFileCount: generated.reduce(
+          (sum, archive) =>
+            sum +
+            (requireGeneratedArchiveKind(archive) === "zip"
+              ? (archive as GeneratedZipArchive).files.length
+              : 1),
+          0
+        )
       });
       await context.updateProgress(100);
       return { result: { resultFileId: artifactFileId } };
@@ -433,7 +456,15 @@ function countGeneratedArchiveBytes(
   maximumBytes: number
 ): number {
   let total = currentBytes;
-  for (const file of archive.files) {
+  const kind = requireGeneratedArchiveKind(archive);
+  if (kind === "single_file") {
+    const content = (archive as GeneratedSingleFileArchive).content;
+    if (content.byteLength > maximumBytes - total) {
+      throw new PackageTaskError("export_too_large");
+    }
+    return total + content.byteLength;
+  }
+  for (const file of (archive as GeneratedZipArchive).files) {
     if (file.content.byteLength > maximumBytes - total) {
       throw new PackageTaskError("export_too_large");
     }
@@ -456,21 +487,31 @@ export function registerProblemPackageHandlers(
 
 /** In-memory, byte-preserving source for isolated worker tests. */
 export class InMemoryVerifiedImportArchiveReader implements VerifiedImportArchiveReader {
-  readonly #archives = new Map<string, { readonly digest: string; readonly archive: SafeArchive }>();
+  readonly #archives = new Map<
+    string,
+    { readonly digest: string; readonly packageInput: SafeProblemPackageInput }
+  >();
 
-  public put(sourceFileId: string, digest: string, archive: SafeArchive): void {
-    this.#archives.set(requireUuid(sourceFileId), { digest: requireSha256(digest), archive });
+  public put(
+    sourceFileId: string,
+    digest: string,
+    packageInput: SafeProblemPackageInput
+  ): void {
+    this.#archives.set(requireUuid(sourceFileId), {
+      digest: requireSha256(digest),
+      packageInput
+    });
   }
 
   public async read(input: {
     readonly sourceFileId: string;
     readonly expectedDigest: string;
     readonly signal: AbortSignal;
-  }): Promise<SafeArchive | undefined> {
+  }): Promise<SafeProblemPackageInput | undefined> {
     assertActive(input.signal);
     const stored = this.#archives.get(requireUuid(input.sourceFileId));
     if (stored === undefined || stored.digest !== requireSha256(input.expectedDigest)) return undefined;
-    return stored.archive;
+    return stored.packageInput;
   }
 }
 
@@ -598,8 +639,33 @@ function toAdapterImportChoices(choices: ProblemPackageImportChoices): ImportCho
 }
 
 function validateGeneratedArchive(archive: GeneratedArchive): GeneratedArchive {
+  const kind = requireGeneratedArchiveKind(archive);
+  if (kind === "single_file") {
+    const singleFile = archive as GeneratedSingleFileArchive;
+    const checked = readProblemPackageInput({
+      originalName: singleFile.fileName,
+      content: singleFile.content
+    });
+    const content = checked.archive.read(singleFileProblemPackagePath);
+    if (checked.kind !== "single_file" || content === undefined) {
+      throw new UnsafeArchiveError([
+        {
+          severity: "error",
+          code: "not_an_xml_file",
+          message: "单文件导出没有产生可识别的 XML 文件。"
+        }
+      ]);
+    }
+    return {
+      kind: "single_file",
+      mediaType: singleFile.mediaType,
+      fileName: singleFile.fileName,
+      content
+    };
+  }
+  const zip = archive as GeneratedZipArchive;
   const safe = createSafeArchive(
-    archive.files.map((file) => ({
+    zip.files.map((file) => ({
       path: file.path,
       kind: "file" as const,
       compressedSize: file.content.byteLength,
@@ -608,10 +674,41 @@ function validateGeneratedArchive(archive: GeneratedArchive): GeneratedArchive {
     }))
   );
   return {
-    mediaType: archive.mediaType,
-    fileName: archive.fileName,
+    kind: "zip",
+    mediaType: zip.mediaType,
+    fileName: zip.fileName,
     files: safe.list().map((file) => ({ path: file.path, content: new Uint8Array(file.content) }))
   };
+}
+
+function requireGeneratedArchiveKind(
+  archive: GeneratedArchive
+): "zip" | "single_file" {
+  const legacyCandidate = archive as unknown as {
+    readonly kind?: unknown;
+    readonly files?: unknown;
+    readonly content?: unknown;
+  };
+  const kind = legacyCandidate.kind;
+  if (
+    kind === undefined &&
+    Array.isArray(legacyCandidate.files) &&
+    legacyCandidate.content === undefined
+  ) {
+    // Problem-format plugin API v1 returned only files. Keep those already
+    // installed ZIP adapters working while new raw-file adapters must opt in.
+    return "zip";
+  }
+  if (kind !== "zip" && kind !== "single_file") {
+    throw new UnsafeArchiveError([
+      {
+        severity: "error",
+        code: "unsupported_archive_feature",
+        message: "格式适配器没有说明导出结果是 ZIP 还是单个 XML 文件。"
+      }
+    ]);
+  }
+  return kind;
 }
 
 async function failImportSafely(
@@ -717,10 +814,24 @@ function copyDocument(problem: CanonicalProblem): Omit<CanonicalProblem, "files"
 }
 
 function copyArchive(archive: GeneratedArchive): GeneratedArchive {
+  if (requireGeneratedArchiveKind(archive) === "single_file") {
+    const singleFile = archive as GeneratedSingleFileArchive;
+    return {
+      kind: "single_file",
+      mediaType: singleFile.mediaType,
+      fileName: singleFile.fileName,
+      content: new Uint8Array(singleFile.content)
+    };
+  }
+  const zip = archive as GeneratedZipArchive;
   return {
-    mediaType: archive.mediaType,
-    fileName: archive.fileName,
-    files: archive.files.map((file) => ({ path: file.path, content: new Uint8Array(file.content) }))
+    kind: "zip",
+    mediaType: zip.mediaType,
+    fileName: zip.fileName,
+    files: zip.files.map((file) => ({
+      path: file.path,
+      content: new Uint8Array(file.content)
+    }))
   };
 }
 
