@@ -14,7 +14,7 @@
       "type": "integer",
       "minimum": 1000,
       "maximum": 120000,
-      "default": 30000,
+      "default": 120000,
       "title": "最长等待时间（毫秒）"
     },
     "failureBehavior": {

@@ -29,7 +29,7 @@ const serviceUrlSchema = z
 export const anklangSettingsSchema = z
   .object({
     baseUrl: serviceUrlSchema,
-    timeoutMs: z.number().int().min(1_000).max(120_000).default(30_000),
+    timeoutMs: z.number().int().min(1_000).max(120_000).default(120_000),
     failureBehavior: z.enum(["block", "continue"]).default("block"),
     blockWhenRecommended: z.boolean().default(true),
     minimumSimilarityToShow: z.number().min(0).max(1).default(0.3),

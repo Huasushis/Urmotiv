@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { BeforeSubmitInput } from "@urmotiv/plugin-sdk";
 import {
@@ -44,6 +45,27 @@ function result(overrides: Partial<AnklangResult> = {}): AnklangResult {
 }
 
 describe("Anklang 设置与 HTTP 边界", () => {
+  it("默认等待时间覆盖 Anklang 的重试与可选模型复核", () => {
+    expect(
+      anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test"
+      }).timeoutMs
+    ).toBe(120_000);
+    const packagedSchema = JSON.parse(
+      readFileSync(new URL("../settings.schema.json", import.meta.url), "utf8")
+    ) as {
+      properties?: { timeoutMs?: { default?: unknown; maximum?: unknown } };
+    };
+    expect(packagedSchema.properties?.timeoutMs?.default).toBe(120_000);
+    expect(packagedSchema.properties?.timeoutMs?.maximum).toBe(120_000);
+    expect(() =>
+      anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        timeoutMs: 120_001
+      })
+    ).toThrow();
+  });
+
   it("拒绝地址中夹带账号密码", () => {
     expect(() =>
       anklangSettingsSchema.parse({ baseUrl: "https://user:secret@example.test" })

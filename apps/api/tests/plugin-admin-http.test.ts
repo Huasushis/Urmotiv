@@ -1,8 +1,13 @@
-import type { PermissionGrant } from "@urmotiv/contracts";
+import {
+  pluginSettingsFormSchema,
+  type PermissionGrant
+} from "@urmotiv/contracts";
+import { pluginManifestSchema } from "@urmotiv/plugin-sdk";
 import { afterEach, describe, expect, it } from "vitest";
 import type { StoredUser } from "../src/domain";
 import { createApp } from "../src/app";
 import {
+  anklangPluginId,
   createBuiltinPluginDefinitions,
   fermataManagementTokenSecretName,
   fermataPluginId
@@ -84,6 +89,20 @@ afterEach(async () => {
 });
 
 describe("插件管理 HTTP 接口", () => {
+  it("内置 Anklang 设置默认给服务端重试和复核留足时间", () => {
+    const definition = createBuiltinPluginDefinitions().find(
+      (candidate) => pluginManifestSchema.parse(candidate.manifest).id === anklangPluginId
+    );
+    expect(definition).toBeDefined();
+    const settingsSchema = pluginSettingsFormSchema.parse(definition?.settingsSchema);
+    const timeoutDefinition = settingsSchema.properties?.timeoutMs;
+    expect(timeoutDefinition).toMatchObject({
+      default: 120_000,
+      maximum: 120_000
+    });
+    expect(timeoutDefinition?.maximum).toBeLessThanOrEqual(125_000);
+  });
+
   it("列表与单项修改响应均禁止缓存", async () => {
     const manager = createUser("plugin-manager", "human", [grant("plugin.manage")]);
     const app = await createApp({

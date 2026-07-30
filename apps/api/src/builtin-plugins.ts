@@ -94,7 +94,7 @@ export function createBuiltinPluginDefinitions(
             description: "Urmotiv 调用原题检索服务的 HTTP 或 HTTPS 地址。认证令牌单独保存。"
           },
           timeoutMs: {
-            type: "integer", minimum: 1000, maximum: 120000, default: 30000,
+            type: "integer", minimum: 1000, maximum: 120000, default: 120000,
             title: "最长等待时间（毫秒）"
           },
           failureBehavior: {
