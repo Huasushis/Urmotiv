@@ -16,6 +16,7 @@ const demoAccounts = [
   { id: "reviewer", title: "审题人", description: "查看待审核题目并提交审核意见" },
   { id: "member", title: "命题组成员", description: "补充资料、配置数据并参与组题" },
   { id: "leader", title: "组长", description: "查看最终状态、导入和导出入口" },
+  { id: "administrator", title: "系统管理员", description: "管理插件、账号和系统运行设置" },
   { id: "robot", title: "审核机器人", description: "检查固定禁止操作不会被绕过" },
   { id: "denied", title: "受限账号", description: "检查明确拒绝优先的界面反馈" }
 ];

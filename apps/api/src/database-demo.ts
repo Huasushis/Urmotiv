@@ -10,6 +10,7 @@ export const databaseDemoUserIds = {
   leader: "9000000000000004",
   robot: "9000000000000005",
   denied: "9000000000000006",
+  administrator: "9000000000000007",
 } as const;
 
 const demoUsers = [
@@ -48,6 +49,12 @@ const demoUsers = [
     nickname: "明确拒绝演示账号",
     accountType: "human",
     roleKey: "reviewer",
+  },
+  {
+    id: databaseDemoUserIds.administrator,
+    nickname: "系统管理员演示账号",
+    accountType: "human",
+    roleKey: "system_administrator",
   },
 ] as const;
 

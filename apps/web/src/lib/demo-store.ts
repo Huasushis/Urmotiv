@@ -21,6 +21,12 @@ const demoUsers = {
   reviewer: { id: "reviewer", nickname: "林澈", accountType: "human" as const, roles: ["审题人"] },
   member: { id: "member", nickname: "周遥", accountType: "human" as const, roles: ["命题组成员"] },
   leader: { id: "leader", nickname: "顾岚", accountType: "human" as const, roles: ["组长"] },
+  administrator: {
+    id: "administrator",
+    nickname: "系统管理员演示账号",
+    accountType: "human" as const,
+    roles: ["系统管理员"]
+  },
   robot: { id: "robot", nickname: "审核助手", accountType: "robot" as const, roles: ["自动审核"] },
   denied: { id: "denied", nickname: "受限账号", accountType: "human" as const, roles: ["投稿人"] }
 };
@@ -288,6 +294,7 @@ export async function getDemoSession(): Promise<SessionResponse> {
   }
   const user = demoUsers[saved as DemoUserId];
   const canManageReviewPolicy = saved === "leader";
+  const canManagePlugins = saved === "administrator";
   return {
     user: {
       id: user.id,
@@ -295,9 +302,12 @@ export async function getDemoSession(): Promise<SessionResponse> {
       accountType: user.accountType,
       roles: user.roles,
       isRoot: false,
-      permissions: canManageReviewPolicy ? ["problem.status.change"] : [],
+      permissions: [
+        ...(canManageReviewPolicy ? ["problem.status.change"] : []),
+        ...(canManagePlugins ? ["system.manage", "plugin.manage"] : [])
+      ],
       canManageReviewPolicy,
-      canManagePlugins: false
+      canManagePlugins
     },
     auth: { emailEnabled: false, emailRegistrationEnabled: false, casEnabled: false, demoEnabled: true }
   };

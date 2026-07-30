@@ -18,16 +18,18 @@ type AppShellProps = {
   children: ReactNode;
 };
 
-const navItems = [
+const baseNavItems = [
   { to: "/problems", label: "题目", icon: BookOpen },
   { to: "/submissions", label: "我的投稿", icon: FilePenLine },
   { to: "/reviews", label: "待审", icon: ClipboardCheck },
   { to: "/contests", label: "组题", icon: ListChecks },
-  { to: "/transfer", label: "导入导出", icon: ArrowLeftRight },
-  { to: "/admin", label: "管理", icon: Settings }
+  { to: "/transfer", label: "导入导出", icon: ArrowLeftRight }
 ];
 
 export function AppShell({ session, demoEnabled, children }: AppShellProps) {
+  const navItems = session.canManageReviewPolicy || session.canManagePlugins
+    ? [...baseNavItems, { to: "/admin", label: "管理", icon: Settings }]
+    : baseNavItems;
   const client = useQueryClient();
   const signOut = useMutation({
     mutationFn: logout,

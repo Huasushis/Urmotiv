@@ -47,6 +47,18 @@ const leaderGrants = [
   allow("user.create")
 ];
 
+const administratorGrants = [
+  allow("auth.login"),
+  allow("user.create"),
+  allow("user.delete"),
+  allow("user.permission.manage"),
+  allow("system.manage"),
+  allow("plugin.manage"),
+  allow("service_account.manage"),
+  allow("tag.manage"),
+  allow("audit.read")
+];
+
 function demoUser(
   id: string,
   nickname: string,
@@ -71,6 +83,12 @@ export function createDemoUsers(): StoredUser[] {
     demoUser("reviewer", "审题人演示账号", ["审题人"], reviewerGrants),
     demoUser("member", "命题组成员演示账号", ["命题组成员"], memberGrants),
     demoUser("leader", "组长演示账号", ["组长"], leaderGrants),
+    demoUser(
+      "administrator",
+      "系统管理员演示账号",
+      ["系统管理员"],
+      administratorGrants
+    ),
     demoUser("robot", "审核机器人演示账号", ["审题机器人"], reviewerGrants, "robot"),
     demoUser(
       "denied",

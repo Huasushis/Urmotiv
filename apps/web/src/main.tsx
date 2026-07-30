@@ -1,14 +1,13 @@
 import "katex/dist/katex.min.css";
 import "./styles.css";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { Settings } from "lucide-react";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { AppShell } from "./components/app-shell";
 import { ApiError, getSession } from "./lib/api";
+import { AdminPage } from "./pages/admin-page";
 import { DemoLoginPage } from "./pages/demo-login-page";
-import { PlaceholderPage } from "./pages/placeholder-page";
 import { CreateProblemPage } from "./pages/create-problem-page";
 import { ContestPage } from "./pages/contest-page";
 import { ProblemListPage } from "./pages/problem-list-page";
@@ -71,18 +70,7 @@ function App() {
         <Route path="/reviews" element={<ProblemListPage fixedStatus="pending_review" />} />
         <Route path="/contests" element={<ContestPage />} />
         <Route path="/transfer" element={<TransferPage />} />
-        <Route
-          path="/admin"
-          element={
-            <PlaceholderPage
-              icon={Settings}
-              eyebrow="管理"
-              title="站点管理"
-              description="账号、权限和插件设置都由服务端再次确认，页面上的隐藏按钮不是权限控制。"
-              details={["管理知识点和成员时保留审计记录", "机器人不能取得固定禁止的操作", "密钥只显示是否配置，不在页面返回完整值"]}
-            />
-          }
-        />
+        <Route path="/admin" element={<AdminPage session={sessionData.user} />} />
         <Route path="*" element={<Navigate to="/problems" replace />} />
       </Routes>
     </AppShell>
