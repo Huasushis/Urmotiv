@@ -4,16 +4,19 @@ import {
   type ProblemFileCategory
 } from "@urmotiv/contracts";
 import type { DatabaseHandle } from "@urmotiv/database";
-import type {
-  AtomicImportedProblemWriter,
-  ExportArtifactWriter,
-  ExportProblemFileDescriptor,
-  ExportProblemRevision,
-  ExportReadAuthorization,
-  FixedRevisionExportReader,
-  ProblemPackageExportSelection,
-  ProblemPackageImportChoices,
-  VerifiedImportArchiveReader
+import {
+  ExportResultSaveError,
+  ImportResultSaveError,
+  ProblemPackageTemporaryError,
+  type AtomicImportedProblemWriter,
+  type ExportArtifactWriter,
+  type ExportProblemFileDescriptor,
+  type ExportProblemRevision,
+  type ExportReadAuthorization,
+  type FixedRevisionExportReader,
+  type ProblemPackageExportSelection,
+  type ProblemPackageImportChoices,
+  type VerifiedImportArchiveReader
 } from "@urmotiv/jobs";
 import {
   UnsafeArchiveError,
@@ -36,7 +39,12 @@ import { sql } from "drizzle-orm";
 import { z } from "zod";
 import type { StoredProblem, StoredUser } from "./domain";
 import type { DatabaseDataStore } from "./database-store";
+import { ApiError } from "./errors";
 import { ProblemFileStore } from "./problem-file-store";
+import {
+  ProblemPackageJobStoreError,
+  completeDatabaseExportJob
+} from "./problem-package-job-store";
 import type { ProblemService } from "./service";
 
 /**
@@ -146,10 +154,31 @@ class TaskAborted extends Error {
   }
 }
 
+class StoredContentMismatch extends Error {
+  public constructor() {
+    super("文件内容与登记信息不一致。");
+    this.name = "StoredContentMismatch";
+  }
+}
+
+class ImportItemAlreadyCommitted extends Error {
+  public constructor() {
+    super("导入项目已经由另一工作进程完成。");
+    this.name = "ImportItemAlreadyCommitted";
+  }
+}
+
 function assertActive(signal: AbortSignal | undefined): void {
   if (signal?.aborted) {
     throw new TaskAborted();
   }
+}
+
+function isHiddenProblemAccessError(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    (error.statusCode === 403 || error.statusCode === 404)
+  );
 }
 
 async function collectBytes(
@@ -163,7 +192,7 @@ async function collectBytes(
     assertActive(signal);
     total += chunk.byteLength;
     if (total > maximumBytes) {
-      throw new StorageError("STORAGE_READ_FAILED", "文件内容超过登记的大小。");
+      throw new StoredContentMismatch();
     }
     chunks.push(chunk);
   }
@@ -192,7 +221,14 @@ export class StorageVerifiedImportArchiveReader implements VerifiedImportArchive
     readonly signal: AbortSignal;
   }): Promise<SafeProblemPackageInput | undefined> {
     assertActive(input.signal);
-    const record = await this.metadata.findStoredFile(input.sourceFileId);
+    let record: Awaited<ReturnType<ProblemFileStore["findStoredFile"]>>;
+    try {
+      record = await this.metadata.findStoredFile(input.sourceFileId);
+    } catch {
+      throw new ProblemPackageTemporaryError(
+        "导入文件暂时无法读取，请稍后重试。"
+      );
+    }
     if (
       record === undefined ||
       record.purpose !== "import_input" ||
@@ -204,12 +240,31 @@ export class StorageVerifiedImportArchiveReader implements VerifiedImportArchive
       return undefined;
     }
 
-    const stream = await this.storage.open({ id: record.id, storageKey: record.storageKey });
-    const bytes = await collectBytes(
-      stream,
-      defaultArchiveSafetyLimits.maxArchiveBytes,
-      input.signal
-    );
+    let bytes: Uint8Array;
+    try {
+      const stream = await this.storage.open({
+        id: record.id,
+        storageKey: record.storageKey
+      });
+      bytes = await collectBytes(
+        stream,
+        defaultArchiveSafetyLimits.maxArchiveBytes,
+        input.signal
+      );
+    } catch (error) {
+      if (error instanceof TaskAborted) {
+        throw error;
+      }
+      if (error instanceof StoredContentMismatch) {
+        return undefined;
+      }
+      if (error instanceof StorageError && error.code === "OBJECT_NOT_FOUND") {
+        return undefined;
+      }
+      throw new ProblemPackageTemporaryError(
+        "导入文件暂时无法读取，请稍后重试。"
+      );
+    }
     if (bytes.byteLength !== record.byteSize || sha256Hex(bytes) !== input.expectedDigest) {
       return undefined;
     }
@@ -262,18 +317,26 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
       throw new Error("当前版本的导入只支持创建新题目。");
     }
 
-    const already = await this.#database.query<{ imported_problem_id: string | null }>(sql`
-      SELECT imported_problem_id::text AS imported_problem_id
-      FROM import_job_items
-      WHERE job_id = ${input.importJobId}::uuid AND position = ${input.position}
-    `);
-    const existingProblemId = already[0]?.imported_problem_id;
-    if (existingProblemId !== null && existingProblemId !== undefined) {
+    let existingProblemId: string | undefined;
+    try {
+      existingProblemId = await this.#findImportedProblemId(
+        input.importJobId,
+        input.position
+      );
+    } catch {
+      throw new ImportResultSaveError();
+    }
+    if (existingProblemId !== undefined) {
       return { problemId: existingProblemId };
     }
 
     const problem = canonicalProblemSchema.parse(input.problem);
-    const knownTags = new Set((await this.#store.listTags()).map((tag) => tag.id));
+    let knownTags: Set<string>;
+    try {
+      knownTags = new Set((await this.#store.listTags()).map((tag) => tag.id));
+    } catch {
+      throw new ImportResultSaveError();
+    }
     const tagIds = problem.tags.filter((tag) => knownTags.has(tag));
     const now = this.#now().toISOString();
     const stored: StoredProblem = {
@@ -312,6 +375,7 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
     };
 
     const published: StoredFile[] = [];
+    let transactionWritesFinished = false;
     try {
       for (const file of problem.files) {
         assertActive(input.signal);
@@ -321,6 +385,18 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
       const created = await this.#store.createProblemWithRevisionAction(
         stored,
         async (revisionId, executor) => {
+          const lockedJob = await executor.query<{ id: string }>(sql`
+            SELECT id::text AS id
+            FROM import_jobs
+            WHERE id = ${input.importJobId}::uuid
+              AND state = 'running'
+              AND requested_by_user_id = ${BigInt(input.requestedByUserId)}
+            FOR UPDATE
+          `);
+          if (lockedJob.length !== 1) {
+            throw new ImportItemAlreadyCommitted();
+          }
+
           for (const [index, file] of problem.files.entries()) {
             const storedFile = published[index];
             if (storedFile === undefined) {
@@ -361,14 +437,114 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
               WHERE id = ${revisionId}::uuid
             `);
           }
+
+          const revision = await executor.query<{ problem_id: string }>(sql`
+            SELECT problem_id::text AS problem_id
+            FROM problem_revisions
+            WHERE id = ${revisionId}::uuid
+          `);
+          const importedProblemId = revision[0]?.problem_id;
+          if (importedProblemId === undefined) {
+            throw new Error("新题目版本没有关联题目。");
+          }
+          const recorded = await executor.query<{ position: number }>(sql`
+            UPDATE import_job_items
+            SET state = 'succeeded',
+                imported_problem_id = ${BigInt(importedProblemId)},
+                report = '{}'::jsonb,
+                failure_code = NULL,
+                failure_message = NULL,
+                finished_at = ${this.#now().toISOString()}::timestamptz
+            WHERE job_id = ${input.importJobId}::uuid
+              AND position = ${input.position}
+              AND imported_problem_id IS NULL
+              AND EXISTS (
+                SELECT 1
+                FROM import_jobs
+                WHERE id = ${input.importJobId}::uuid
+                  AND state = 'running'
+                  AND requested_by_user_id = ${BigInt(input.requestedByUserId)}
+              )
+            RETURNING position
+          `);
+          if (recorded.length !== 1) {
+            throw new ImportItemAlreadyCommitted();
+          }
+          transactionWritesFinished = true;
         }
       );
       return { problemId: created.id };
-    } catch (error) {
-      for (const storedFile of published) {
-        await this.#storage.delete(storedFile).catch(() => undefined);
+    } catch {
+      let committedProblemId: string | undefined;
+      try {
+        committedProblemId = await this.#findImportedProblemId(
+          input.importJobId,
+          input.position
+        );
+        if (committedProblemId !== undefined) {
+          const linkedToCommittedProblem = await this.#publishedFilesBelongToProblem(
+            committedProblemId,
+            published
+          );
+          if (!linkedToCommittedProblem) {
+            await this.#deletePublishedFiles(published);
+          }
+          return { problemId: committedProblemId };
+        }
+      } catch {
+        if (!transactionWritesFinished) {
+          await this.#deletePublishedFiles(published);
+        }
+        throw new ImportResultSaveError();
       }
-      throw error;
+      if (transactionWritesFinished) {
+        // The transaction body finished, so a lost commit response can leave a
+        // valid problem that is not visible to this connection yet. Keep the
+        // objects until a retry can read the committed item.
+        throw new ImportResultSaveError();
+      }
+      await this.#deletePublishedFiles(published);
+      throw new ImportResultSaveError();
+    }
+  }
+
+  async #findImportedProblemId(
+    importJobId: string,
+    position: number
+  ): Promise<string | undefined> {
+    const rows = await this.#database.query<{ imported_problem_id: string | null }>(sql`
+      SELECT imported_problem_id::text AS imported_problem_id
+      FROM import_job_items
+      WHERE job_id = ${importJobId}::uuid AND position = ${position}
+    `);
+    return rows[0]?.imported_problem_id ?? undefined;
+  }
+
+  async #publishedFilesBelongToProblem(
+    problemId: string,
+    published: readonly StoredFile[]
+  ): Promise<boolean> {
+    for (const storedFile of published) {
+      const rows = await this.#database.query<{ linked: boolean }>(sql`
+        SELECT EXISTS (
+          SELECT 1
+          FROM problem_revision_files association
+          INNER JOIN problem_revisions revision
+            ON revision.id = association.revision_id
+          WHERE revision.problem_id = ${BigInt(problemId)}
+            AND association.file_id = ${storedFile.id}::uuid
+        ) AS linked
+      `);
+      if (rows[0]?.linked !== true) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  async #deletePublishedFiles(published: readonly StoredFile[]): Promise<void> {
+    for (const storedFile of published) {
+      await this.#storage.delete(storedFile).catch(() => undefined);
     }
   }
 
@@ -434,18 +610,23 @@ export class ServiceExportReadAuthorization implements ExportReadAuthorization {
     userId: string,
     problemId: string
   ): Promise<{ canExport: boolean; canReadTestdata: boolean } | undefined> {
-    const user = await this.dependencies.getUser(userId);
-    if (user === undefined) {
-      return undefined;
-    }
     try {
+      const user = await this.dependencies.getUser(userId);
+      if (user === undefined) {
+        return undefined;
+      }
       const { capabilities } = await this.dependencies.service.getProblemForFileAccess(
         user,
         problemId
       );
       return { canExport: capabilities.canExport, canReadTestdata: capabilities.canReadTestdata };
-    } catch {
-      return undefined;
+    } catch (error) {
+      if (isHiddenProblemAccessError(error)) {
+        return undefined;
+      }
+      throw new ProblemPackageTemporaryError(
+        "题目权限检查暂时失败，请稍后重试。"
+      );
     }
   }
 }
@@ -493,6 +674,22 @@ export class DatabaseFixedRevisionExportReader implements FixedRevisionExportRea
   public constructor(private readonly dependencies: DatabaseFixedRevisionExportReaderDependencies) {}
 
   public async readRevision(input: {
+    readonly selection: ProblemPackageExportSelection;
+    readonly signal: AbortSignal;
+  }): Promise<ExportProblemRevision | undefined> {
+    try {
+      return await this.#readRevision(input);
+    } catch (error) {
+      if (error instanceof TaskAborted || error instanceof ProblemPackageTemporaryError) {
+        throw error;
+      }
+      throw new ProblemPackageTemporaryError(
+        "导出题目暂时无法读取，请稍后重试。"
+      );
+    }
+  }
+
+  async #readRevision(input: {
     readonly selection: ProblemPackageExportSelection;
     readonly signal: AbortSignal;
   }): Promise<ExportProblemRevision | undefined> {
@@ -596,6 +793,29 @@ export class DatabaseFixedRevisionExportReader implements FixedRevisionExportRea
     readonly file: ExportProblemFileDescriptor;
     readonly signal: AbortSignal;
   }): Promise<CanonicalFile | undefined> {
+    try {
+      return await this.#readFile(input);
+    } catch (error) {
+      if (error instanceof TaskAborted || error instanceof ProblemPackageTemporaryError) {
+        throw error;
+      }
+      if (error instanceof StoredContentMismatch) {
+        return undefined;
+      }
+      if (error instanceof StorageError && error.code === "OBJECT_NOT_FOUND") {
+        return undefined;
+      }
+      throw new ProblemPackageTemporaryError(
+        "导出文件暂时无法读取，请稍后重试。"
+      );
+    }
+  }
+
+  async #readFile(input: {
+    readonly selection: ProblemPackageExportSelection;
+    readonly file: ExportProblemFileDescriptor;
+    readonly signal: AbortSignal;
+  }): Promise<CanonicalFile | undefined> {
     assertActive(input.signal);
     const { metadata, storage } = this.dependencies;
     const records = await metadata.listRevisionFiles(input.selection.revisionId);
@@ -686,6 +906,30 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
     readonly archives: readonly GeneratedArchive[];
     readonly signal: AbortSignal;
   }): Promise<{ readonly fileId: string; readonly expiresAt: string }> {
+    return this.#write(input);
+  }
+
+  public async writeAndComplete(input: {
+    readonly exportJobId: string;
+    readonly requestedByUserId: string;
+    readonly targetFormat: string;
+    readonly archives: readonly GeneratedArchive[];
+    readonly outputFileCount: number;
+    readonly signal: AbortSignal;
+  }): Promise<{ readonly fileId: string; readonly expiresAt: string }> {
+    return this.#write(input, input.outputFileCount);
+  }
+
+  async #write(
+    input: {
+      readonly exportJobId: string;
+      readonly requestedByUserId: string;
+      readonly targetFormat: string;
+      readonly archives: readonly GeneratedArchive[];
+      readonly signal: AbortSignal;
+    },
+    outputFileCount?: number
+  ): Promise<{ readonly fileId: string; readonly expiresAt: string }> {
     assertActive(input.signal);
     if (input.archives.length === 0) {
       throw new Error("导出任务没有产生任何题目包。");
@@ -771,37 +1015,97 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
     }
 
     assertActive(input.signal);
-    const staged = await this.#storage.stage({
-      originalName: fileName,
-      mediaType,
-      content: singleChunk(bytes)
-    });
+    let staged: StagedFile;
+    try {
+      staged = await this.#storage.stage({
+        originalName: fileName,
+        mediaType,
+        content: singleChunk(bytes)
+      });
+    } catch {
+      throw new ExportResultSaveError();
+    }
     let stored: StoredFile;
     try {
       stored = await this.#storage.publish(staged);
-    } catch (error) {
+    } catch {
       await this.#discardStaged(staged);
-      throw error;
+      throw new ExportResultSaveError();
     }
 
     const expiresAt = new Date(this.#now().getTime() + this.#timeToLiveMs).toISOString();
+    const metadataInput = {
+      id: stored.id,
+      purpose: "export_output" as const,
+      storageKey: stored.storageKey,
+      originalName: fileName,
+      mediaType,
+      byteSize: stored.byteSize,
+      sha256: stored.sha256,
+      createdByUserId: input.requestedByUserId,
+      expiresAt
+    };
+    let transactionWritesFinished = false;
     try {
-      await this.#metadata.createStoredFile({
-        id: stored.id,
-        purpose: "export_output",
-        storageKey: stored.storageKey,
-        originalName: fileName,
-        mediaType,
-        byteSize: stored.byteSize,
-        sha256: stored.sha256,
-        createdByUserId: input.requestedByUserId,
-        expiresAt
-      });
+      if (outputFileCount === undefined) {
+        await this.#metadata.createStoredFile(metadataInput);
+      } else {
+        await this.#database.transaction(async (transaction) => {
+          await this.#metadata.createStoredFile(metadataInput, transaction);
+          await completeDatabaseExportJob(
+            transaction,
+            this.#now,
+            input.exportJobId,
+            {
+              resultFileId: stored.id,
+              resultExpiresAt: expiresAt,
+              outputFileCount
+            }
+          );
+          transactionWritesFinished = true;
+        });
+      }
     } catch (error) {
+      if (outputFileCount !== undefined) {
+        if (error instanceof ProblemPackageJobStoreError) {
+          await this.#storage.delete(stored).catch(() => undefined);
+          throw new ExportResultSaveError();
+        }
+        if (!transactionWritesFinished) {
+          await this.#storage.delete(stored).catch(() => undefined);
+          throw new ExportResultSaveError();
+        }
+        try {
+          if (await this.#isCompletedWithFile(input.exportJobId, stored.id)) {
+            return { fileId: stored.id, expiresAt };
+          }
+        } catch {
+          // The object may already be referenced by a committed task. Deleting it
+          // while the database is unavailable would turn a valid result into a broken one.
+          throw new ExportResultSaveError();
+        }
+        // A connection failure can race with a commit that is still becoming
+        // visible. Preserve the object unless the transaction reported a
+        // definite task-state rejection above.
+        throw new ExportResultSaveError();
+      }
       await this.#storage.delete(stored).catch(() => undefined);
-      throw error;
+      throw new ExportResultSaveError();
     }
     return { fileId: stored.id, expiresAt };
+  }
+
+  async #isCompletedWithFile(exportJobId: string, fileId: string): Promise<boolean> {
+    const rows = await this.#database.query<{
+      state: string;
+      result_file_id: string | null;
+    }>(sql`
+      SELECT state::text AS state, result_file_id::text AS result_file_id
+      FROM export_jobs
+      WHERE id = ${exportJobId}::uuid
+    `);
+    const row = rows[0];
+    return row?.state === "succeeded" && row.result_file_id === fileId;
   }
 
   public async discard(fileId: string): Promise<void> {

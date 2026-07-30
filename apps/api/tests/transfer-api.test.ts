@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createLocalDatabase,
+  type DatabaseExecutor,
   type LocalDatabaseHandle,
   migrateDatabase,
   seedCoreDatabase
@@ -26,7 +27,7 @@ import {
   type GeneratedZipArchive,
   type ProblemFormatAdapter
 } from "@urmotiv/problem-package";
-import { LocalFileStorage } from "@urmotiv/storage";
+import { LocalFileStorage, StorageError } from "@urmotiv/storage";
 import { sql } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -67,7 +68,9 @@ interface TransferTestContext {
   readonly storage: LocalFileStorage;
   readonly storageRoot: string;
   readonly store: DatabaseDataStore;
+  readonly service: ProblemService;
   readonly transfer: TransferService;
+  readonly writer: DatabaseImportedProblemWriter;
   readonly worker: JobWorker;
 }
 
@@ -123,12 +126,13 @@ async function makeTransferApp(
       ? {}
       : { multiProblemOuterArchiveMaxBytes: options.multiProblemOuterArchiveMaxBytes })
   });
+  const writer = new DatabaseImportedProblemWriter({ database, store, metadata, storage });
   const worker = new JobWorker(queue, { workerId: "test-worker", logger: silentLogger });
   registerProblemPackageHandlers(worker, {
     import: {
       jobs: jobStore,
       archives: new StorageVerifiedImportArchiveReader(metadata, storage),
-      writer: new DatabaseImportedProblemWriter({ database, store, metadata, storage })
+      writer
     },
     export: {
       jobs: jobStore,
@@ -172,7 +176,9 @@ async function makeTransferApp(
     storage,
     storageRoot,
     store,
+    service,
     transfer,
+    writer,
     worker
   };
 }
@@ -802,6 +808,325 @@ describe("题目包导入", () => {
     });
     expect(reread).toBeUndefined();
   });
+
+  it("后台导入读取暂时故障时使用固定错误并保留重试机会", async () => {
+    const { app, metadata, storage } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const uploaded = await uploadPackage(
+      app,
+      leader,
+      await nativeZipOf(fixtureProblem())
+    );
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+    const privateFailure = `database unavailable ${statementText}`;
+    const metadataFailure = vi
+      .spyOn(metadata, "findStoredFile")
+      .mockRejectedValueOnce(new Error(privateFailure));
+
+    let firstFailure: unknown;
+    try {
+      await new StorageVerifiedImportArchiveReader(metadata, storage).read({
+        sourceFileId: upload.fileId,
+        expectedDigest: upload.sha256,
+        signal: new AbortController().signal
+      });
+    } catch (error) {
+      firstFailure = error;
+    }
+    expect(firstFailure).toMatchObject({
+      name: "ProblemPackageTemporaryError",
+      message: "导入文件暂时无法读取，请稍后重试。"
+    });
+    expect(JSON.stringify(firstFailure)).not.toContain(privateFailure);
+    metadataFailure.mockRestore();
+
+    const storageFailure = vi
+      .spyOn(storage, "open")
+      .mockRejectedValueOnce(new Error(privateFailure));
+    let secondFailure: unknown;
+    try {
+      await new StorageVerifiedImportArchiveReader(metadata, storage).read({
+        sourceFileId: upload.fileId,
+        expectedDigest: upload.sha256,
+        signal: new AbortController().signal
+      });
+    } catch (error) {
+      secondFailure = error;
+    }
+    expect(secondFailure).toMatchObject({
+      name: "ProblemPackageTemporaryError",
+      message: "导入文件暂时无法读取，请稍后重试。"
+    });
+    expect(JSON.stringify(secondFailure)).not.toContain(privateFailure);
+    storageFailure.mockRestore();
+  });
+
+  it("两个工作进程同时写同一导入项目时只保留一道题并复用题目编号", async () => {
+    const { app, database, jobs, storage, store, writer } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const uploaded = await uploadPackage(app, leader, await nativeZipOf(fixtureProblem()));
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: upload.fileId,
+        sha256: upload.sha256,
+        formatId: "urmotiv",
+        idempotencyKey: "concurrent-import-writer"
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const jobId = (created.json() as { id: string }).id;
+    await jobs.startImportJob(jobId);
+    const before = await database.query<{ count: number | string }>(sql`
+      SELECT count(*)::integer AS count
+      FROM problems
+    `);
+    const deleted = vi.spyOn(storage, "delete");
+    const originalListTags = store.listTags.bind(store);
+    let releaseBothTagReads: (() => void) | undefined;
+    const bothTagReads = new Promise<void>((resolve) => {
+      releaseBothTagReads = resolve;
+    });
+    let tagReadCount = 0;
+    vi.spyOn(store, "listTags").mockImplementation(async () => {
+      const tags = await originalListTags();
+      tagReadCount += 1;
+      if (tagReadCount === 2) {
+        releaseBothTagReads?.();
+      }
+      await bothTagReads;
+      return tags;
+    });
+    const signal = new AbortController().signal;
+    const write = () =>
+      writer.write({
+        importJobId: jobId,
+        position: 0,
+        requestedByUserId: databaseDemoUserIds.leader,
+        choices: { conflictAction: "create" },
+        problem: fixtureProblem(),
+        signal
+      });
+
+    const results = await Promise.all([write(), write()]);
+
+    expect(results[0]?.problemId).toBe(results[1]?.problemId);
+    expect(await jobs.getImportItems(jobId)).toEqual([
+      expect.objectContaining({
+        state: "succeeded",
+        importedProblemId: results[0]?.problemId
+      })
+    ]);
+    const after = await database.query<{ count: number | string }>(sql`
+      SELECT count(*)::integer AS count
+      FROM problems
+    `);
+    expect(Number(after[0]?.count)).toBe(Number(before[0]?.count) + 1);
+    expect(deleted).toHaveBeenCalledTimes(fixtureProblem().files.length);
+    const storedProblemFiles = await database.query<{ count: number | string }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'problem'
+        AND deleted_at IS NULL
+    `);
+    expect(Number(storedProblemFiles[0]?.count)).toBe(fixtureProblem().files.length);
+  });
+
+  it("导入成功与任务失败并发时不会留下相互矛盾的状态", async () => {
+    const { app, database, jobs, writer } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const uploaded = await uploadPackage(app, leader, await nativeZipOf(fixtureProblem()));
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: upload.fileId,
+        sha256: upload.sha256,
+        formatId: "urmotiv",
+        idempotencyKey: "concurrent-import-success-and-failure"
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const jobId = (created.json() as { id: string }).id;
+    await jobs.startImportJob(jobId);
+    const before = await database.query<{ count: number | string }>(sql`
+      SELECT count(*)::integer AS count
+      FROM problems
+    `);
+
+    const [writeResult, failResult] = await Promise.allSettled([
+      writer.write({
+        importJobId: jobId,
+        position: 0,
+        requestedByUserId: databaseDemoUserIds.leader,
+        choices: { conflictAction: "create" },
+        problem: fixtureProblem(),
+        signal: new AbortController().signal
+      }),
+      jobs.failImportJob(jobId, "import_write_failed", {
+        version: 1,
+        phase: "failed",
+        completedItems: 0,
+        failedItems: 1,
+        skippedItems: 0
+      })
+    ]);
+
+    const job = await jobs.getImportJob(jobId);
+    const items = await jobs.getImportItems(jobId);
+    const after = await database.query<{ count: number | string }>(sql`
+      SELECT count(*)::integer AS count
+      FROM problems
+    `);
+    expect([writeResult.status, failResult.status].sort()).toEqual([
+      "fulfilled",
+      "rejected"
+    ]);
+    if (job?.state === "failed") {
+      expect(writeResult.status).toBe("rejected");
+      expect(items.some((item) => item.state === "succeeded")).toBe(false);
+      expect(Number(after[0]?.count)).toBe(Number(before[0]?.count));
+    } else {
+      expect(job?.state).toBe("running");
+      expect(writeResult.status).toBe("fulfilled");
+      expect(items).toEqual([
+        expect.objectContaining({
+          state: "succeeded",
+          importedProblemId:
+            writeResult.status === "fulfilled" ? writeResult.value.problemId : null
+        })
+      ]);
+      expect(Number(after[0]?.count)).toBe(Number(before[0]?.count) + 1);
+    }
+  });
+
+  it("导入事务正文未执行且复查失败时清理已发布文件", async () => {
+    const { app, database, jobs, storage, writer } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const uploaded = await uploadPackage(app, leader, await nativeZipOf(fixtureProblem()));
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: upload.fileId,
+        sha256: upload.sha256,
+        formatId: "urmotiv",
+        idempotencyKey: "import-transaction-not-started"
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const jobId = (created.json() as { id: string }).id;
+    await jobs.startImportJob(jobId);
+    const before = await database.query<{ count: number | string }>(sql`
+      SELECT count(*)::integer AS count
+      FROM problems
+    `);
+    const deleted = vi.spyOn(storage, "delete");
+    vi.spyOn(database, "transaction").mockImplementationOnce(
+      async <T>(
+        _work: (executor: DatabaseExecutor) => Promise<T>
+      ): Promise<T> => {
+        vi.spyOn(database, "query").mockRejectedValueOnce(
+          new Error("database unavailable while checking import result")
+        );
+        throw new Error("database unavailable before import transaction");
+      }
+    );
+
+    await expect(
+      writer.write({
+        importJobId: jobId,
+        position: 0,
+        requestedByUserId: databaseDemoUserIds.leader,
+        choices: { conflictAction: "create" },
+        problem: fixtureProblem(),
+        signal: new AbortController().signal
+      })
+    ).rejects.toMatchObject({
+      name: "ImportResultSaveError",
+      message: "导入结果的保存状态暂时无法确认。"
+    });
+    expect(deleted).toHaveBeenCalledTimes(fixtureProblem().files.length);
+    const after = await database.query<{ count: number | string }>(sql`
+      SELECT count(*)::integer AS count
+      FROM problems
+    `);
+    expect(Number(after[0]?.count)).toBe(Number(before[0]?.count));
+  });
+
+  it("导入事务提交结果暂时不可见时保留文件并在重试后复用题目", async () => {
+    const { app, database, jobs, storage, writer } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const uploaded = await uploadPackage(app, leader, await nativeZipOf(fixtureProblem()));
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: upload.fileId,
+        sha256: upload.sha256,
+        formatId: "urmotiv",
+        idempotencyKey: "import-response-lost"
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const jobId = (created.json() as { id: string }).id;
+    await jobs.startImportJob(jobId);
+    const deleted = vi.spyOn(storage, "delete");
+    const originalTransaction = database.transaction.bind(database);
+    vi.spyOn(database, "transaction").mockImplementationOnce(
+      async <T>(work: (executor: DatabaseExecutor) => Promise<T>): Promise<T> => {
+        await originalTransaction(work);
+        vi.spyOn(database, "query").mockResolvedValueOnce([]);
+        throw new Error("database response lost after import commit");
+      }
+    );
+
+    const input = {
+      importJobId: jobId,
+      position: 0,
+      requestedByUserId: databaseDemoUserIds.leader,
+      choices: { conflictAction: "create" as const },
+      problem: fixtureProblem(),
+      signal: new AbortController().signal
+    };
+    await expect(writer.write(input)).rejects.toMatchObject({
+      name: "ImportResultSaveError",
+      message: "导入结果的保存状态暂时无法确认。"
+    });
+    expect(deleted).not.toHaveBeenCalled();
+
+    const result = await writer.write(input);
+
+    expect(await jobs.getImportItems(jobId)).toEqual([
+      expect.objectContaining({
+        state: "succeeded",
+        importedProblemId: result.problemId
+      })
+    ]);
+    expect(deleted).not.toHaveBeenCalled();
+    const linkedFiles = await database.query<{ count: number | string }>(sql`
+      SELECT count(*)::integer AS count
+      FROM problem_revision_files association
+      INNER JOIN problem_revisions revision
+        ON revision.id = association.revision_id
+      WHERE revision.problem_id = ${BigInt(result.problemId)}
+    `);
+    expect(Number(linkedFiles[0]?.count)).toBe(fixtureProblem().files.length);
+  });
 });
 
 describe("题目包导出", () => {
@@ -827,6 +1152,223 @@ describe("题目包导出", () => {
     expect(stored.mediaType).toBe("application/vnd.fps+xml");
     expect(new TextDecoder().decode(stored.content)).toBe(xml);
     expect(() => readZipArchive(stored.content)).toThrow(UnsafeArchiveError);
+  });
+
+  it("原子写入失败会撤销文件记录并删除对象，重试后只留下一个有效结果", async () => {
+    const { app, artifacts, database, jobs, storage, worker } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const problemId = await importFixtureProblem(app, worker, leader);
+    const exportJobId = await createExportJob(
+      app,
+      leader,
+      problemId,
+      "atomic-export-retry"
+    );
+    const deleted = vi.spyOn(storage, "delete");
+    const archive = syntheticGeneratedArchive("problem.zip", false);
+
+    await expect(
+      artifacts.writeAndComplete({
+        exportJobId,
+        requestedByUserId: databaseDemoUserIds.leader,
+        targetFormat: "urmotiv",
+        archives: [archive],
+        outputFileCount: archive.files.length,
+        signal: new AbortController().signal
+      })
+    ).rejects.toMatchObject({
+      name: "ExportResultSaveError",
+      message: "导出结果的保存状态暂时无法确认。"
+    });
+    expect(deleted).toHaveBeenCalledTimes(1);
+    const afterRejected = await database.query<{ count: number | string }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'export_output'
+    `);
+    expect(Number(afterRejected[0]?.count)).toBe(0);
+
+    await jobs.startExportJob(exportJobId);
+    const written = await artifacts.writeAndComplete({
+      exportJobId,
+      requestedByUserId: databaseDemoUserIds.leader,
+      targetFormat: "urmotiv",
+      archives: [archive],
+      outputFileCount: archive.files.length,
+      signal: new AbortController().signal
+    });
+
+    expect(await jobs.getExportJob(exportJobId)).toEqual(
+      expect.objectContaining({
+        state: "succeeded",
+        resultFileId: written.fileId,
+        progressPercent: 100
+      })
+    );
+    const afterRetry = await database.query<{ count: number | string }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'export_output'
+        AND deleted_at IS NULL
+    `);
+    expect(Number(afterRetry[0]?.count)).toBe(1);
+  });
+
+  it("原子导出事务正文未执行时删除已发布对象", async () => {
+    const { app, artifacts, database, jobs, storage, worker } =
+      await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const problemId = await importFixtureProblem(app, worker, leader);
+    const exportJobId = await createExportJob(
+      app,
+      leader,
+      problemId,
+      "atomic-export-transaction-not-started"
+    );
+    await jobs.startExportJob(exportJobId);
+    const deleted = vi.spyOn(storage, "delete");
+    vi.spyOn(database, "transaction").mockImplementationOnce(
+      async <T>(
+        _work: (executor: DatabaseExecutor) => Promise<T>
+      ): Promise<T> => {
+        throw new Error("database unavailable before export transaction");
+      }
+    );
+    const archive = syntheticGeneratedArchive("problem.zip", false);
+
+    await expect(
+      artifacts.writeAndComplete({
+        exportJobId,
+        requestedByUserId: databaseDemoUserIds.leader,
+        targetFormat: "urmotiv",
+        archives: [archive],
+        outputFileCount: archive.files.length,
+        signal: new AbortController().signal
+      })
+    ).rejects.toMatchObject({
+      name: "ExportResultSaveError",
+      message: "导出结果的保存状态暂时无法确认。"
+    });
+    expect(deleted).toHaveBeenCalledTimes(1);
+    const storedFiles = await database.query<{ count: number | string }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'export_output'
+    `);
+    expect(Number(storedFiles[0]?.count)).toBe(0);
+  });
+
+  it("数据库已提交但响应丢失时保留已被成功任务引用的导出文件", async () => {
+    const { app, artifacts, database, jobs, metadata, storage, worker } =
+      await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const problemId = await importFixtureProblem(app, worker, leader);
+    const exportJobId = await createExportJob(
+      app,
+      leader,
+      problemId,
+      "atomic-export-response-lost"
+    );
+    await jobs.startExportJob(exportJobId);
+    const deleted = vi.spyOn(storage, "delete");
+    const originalTransaction = database.transaction.bind(database);
+    vi.spyOn(database, "transaction").mockImplementationOnce(
+      async <T>(work: (executor: DatabaseExecutor) => Promise<T>): Promise<T> => {
+        await originalTransaction(work);
+        throw new Error("database response lost after commit");
+      }
+    );
+    const archive = syntheticGeneratedArchive("problem.zip", false);
+
+    const written = await artifacts.writeAndComplete({
+      exportJobId,
+      requestedByUserId: databaseDemoUserIds.leader,
+      targetFormat: "urmotiv",
+      archives: [archive],
+      outputFileCount: archive.files.length,
+      signal: new AbortController().signal
+    });
+
+    const finished = await jobs.getExportJob(exportJobId);
+    expect(finished).toEqual(
+      expect.objectContaining({
+        state: "succeeded",
+        resultFileId: written.fileId
+      })
+    );
+    expect(await metadata.findStoredFile(written.fileId)).toBeDefined();
+    expect(deleted).not.toHaveBeenCalled();
+  });
+
+  it("导出文件确实不存在与暂时读取失败使用不同结果", async () => {
+    const { app, database, metadata, storage, worker } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const problemId = await importFixtureProblem(app, worker, leader);
+    const revisions = await database.query<{ id: string }>(sql`
+      SELECT id::text AS id
+      FROM problem_revisions
+      WHERE problem_id = ${BigInt(problemId)}
+      ORDER BY revision DESC
+      LIMIT 1
+    `);
+    const revisionId = revisions[0]?.id;
+    if (revisionId === undefined) {
+      throw new Error("测试题目没有固定版本。");
+    }
+    const selection = {
+      problemId,
+      revisionId,
+      includedFileCategories: ["testdata" as const]
+    };
+    const reader = new DatabaseFixedRevisionExportReader({
+      database,
+      metadata,
+      storage
+    });
+    const revision = await reader.readRevision({
+      selection,
+      signal: new AbortController().signal
+    });
+    const descriptor = revision?.files[0];
+    const storedFile = (await metadata.listRevisionFiles(revisionId))[0];
+    if (descriptor === undefined || storedFile === undefined) {
+      throw new Error("测试题目没有数据文件。");
+    }
+    const privateFailure = `storage unavailable ${statementText}`;
+    const openFailure = vi
+      .spyOn(storage, "open")
+      .mockRejectedValueOnce(
+        new StorageError("STORAGE_READ_FAILED", privateFailure)
+      );
+
+    let temporaryFailure: unknown;
+    try {
+      await reader.readFile({
+        selection,
+        file: descriptor,
+        signal: new AbortController().signal
+      });
+    } catch (error) {
+      temporaryFailure = error;
+    }
+    expect(temporaryFailure).toMatchObject({
+      name: "ProblemPackageTemporaryError",
+      message: "导出文件暂时无法读取，请稍后重试。"
+    });
+    expect(JSON.stringify(temporaryFailure)).not.toContain(privateFailure);
+    openFailure.mockRestore();
+
+    await storage.delete({
+      id: storedFile.id,
+      storageKey: storedFile.storageKey
+    });
+    await expect(
+      reader.readFile({
+        selection,
+        file: descriptor,
+        signal: new AbortController().signal
+      })
+    ).resolves.toBeUndefined();
   });
 
   it("原始单文件的扩展名或内容不符时不会写出产物", async () => {
@@ -1134,6 +1676,35 @@ describe("题目包导出", () => {
 });
 
 describe("题目包导出权限", () => {
+  it("题目权限查询发生系统故障时返回固定失败而不是伪装成不存在", async () => {
+    const { service, store, transfer } = await makeTransferApp();
+    const leader = await store.getUser(databaseDemoUserIds.leader);
+    if (leader === undefined) {
+      throw new Error("测试组长账号不存在。");
+    }
+    vi.spyOn(service, "getProblemForFileAccess").mockRejectedValue(
+      new Error(`database unavailable ${statementText}`)
+    );
+
+    let failure: unknown;
+    try {
+      await transfer.previewExport(leader, {
+        targetFormat: "urmotiv",
+        problems: [{ problemId: "1", includeFileCategories: [] }]
+      });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      statusCode: 500,
+      code: "PROBLEM_ACCESS_CHECK_FAILED",
+      message: "题目权限检查暂时失败，请稍后重试。"
+    });
+    expect(JSON.stringify(failure)).not.toContain(statementText);
+    expect(JSON.stringify(failure)).not.toContain("database unavailable");
+  });
+
   it("无权用户的导出预览统一显示不存在，创建导出任务返回不存在", async () => {
     const { app, worker } = await makeTransferApp();
     const leader = await login(app, databaseDemoUserIds.leader);

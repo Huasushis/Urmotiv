@@ -30,6 +30,7 @@ import {
   type ProblemPackageFileCategory,
   type ProblemPackageImportJob,
   type ProblemPackageImportChoices,
+  type ProblemPackageImportItem,
   type ProblemPackageJobReport,
   type ProblemPackageJobStore
 } from "./problem-package";
@@ -57,9 +58,10 @@ export interface VerifiedImportArchiveReader {
 }
 
 /**
- * A writer must use one database transaction per item and use importJobId plus
- * position as its idempotency key. On rejection it must leave no problem,
- * revision, or file relation behind.
+ * A writer must use one database transaction per item, use importJobId plus
+ * position as its idempotency key, and save importedProblemId in that same
+ * transaction. On rejection it must leave no problem, revision, or file
+ * relation behind.
  */
 export interface AtomicImportedProblemWriter {
   write(input: {
@@ -131,7 +133,48 @@ export interface ExportArtifactWriter {
     readonly archives: readonly GeneratedArchive[];
     readonly signal: AbortSignal;
   }): Promise<{ readonly fileId: string; readonly expiresAt: string }>;
+  /**
+   * 生产环境可以实现这个入口，把文件元数据和导出任务结果放在同一次数据库提交中。
+   * 只实现 write 的测试或旧实现仍由任务存储单独完成任务。
+   */
+  writeAndComplete?(input: {
+    readonly exportJobId: string;
+    readonly requestedByUserId: string;
+    readonly targetFormat: string;
+    readonly archives: readonly GeneratedArchive[];
+    readonly outputFileCount: number;
+    readonly signal: AbortSignal;
+  }): Promise<{ readonly fileId: string; readonly expiresAt: string }>;
   discard?(fileId: string): Promise<void>;
+}
+
+/**
+ * A dependency needed by the task is temporarily unavailable. The worker must
+ * retry instead of recording a permanent package failure.
+ */
+export class ProblemPackageTemporaryError extends Error {
+  public constructor(message = "题目包任务暂时无法继续，请稍后重试。") {
+    super(message);
+    this.name = "ProblemPackageTemporaryError";
+  }
+}
+
+export class ImportResultSaveError extends ProblemPackageTemporaryError {
+  public constructor() {
+    super("导入结果的保存状态暂时无法确认。");
+    this.name = "ImportResultSaveError";
+  }
+}
+
+/**
+ * 文件可能已经与成功任务关联，但数据库响应没有送达时使用。它不是业务失败，
+ * JobWorker 会重试并先读取既有任务结果。
+ */
+export class ExportResultSaveError extends ProblemPackageTemporaryError {
+  public constructor() {
+    super("导出结果的保存状态暂时无法确认。");
+    this.name = "ExportResultSaveError";
+  }
 }
 
 export interface ProblemPackageExportHandlerDependencies {
@@ -157,19 +200,33 @@ export function createProblemPackageImportHandler(
     let itemSucceeded = false;
 
     try {
-      job = await dependencies.jobs.startImportJob(importJobId);
+      job = await startImportOrRetry(dependencies.jobs, importJobId);
       if (job === undefined) {
-        throw new PackageTaskError("source_unavailable");
+        throw permanentFailure("source_unavailable");
       }
       if (job.state !== "running") {
         if (job.state === "succeeded") {
           return { result: { importedProblemCount: job.report.completedItems, failedProblemCount: 0 } };
         }
-        throw new PackageTaskError("cancelled");
+        throw permanentFailure(job.failure?.code ?? "cancelled");
+      }
+
+      let existingItems: readonly ProblemPackageImportItem[];
+      try {
+        existingItems = await dependencies.jobs.getImportItems(importJobId);
+      } catch {
+        throw new TaskStatePersistenceError();
+      }
+      const existingItem = existingItems.find((item) => item.position === 0);
+      if (existingItem?.state === "succeeded" && existingItem.importedProblemId !== null) {
+        itemSucceeded = true;
+        await completeImportOrRetry(dependencies.jobs, importJobId);
+        await reportCompletedImport(context, existingItem.importedProblemId);
+        return { result: { importedProblemCount: 1, failedProblemCount: 0 } };
       }
 
       assertActive(context.signal);
-      await context.putItemReport({ itemId: "0", state: "running" });
+      await putRunningItemOrRetry(context, "0");
       const packageInput = await dependencies.archives.read({
         sourceFileId: job.sourceFileId,
         expectedDigest: job.inputDigest,
@@ -190,7 +247,12 @@ export function createProblemPackageImportHandler(
       if (inputKindForProblemFormatAdapter(adapter) !== packageInput.kind) {
         throw new PackageTaskError("format_unavailable");
       }
-      await dependencies.jobs.updateImportJob(importJobId, 30, report("converting", 0, 0));
+      await updateImportOrRetry(
+        dependencies.jobs,
+        importJobId,
+        30,
+        report("converting", 0, 0)
+      );
       assertActive(context.signal);
       const problem = await adapter.import(
         packageInput.archive,
@@ -198,7 +260,12 @@ export function createProblemPackageImportHandler(
       );
       assertActive(context.signal);
 
-      await dependencies.jobs.updateImportJob(importJobId, 60, report("writing", 0, 0));
+      await updateImportOrRetry(
+        dependencies.jobs,
+        importJobId,
+        60,
+        report("writing", 0, 0)
+      );
       const committed = await dependencies.writer.write({
         importJobId,
         position: 0,
@@ -213,13 +280,79 @@ export function createProblemPackageImportHandler(
         state: "succeeded",
         importedProblemId
       });
-      await dependencies.jobs.completeImportJob(importJobId, report("completed", 1, 0));
-      await context.updateProgress(100);
-      await context.putItemReport({ itemId: "0", state: "succeeded", resultId: importedProblemId });
+      await completeImportOrRetry(dependencies.jobs, importJobId);
+      await reportCompletedImport(context, importedProblemId);
       return { result: { importedProblemCount: 1, failedProblemCount: 0 } };
     } catch (error) {
+      if (error instanceof PermanentJobError) {
+        throw error;
+      }
+      if (error instanceof ProblemPackageTemporaryError) {
+        if (context.attempt < context.maxAttempts) {
+          throw error;
+        }
+        let current = await getImportOrRetry(dependencies.jobs, importJobId);
+        if (current === undefined) {
+          throw permanentFailure("source_unavailable");
+        }
+        if (current.state === "succeeded") {
+          return {
+            result: {
+              importedProblemCount: current.report.completedItems,
+              failedProblemCount: 0
+            }
+          };
+        }
+        if (current.state === "failed" || current.state === "cancelled") {
+          throw permanentFailure(current.failure?.code ?? "cancelled");
+        }
+        if (current.state === "queued") {
+          current = await startImportOrRetry(dependencies.jobs, importJobId);
+        }
+        if (current?.state !== "running") {
+          throw new TaskStatePersistenceError();
+        }
+        const committedProblemId = await completedImportIdOrRetry(
+          dependencies.jobs,
+          importJobId
+        );
+        if (committedProblemId !== undefined) {
+          await completeImportOrRetry(dependencies.jobs, importJobId);
+          await reportCompletedImport(context, committedProblemId);
+          return { result: { importedProblemCount: 1, failedProblemCount: 0 } };
+        }
+        const code: ProblemPackageFailureCode = "import_write_failed";
+        try {
+          await failImportSafely(dependencies.jobs, importJobId, code);
+        } catch (failureError) {
+          const racedProblemId = await completedImportIdOrRetry(
+            dependencies.jobs,
+            importJobId
+          );
+          if (racedProblemId !== undefined) {
+            await completeImportOrRetry(dependencies.jobs, importJobId);
+            await reportCompletedImport(context, racedProblemId);
+            return { result: { importedProblemCount: 1, failedProblemCount: 0 } };
+          }
+          throw failureError;
+        }
+        await putFailureReport(context, "0", code);
+        throw permanentFailure(code);
+      }
+      const committedProblemId = await completedImportIdOrRetry(
+        dependencies.jobs,
+        importJobId
+      );
+      if (committedProblemId !== undefined) {
+        await completeImportOrRetry(dependencies.jobs, importJobId);
+        await reportCompletedImport(context, committedProblemId);
+        return { result: { importedProblemCount: 1, failedProblemCount: 0 } };
+      }
       const code = classifyImportFailure(error, context.signal);
-      await failImportSafely(dependencies.jobs, importJobId, code, itemSucceeded);
+      if (itemSucceeded) {
+        throw new TaskStatePersistenceError();
+      }
+      await failImportSafely(dependencies.jobs, importJobId, code);
       await putFailureReport(context, "0", code);
       const failure = safeProblemPackageFailure(code);
       throw new PermanentJobError(failure.code, failure.message);
@@ -248,15 +381,15 @@ export function createProblemPackageExportHandler(
     let artifactFileId: string | undefined;
 
     try {
-      job = await dependencies.jobs.startExportJob(exportJobId);
+      job = await startExportOrRetry(dependencies.jobs, exportJobId);
       if (job === undefined) {
-        throw new PackageTaskError("export_source_missing");
+        throw permanentFailure("export_source_missing");
       }
       if (job.state !== "running") {
         if (job.state === "succeeded" && job.resultFileId !== null) {
           return { result: { resultFileId: job.resultFileId } };
         }
-        throw new PackageTaskError("cancelled");
+        throw permanentFailure(job.failure?.code ?? "cancelled");
       }
 
       const adapter = adapters.get(job.targetFormat);
@@ -275,7 +408,7 @@ export function createProblemPackageExportHandler(
       let generatedBytes = 0;
       for (const [position, selection] of job.problems.entries()) {
         assertActive(context.signal);
-        await context.putItemReport({ itemId: String(position), state: "running" });
+        await putRunningItemOrRetry(context, String(position));
         const allowedProblem = await dependencies.authorization.canReadProblem({
           requestedByUserId: job.requestedByUserId,
           selection,
@@ -289,7 +422,8 @@ export function createProblemPackageExportHandler(
         if (revision === undefined) {
           throw new PackageTaskError("export_source_missing");
         }
-        await dependencies.jobs.updateExportJob(
+        await updateExportOrRetry(
+          dependencies.jobs,
           exportJobId,
           Math.max(5, Math.floor((position * 70) / job.problems.length)),
           report("reading", position, 0)
@@ -327,7 +461,8 @@ export function createProblemPackageExportHandler(
 
         const canonical = canonicalProblemSchema.parse({ ...revision.document, files });
         const options = exportOptionsForSelection(job, selection);
-        await dependencies.jobs.updateExportJob(
+        await updateExportOrRetry(
+          dependencies.jobs,
           exportJobId,
           Math.max(10, Math.floor(((position + 1) * 70) / job.problems.length)),
           report("converting", position, 0)
@@ -344,42 +479,137 @@ export function createProblemPackageExportHandler(
           maxInMemoryBytes
         );
         generated.push(validateGeneratedArchive(archive));
-        await context.putItemReport({ itemId: String(position), state: "succeeded" });
+        await putSucceededItemOrRetry(context, String(position));
       }
 
       assertActive(context.signal);
-      await dependencies.jobs.updateExportJob(
+      await updateExportOrRetry(
+        dependencies.jobs,
         exportJobId,
         85,
         report("writing", job.problems.length, 0)
       );
-      const written = await dependencies.artifacts.write({
-        exportJobId,
-        requestedByUserId: job.requestedByUserId,
-        targetFormat: job.targetFormat,
-        archives: generated,
-        signal: context.signal
-      });
+      const outputFileCount = generated.reduce(
+        (sum, archive) =>
+          sum +
+          (requireGeneratedArchiveKind(archive) === "zip"
+            ? (archive as GeneratedZipArchive).files.length
+            : 1),
+        0
+      );
+      const written =
+        dependencies.artifacts.writeAndComplete === undefined
+          ? await dependencies.artifacts.write({
+              exportJobId,
+              requestedByUserId: job.requestedByUserId,
+              targetFormat: job.targetFormat,
+              archives: generated,
+              signal: context.signal
+            })
+          : await dependencies.artifacts.writeAndComplete({
+              exportJobId,
+              requestedByUserId: job.requestedByUserId,
+              targetFormat: job.targetFormat,
+              archives: generated,
+              outputFileCount,
+              signal: context.signal
+            });
       artifactFileId = requireUuid(written.fileId);
-      await dependencies.jobs.completeExportJob(exportJobId, {
-        resultFileId: artifactFileId,
-        resultExpiresAt: validDateTime(written.expiresAt),
-        outputFileCount: generated.reduce(
-          (sum, archive) =>
-            sum +
-            (requireGeneratedArchiveKind(archive) === "zip"
-              ? (archive as GeneratedZipArchive).files.length
-              : 1),
-          0
-        )
-      });
-      await context.updateProgress(100);
+      if (dependencies.artifacts.writeAndComplete === undefined) {
+        try {
+          await dependencies.jobs.completeExportJob(exportJobId, {
+            resultFileId: artifactFileId,
+            resultExpiresAt: validDateTime(written.expiresAt),
+            outputFileCount
+          });
+        } catch {
+          let current: ProblemPackageExportJob | undefined;
+          try {
+            current = await dependencies.jobs.getExportJob(exportJobId);
+          } catch {
+            throw new ExportResultSaveError();
+          }
+          if (current?.state === "succeeded" && current.resultFileId !== null) {
+            if (current.resultFileId !== artifactFileId) {
+              await dependencies.artifacts.discard?.(artifactFileId).catch(() => undefined);
+            }
+            artifactFileId = current.resultFileId;
+          } else {
+            // The completion statement may have committed even when a following
+            // read still sees the old state. Keep the file until a retry can
+            // observe an authoritative result.
+            throw new ExportResultSaveError();
+          }
+        }
+      }
+      await reportCompletedExport(context);
       return { result: { resultFileId: artifactFileId } };
     } catch (error) {
-      const code = classifyExportFailure(error, context.signal);
+      if (error instanceof PermanentJobError) {
+        throw error;
+      }
+      if (error instanceof ProblemPackageTemporaryError) {
+        if (context.attempt < context.maxAttempts) {
+          throw error;
+        }
+        let current = await getExportOrRetry(dependencies.jobs, exportJobId);
+        if (current === undefined) {
+          throw permanentFailure("export_source_missing");
+        }
+        if (current.state === "succeeded" && current.resultFileId !== null) {
+          if (
+            artifactFileId !== undefined &&
+            artifactFileId !== current.resultFileId
+          ) {
+            await dependencies.artifacts
+              .discard?.(artifactFileId)
+              .catch(() => undefined);
+          }
+          return { result: { resultFileId: current.resultFileId } };
+        }
+        if (current.state === "failed" || current.state === "cancelled") {
+          if (artifactFileId !== undefined) {
+            await dependencies.artifacts
+              .discard?.(artifactFileId)
+              .catch(() => undefined);
+          }
+          throw permanentFailure(current.failure?.code ?? "cancelled");
+        }
+        if (current.state === "queued") {
+          current = await startExportOrRetry(dependencies.jobs, exportJobId);
+        }
+        if (current?.state !== "running") {
+          throw new TaskStatePersistenceError();
+        }
+        const code: ProblemPackageFailureCode = "export_write_failed";
+        try {
+          await failExportSafely(dependencies.jobs, exportJobId, code);
+        } catch (failureError) {
+          const raced = await getExportOrRetry(dependencies.jobs, exportJobId);
+          if (raced?.state === "succeeded" && raced.resultFileId !== null) {
+            if (
+              artifactFileId !== undefined &&
+              artifactFileId !== raced.resultFileId
+            ) {
+              await dependencies.artifacts
+                .discard?.(artifactFileId)
+                .catch(() => undefined);
+            }
+            return { result: { resultFileId: raced.resultFileId } };
+          }
+          throw failureError;
+        }
+        if (artifactFileId !== undefined) {
+          await dependencies.artifacts
+            .discard?.(artifactFileId)
+            .catch(() => undefined);
+        }
+        throw permanentFailure(code);
+      }
       if (artifactFileId !== undefined) {
         await dependencies.artifacts.discard?.(artifactFileId).catch(() => undefined);
       }
+      const code = classifyExportFailure(error, context.signal);
       await failExportSafely(dependencies.jobs, exportJobId, code);
       const failure = safeProblemPackageFailure(code);
       throw new PermanentJobError(failure.code, failure.message);
@@ -611,6 +841,18 @@ class PackageTaskError extends Error {
   }
 }
 
+class TaskStatePersistenceError extends ProblemPackageTemporaryError {
+  public constructor() {
+    super("题目包任务状态暂时无法保存。");
+    this.name = "TaskStatePersistenceError";
+  }
+}
+
+function permanentFailure(code: ProblemPackageFailureCode): PermanentJobError {
+  const failure = safeProblemPackageFailure(code);
+  return new PermanentJobError(failure.code, failure.message);
+}
+
 function report(
   phase: ProblemPackageJobReport["phase"],
   completedItems: number,
@@ -714,16 +956,125 @@ function requireGeneratedArchiveKind(
 async function failImportSafely(
   jobs: ProblemPackageJobStore,
   jobId: string,
-  code: ProblemPackageFailureCode,
-  itemSucceeded: boolean
+  code: ProblemPackageFailureCode
 ): Promise<void> {
   try {
-    if (!itemSucceeded) {
-      await jobs.recordImportItem(jobId, 0, { state: "failed", failureCode: code });
-    }
-    await jobs.failImportJob(jobId, code, report("failed", itemSucceeded ? 1 : 0, itemSucceeded ? 0 : 1));
+    await jobs.recordImportItem(jobId, 0, { state: "failed", failureCode: code });
   } catch {
-    // The generic worker failure still has a stable error code; never expose a storage error here.
+    // failImportJob below is authoritative and must still be attempted.
+  }
+  try {
+    await jobs.failImportJob(jobId, code, report("failed", 0, 1));
+  } catch {
+    throw new TaskStatePersistenceError();
+  }
+}
+
+async function completedImportIdOrRetry(
+  jobs: ProblemPackageJobStore,
+  jobId: string
+): Promise<string | undefined> {
+  let items: readonly ProblemPackageImportItem[];
+  try {
+    items = await jobs.getImportItems(jobId);
+  } catch {
+    throw new TaskStatePersistenceError();
+  }
+  const completed = items.find(
+    (item) => item.state === "succeeded" && item.importedProblemId !== null
+  );
+  return completed?.importedProblemId ?? undefined;
+}
+
+async function getImportOrRetry(
+  jobs: ProblemPackageJobStore,
+  jobId: string
+): Promise<ProblemPackageImportJob | undefined> {
+  try {
+    return await jobs.getImportJob(jobId);
+  } catch {
+    throw new TaskStatePersistenceError();
+  }
+}
+
+async function getExportOrRetry(
+  jobs: ProblemPackageJobStore,
+  jobId: string
+): Promise<ProblemPackageExportJob | undefined> {
+  try {
+    return await jobs.getExportJob(jobId);
+  } catch {
+    throw new TaskStatePersistenceError();
+  }
+}
+
+async function startImportOrRetry(
+  jobs: ProblemPackageJobStore,
+  jobId: string
+): Promise<ProblemPackageImportJob | undefined> {
+  try {
+    return await jobs.startImportJob(jobId);
+  } catch {
+    throw new TaskStatePersistenceError();
+  }
+}
+
+async function startExportOrRetry(
+  jobs: ProblemPackageJobStore,
+  jobId: string
+): Promise<ProblemPackageExportJob | undefined> {
+  try {
+    return await jobs.startExportJob(jobId);
+  } catch {
+    throw new TaskStatePersistenceError();
+  }
+}
+
+async function updateImportOrRetry(
+  jobs: ProblemPackageJobStore,
+  jobId: string,
+  progressPercent: number,
+  taskReport: ProblemPackageJobReport
+): Promise<void> {
+  try {
+    await jobs.updateImportJob(jobId, progressPercent, taskReport);
+  } catch {
+    throw new TaskStatePersistenceError();
+  }
+}
+
+async function updateExportOrRetry(
+  jobs: ProblemPackageJobStore,
+  jobId: string,
+  progressPercent: number,
+  taskReport: ProblemPackageJobReport
+): Promise<void> {
+  try {
+    await jobs.updateExportJob(jobId, progressPercent, taskReport);
+  } catch {
+    throw new TaskStatePersistenceError();
+  }
+}
+
+async function putRunningItemOrRetry(
+  context: Parameters<JobHandler>[1],
+  itemId: string
+): Promise<void> {
+  try {
+    await context.putItemReport({ itemId, state: "running" });
+  } catch {
+    throw new TaskStatePersistenceError();
+  }
+}
+
+async function putSucceededItemOrRetry(
+  context: Parameters<JobHandler>[1],
+  itemId: string
+): Promise<void> {
+  try {
+    await context.putItemReport({ itemId, state: "succeeded" });
+  } catch {
+    throw new TaskStatePersistenceError();
   }
 }
 
@@ -735,8 +1086,41 @@ async function failExportSafely(
   try {
     await jobs.failExportJob(jobId, code);
   } catch {
-    // See failImportSafely: task logs must not gain database error text.
+    throw new TaskStatePersistenceError();
   }
+}
+
+async function completeImportOrRetry(
+  jobs: ProblemPackageJobStore,
+  jobId: string
+): Promise<void> {
+  try {
+    await jobs.completeImportJob(jobId, report("completed", 1, 0));
+  } catch {
+    const current = await getImportOrRetry(jobs, jobId);
+    if (current?.state === "succeeded") {
+      return;
+    }
+    throw new TaskStatePersistenceError();
+  }
+}
+
+async function reportCompletedImport(
+  context: Parameters<JobHandler>[1],
+  importedProblemId: string
+): Promise<void> {
+  await Promise.all([
+    context.updateProgress(100).catch(() => undefined),
+    context
+      .putItemReport({ itemId: "0", state: "succeeded", resultId: importedProblemId })
+      .catch(() => undefined)
+  ]);
+}
+
+async function reportCompletedExport(
+  context: Parameters<JobHandler>[1]
+): Promise<void> {
+  await context.updateProgress(100).catch(() => undefined);
 }
 
 async function putFailureReport(

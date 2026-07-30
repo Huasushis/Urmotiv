@@ -15,6 +15,7 @@ import {
   problemPackageImportItemSchema,
   problemPackageImportJobSchema,
   problemPackageJobReportSchema,
+  ProblemPackageTemporaryError,
   safeProblemPackageFailure,
   type CompleteProblemPackageExport,
   type CreateProblemPackageExportJob,
@@ -293,11 +294,14 @@ function initialReport(): ProblemPackageJobReport {
   return { version: 1, phase: "queued", completedItems: 0, failedItems: 0, skippedItems: 0 };
 }
 
-function makeContext(): JobHandlerContext & { readonly itemReports: JobItemReport[] } {
+function makeContext(
+  overrides: Partial<Pick<JobHandlerContext, "attempt" | "maxAttempts">> = {}
+): JobHandlerContext & { readonly itemReports: JobItemReport[] } {
   const itemReports: JobItemReport[] = [];
   return {
     jobId: randomUUID(),
-    attempt: 1,
+    attempt: overrides.attempt ?? 1,
+    maxAttempts: overrides.maxAttempts ?? 3,
     signal: new AbortController().signal,
     itemReports,
     updateProgress: async () => {},
@@ -414,6 +418,48 @@ describe("题目包导入任务处理器", () => {
       })
     );
     expect(store.importItems.get(job.id)?.[0]?.state).toBe("failed");
+  });
+
+  it("不存在或已经失败的导入任务直接结束，不再尝试改写终态", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const failed = store.seedImport({
+      state: "failed",
+      report: {
+        version: 1,
+        phase: "failed",
+        completedItems: 0,
+        failedItems: 1,
+        skippedItems: 0
+      },
+      failure: safeProblemPackageFailure("import_invalid"),
+      startedAt: fixedNow,
+      finishedAt: fixedNow
+    });
+    const handler = createProblemPackageImportHandler({
+      jobs: store,
+      archives: {
+        read: async () => {
+          throw new Error("终态任务不应读取题目包。");
+        }
+      },
+      writer: {
+        write: async () => {
+          throw new Error("终态任务不应写入题目。");
+        }
+      }
+    });
+
+    await expect(
+      handler({ importJobId: randomUUID() }, makeContext())
+    ).rejects.toMatchObject({
+      name: "PermanentJobError",
+      code: "source_unavailable"
+    });
+    await expect(handler({ importJobId: failed.id }, makeContext())).rejects.toMatchObject({
+      name: "PermanentJobError",
+      code: "import_invalid"
+    });
+    expect(store.imports.get(failed.id)?.state).toBe("failed");
   });
 
   it("所选格式不可用时不读取包内容", async () => {
@@ -560,6 +606,123 @@ describe("题目包导入任务处理器", () => {
     );
   });
 
+  it("题目已经与导入项目一起提交时，重试只完成任务而不再读取或写入", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedImport({
+      state: "running",
+      progressPercent: 60,
+      report: {
+        version: 1,
+        phase: "writing",
+        completedItems: 0,
+        failedItems: 0,
+        skippedItems: 0
+      },
+      startedAt: fixedNow
+    });
+    store.importItems.set(job.id, [
+      problemPackageImportItemSchema.parse({
+        jobId: job.id,
+        position: 0,
+        state: "succeeded",
+        importedProblemId: "42",
+        failure: null,
+        finishedAt: fixedNow
+      })
+    ]);
+    const handler = createProblemPackageImportHandler({
+      jobs: store,
+      archives: {
+        read: async () => {
+          throw new Error("已提交的导入项目不应再次读取题目包。");
+        }
+      },
+      writer: {
+        write: async () => {
+          throw new Error("已提交的导入项目不应再次创建题目。");
+        }
+      }
+    });
+
+    await expect(handler({ importJobId: job.id }, makeContext())).resolves.toEqual({
+      result: { importedProblemCount: 1, failedProblemCount: 0 }
+    });
+    expect(store.imports.get(job.id)).toEqual(
+      expect.objectContaining({
+        state: "succeeded",
+        progressPercent: 100,
+        report: expect.objectContaining({ completedItems: 1 })
+      })
+    );
+  });
+
+  it("导入失败状态无法保存时保留运行状态并交给队列重试", async () => {
+    class FailingStateStore extends FakeProblemPackageJobStore {
+      public override async failImportJob(): Promise<void> {
+        throw new Error(`database rejected ${statementText}`);
+      }
+    }
+
+    const store = new FailingStateStore();
+    const job = store.seedImport();
+    const handler = createProblemPackageImportHandler({
+      jobs: store,
+      archives: new InMemoryVerifiedImportArchiveReader(),
+      writer: {
+        write: async () => {
+          throw new Error("输入缺失时不应写入题目。");
+        }
+      }
+    });
+
+    await expect(handler({ importJobId: job.id }, makeContext())).rejects.toMatchObject({
+      name: "TaskStatePersistenceError",
+      message: "题目包任务状态暂时无法保存。"
+    });
+    expect(store.imports.get(job.id)?.state).toBe("running");
+    expect(JSON.stringify(store.imports.get(job.id))).not.toContain(statementText);
+  });
+
+  it("最后一次临时导入失败会用固定错误结束业务任务", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedImport();
+    const handler = createProblemPackageImportHandler({
+      jobs: store,
+      archives: {
+        read: async () => {
+          throw new ProblemPackageTemporaryError();
+        }
+      },
+      writer: {
+        write: async () => {
+          throw new Error("读取失败时不应写入题目。");
+        }
+      }
+    });
+
+    await expect(
+      handler(
+        { importJobId: job.id },
+        makeContext({ attempt: 3, maxAttempts: 3 })
+      )
+    ).rejects.toMatchObject({
+      name: "PermanentJobError",
+      code: "import_write_failed"
+    });
+    expect(store.imports.get(job.id)).toEqual(
+      expect.objectContaining({
+        state: "failed",
+        failure: safeProblemPackageFailure("import_write_failed")
+      })
+    );
+    expect(store.importItems.get(job.id)?.[0]).toEqual(
+      expect.objectContaining({
+        state: "failed",
+        failure: safeProblemPackageFailure("import_write_failed")
+      })
+    );
+  });
+
   it("已成功的任务重复领取时直接返回结果，不再写入", async () => {
     const store = new FakeProblemPackageJobStore();
     const job = store.seedImport({
@@ -623,6 +786,347 @@ describe("题目包导出任务处理器", () => {
     expect(outcome).toEqual({ result: { resultFileId: finished?.resultFileId } });
     const artifact = artifacts.get(finished?.resultFileId ?? "");
     expect(artifact?.archives).toHaveLength(1);
+  });
+
+  it("原子写入已完成后队列进度保存失败不会删除有效导出结果", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedExport();
+    const selection = job.problems[0];
+    if (selection === undefined) {
+      throw new Error("测试导出任务没有题目选择。");
+    }
+    const source = new InMemoryFixedRevisionExportReader();
+    source.put(selection, fixtureProblem());
+    const fileId = randomUUID();
+    const discarded: string[] = [];
+    const context = {
+      ...makeContext(),
+      updateProgress: async () => {
+        throw new Error("queue progress unavailable");
+      }
+    };
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source,
+      authorization: allowAll(),
+      artifacts: {
+        write: async () => {
+          throw new Error("支持原子写入时不应调用旧写入入口。");
+        },
+        writeAndComplete: async (input) => {
+          await store.completeExportJob(input.exportJobId, {
+            resultFileId: fileId,
+            resultExpiresAt: "2026-07-27T00:00:00.000Z",
+            outputFileCount: input.outputFileCount
+          });
+          return {
+            fileId,
+            expiresAt: "2026-07-27T00:00:00.000Z"
+          };
+        },
+        discard: async (discardedFileId) => {
+          discarded.push(discardedFileId);
+        }
+      }
+    });
+
+    const outcome = await handler({ exportJobId: job.id }, context);
+
+    const finished = store.exports.get(job.id);
+    expect(finished?.state).toBe("succeeded");
+    expect(finished?.resultFileId).toBe(fileId);
+    expect(discarded).toEqual([]);
+    expect(outcome).toEqual({ result: { resultFileId: finished?.resultFileId } });
+  });
+
+  it("导出完成状态无法确认时保留产物并交给队列重试", async () => {
+    class FailingCompletionStore extends FakeProblemPackageJobStore {
+      public override async completeExportJob(): Promise<void> {
+        throw new Error(`database rejected ${statementText}`);
+      }
+    }
+
+    const store = new FailingCompletionStore();
+    const job = store.seedExport();
+    const selection = job.problems[0];
+    if (selection === undefined) {
+      throw new Error("测试导出任务没有题目选择。");
+    }
+    const source = new InMemoryFixedRevisionExportReader();
+    source.put(selection, fixtureProblem());
+    const fileId = randomUUID();
+    const discarded: string[] = [];
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source,
+      authorization: allowAll(),
+      artifacts: {
+        write: async () => ({
+          fileId,
+          expiresAt: "2026-07-27T00:00:00.000Z"
+        }),
+        discard: async (discardedFileId) => {
+          discarded.push(discardedFileId);
+        }
+      }
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).rejects.toMatchObject({
+      name: "ExportResultSaveError",
+      message: "导出结果的保存状态暂时无法确认。"
+    });
+    expect(discarded).toEqual([]);
+    expect(store.exports.get(job.id)?.state).toBe("running");
+    expect(JSON.stringify(store.exports.get(job.id))).not.toContain(statementText);
+  });
+
+  it("旧写入方式完成已提交但响应丢失时复用有效结果", async () => {
+    class ResponseLostStore extends FakeProblemPackageJobStore {
+      public override async completeExportJob(
+        jobId: string,
+        result: CompleteProblemPackageExport
+      ): Promise<void> {
+        await super.completeExportJob(jobId, result);
+        throw new Error("数据库响应在提交后丢失。");
+      }
+    }
+
+    const store = new ResponseLostStore();
+    const job = store.seedExport();
+    const selection = job.problems[0];
+    if (selection === undefined) {
+      throw new Error("测试导出任务没有题目选择。");
+    }
+    const source = new InMemoryFixedRevisionExportReader();
+    source.put(selection, fixtureProblem());
+    const fileId = randomUUID();
+    const discarded: string[] = [];
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source,
+      authorization: allowAll(),
+      artifacts: {
+        write: async () => ({
+          fileId,
+          expiresAt: "2026-07-27T00:00:00.000Z"
+        }),
+        discard: async (discardedFileId) => {
+          discarded.push(discardedFileId);
+        }
+      }
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).resolves.toEqual({
+      result: { resultFileId: fileId }
+    });
+    expect(store.exports.get(job.id)).toEqual(
+      expect.objectContaining({ state: "succeeded", resultFileId: fileId })
+    );
+    expect(discarded).toEqual([]);
+  });
+
+  it("最后一次复查发现其他导出结果已成功时清理当前产物", async () => {
+    const existingFileId = randomUUID();
+    class ConcurrentCompletionStore extends FakeProblemPackageJobStore {
+      private readsAfterCompletionFailure = 0;
+
+      public override async completeExportJob(): Promise<void> {
+        throw new Error("数据库响应暂时不可用。");
+      }
+
+      public override async getExportJob(
+        jobId: string
+      ): Promise<ProblemPackageExportJob | undefined> {
+        this.readsAfterCompletionFailure += 1;
+        if (this.readsAfterCompletionFailure === 1) {
+          throw new Error("第一次结果复查暂时不可用。");
+        }
+        const current = this.exports.get(jobId);
+        if (current === undefined) {
+          return undefined;
+        }
+        const completed = problemPackageExportJobSchema.parse({
+          ...current,
+          state: "succeeded",
+          progressPercent: 100,
+          report: {
+            ...current.report,
+            phase: "completed",
+            outputFileCount: 1
+          },
+          resultFileId: existingFileId,
+          resultExpiresAt: "2026-07-27T00:00:00.000Z",
+          failure: null,
+          finishedAt: fixedNow
+        });
+        this.exports.set(jobId, completed);
+        return completed;
+      }
+    }
+
+    const store = new ConcurrentCompletionStore();
+    const job = store.seedExport();
+    const selection = job.problems[0];
+    if (selection === undefined) {
+      throw new Error("测试导出任务没有题目选择。");
+    }
+    const source = new InMemoryFixedRevisionExportReader();
+    source.put(selection, fixtureProblem());
+    const currentFileId = randomUUID();
+    const discarded: string[] = [];
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source,
+      authorization: allowAll(),
+      artifacts: {
+        write: async () => ({
+          fileId: currentFileId,
+          expiresAt: "2026-07-27T00:00:00.000Z"
+        }),
+        discard: async (fileId) => {
+          discarded.push(fileId);
+        }
+      }
+    });
+
+    await expect(
+      handler(
+        { exportJobId: job.id },
+        makeContext({ attempt: 3, maxAttempts: 3 })
+      )
+    ).resolves.toEqual({
+      result: { resultFileId: existingFileId }
+    });
+    expect(discarded).toEqual([currentFileId]);
+  });
+
+  it("导出失败状态无法保存时保留运行状态并交给队列重试", async () => {
+    class FailingStateStore extends FakeProblemPackageJobStore {
+      public override async failExportJob(): Promise<void> {
+        throw new Error(`database rejected ${statementText}`);
+      }
+    }
+
+    const store = new FailingStateStore();
+    const job = store.seedExport();
+    const selection = job.problems[0];
+    if (selection === undefined) {
+      throw new Error("测试导出任务没有题目选择。");
+    }
+    const source = new InMemoryFixedRevisionExportReader();
+    source.put(selection, fixtureProblem());
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source,
+      authorization: {
+        canReadProblem: async () => false,
+        canReadFile: async () => true
+      },
+      artifacts: new InMemoryExportArtifactWriter()
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).rejects.toMatchObject({
+      name: "TaskStatePersistenceError",
+      message: "题目包任务状态暂时无法保存。"
+    });
+    expect(store.exports.get(job.id)?.state).toBe("running");
+    expect(JSON.stringify(store.exports.get(job.id))).not.toContain(statementText);
+  });
+
+  it("权限服务暂时失败时不把导出任务记成永久失败", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedExport();
+    const selection = job.problems[0];
+    if (selection === undefined) {
+      throw new Error("测试导出任务没有题目选择。");
+    }
+    const source = new InMemoryFixedRevisionExportReader();
+    source.put(selection, fixtureProblem());
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source,
+      authorization: {
+        canReadProblem: async () => {
+          throw new ProblemPackageTemporaryError();
+        },
+        canReadFile: async () => true
+      },
+      artifacts: new InMemoryExportArtifactWriter()
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).rejects.toMatchObject({
+      name: "ProblemPackageTemporaryError",
+      message: "题目包任务暂时无法继续，请稍后重试。"
+    });
+    expect(store.exports.get(job.id)?.state).toBe("running");
+    expect(store.exports.get(job.id)?.failure).toBeNull();
+  });
+
+  it("最后一次临时导出失败会用固定错误结束业务任务", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedExport();
+    const selection = job.problems[0];
+    if (selection === undefined) {
+      throw new Error("测试导出任务没有题目选择。");
+    }
+    const source = new InMemoryFixedRevisionExportReader();
+    source.put(selection, fixtureProblem());
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source,
+      authorization: {
+        canReadProblem: async () => {
+          throw new ProblemPackageTemporaryError();
+        },
+        canReadFile: async () => true
+      },
+      artifacts: new InMemoryExportArtifactWriter()
+    });
+
+    await expect(
+      handler(
+        { exportJobId: job.id },
+        makeContext({ attempt: 3, maxAttempts: 3 })
+      )
+    ).rejects.toMatchObject({
+      name: "PermanentJobError",
+      code: "export_write_failed"
+    });
+    expect(store.exports.get(job.id)).toEqual(
+      expect.objectContaining({
+        state: "failed",
+        failure: safeProblemPackageFailure("export_write_failed")
+      })
+    );
+  });
+
+  it("已经失败的导出任务直接结束，不再尝试改写终态", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedExport({
+      state: "failed",
+      report: {
+        version: 1,
+        phase: "failed",
+        completedItems: 0,
+        failedItems: 1,
+        skippedItems: 0
+      },
+      failure: safeProblemPackageFailure("export_access_revoked"),
+      startedAt: fixedNow,
+      finishedAt: fixedNow
+    });
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source: new InMemoryFixedRevisionExportReader(),
+      authorization: allowAll(),
+      artifacts: new InMemoryExportArtifactWriter()
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).rejects.toMatchObject({
+      name: "PermanentJobError",
+      code: "export_access_revoked"
+    });
+    expect(store.exports.get(job.id)?.state).toBe("failed");
   });
 
   it("原始 XML 产物按一个文件计数并保持字节不变", async () => {

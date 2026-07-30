@@ -168,6 +168,7 @@ export class JobWorker {
     const context: JobHandlerContext = {
       jobId: job.id,
       attempt: job.attempt,
+      maxAttempts: job.maxAttempts,
       signal: controller.signal,
       updateProgress: async (progressPercent) => {
         await this.#queue.updateProgress(job.id, job.lease.id, progressPercent);

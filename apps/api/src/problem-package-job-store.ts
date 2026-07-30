@@ -324,6 +324,19 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
     if (items === undefined || !Number.isInteger(position) || position < 0 || position >= items.length) {
       throw new ProblemPackageJobStoreError("TASK_NOT_FOUND", "导入项目不存在。");
     }
+    const currentItem = items[position];
+    if (currentItem?.state === "succeeded") {
+      if (
+        parsed.state === "succeeded" &&
+        currentItem.importedProblemId === parsed.importedProblemId
+      ) {
+        return;
+      }
+      throw new ProblemPackageJobStoreError(
+        "INVALID_STATE",
+        "已经成功的导入项目不能改成其他结果。"
+      );
+    }
     const failure = parsed.failureCode === undefined ? null : safeProblemPackageFailure(parsed.failureCode);
     items[position] = problemPackageImportItemSchema.parse({
       jobId: job.id,
@@ -377,6 +390,13 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
   ): Promise<void> {
     const job = this.#requiredImport(jobId);
     assertRunning(job.state);
+    const items = this.#importItems.get(job.id) ?? [];
+    if (items.some((item) => item.state === "succeeded")) {
+      throw new ProblemPackageJobStoreError(
+        "INVALID_STATE",
+        "已有导入项目成功，任务不能标记为失败。"
+      );
+    }
     this.#imports.set(job.id, {
       ...job,
       state: "failed",
@@ -608,19 +628,51 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
     const id = uuidSchema.parse(jobId);
     const parsed = importItemOutcomeSchema.parse(outcome);
     const failure = parsed.failureCode === undefined ? null : safeProblemPackageFailure(parsed.failureCode);
-    const result = await this.database.query<{ position: number }>(sql`
-      UPDATE import_job_items
-      SET state = ${parsed.state},
-          imported_problem_id = ${parsed.importedProblemId === undefined ? null : requireDatabaseId(parsed.importedProblemId, "题目编号")},
-          report = ${json({})}::jsonb,
-          failure_code = ${failure?.code ?? null},
-          failure_message = ${failure?.message ?? null},
-          finished_at = ${this.now().toISOString()}::timestamptz
-      WHERE job_id = ${id}::uuid AND position = ${parsePosition(position)}
-        AND EXISTS (SELECT 1 FROM import_jobs WHERE id = ${id}::uuid AND state = 'running')
-      RETURNING position
-    `);
-    if (result.length !== 1) throw new ProblemPackageJobStoreError("INVALID_STATE", "任务当前不能更新导入项目。");
+    const importedProblemId =
+      parsed.importedProblemId === undefined
+        ? null
+        : requireDatabaseId(parsed.importedProblemId, "题目编号");
+    const stateGuard =
+      parsed.state === "succeeded" && importedProblemId !== null
+        ? sql`
+            AND (
+              (state <> 'succeeded' AND imported_problem_id IS NULL)
+              OR (state = 'succeeded' AND imported_problem_id = ${importedProblemId})
+            )
+          `
+        : sql`AND state <> 'succeeded' AND imported_problem_id IS NULL`;
+    await this.database.transaction(async (transaction) => {
+      const locked = await transaction.query<{ state: string }>(sql`
+        SELECT state::text AS state
+        FROM import_jobs
+        WHERE id = ${id}::uuid
+        FOR UPDATE
+      `);
+      if (locked[0]?.state !== "running") {
+        throw new ProblemPackageJobStoreError(
+          "INVALID_STATE",
+          "任务当前不能更新导入项目。"
+        );
+      }
+      const result = await transaction.query<{ position: number }>(sql`
+        UPDATE import_job_items
+        SET state = ${parsed.state},
+            imported_problem_id = ${importedProblemId},
+            report = ${json({})}::jsonb,
+            failure_code = ${failure?.code ?? null},
+            failure_message = ${failure?.message ?? null},
+            finished_at = ${this.now().toISOString()}::timestamptz
+        WHERE job_id = ${id}::uuid AND position = ${parsePosition(position)}
+          ${stateGuard}
+        RETURNING position
+      `);
+      if (result.length !== 1) {
+        throw new ProblemPackageJobStoreError(
+          "INVALID_STATE",
+          "任务当前不能更新导入项目。"
+        );
+      }
+    });
   }
 
   public async completeImportJob(jobId: string, report: ProblemPackageJobReport): Promise<void> {
@@ -640,25 +692,9 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
     jobId: string,
     result: CompleteProblemPackageExport
   ): Promise<void> {
-    const id = uuidSchema.parse(jobId);
-    const parsed = parseCompleteExport(result);
-    const current = await this.getExportJob(id);
-    const completedReport = {
-      ...completeReport(current?.report ?? initialReport()),
-      outputFileCount: parsed.outputFileCount
-    };
-    const updated = await this.database.query<{ id: string }>(sql`
-      UPDATE export_jobs
-      SET state = 'succeeded', progress_percent = 100,
-          report = ${json(completedReport)}::jsonb,
-          result_file_id = ${parsed.resultFileId}::uuid,
-          result_expires_at = ${parsed.resultExpiresAt}::timestamptz,
-          failure_code = NULL, failure_message = NULL,
-          finished_at = ${this.now().toISOString()}::timestamptz
-      WHERE id = ${id}::uuid AND state = 'running'
-      RETURNING id::text AS id
-    `);
-    if (updated.length !== 1) throw new ProblemPackageJobStoreError("INVALID_STATE", "任务当前不能完成。");
+    await this.database.transaction((transaction) =>
+      completeDatabaseExportJob(transaction, this.now, jobId, result)
+    );
   }
 
   public async failImportJob(
@@ -666,16 +702,50 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
     code: ProblemPackageFailureCode,
     report: ProblemPackageJobReport
   ): Promise<void> {
+    const id = uuidSchema.parse(jobId);
     const failure = safeProblemPackageFailure(code);
-    const updated = await this.database.query<{ id: string }>(sql`
-      UPDATE import_jobs
-      SET state = 'failed', report = ${json(failedReport(report))}::jsonb,
-          failure_code = ${failure.code}, failure_message = ${failure.message},
-          finished_at = ${this.now().toISOString()}::timestamptz
-      WHERE id = ${uuidSchema.parse(jobId)}::uuid AND state = 'running'
-      RETURNING id::text AS id
-    `);
-    if (updated.length !== 1) throw new ProblemPackageJobStoreError("INVALID_STATE", "任务当前不能标记为失败。");
+    const parsedReport = problemPackageJobReportSchema.parse(report);
+    await this.database.transaction(async (transaction) => {
+      const locked = await transaction.query<{ state: string }>(sql`
+        SELECT state::text AS state
+        FROM import_jobs
+        WHERE id = ${id}::uuid
+        FOR UPDATE
+      `);
+      if (locked[0]?.state !== "running") {
+        throw new ProblemPackageJobStoreError(
+          "INVALID_STATE",
+          "任务当前不能标记为失败。"
+        );
+      }
+      const succeeded = await transaction.query<{ position: number }>(sql`
+        SELECT position
+        FROM import_job_items
+        WHERE job_id = ${id}::uuid
+          AND state = 'succeeded'
+        LIMIT 1
+      `);
+      if (succeeded.length > 0) {
+        throw new ProblemPackageJobStoreError(
+          "INVALID_STATE",
+          "已有导入项目成功，任务不能标记为失败。"
+        );
+      }
+      const updated = await transaction.query<{ id: string }>(sql`
+        UPDATE import_jobs
+        SET state = 'failed', report = ${json(failedReport(parsedReport))}::jsonb,
+            failure_code = ${failure.code}, failure_message = ${failure.message},
+            finished_at = ${this.now().toISOString()}::timestamptz
+        WHERE id = ${id}::uuid AND state = 'running'
+        RETURNING id::text AS id
+      `);
+      if (updated.length !== 1) {
+        throw new ProblemPackageJobStoreError(
+          "INVALID_STATE",
+          "任务当前不能标记为失败。"
+        );
+      }
+    });
   }
 
   public async failExportJob(jobId: string, code: ProblemPackageFailureCode): Promise<void> {
@@ -719,6 +789,57 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
       RETURNING id::text AS id
     `);
     if (updated.length !== 1) throw new ProblemPackageJobStoreError("INVALID_STATE", "任务当前不能更新进度。");
+  }
+}
+
+/**
+ * 供导出文件写入器复用：调用方可以把文件元数据写入和任务完成放进同一个数据库事务。
+ * 相同结果重复提交会直接成功，不会改写成另一份文件。
+ */
+export async function completeDatabaseExportJob(
+  executor: DatabaseExecutor,
+  now: () => Date,
+  jobId: string,
+  result: CompleteProblemPackageExport
+): Promise<void> {
+  const id = uuidSchema.parse(jobId);
+  const parsed = parseCompleteExport(result);
+  const resultExpiresAt = new Date(parsed.resultExpiresAt).toISOString();
+  const current = await findExportById(executor, id);
+  if (current === undefined) {
+    throw new ProblemPackageJobStoreError("TASK_NOT_FOUND", "任务记录不存在。");
+  }
+  if (current.state === "succeeded") {
+    if (
+      current.resultFileId === parsed.resultFileId &&
+      current.resultExpiresAt === resultExpiresAt &&
+      current.report.outputFileCount === parsed.outputFileCount
+    ) {
+      return;
+    }
+    throw new ProblemPackageJobStoreError("INVALID_STATE", "任务当前不能完成。");
+  }
+  if (current.state !== "running") {
+    throw new ProblemPackageJobStoreError("INVALID_STATE", "任务当前不能完成。");
+  }
+
+  const completedReport = {
+    ...completeReport(current.report),
+    outputFileCount: parsed.outputFileCount
+  };
+  const updated = await executor.query<{ id: string }>(sql`
+    UPDATE export_jobs
+    SET state = 'succeeded', progress_percent = 100,
+        report = ${json(completedReport)}::jsonb,
+        result_file_id = ${parsed.resultFileId}::uuid,
+        result_expires_at = ${resultExpiresAt}::timestamptz,
+        failure_code = NULL, failure_message = NULL,
+        finished_at = ${now().toISOString()}::timestamptz
+    WHERE id = ${id}::uuid AND state = 'running'
+    RETURNING id::text AS id
+  `);
+  if (updated.length !== 1) {
+    throw new ProblemPackageJobStoreError("INVALID_STATE", "任务当前不能完成。");
   }
 }
 

@@ -273,6 +273,55 @@ describe("数据库题目包任务存储", () => {
     ).rejects.toMatchObject({ code: "INVALID_STATE" });
   });
 
+  it("已经成功的导入项目不能被并发失败结果覆盖", async () => {
+    const database = await openDatabase();
+    const files = new ProblemFileStore(database);
+    const source = await files.createStoredFile(storedFileInput("import_input"));
+    const store = new DatabaseProblemPackageJobStore(database);
+    const { problemId: importedProblemId } = await createProblemWithRevision(database);
+    const job = await store.createImportJob(
+      importRequest(source.id, { idempotencyKey: "import-success-wins" })
+    );
+    await store.startImportJob(job.id);
+    await store.recordImportItem(job.id, 0, {
+      state: "succeeded",
+      importedProblemId
+    });
+
+    await expect(
+      store.recordImportItem(job.id, 0, {
+        state: "failed",
+        failureCode: "import_write_failed"
+      })
+    ).rejects.toMatchObject({ code: "INVALID_STATE" });
+    await expect(
+      store.failImportJob(job.id, "import_write_failed", {
+        version: 1,
+        phase: "failed",
+        completedItems: 0,
+        failedItems: 1,
+        skippedItems: 0
+      })
+    ).rejects.toMatchObject({ code: "INVALID_STATE" });
+
+    expect(await store.getImportJob(job.id)).toEqual(
+      expect.objectContaining({ state: "running", failure: null })
+    );
+    expect(await store.getImportItems(job.id)).toEqual([
+      expect.objectContaining({
+        state: "succeeded",
+        importedProblemId,
+        failure: null
+      })
+    ]);
+    await expect(
+      store.recordImportItem(job.id, 0, {
+        state: "succeeded",
+        importedProblemId
+      })
+    ).resolves.toBeUndefined();
+  });
+
   it("失败的导入任务只保留固定文案", async () => {
     const database = await openDatabase();
     const files = new ProblemFileStore(database);

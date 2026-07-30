@@ -524,8 +524,18 @@ export class TransferService {
           canReadTestdata: capabilities.canReadTestdata
         }
       };
-    } catch {
-      return undefined;
+    } catch (error) {
+      if (
+        error instanceof ApiError &&
+        (error.statusCode === 403 || error.statusCode === 404)
+      ) {
+        return undefined;
+      }
+      throw new ApiError(
+        500,
+        "PROBLEM_ACCESS_CHECK_FAILED",
+        "题目权限检查暂时失败，请稍后重试。"
+      );
     }
   }
 

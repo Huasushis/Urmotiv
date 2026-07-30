@@ -18,6 +18,7 @@ export type JobHandlerResult = z.output<typeof jobHandlerResultSchema>;
 export interface JobHandlerContext {
   readonly jobId: string;
   readonly attempt: number;
+  readonly maxAttempts: number;
   readonly signal: AbortSignal;
   updateProgress(progressPercent: number): Promise<void>;
   putItemReport(report: JobItemReport): Promise<void>;
