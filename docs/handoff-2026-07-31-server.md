@@ -6,13 +6,15 @@
 
 ```text
 /home/ubuntu/codex-urmotiv/
-├── AGENTS.md       # 从 docs/server-root-agents.md 复制的顶层规则
-├── HANDOFF.md      # 本文
-├── Urmotiv/        # 主系统，含自己的 .git 和尚未提交的工作
-├── Fermata/        # AI 审题服务，独立 .git
-├── Anklang/        # 原题检索服务，独立 .git
-├── .tools/         # 建议放项目专用工具，按需创建
-└── .cache/         # 建议放项目专用缓存，按需创建
+├── README.md                    # 每个目录的用途和使用边界
+├── AGENTS.md                    # 从 docs/server-root-agents.md 复制的顶层规则
+├── HANDOFF.md                   # 本文
+├── PROMPT-FOR-NEXT-AI.md        # 可直接交给新 AI 的提示词
+├── Urmotiv/                     # 正式主系统仓库，含自己的 .git 和尚未提交的工作
+├── Fermata/                     # 正式 AI 审题服务仓库，独立 .git
+├── Anklang/                     # 正式原题检索服务仓库，独立 .git
+├── previous-server-work/        # 迁移前的全部服务器实验环境与实验数据
+└── validation/                  # 迁移与部署验证记录
 ```
 
 用户准备从这个目录直接启动 Codex。推荐入口：
@@ -22,7 +24,9 @@ cd /home/ubuntu/codex-urmotiv
 codex
 ```
 
-旧工作目录 `/home/ubuntu/urmotiv-codex/` 没有删除，也没有覆盖。另一个智能体可能仍在那里工作，严禁把新目录反向同步到旧目录或批量结束旧目录中的进程。
+2026-07-31 已参照 `/home/ubuntu/codex-dolly` 的结构，把本项目原先散落在主目录中的两个旧目录原样移动到 `previous-server-work/`。现在主目录只保留一个 Urmotiv 项目入口 `/home/ubuntu/codex-urmotiv`。旧实验环境和实验数据没有删除；详细映射和核验数据见 `README.md` 与 `validation/20260731-consolidation/README.md`。
+
+主目录下的其他项目和文件不属于 Urmotiv。尤其 `/home/ubuntu/cc.sql` 明确不属于本项目，不能查找、恢复、迁移或处理。
 
 这次使用 `scp -r -p` 从 Windows 复制了三个完整目录，包括 `.git`、未提交文件和被 Git 忽略的私有材料。Windows 的依赖链接可能被展开，复制来的 `node_modules` 可能含 Windows 平台产物，不能作为 Linux 依赖已正确安装的证据。
 
@@ -32,6 +36,7 @@ codex
 
 ```bash
 cd /home/ubuntu/codex-urmotiv
+sed -n '1,260p' README.md
 sed -n '1,240p' AGENTS.md
 sed -n '1,320p' HANDOFF.md
 
@@ -59,6 +64,7 @@ env | grep -iE '^(http|https|all|no)_proxy=' || true
 - `Urmotiv/docs/handoff-2026-07-27.md`、`handoff-2026-07-26.md` 作为背景
 - `Fermata/AGENTS.md`、`Fermata/README.md`
 - `Anklang/AGENTS.md`、`Anklang/README.md`、`Anklang/docs/plan.md`
+- 根目录 `README.md` 中 `previous-server-work/` 的逐项说明；旧实验报告是准确性工作的证据，不能因代码较旧而删除
 
 最后在不打印内容的前提下确认 `Urmotiv/private/urmotiv.txt` 存在，并在服务器本地阅读。那是用户最初的产品想法。所有功能接近完成时，要制作一份仅含“需求名称、实现位置、测试证据、未完成原因”的对照表；不要把私有原文复制到公开文档或 Git。
 
@@ -75,12 +81,22 @@ env | grep -iE '^(http|https|all|no)_proxy=' || true
   node scripts/run-with-env.mjs <环境文件> <命令> [参数...]
   ```
 
+### 3.1 旧服务器资料的位置
+
+`previous-server-work/urmotiv-codex/` 是迁移前的完整服务器工作目录，包含旧 Urmotiv/Fermata/Anklang 运行副本、数据库测试状态、浏览器测试结果、Fermata 准确性与超时实验、私有配置、Hydro 格式研究资料、Linux Node.js 和浏览器程序。它们用于复现实验、核对数据和恢复环境，不是新的正式代码来源。
+
+`previous-server-work/codex-urmotiv-database-foundation-019f99c1/` 是较早的数据库基础实验副本。它的代码早于当前正式仓库，但依赖和当时的环境完整保留。
+
+`previous-server-work/malformed-empty-directories-20260730/` 是一次错误命令留下的 53 个空目录，没有普通文件或链接。它仅作为事故记录保留，不参与开发。
+
+旧资料默认只读。需要采用其中的代码时，先与正式仓库逐文件比较；需要采用其中的实验数据时，只复制到明确的私有目录。不得在旧副本中提交或推送，也不得一次性把旧目录覆盖回正式仓库。
+
 ## 4. 三个仓库的精确快照
 
 ### 4.1 Urmotiv
 
 - 分支：`codex/review-admin`
-- 业务代码基线：`2c2e776 fix: make problem package tasks retry safely`。本文和顶层规则会作为只含文档的后续提交，因此接手时的 `HEAD` 可能比这个基线多一笔文档提交；以 `git log` 为准。
+- 业务代码基线：`2c2e776 fix: make problem package tasks retry safely`。交接、目录整理和顶层规则作为只含文档的后续提交，因此接手时的 `HEAD` 会比这个基线多一笔或多笔文档提交；以 `git log` 为准。
 - 业务代码基线当时与 `origin/codex/review-admin` 一致。
 - 最近的重要已提交工作：
 
@@ -181,6 +197,14 @@ packages/auth/test/tokens.test.ts
 
 **不要把这些工程测试写成“AI 判断准确性通过”。准确性目前没有通过。**
 
+迁移前的 Fermata 报告全部保留在：
+
+- `previous-server-work/urmotiv-codex/fermata-repo/experiments/results/`：21 份结果文件；
+- `previous-server-work/urmotiv-codex/fermata-accuracy-20260731/experiments/results/`：6 份准确性实验结果；
+- `previous-server-work/urmotiv-codex/fermata-timeout-review-20260731/experiments/results/`：11 份超时审查结果。
+
+这些结果没有并入 Git，也没有复制成正式仓库中的假基线。新实验开始前必须先阅读并登记它们，避免重复付费或丢失修改前证据。
+
 已知准确性证据：
 
 - Codeforces 难度的旧公开集只有 33 题，平均绝对误差约 281.8，误差不超过 200 的比例约 63.6%，高难题普遍低估；当前难度配置只有两个临时参考点。
@@ -219,10 +243,13 @@ packages/auth/test/tokens.test.ts
 - 旧服务器基线曾达到完整 146 项、目标 109 项测试通过；复制和新环境建立后仍要重跑，不能把旧数字当新目录的验证结果。
 - 转发模式、本地检索框架、来源接口和示例来源已存在。真实抓取源不能进入公开仓库。
 - vjudge 来源按计划暂缓，原因是规模、合规、账号和代理维护风险。代理现在可用不代表这些风险消失，不要擅自开始公开爬虫。
+- 旧 Anklang 的本地数据仍在 `previous-server-work/urmotiv-codex/anklang-repo/problems-data/`，不得因正式仓库没有这个目录而判断数据无用。
 
 ## 5. 历史题目：必须继续，但不能直接批量导入
 
 私有目录当前安全摘要：`hist_problem/` 顶层有 71 个混合文件，其中 45 个 Markdown、23 个 ZIP、1 个表格、1 张图片、1 个 PDF；仓库根目录另有 `USTC题目列表.xlsx`。这些是文件容器，不是 71 道题：有些 Markdown 和 ZIP 内含多题，一道题也可能分散在多个文件中。
+
+迁移前服务器另有 244 个私有实验文件，现完整保留在 `previous-server-work/urmotiv-codex/private/`。它们与正式仓库 `Urmotiv/private/` 中的资料不是同一批文件，不能互相替代，也不能批量导入 Git。
 
 已有 `scripts/migrate-hist` 只接受人工提前拆好的 Markdown/文本，并要求两次确认。现有私有目录里只有清单和未确认材料，还没有可直接导入的正式题目包。
 
@@ -333,7 +360,7 @@ Fermata 和 Anklang 当前已推送，不要为了“留下记录”创建空提
 
 ## 10. 给接手智能体的首要任务
 
-1. 确认本次复制、权限、工具版本和三仓库状态，没有误用旧目录。
+1. 确认根目录结构、迁移核验记录、工具版本和三仓库状态；正式开发只在三个根仓库中进行，旧实验资料按需只读查阅。
 2. 静态复核 Urmotiv 审核可见性/本人编辑改动，特别检查缓存、草稿跨账号、内部备注泄露、关闭轮次和失败回滚。
 3. 在服务器跑这组目标测试与页面测试，修复后小步提交并推送。
 4. 分离并完成题目包审计改动。

@@ -1,24 +1,26 @@
 # `/home/ubuntu/codex-urmotiv` 顶层开发约定
 
-本文件会复制成服务器 `/home/ubuntu/codex-urmotiv/AGENTS.md`，适用于这个目录下的三个独立仓库。新会话从这个目录启动后，先完整阅读同目录的 `HANDOFF.md`，再按下面顺序阅读各仓库自己的说明。
+本文件会复制成服务器 `/home/ubuntu/codex-urmotiv/AGENTS.md`，适用于这个目录下的三个独立仓库。新会话从这个目录启动后，先完整阅读同目录的 `README.md` 和 `HANDOFF.md`，再按下面顺序阅读各仓库自己的说明。
 
 ## 开始顺序
 
-1. 运行只读命令，确认三个仓库的分支、提交和未提交文件；不要先安装、格式化或改代码。
-2. 阅读 `Urmotiv/AGENTS.md`、`Urmotiv/docs/spec.md`、`Urmotiv/docs/permissions.md`、`Urmotiv/docs/problem-package.md`、`Urmotiv/docs/plugins.md`。
-3. 阅读 `Fermata/AGENTS.md`、`Fermata/README.md`，特别是“当前校准状态”。
-4. 阅读 `Anklang/AGENTS.md`、`Anklang/README.md`、`Anklang/docs/plan.md`。
-5. 在不输出内容的前提下确认 `Urmotiv/private/urmotiv.txt` 存在，然后在本机终端中阅读。它是用户最初的产品想法；最终验收必须逐项对照它，不能只依赖公开规格的摘要。
+1. 完整阅读根目录 `README.md`、`HANDOFF.md` 和 `PROMPT-FOR-NEXT-AI.md`，理解正式仓库与旧实验资料的区别。
+2. 运行只读命令，确认三个正式仓库的分支、提交和未提交文件；不要先安装、格式化或改代码。
+3. 阅读 `Urmotiv/AGENTS.md`、`Urmotiv/docs/spec.md`、`Urmotiv/docs/permissions.md`、`Urmotiv/docs/problem-package.md`、`Urmotiv/docs/plugins.md`。
+4. 阅读 `Fermata/AGENTS.md`、`Fermata/README.md`，特别是“当前校准状态”。
+5. 阅读 `Anklang/AGENTS.md`、`Anklang/README.md`、`Anklang/docs/plan.md`。
+6. 在不输出内容的前提下确认 `Urmotiv/private/urmotiv.txt` 存在，然后在服务器本地阅读。它是用户最初的产品想法；最终验收必须逐项对照它，不能只依赖公开规格的摘要。
 
 ## 目录与隔离边界
 
 - `Urmotiv/`：题库、投题、审题、组题、导入导出、权限和插件宿主。
 - `Fermata/`：独立的 AI 审题服务，只通过带版本号的 HTTP 接口与 Urmotiv 通信，不共享数据库。
 - `Anklang/`：独立的原题检索服务，也不共享数据库。
+- `previous-server-work/`：迁移前的服务器实验环境、实验结果、私有配置和研究资料，按原目录完整保存。它不是正式代码来源，不能批量删除；需要复现实验或核对旧结果时按 `README.md` 定位。
+- `validation/`：目录迁移和后续部署验证的记录，只放不含题面、密钥和模型原始回答的安全摘要。
 - `.tools/`、`.cache/`：如需自行安装 Node.js、pnpm 或其他工具，优先放在这里。
-- 旧目录 `/home/ubuntu/urmotiv-codex/` 仍可能被另一个智能体使用。不要修改、删除、同步覆盖或从中批量结束进程。
 
-用户允许在服务器安装软件和调整配置，但授权范围不是整个用户目录。服务器上还有其他项目：只在 `/home/ubuntu/codex-urmotiv/` 及其明确属于本项目的进程中操作，不整理用户主目录，不修改其他项目，不使用宽泛路径执行删除、移动、改权限或搜索替换。
+用户允许在服务器安装软件和调整配置，但授权范围不是整个用户目录。服务器上还有其他项目：只在 `/home/ubuntu/codex-urmotiv/` 及其明确属于本项目的进程中操作，不整理用户主目录，不修改其他项目，不使用宽泛路径执行删除、移动、改权限或搜索替换。主目录下的其他文件和目录一律视为不属于本项目，不能凭名称猜测归属；`/home/ubuntu/cc.sql` 明确不属于本项目，不得查找、恢复或处理。
 
 结束进程前必须同时核对进程号、父进程、完整命令和当前工作目录。只结束能确认属于 `/home/ubuntu/codex-urmotiv/` 的进程；不得按进程名批量结束 `node`、`python`、`pnpm` 等进程。
 
@@ -38,7 +40,7 @@
 
 ## 私有资料与密钥
 
-- `Urmotiv/private/`、`Urmotiv/hist_problem/`、`Urmotiv/USTC题目列表.xlsx` 及 Fermata 的私有标定材料只能留在服务器非 Git 区域。
+- `Urmotiv/private/`、`Urmotiv/hist_problem/`、`Urmotiv/USTC题目列表.xlsx` 及 Fermata 的私有标定材料只能留在服务器非 Git 区域。旧服务器的私有实验资料仍在 `previous-server-work/urmotiv-codex/private/` 和相关 Fermata 实验目录中；读取前先看根目录 `README.md`，不得把它们复制进正式仓库的跟踪文件。
 - 不得把真实题面、题解、测试数据、附件、题目表格、模型原始响应、账号、密码、令牌或密钥写入 Git、日志、错误信息、任务报告或聊天回复。
 - 只输出安全的文件数量、大小、哈希或是否存在；不要用会把文件内容带进终端记录的命令检查私有资料。
 - 不要用 shell 的 `source` 或 `.` 加载 `.env`。值中的特殊字符可能让命令失败并把密钥显示出来。Fermata 必须使用 `scripts/run-with-env.mjs <环境文件> <命令>`。
