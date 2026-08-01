@@ -25,6 +25,7 @@ import { createReview, listReviewItems, listReviews, listTags } from "../lib/api
 import { dateTime, isFrozen, reviewVerdictText, statusText, typeText } from "../lib/presentation";
 import { MarkdownEditor } from "./markdown-editor";
 import {
+  JudgeProgramPanel,
   ProblemFilesPanel,
   useStatementImageUploader
 } from "./problem-files";
@@ -38,10 +39,27 @@ type ProblemTabProps = {
   fileUploadsDisabled?: boolean;
   onFileRevisionChange?: ((revision: number) => void) | undefined;
   onFileUploadPendingChange?: ((pending: boolean) => void) | undefined;
+  onJudgeProgramBound?: ((revision: number, judgeConfig: ProblemJudgeConfig) => void) | undefined;
 };
 
 function setContent(problem: Problem, key: keyof Problem["content"], value: string): Problem {
   return { ...problem, content: { ...problem.content, [key]: value } };
+}
+
+function judgeConfigForType(
+  config: ProblemJudgeConfig | null,
+  type: Problem["type"]
+): ProblemJudgeConfig | null {
+  if (config === null) return null;
+  const {
+    checker: _checker,
+    interactor: _interactor,
+    answerChecker: _answerChecker,
+    ...withoutProgram
+  } = config;
+  return type === "traditional"
+    ? { ...withoutProgram, checker: { type: "standard" } }
+    : withoutProgram;
 }
 
 export function OverviewTab({ problem, update }: ProblemTabProps) {
@@ -74,7 +92,14 @@ export function OverviewTab({ problem, update }: ProblemTabProps) {
           <select
             value={problem.type}
             onChange={(event) =>
-              update((current) => ({ ...current, type: event.target.value as Problem["type"] }))
+              update((current) => {
+                const type = event.target.value as Problem["type"];
+                return {
+                  ...current,
+                  type,
+                  judgeConfig: judgeConfigForType(current.judgeConfig, type)
+                };
+              })
             }
             disabled={!canEdit}
           >
@@ -287,15 +312,15 @@ export function SamplesTab({ problem, update }: ProblemTabProps) {
   );
 }
 
-function createJudgeConfig(): ProblemJudgeConfig {
-  return {
+function createJudgeConfig(type: Problem["type"]): ProblemJudgeConfig {
+  const base: ProblemJudgeConfig = {
     version: 1,
     limits: { timeMs: 1000, memoryMiB: 512 },
     scoring: { total: 100, subtaskMode: "sum" },
     subtasks: [],
-    testcases: [],
-    checker: { type: "standard" }
+    testcases: []
   };
+  return type === "traditional" ? { ...base, checker: { type: "standard" } } : base;
 }
 
 function setJudgeTestcases(
@@ -322,7 +347,13 @@ function setJudgeSubtasks(
   };
 }
 
-export function DataAndJudgeTab({ problem, update }: ProblemTabProps) {
+export function DataAndJudgeTab({
+  problem,
+  update,
+  fileUploadsDisabled,
+  onFileUploadPendingChange,
+  onJudgeProgramBound
+}: ProblemTabProps) {
   const canRead = problem.capabilities.canReadTestdata;
   const canWrite = problem.capabilities.canWriteTestdata;
   const config = problem.judgeConfig;
@@ -347,7 +378,10 @@ export function DataAndJudgeTab({ problem, update }: ProblemTabProps) {
           <button
             className="primary-button"
             type="button"
-            onClick={() => update((current) => ({ ...current, judgeConfig: createJudgeConfig() }))}
+            onClick={() => update((current) => ({
+              ...current,
+              judgeConfig: createJudgeConfig(current.type)
+            }))}
           >
             创建评测配置
           </button>
@@ -413,13 +447,6 @@ export function DataAndJudgeTab({ problem, update }: ProblemTabProps) {
       ]);
     });
   };
-
-  const programTitle =
-    problem.type === "traditional"
-      ? "特殊判断程序"
-      : problem.type === "interactive"
-        ? "交互程序"
-        : "答案判断程序";
 
   return (
     <div className="workspace-section judge-tab">
@@ -563,16 +590,14 @@ export function DataAndJudgeTab({ problem, update }: ProblemTabProps) {
         </section>
       ) : null}
 
-      <section className="program-upload">
-        <div>
-          <FileCode2 size={21} aria-hidden="true" />
-          <div>
-            <h3>{programTitle}</h3>
-            <p>先在文件区上传程序，再填写它在内部文件区的路径。系统会在保存和导出时核对路径。</p>
-          </div>
-        </div>
-        {canWrite ? <span>文件上传区会在本页下方显示。</span> : <span>只读</span>}
-      </section>
+      {onJudgeProgramBound !== undefined ? (
+        <JudgeProgramPanel
+          problem={problem}
+          uploadsDisabled={fileUploadsDisabled ?? false}
+          onPendingChange={onFileUploadPendingChange}
+          onBound={onJudgeProgramBound}
+        />
+      ) : null}
     </div>
   );
 }

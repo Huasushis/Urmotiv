@@ -10,12 +10,14 @@ import {
   seedCoreDatabase
 } from "@urmotiv/database";
 import { LocalFileStorage } from "@urmotiv/storage";
+import { sql } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import { DatabaseContestStore } from "../src/database-contest-store";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo";
 import { DatabaseDataStore } from "../src/database-store";
+import { DatabaseFixedRevisionExportReader } from "../src/problem-package-runtime";
 import { ProblemFileStore } from "../src/problem-file-store";
 
 const localOrigin = "http://localhost:5173";
@@ -33,6 +35,9 @@ const fullContent = {
 
 interface FileTestContext {
   readonly app: FastifyInstance;
+  readonly database: LocalDatabaseHandle;
+  readonly metadata: ProblemFileStore;
+  readonly storage: LocalFileStorage;
   readonly objectsDirectory: string;
   readonly stagingDirectory: string;
 }
@@ -63,6 +68,8 @@ async function makeFileApp(maxBytes = 1024 * 1024): Promise<FileTestContext> {
   await seedDatabaseDemoData(database);
 
   const storageRoot = join(temporaryDirectory, `storage-${randomUUID()}`);
+  const metadata = new ProblemFileStore(database);
+  const storage = new LocalFileStorage({ rootDirectory: storageRoot, limits: { maxBytes } });
   const app = await createApp({
     demoAuthEnabled: true,
     store: new DatabaseDataStore(database),
@@ -70,13 +77,16 @@ async function makeFileApp(maxBytes = 1024 * 1024): Promise<FileTestContext> {
     demoUserIds: Object.values(databaseDemoUserIds),
     demoLoginUserIds: databaseDemoUserIds,
     problemFiles: {
-      metadata: new ProblemFileStore(database),
-      storage: new LocalFileStorage({ rootDirectory: storageRoot, limits: { maxBytes } })
+      metadata,
+      storage
     }
   });
   openApps.push(app);
   return {
     app,
+    database,
+    metadata,
+    storage,
     objectsDirectory: join(storageRoot, "objects"),
     stagingDirectory: join(storageRoot, "staging")
   };
@@ -96,14 +106,18 @@ async function login(app: FastifyInstance, userId: string): Promise<string> {
   return (firstCookie as string).split(";", 1)[0] as string;
 }
 
-async function createDraft(app: FastifyInstance, cookie: string): Promise<{ id: string; revision: number }> {
+async function createDraft(
+  app: FastifyInstance,
+  cookie: string,
+  type: "traditional" | "interactive" | "submit_answer" = "traditional"
+): Promise<{ id: string; revision: number }> {
   const response = await app.inject({
     method: "POST",
     url: "/api/v1/problems",
     headers: { cookie, origin: localOrigin },
     payload: {
       title: "文件接口演示题目",
-      type: "traditional",
+      type,
       tagIds: ["algorithm.implementation"],
       content: fullContent
     }
@@ -120,6 +134,7 @@ interface UploadOptions {
   readonly originalName: string;
   readonly mediaType?: string;
   readonly replaceExisting?: boolean;
+  readonly bindJudgeProgram?: boolean;
   readonly content?: string | Buffer | Readable;
 }
 
@@ -139,6 +154,9 @@ async function uploadFile(
   if (options.replaceExisting === true) {
     query.set("replaceExisting", "true");
   }
+  if (options.bindJudgeProgram === true) {
+    query.set("bindJudgeProgram", "true");
+  }
   return app.inject({
     method: "PUT",
     url: `/api/v1/problems/${problemId}/files?${query.toString()}`,
@@ -156,6 +174,306 @@ async function countFiles(directory: string): Promise<number> {
 }
 
 describe("题目文件接口", () => {
+  it("按三种题型上传并绑定唯一的当前评测程序，刷新题目后仍返回绑定", async () => {
+    const { app } = await makeFileApp();
+    const author = await login(app, databaseDemoUserIds.author);
+    const member = await login(app, databaseDemoUserIds.member);
+    const cases = [
+      {
+        type: "traditional" as const,
+        category: "checker",
+        logicalPath: "judge/checker/check.cpp",
+        configField: "checker"
+      },
+      {
+        type: "interactive" as const,
+        category: "interactor",
+        logicalPath: "judge/interactor/interact.cpp",
+        configField: "interactor"
+      },
+      {
+        type: "submit_answer" as const,
+        category: "answer_checker",
+        logicalPath: "judge/answer-checker/score.cpp",
+        configField: "answerChecker"
+      }
+    ];
+
+    for (const testCase of cases) {
+      const draft = await createDraft(app, author, testCase.type);
+      const uploaded = await uploadFile(app, member, draft.id, {
+        expectedRevision: draft.revision,
+        category: testCase.category,
+        logicalPath: testCase.logicalPath,
+        originalName: "program.cpp",
+        mediaType: "text/x-c++src",
+        bindJudgeProgram: true
+      });
+      expect(uploaded.statusCode).toBe(200);
+      const uploadBody = uploaded.json() as { item: { id: string }; revision: number };
+
+      const refreshed = await app.inject({
+        method: "GET",
+        url: `/api/v1/problems/${draft.id}`,
+        headers: { cookie: member }
+      });
+      expect(refreshed.statusCode).toBe(200);
+      const problem = refreshed.json() as {
+        revision: number;
+        judgeConfig: Record<string, unknown>;
+      };
+      expect(problem.revision).toBe(uploadBody.revision);
+      expect(problem.judgeConfig[testCase.configField]).toEqual(
+        testCase.category === "checker"
+          ? { type: "special", source: testCase.logicalPath }
+          : { source: testCase.logicalPath }
+      );
+
+      const listed = await app.inject({
+        method: "GET",
+        url: `/api/v1/problems/${draft.id}/files`,
+        headers: { cookie: member }
+      });
+      expect(listed.statusCode).toBe(200);
+      expect((listed.json() as { items: Array<{ id: string; category: string }> }).items).toEqual([
+        expect.objectContaining({ id: uploadBody.item.id, category: testCase.category })
+      ]);
+    }
+  });
+
+  it("评测程序上传同时检查题目可见、编辑、测试数据写入权限和题型类别", async () => {
+    const { app, objectsDirectory } = await makeFileApp();
+    const author = await login(app, databaseDemoUserIds.author);
+    const member = await login(app, databaseDemoUserIds.member);
+    const denied = await login(app, databaseDemoUserIds.denied);
+    const draft = await createDraft(app, author);
+
+    const noWrite = await uploadFile(app, author, draft.id, {
+      expectedRevision: draft.revision,
+      category: "checker",
+      logicalPath: "judge/checker/no-write.cpp",
+      originalName: "no-write.cpp",
+      bindJudgeProgram: true
+    });
+    expect(noWrite.statusCode).toBe(403);
+
+    const invisible = await uploadFile(app, denied, draft.id, {
+      expectedRevision: draft.revision,
+      category: "checker",
+      logicalPath: "judge/checker/invisible.cpp",
+      originalName: "invisible.cpp",
+      bindJudgeProgram: true
+    });
+    expect(invisible.statusCode).toBe(404);
+    expect(invisible.body).not.toContain("checker");
+
+    const wrongType = await uploadFile(app, member, draft.id, {
+      expectedRevision: draft.revision,
+      category: "interactor",
+      logicalPath: "judge/interactor/wrong.cpp",
+      originalName: "wrong.cpp",
+      bindJudgeProgram: true
+    });
+    expect(wrongType.statusCode).toBe(422);
+    expect(wrongType.json()).toEqual({
+      error: expect.objectContaining({ code: "INVALID_JUDGE_PROGRAM_CATEGORY" })
+    });
+
+    const notBound = await uploadFile(app, member, draft.id, {
+      expectedRevision: draft.revision,
+      category: "checker",
+      logicalPath: "judge/checker/unbound.cpp",
+      originalName: "unbound.cpp"
+    });
+    expect(notBound.statusCode).toBe(422);
+    expect(notBound.json()).toEqual({
+      error: expect.objectContaining({ code: "INVALID_JUDGE_PROGRAM_UPLOAD" })
+    });
+    expect(await countFiles(objectsDirectory)).toBe(0);
+  });
+
+  it("保存配置拒绝错误类别、跨题和已被替换的旧修订引用，竞态失败保留原绑定", async () => {
+    const { app, database, metadata, storage, objectsDirectory } = await makeFileApp();
+    const author = await login(app, databaseDemoUserIds.author);
+    const member = await login(app, databaseDemoUserIds.member);
+    const firstProblem = await createDraft(app, author);
+    const otherProblem = await createDraft(app, author);
+
+    const first = await uploadFile(app, member, firstProblem.id, {
+      expectedRevision: firstProblem.revision,
+      category: "checker",
+      logicalPath: "judge/checker/first.cpp",
+      originalName: "first.cpp",
+      bindJudgeProgram: true
+    });
+    expect(first.statusCode).toBe(200);
+    const firstUpload = first.json() as { revision: number };
+
+    const crossProblem = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${otherProblem.id}`,
+      headers: { cookie: member, origin: localOrigin },
+      payload: {
+        expectedRevision: otherProblem.revision,
+        judgeConfig: {
+          version: 1,
+          limits: { timeMs: 1000, memoryMiB: 512 },
+          scoring: { total: 100, subtaskMode: "sum" },
+          subtasks: [],
+          testcases: [],
+          checker: { type: "special", source: "judge/checker/first.cpp" }
+        }
+      }
+    });
+    expect(crossProblem.statusCode).toBe(422);
+    expect(crossProblem.body).not.toContain("first.cpp");
+
+    const wrongCategoryUpload = await uploadFile(app, member, otherProblem.id, {
+      expectedRevision: otherProblem.revision,
+      category: "internal_attachment",
+      logicalPath: "judge/checker/not-a-checker.cpp",
+      originalName: "not-a-checker.cpp"
+    });
+    expect(wrongCategoryUpload.statusCode).toBe(200);
+    const wrongCategoryRevision = (wrongCategoryUpload.json() as { revision: number }).revision;
+    const wrongCategory = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${otherProblem.id}`,
+      headers: { cookie: member, origin: localOrigin },
+      payload: {
+        expectedRevision: wrongCategoryRevision,
+        judgeConfig: {
+          version: 1,
+          limits: { timeMs: 1000, memoryMiB: 512 },
+          scoring: { total: 100, subtaskMode: "sum" },
+          subtasks: [],
+          testcases: [],
+          checker: { type: "special", source: "judge/checker/not-a-checker.cpp" }
+        }
+      }
+    });
+    expect(wrongCategory.statusCode).toBe(422);
+    expect(wrongCategory.json()).toEqual({
+      error: expect.objectContaining({ code: "INVALID_JUDGE_PROGRAM_REFERENCE" })
+    });
+    expect(wrongCategory.body).not.toContain("not-a-checker.cpp");
+
+    const replacement = await uploadFile(app, member, firstProblem.id, {
+      expectedRevision: firstUpload.revision,
+      category: "checker",
+      logicalPath: "judge/checker/replacement.cpp",
+      originalName: "replacement.cpp",
+      bindJudgeProgram: true
+    });
+    expect(replacement.statusCode).toBe(200);
+    const replacementBody = replacement.json() as { item: { id: string }; revision: number };
+
+    const revisionRows = await database.query<{ id: string; revision: number }>(sql`
+      SELECT id::text AS id, revision
+      FROM problem_revisions
+      WHERE problem_id = ${BigInt(firstProblem.id)}
+        AND revision IN (${firstUpload.revision}, ${replacementBody.revision})
+      ORDER BY revision ASC
+    `);
+    const oldRevision = revisionRows.find((row) => Number(row.revision) === firstUpload.revision);
+    const currentRevision = revisionRows.find(
+      (row) => Number(row.revision) === replacementBody.revision
+    );
+    if (oldRevision === undefined || currentRevision === undefined) {
+      throw new Error("测试题目缺少评测程序替换前后的固定修订。");
+    }
+    expect((await metadata.listRevisionFiles(oldRevision.id)).map((file) => file.logicalPath))
+      .toEqual(["judge/checker/first.cpp"]);
+    expect((await metadata.listRevisionFiles(currentRevision.id)).map((file) => file.logicalPath))
+      .toEqual(["judge/checker/replacement.cpp"]);
+
+    const exportReader = new DatabaseFixedRevisionExportReader({ database, metadata, storage });
+    const readExportRevision = (revisionId: string) => exportReader.readRevision({
+      selection: {
+        problemId: firstProblem.id,
+        revisionId,
+        includedFileCategories: ["checker"]
+      },
+      signal: new AbortController().signal
+    });
+    const oldExport = await readExportRevision(oldRevision.id);
+    const currentExport = await readExportRevision(currentRevision.id);
+    expect(oldExport?.files.map((file) => file.path)).toEqual(["judge/checker/first.cpp"]);
+    expect(oldExport?.document.judge?.checker).toEqual({
+      type: "special",
+      source: "judge/checker/first.cpp"
+    });
+    expect(currentExport?.files.map((file) => file.path)).toEqual([
+      "judge/checker/replacement.cpp"
+    ]);
+    expect(currentExport?.document.judge?.checker).toEqual({
+      type: "special",
+      source: "judge/checker/replacement.cpp"
+    });
+
+    const oldRevisionReference = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${firstProblem.id}`,
+      headers: { cookie: member, origin: localOrigin },
+      payload: {
+        expectedRevision: replacementBody.revision,
+        judgeConfig: {
+          version: 1,
+          limits: { timeMs: 1000, memoryMiB: 512 },
+          scoring: { total: 100, subtaskMode: "sum" },
+          subtasks: [],
+          testcases: [],
+          checker: { type: "special", source: "judge/checker/first.cpp" }
+        }
+      }
+    });
+    expect(oldRevisionReference.statusCode).toBe(422);
+
+    const removeBound = await app.inject({
+      method: "DELETE",
+      url: `/api/v1/problems/${firstProblem.id}/files/${replacementBody.item.id}`,
+      headers: { cookie: member, origin: localOrigin },
+      payload: { expectedRevision: replacementBody.revision }
+    });
+    expect(removeBound.statusCode).toBe(422);
+    expect(removeBound.json()).toEqual({
+      error: expect.objectContaining({ code: "INVALID_JUDGE_PROGRAM_REFERENCE" })
+    });
+
+    const staleReplacement = await uploadFile(app, member, firstProblem.id, {
+      expectedRevision: firstUpload.revision,
+      category: "checker",
+      logicalPath: "judge/checker/stale.cpp",
+      originalName: "stale.cpp",
+      bindJudgeProgram: true
+    });
+    expect(staleReplacement.statusCode).toBe(409);
+
+    const refreshed = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${firstProblem.id}`,
+      headers: { cookie: member }
+    });
+    expect(refreshed.json()).toEqual(expect.objectContaining({
+      revision: replacementBody.revision,
+      judgeConfig: expect.objectContaining({
+        checker: { type: "special", source: "judge/checker/replacement.cpp" }
+      })
+    }));
+    const listed = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${firstProblem.id}/files`,
+      headers: { cookie: member }
+    });
+    expect((listed.json() as { items: Array<{ id: string; logicalPath: string }> }).items).toEqual([
+      expect.objectContaining({
+        id: replacementBody.item.id,
+        logicalPath: "judge/checker/replacement.cpp"
+      })
+    ]);
+    expect(await countFiles(objectsDirectory)).toBe(3);
+  });
+
   it("作者上传公开附件后可以列出并下载，题目版本号随之增加", async () => {
     const { app } = await makeFileApp();
     const author = await login(app, databaseDemoUserIds.author);
@@ -471,7 +789,8 @@ describe("题目文件接口", () => {
       category: "checker",
       logicalPath: "judge/checker/check.cpp",
       originalName: "check.cpp",
-      mediaType: "text/x-c++src"
+      mediaType: "text/x-c++src",
+      bindJudgeProgram: true
     });
     expect(uploadedInternal.statusCode).toBe(200);
     const internalBody = uploadedInternal.json() as { item: { id: string }; revision: number };

@@ -17,7 +17,12 @@ import {
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import type { Problem, SimilarityCheckResponse, UpdateProblemInput } from "@urmotiv/contracts";
+import type {
+  Problem,
+  ProblemJudgeConfig,
+  SimilarityCheckResponse,
+  UpdateProblemInput
+} from "@urmotiv/contracts";
 import {
   getProblem,
   recordProblemActivity,
@@ -214,6 +219,22 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
     setFileUploadsInFlight((current) => pending ? current + 1 : Math.max(0, current - 1));
   }, []);
 
+  const synchronizeJudgeProgramBinding = useCallback((
+    revision: number,
+    judgeConfig: ProblemJudgeConfig
+  ) => {
+    setWorking((current) => current === null
+      ? current
+      : { ...current, revision, judgeConfig });
+    client.setQueryData<Problem>(
+      ["problem", problemId, currentUserId],
+      (current) => current === undefined
+        ? current
+        : { ...current, revision, judgeConfig }
+    );
+    void client.invalidateQueries({ queryKey: ["problem", problemId, currentUserId] });
+  }, [client, currentUserId, problemId]);
+
   const statusAction = useMutation({
     mutationFn: async (action: "submit" | "withdraw") => {
       if (!working) {
@@ -376,7 +397,15 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
           />
         ) : null}
         {activeTab === "samples" ? <SamplesTab problem={working} update={update} /> : null}
-        {activeTab === "judge" ? <DataAndJudgeTab problem={working} update={update} /> : null}
+        {activeTab === "judge" ? (
+          <DataAndJudgeTab
+            problem={working}
+            update={update}
+            fileUploadsDisabled={dirty || save.isPending || fileUploadPending}
+            onFileUploadPendingChange={updateFileUploadPending}
+            onJudgeProgramBound={synchronizeJudgeProgramBinding}
+          />
+        ) : null}
         {activeTab === "solution" ? (
           <SolutionTab
             problem={working}

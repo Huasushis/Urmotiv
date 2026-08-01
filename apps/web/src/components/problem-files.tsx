@@ -1,7 +1,12 @@
 import { Download, File as FileIcon, FileCode2, Image, Paperclip, Upload } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useRef } from "react";
-import type { Problem, ProblemFileCategory } from "@urmotiv/contracts";
+import type {
+  JudgeProgramFileCategory,
+  Problem,
+  ProblemFileCategory,
+  ProblemJudgeConfig
+} from "@urmotiv/contracts";
 import {
   listProblemFiles,
   problemFileDownloadUrl,
@@ -124,6 +129,178 @@ export function useStatementImageUploader(
       return problemFileReferenceUrl(problem.id, result.item.id);
     },
     [problem.id, upload]
+  );
+}
+
+export function judgeProgramCategoryForType(
+  type: Problem["type"]
+): JudgeProgramFileCategory {
+  if (type === "traditional") return "checker";
+  if (type === "interactive") return "interactor";
+  return "answer_checker";
+}
+
+export function bindJudgeProgramConfig(
+  config: ProblemJudgeConfig | null,
+  type: Problem["type"],
+  source: string
+): ProblemJudgeConfig {
+  const current = config ?? {
+    version: 1 as const,
+    limits: { timeMs: 1000, memoryMiB: 512 },
+    scoring: { total: 100, subtaskMode: "sum" as const },
+    subtasks: [],
+    testcases: []
+  };
+  const {
+    checker: _checker,
+    interactor: _interactor,
+    answerChecker: _answerChecker,
+    ...withoutProgram
+  } = current;
+  if (type === "traditional") {
+    return { ...withoutProgram, checker: { type: "special", source } };
+  }
+  if (type === "interactive") {
+    return { ...withoutProgram, interactor: { source } };
+  }
+  return { ...withoutProgram, answerChecker: { source } };
+}
+
+export function judgeProgramSource(problem: Pick<Problem, "type" | "judgeConfig">): string | undefined {
+  const config = problem.judgeConfig;
+  if (config === null) return undefined;
+  if (problem.type === "traditional") {
+    return config.checker?.type === "special" ? config.checker.source : undefined;
+  }
+  if (problem.type === "interactive") return config.interactor?.source;
+  return config.answerChecker?.source;
+}
+
+type JudgeProgramPanelProps = {
+  problem: Problem;
+  uploadsDisabled?: boolean;
+  onBound: (revision: number, judgeConfig: ProblemJudgeConfig) => void;
+  onPendingChange?: ((pending: boolean) => void) | undefined;
+};
+
+export function JudgeProgramPanel({
+  problem,
+  uploadsDisabled = false,
+  onBound,
+  onPendingChange
+}: JudgeProgramPanelProps) {
+  const client = useQueryClient();
+  const input = useRef<HTMLInputElement>(null);
+  const category = judgeProgramCategoryForType(problem.type);
+  const source = judgeProgramSource(problem);
+  const files = useQuery({
+    queryKey: ["problem-files", problem.id, problem.revision],
+    queryFn: () => listProblemFiles(problem.id)
+  });
+  const upload = useMutation({
+    mutationFn: async (file: File) => {
+      onPendingChange?.(true);
+      return uploadProblemFile(problem.id, {
+        file,
+        expectedRevision: problem.revision,
+        category,
+        logicalPath: makeProblemFileLogicalPath(file, category),
+        bindJudgeProgram: true
+      });
+    },
+    onSuccess: (result) => {
+      onBound(
+        result.revision,
+        bindJudgeProgramConfig(problem.judgeConfig, problem.type, result.item.logicalPath)
+      );
+      void client.invalidateQueries({ queryKey: ["problem-files", problem.id] });
+    },
+    onSettled: () => onPendingChange?.(false)
+  });
+  const boundFile = source === undefined
+    ? undefined
+    : files.data?.items.find(
+        (file) => file.category === category && file.logicalPath === source
+      );
+  const title = categoryLabels[category];
+  const description = problem.type === "traditional"
+    ? "答案不唯一时上传特殊判断程序；未绑定程序时使用标准比较。"
+    : problem.type === "interactive"
+      ? "交互程序在评测时与选手程序交换信息。"
+      : "答案判断程序读取提交文件并判断得分。";
+  const busy = uploadsDisabled || upload.isPending;
+
+  return (
+    <section className="program-upload" aria-label={title}>
+      <div>
+        <FileCode2 size={21} aria-hidden="true" />
+        <div>
+          <h3>{title}</h3>
+          <p>{description}</p>
+        </div>
+      </div>
+
+      <div className="inline-actions">
+        {source === undefined ? (
+          <p className="file-help">
+            {problem.type === "traditional" ? "当前使用标准比较。" : `尚未绑定${title}。`}
+          </p>
+        ) : files.isLoading ? (
+          <p className="file-help">正在核对已绑定程序…</p>
+        ) : boundFile === undefined ? (
+          <p className="inline-error file-error" role="alert">已保存的程序文件不可用，请重新上传。</p>
+        ) : (
+          <div className="problem-file-row">
+            <span className="problem-file-kind"><FileCode2 size={16} aria-hidden="true" />已绑定</span>
+            <span className="problem-file-name" title={boundFile.originalName}>{boundFile.originalName}</span>
+            <span className="problem-file-size">{formatByteSize(boundFile.byteSize)}</span>
+            <a
+              className="secondary-button compact-button"
+              href={problemFileDownloadUrl(problem.id, boundFile.id)}
+              download={boundFile.originalName}
+            >
+              <Download size={15} aria-hidden="true" />
+              下载
+            </a>
+          </div>
+        )}
+
+        {files.isError ? <p className="inline-error file-error" role="alert">{files.error.message}</p> : null}
+        {upload.error ? <p className="inline-error file-error" role="alert">{upload.error.message}</p> : null}
+        {upload.isPending ? <p className="file-help" aria-live="polite">正在上传并绑定，请勿保存其他修改…</p> : null}
+        {uploadsDisabled && !upload.isPending ? (
+          <p className="file-help">请先等待当前修改保存完成，再更换评测程序。</p>
+        ) : null}
+
+        {problem.capabilities.canEdit && problem.capabilities.canWriteTestdata ? (
+          <>
+            <input
+              ref={input}
+              className="problem-file-input"
+              type="file"
+              tabIndex={-1}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                if (file !== undefined) upload.mutate(file);
+              }}
+            />
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={busy}
+              onClick={() => input.current?.click()}
+            >
+              <Upload size={15} aria-hidden="true" />
+              {source === undefined ? `上传并绑定${title}` : `更换${title}`}
+            </button>
+          </>
+        ) : (
+          <span className="file-help">只读</span>
+        )}
+      </div>
+    </section>
   );
 }
 

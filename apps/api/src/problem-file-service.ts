@@ -1,11 +1,15 @@
 import {
+  judgeProgramFileCategories,
   problemFileSummarySchema,
+  type JudgeProgramFileCategory,
   type ProblemFileCategory,
   type ProblemFileListResponse,
   type ProblemFileSummary,
+  type ProblemJudgeConfig,
   type ProblemRevisionFileRecord,
   type UploadProblemFileInput
 } from "@urmotiv/contracts";
+import type { DatabaseExecutor } from "@urmotiv/database";
 import { StorageError, type FileStorage, type StagedFile, type StoredFile } from "@urmotiv/storage";
 import { ApiError, conflict, forbidden, notFound } from "./errors";
 import type { StoredProblem, StoredUser } from "./domain";
@@ -37,6 +41,21 @@ export const internalProblemFileCategories = [
 const internalCategorySet: ReadonlySet<ProblemFileCategory> = new Set(
   internalProblemFileCategories
 );
+const judgeProgramCategorySet: ReadonlySet<ProblemFileCategory> = new Set(
+  judgeProgramFileCategories
+);
+
+const judgeProgramCategoryByType = {
+  traditional: "checker",
+  interactive: "interactor",
+  submit_answer: "answer_checker"
+} as const satisfies Record<StoredProblem["type"], JudgeProgramFileCategory>;
+
+const judgeProgramPrefixByCategory = {
+  checker: "judge/checker/",
+  interactor: "judge/interactor/",
+  answer_checker: "judge/answer-checker/"
+} as const satisfies Record<JudgeProgramFileCategory, string>;
 
 export function isInternalProblemFileCategory(category: ProblemFileCategory): boolean {
   return internalCategorySet.has(category);
@@ -45,6 +64,52 @@ export function isInternalProblemFileCategory(category: ProblemFileCategory): bo
 export interface ProblemFileUploadResult {
   readonly item: ProblemFileSummary;
   readonly revision: number;
+}
+
+/**
+ * Runs after a new problem revision has copied its predecessor's files. Every configured program
+ * must resolve inside that exact revision with the expected category. Program files not referenced
+ * by the new config are unlinked from the new revision, while immutable older revisions retain them.
+ */
+export async function synchronizeJudgeProgramFiles(
+  metadata: ProblemFileStore,
+  problem: StoredProblem,
+  revisionId: string,
+  executor: DatabaseExecutor
+): Promise<void> {
+  const records = await metadata.listRevisionFiles(revisionId, executor);
+  const reference = judgeProgramReference(problem);
+  if (reference !== undefined) {
+    const prefix = judgeProgramPrefixByCategory[reference.category];
+    const matched = records.some(
+      (record) =>
+        record.category === reference.category &&
+        record.logicalPath === reference.logicalPath &&
+        record.logicalPath.startsWith(prefix)
+    );
+    if (!matched) {
+      throw new ApiError(
+        422,
+        "INVALID_JUDGE_PROGRAM_REFERENCE",
+        "评测程序必须引用当前题目当前版本中类别正确的文件。",
+        { [reference.field]: ["选择的评测程序不可用于当前题目版本。"] }
+      );
+    }
+  }
+
+  for (const record of records) {
+    if (
+      judgeProgramCategorySet.has(record.category) &&
+      (reference === undefined ||
+        record.category !== reference.category ||
+        record.logicalPath !== reference.logicalPath)
+    ) {
+      const removed = await metadata.removeFileRelation(revisionId, record.id, executor);
+      if (!removed) {
+        throw new ProblemFileStoreError("WRITE_FAILED", "旧评测程序关联没有被移除。");
+      }
+    }
+  }
 }
 
 export interface ProblemFileRemovalResult {
@@ -99,12 +164,32 @@ export class ProblemFileService {
     input: UploadProblemFileInput,
     content: AsyncIterable<Uint8Array>
   ): Promise<ProblemFileUploadResult> {
-    const { capabilities } = await this.#service.getProblemForFileAccess(user, problemId);
+    const { problem, capabilities } = await this.#service.getProblemForFileAccess(user, problemId);
     if (!capabilities.canEdit) {
       throw forbidden();
     }
     if (isInternalProblemFileCategory(input.category) && !capabilities.canWriteTestdata) {
       throw forbidden("上传测试数据或内部资料需要测试数据管理权限。");
+    }
+    const isJudgeProgram = judgeProgramCategorySet.has(input.category);
+    if (isJudgeProgram !== input.bindJudgeProgram) {
+      throw new ApiError(
+        422,
+        "INVALID_JUDGE_PROGRAM_UPLOAD",
+        isJudgeProgram
+          ? "评测程序上传必须同时绑定到当前题目。"
+          : "只有评测程序文件可以使用上传并绑定操作。"
+      );
+    }
+    if (
+      input.bindJudgeProgram &&
+      input.category !== judgeProgramCategoryByType[problem.type]
+    ) {
+      throw new ApiError(
+        422,
+        "INVALID_JUDGE_PROGRAM_CATEGORY",
+        "上传的评测程序类别与当前题目类型不一致。"
+      );
     }
 
     let preparedImage: PreparedStatementImage | undefined;
@@ -159,10 +244,21 @@ export class ProblemFileService {
       const updated = await this.#service.updateProblem(
         user,
         problemId,
-        { expectedRevision: input.expectedRevision },
+        {
+          expectedRevision: input.expectedRevision,
+          ...(input.bindJudgeProgram
+            ? { judgeConfig: bindJudgeProgram(problem.judgeConfig, problem.type, input.logicalPath) }
+            : {})
+        },
         async (revisionId, executor) => {
-          if (input.replaceExisting) {
-            const copied = await this.#metadata.listRevisionFiles(revisionId, executor);
+          const copied = await this.#metadata.listRevisionFiles(revisionId, executor);
+          if (input.bindJudgeProgram) {
+            for (const existing of copied) {
+              if (judgeProgramCategorySet.has(existing.category)) {
+                await this.#metadata.removeFileRelation(revisionId, existing.id, executor);
+              }
+            }
+          } else if (input.replaceExisting) {
             const existing = copied.find((record) => record.logicalPath === input.logicalPath);
             if (existing !== undefined) {
               await this.#metadata.removeFileRelation(revisionId, existing.id, executor);
@@ -288,6 +384,73 @@ export class ProblemFileService {
     }
     return record;
   }
+}
+
+function baseJudgeConfig(config: ProblemJudgeConfig | null | undefined): ProblemJudgeConfig {
+  return config ?? {
+    version: 1,
+    limits: { timeMs: 1000, memoryMiB: 512 },
+    scoring: { total: 100, subtaskMode: "sum" },
+    subtasks: [],
+    testcases: []
+  };
+}
+
+function bindJudgeProgram(
+  config: ProblemJudgeConfig | null | undefined,
+  type: StoredProblem["type"],
+  source: string
+): ProblemJudgeConfig {
+  const current = baseJudgeConfig(config);
+  const {
+    checker: _checker,
+    interactor: _interactor,
+    answerChecker: _answerChecker,
+    ...withoutProgram
+  } = current;
+  if (type === "traditional") {
+    return { ...withoutProgram, checker: { type: "special", source } };
+  }
+  if (type === "interactive") {
+    return { ...withoutProgram, interactor: { source } };
+  }
+  return { ...withoutProgram, answerChecker: { source } };
+}
+
+function judgeProgramReference(problem: StoredProblem): {
+  readonly category: JudgeProgramFileCategory;
+  readonly logicalPath: string;
+  readonly field: string;
+} | undefined {
+  const config = problem.judgeConfig;
+  if (config === null || config === undefined) {
+    return undefined;
+  }
+  if (problem.type === "traditional") {
+    return config.checker?.type === "special"
+      ? {
+          category: "checker",
+          logicalPath: config.checker.source,
+          field: "judgeConfig.checker.source"
+        }
+      : undefined;
+  }
+  if (problem.type === "interactive") {
+    return config.interactor === undefined
+      ? undefined
+      : {
+          category: "interactor",
+          logicalPath: config.interactor.source,
+          field: "judgeConfig.interactor.source"
+        };
+  }
+  return config.answerChecker === undefined
+    ? undefined
+    : {
+        category: "answer_checker",
+        logicalPath: config.answerChecker.source,
+        field: "judgeConfig.answerChecker.source"
+      };
 }
 
 interface ProblemFileAccessCapabilities {

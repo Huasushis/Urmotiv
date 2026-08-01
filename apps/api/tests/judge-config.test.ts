@@ -62,6 +62,7 @@ function createUsers(): StoredUser[] {
     ]),
     user("writer", [
       grant("auth.login"),
+      grant("problem.create"),
       grant("problem.view.all"),
       grant("problem.edit.all"),
       grant("problem.testdata.read"),
@@ -164,6 +165,23 @@ describe("题目评测配置 API", () => {
     expect(editorUpdate.statusCode).toBe(403);
     expect(editorUpdate.json()).toEqual({ error: expect.objectContaining({ code: "FORBIDDEN" }) });
 
+    const editorStaleUpdate = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${problem.id}`,
+      headers: { cookie: editorCookie, origin },
+      payload: {
+        expectedRevision: problem.revision,
+        judgeConfig: {
+          ...judgeConfig,
+          limits: { ...judgeConfig.limits, timeMs: 3000 }
+        }
+      }
+    });
+    expect(editorStaleUpdate.statusCode).toBe(403);
+    expect(editorStaleUpdate.json()).toEqual({
+      error: expect.objectContaining({ code: "FORBIDDEN" })
+    });
+
     const viewerRead = await app.inject({
       method: "GET",
       url: `/api/v1/problems/${problem.id}`,
@@ -203,5 +221,59 @@ describe("题目评测配置 API", () => {
         fieldErrors: expect.objectContaining({ "judgeConfig.scoring.total": expect.any(Array) })
       })
     });
+  });
+
+  it("拒绝与题目类型不一致的评测程序字段", async () => {
+    const app = await makeApp();
+    const editorCookie = await login(app, "editor");
+    const writerCookie = await login(app, "writer");
+    const problem = await createProblem(app, editorCookie);
+
+    const invalid = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${problem.id}`,
+      headers: { cookie: writerCookie, origin },
+      payload: {
+        expectedRevision: problem.revision,
+        type: "interactive",
+        judgeConfig
+      }
+    });
+    expect(invalid.statusCode).toBe(422);
+    expect(invalid.json()).toEqual({
+      error: expect.objectContaining({
+        code: "INVALID_JUDGE_CONFIG",
+        fieldErrors: expect.objectContaining({ "judgeConfig.checker": expect.any(Array) })
+      })
+    });
+  });
+
+  it("创建题目时不能预填尚未属于首个修订的评测程序引用", async () => {
+    const app = await makeApp();
+    const writerCookie = await login(app, "writer");
+    const invalid = await app.inject({
+      method: "POST",
+      url: "/api/v1/problems",
+      headers: { cookie: writerCookie, origin },
+      payload: {
+        title: "无效首修订程序引用",
+        type: "traditional",
+        tagIds: ["algorithm.implementation"],
+        content: fullContent,
+        judgeConfig: {
+          version: 1,
+          limits: { timeMs: 1000, memoryMiB: 512 },
+          scoring: { total: 100, subtaskMode: "sum" },
+          subtasks: [],
+          testcases: [],
+          checker: { type: "special", source: "judge/checker/missing.cpp" }
+        }
+      }
+    });
+    expect(invalid.statusCode).toBe(422);
+    expect(invalid.json()).toEqual({
+      error: expect.objectContaining({ code: "INVALID_JUDGE_PROGRAM_REFERENCE" })
+    });
+    expect(invalid.body).not.toContain("missing.cpp");
   });
 });

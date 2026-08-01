@@ -184,7 +184,8 @@ describe("题面图片文件头检查", () => {
         position: 0,
         originalName: "image.png",
         mediaType: "image/png",
-        replaceExisting: false
+        replaceExisting: false,
+        bindJudgeProgram: false
       }, controlled.source)
     ).rejects.toMatchObject({ statusCode: 500, code: "STORAGE_FAILED" });
     expect(controlled.close).toHaveBeenCalledOnce();

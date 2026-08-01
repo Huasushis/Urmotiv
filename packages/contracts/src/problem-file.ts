@@ -20,6 +20,14 @@ export const problemFileCategories = [
 export const problemFileCategorySchema = z.enum(problemFileCategories);
 export type ProblemFileCategory = z.infer<typeof problemFileCategorySchema>;
 
+export const judgeProgramFileCategories = [
+  "checker",
+  "interactor",
+  "answer_checker"
+] as const satisfies readonly ProblemFileCategory[];
+export const judgeProgramFileCategorySchema = z.enum(judgeProgramFileCategories);
+export type JudgeProgramFileCategory = z.infer<typeof judgeProgramFileCategorySchema>;
+
 const maximumDatabaseId = 9_223_372_036_854_775_807n;
 const maximumInteger = 2_147_483_647;
 
@@ -144,7 +152,8 @@ export const uploadProblemFileInputSchema = z
     position: z.number().int().min(0).max(maximumInteger).default(0),
     originalName: fileOriginalNameSchema,
     mediaType: mediaTypeSchema,
-    replaceExisting: z.boolean().default(false)
+    replaceExisting: z.boolean().default(false),
+    bindJudgeProgram: z.boolean().default(false)
   })
   .strict();
 
@@ -163,6 +172,10 @@ export const uploadProblemFileQuerySchema = z
     originalName: fileOriginalNameSchema,
     mediaType: mediaTypeSchema,
     replaceExisting: z
+      .enum(["true", "false"])
+      .default("false")
+      .transform((value) => value === "true"),
+    bindJudgeProgram: z
       .enum(["true", "false"])
       .default("false")
       .transform((value) => value === "true")

@@ -6,6 +6,7 @@ import {
   type Problem,
   type ProblemCapabilities,
   type ProblemContent,
+  type ProblemJudgeConfig,
   type ProblemListItem,
   type ProblemListQuery,
   type ProblemListResponse,
@@ -77,6 +78,15 @@ export interface ProblemServiceOptions {
   reviewItems?: ReviewItemStore;
   /** Evaluates the immutable rule saved for each review round. */
   reviewDecisions?: ReviewDecisionRunner;
+  /**
+   * Runs inside the transaction after a new revision and its copied file relations exist.
+   * Production uses this to validate judge-program references and remove superseded programs.
+   */
+  judgeConfigRevisionAction?: (
+    problem: StoredProblem,
+    revisionId: string,
+    executor: DatabaseExecutor
+  ) => Promise<void>;
 }
 
 function emptyContent(): ProblemContent {
@@ -131,11 +141,78 @@ function mergedContent(current: ProblemContent, next: ProblemContent | undefined
   return next === undefined ? current : { ...current, ...next };
 }
 
+function judgeConfigTypeErrors(
+  type: StoredProblem["type"],
+  config: ProblemJudgeConfig | null | undefined
+): FieldErrors | undefined {
+  if (config === null || config === undefined) {
+    return undefined;
+  }
+
+  const errors: FieldErrors = {};
+  if (type === "traditional") {
+    if (config.interactor !== undefined) {
+      errors["judgeConfig.interactor"] = ["传统题不能设置交互程序。"];
+    }
+    if (config.answerChecker !== undefined) {
+      errors["judgeConfig.answerChecker"] = ["传统题不能设置答案判断程序。"];
+    }
+  } else if (type === "interactive") {
+    if (config.checker !== undefined) {
+      errors["judgeConfig.checker"] = ["交互题不能设置传统题判断程序。"];
+    }
+    if (config.answerChecker !== undefined) {
+      errors["judgeConfig.answerChecker"] = ["交互题不能设置答案判断程序。"];
+    }
+  } else {
+    if (config.checker !== undefined) {
+      errors["judgeConfig.checker"] = ["提交答案题不能设置传统题判断程序。"];
+    }
+    if (config.interactor !== undefined) {
+      errors["judgeConfig.interactor"] = ["提交答案题不能设置交互程序。"];
+    }
+  }
+
+  return Object.keys(errors).length === 0 ? undefined : errors;
+}
+
+function assertJudgeConfigMatchesType(
+  type: StoredProblem["type"],
+  config: ProblemJudgeConfig | null | undefined
+): void {
+  const errors = judgeConfigTypeErrors(type, config);
+  if (errors !== undefined) {
+    throw new ApiError(
+      422,
+      "INVALID_JUDGE_CONFIG",
+      "评测程序配置与题目类型不一致。",
+      errors
+    );
+  }
+}
+
+function assertCreateHasNoJudgeProgramReference(
+  config: ProblemJudgeConfig | null | undefined
+): void {
+  const hasReference =
+    config?.checker?.type === "special" ||
+    config?.interactor !== undefined ||
+    config?.answerChecker !== undefined;
+  if (hasReference) {
+    throw new ApiError(
+      422,
+      "INVALID_JUDGE_PROGRAM_REFERENCE",
+      "请先创建题目，再通过数据与评测页上传并绑定评测程序。"
+    );
+  }
+}
+
 export class ProblemService {
   private readonly now: () => Date;
   private readonly submitChecks: SubmitCheckRunner | undefined;
   private readonly reviewItems: ReviewItemStore | undefined;
   private readonly reviewDecisions: ReviewDecisionRunner;
+  private readonly judgeConfigRevisionAction: ProblemServiceOptions["judgeConfigRevisionAction"];
 
   public constructor(
     private readonly store: DataStore,
@@ -145,6 +222,7 @@ export class ProblemService {
     this.submitChecks = options.submitChecks;
     this.reviewItems = options.reviewItems;
     this.reviewDecisions = options.reviewDecisions ?? new DefaultReviewDecisionRunner();
+    this.judgeConfigRevisionAction = options.judgeConfigRevisionAction;
   }
 
   public getSessionUser(user: StoredUser): SessionUser {
@@ -196,6 +274,8 @@ export class ProblemService {
     ) {
       throw forbidden();
     }
+    assertJudgeConfigMatchesType(input.type, input.judgeConfig);
+    assertCreateHasNoJudgeProgramReference(input.judgeConfig);
 
     const tagIds = input.tagIds ?? [];
     await this.assertKnownTags(tagIds);
@@ -251,7 +331,6 @@ export class ProblemService {
       throw forbidden();
     }
 
-    this.assertExpectedRevision(current, input.expectedRevision);
     const target = { ownerId: current.ownerId, objectId: current.id };
     const judgeConfigChanged =
       input.judgeConfig !== undefined &&
@@ -262,6 +341,7 @@ export class ProblemService {
     ) {
       throw forbidden();
     }
+    this.assertExpectedRevision(current, input.expectedRevision);
     const frozenErrors = frozenFieldErrors(current, input);
     if (frozenErrors !== undefined) {
       throw conflict("题目正在审核或已通过，三个审核字段已冻结。", frozenErrors);
@@ -287,13 +367,20 @@ export class ProblemService {
       revision: current.revision + 1,
       updatedAt: asIso(this.now())
     };
-    const updated = revisionAction === undefined
+    assertJudgeConfigMatchesType(next.type, next.judgeConfig);
+    const combinedRevisionAction = this.judgeConfigRevisionAction === undefined
+      ? revisionAction
+      : async (revisionId: string, executor: DatabaseExecutor) => {
+          await revisionAction?.(revisionId, executor);
+          await this.judgeConfigRevisionAction?.(next, revisionId, executor);
+        };
+    const updated = combinedRevisionAction === undefined
       ? await this.store.replaceProblem(next, input.expectedRevision, user.id)
       : await this.store.replaceProblemWithRevisionAction?.(
         next,
         input.expectedRevision,
         user.id,
-        revisionAction
+        combinedRevisionAction
       );
     if (updated === undefined) {
       throw new Error("当前数据存储不支持带文件关联的题目修订。");
@@ -320,6 +407,7 @@ export class ProblemService {
     }
 
     this.assertExpectedRevision(current, expectedRevision);
+    assertJudgeConfigMatchesType(current.type, current.judgeConfig);
     await this.assertKnownTags(current.tagIds);
     const requiredFieldErrors: FieldErrors = {};
     if (current.content.basicStatement.trim().length === 0) {

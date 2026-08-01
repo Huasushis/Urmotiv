@@ -61,7 +61,10 @@ import {
   type EmailVerificationDelivery
 } from "./email-verification";
 import type { ProblemFileStore } from "./problem-file-store";
-import { ProblemFileService } from "./problem-file-service";
+import {
+  ProblemFileService,
+  synchronizeJudgeProgramFiles
+} from "./problem-file-service";
 import { ProblemService, type SubmitCheckRunner } from "./service";
 import type { TransferService } from "./transfer-service";
 import type { AnklangCache } from "@urmotiv/plugin-anklang";
@@ -376,7 +379,18 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     now,
     submitChecks,
     reviewItems,
-    reviewDecisions
+    reviewDecisions,
+    ...(options.problemFiles === undefined
+      ? {}
+      : {
+          judgeConfigRevisionAction: (problem, revisionId, executor) =>
+            synchronizeJudgeProgramFiles(
+              options.problemFiles!.metadata,
+              problem,
+              revisionId,
+              executor
+            )
+        })
   });
   return {
     store,

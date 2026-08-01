@@ -93,6 +93,7 @@ export type ProblemFileUploadRequest = {
   logicalPath: string;
   position?: number;
   replaceExisting?: boolean;
+  bindJudgeProgram?: boolean;
 };
 
 function apiBaseUrl(): string {
@@ -302,7 +303,8 @@ export function uploadProblemFile(
     position: String(input.position ?? 0),
     originalName: input.file.name,
     mediaType: input.file.type.trim().toLowerCase() || "application/octet-stream",
-    replaceExisting: String(input.replaceExisting ?? false)
+    replaceExisting: String(input.replaceExisting ?? false),
+    bindJudgeProgram: String(input.bindJudgeProgram ?? false)
   });
   return request(
     `/problems/${encodeURIComponent(problemId)}/files?${parameters.toString()}`,

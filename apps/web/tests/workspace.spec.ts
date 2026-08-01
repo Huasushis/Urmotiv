@@ -179,6 +179,109 @@ test("题面图片与公开附件可以上传、预览和下载", async ({ page 
   await page.screenshot({ path: testInfo.outputPath("problem-files.png"), fullPage: true });
 });
 
+test("评测程序在真实 API 中原子绑定，冲突失败不产生假绑定", async ({ page }, testInfo) => {
+  // 系统管理员不自动拥有题目内容权限；组长负责建题，命题组成员通过已授予的
+  // problem.edit.all 与 problem.testdata.write 权限补充评测资料。
+  await loginAs(page, /组长/);
+  const problem = await postJson(page, "/api/v1/problems", {
+    title: `评测程序联调题-${testInfo.project.name}-${Date.now()}`,
+    type: "traditional",
+    tagIds: ["algorithm.implementation"],
+    content: {
+      basicStatement: "给定一个整数，原样输出。",
+      basicSolution: "直接输出输入值。",
+      background: "",
+      statement: "",
+      inputFormat: "",
+      outputFormat: "",
+      constraints: "",
+      solution: "",
+      hints: ""
+    },
+    samples: [],
+    judgeConfig: {
+      version: 1,
+      limits: { timeMs: 1000, memoryMiB: 512 },
+      scoring: { total: 100, subtaskMode: "sum" },
+      subtasks: [],
+      testcases: [],
+      checker: { type: "standard" }
+    }
+  });
+  const problemId = problem.id as string;
+
+  await loginAs(page, /命题组成员/);
+  await page.goto(`/problems/${problemId}?tab=judge`);
+  const firstButton = page.getByRole("button", { name: "上传并绑定特殊判断程序" });
+  await expect(firstButton).toBeEnabled();
+  const firstChooser = page.waitForEvent("filechooser");
+  await firstButton.click();
+  await (await firstChooser).setFiles({
+    name: "checker-first.cpp",
+    mimeType: "text/x-c++src",
+    buffer: Buffer.from("int main() { return 0; }", "utf8")
+  });
+
+  const boundRow = page.locator(".problem-file-row", { hasText: "checker-first.cpp" });
+  await expect(boundRow).toBeVisible();
+  await expect(page.getByRole("button", { name: "更换特殊判断程序" })).toBeEnabled();
+  const afterBindingResponse = await page.request.get(`/api/v1/problems/${problemId}`);
+  expect(afterBindingResponse.ok()).toBe(true);
+  const afterBinding = await afterBindingResponse.json() as {
+    revision: number;
+    judgeConfig: { checker?: { type: string; source?: string } };
+  };
+  expect(afterBinding.judgeConfig.checker).toEqual({
+    type: "special",
+    source: expect.stringMatching(/^judge\/checker\/[0-9a-f-]+\.cpp$/)
+  });
+
+  await page.reload();
+  await expect(page.locator(".problem-file-row", { hasText: "checker-first.cpp" })).toBeVisible();
+
+  const attachmentQuery = new URLSearchParams({
+    expectedRevision: String(afterBinding.revision),
+    category: "internal_attachment",
+    logicalPath: `attachments/internal/${crypto.randomUUID()}.txt`,
+    position: "0",
+    originalName: "concurrent-change.txt",
+    mediaType: "text/plain",
+    replaceExisting: "false",
+    bindJudgeProgram: "false"
+  });
+  const concurrentUpdate = await page.request.put(
+    `/api/v1/problems/${problemId}/files?${attachmentQuery.toString()}`,
+    {
+      data: Buffer.from("synthetic concurrent change", "utf8"),
+      headers: { Origin: localOrigin, "Content-Type": "application/octet-stream" }
+    }
+  );
+  expect(concurrentUpdate.ok(), await concurrentUpdate.text()).toBe(true);
+
+  const replacementButton = page.getByRole("button", { name: "更换特殊判断程序" });
+  const replacementChooser = page.waitForEvent("filechooser");
+  await replacementButton.click();
+  await (await replacementChooser).setFiles({
+    name: "checker-stale.cpp",
+    mimeType: "text/x-c++src",
+    buffer: Buffer.from("int main() { return 1; }", "utf8")
+  });
+  await expect(page.getByRole("alert")).toContainText("题目已被其他操作修改");
+  await expect(page.locator(".problem-file-row", { hasText: "checker-first.cpp" })).toBeVisible();
+  await expect(page.locator(".problem-file-row", { hasText: "checker-stale.cpp" })).toHaveCount(0);
+
+  const latestResponse = await page.request.get(`/api/v1/problems/${problemId}`);
+  expect(latestResponse.ok()).toBe(true);
+  const latest = await latestResponse.json() as {
+    judgeConfig: { checker?: { type: string; source?: string } };
+  };
+  expect(latest.judgeConfig.checker).toEqual(afterBinding.judgeConfig.checker);
+  expect(await page.evaluate(
+    () => document.documentElement.scrollWidth <= document.documentElement.clientWidth
+  )).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("judge-program-binding.png"), fullPage: true });
+});
+
 test("评价公开字段、本人修改和状态联动在桌面与手机上保持一致", async ({ page }, testInfo) => {
   await loginAsAuthor(page);
   const problem = await postJson(page, "/api/v1/problems", {
