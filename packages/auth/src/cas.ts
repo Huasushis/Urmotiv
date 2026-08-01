@@ -8,7 +8,11 @@ import { XMLParser } from "fast-xml-parser";
 import { z } from "zod";
 
 const stateLifetimeMs = 10 * 60_000;
+const stateLifetimeSeconds = stateLifetimeMs / 1_000;
 const responseByteLimit = 1_000_000;
+const browserBindingByteLength = 32;
+const browserBindingDigestContext = "urmotiv:cas:browser-binding:v2\0";
+const browserBindingSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const safeAttributeNameSchema = z.string().min(1).max(160).regex(/^[A-Za-z0-9_.:-]+$/);
 
 const httpUrlSchema = z.string().url().refine((value) => {
@@ -57,11 +61,17 @@ export interface CasLoginStart {
   readonly state: string;
   readonly serviceUrl: string;
   readonly expiresAt: string;
+  readonly browserBindingCookie: {
+    readonly name: string;
+    readonly value: string;
+    readonly maxAgeSeconds: number;
+  };
 }
 
 interface CasStatePayload {
-  readonly version: 1;
+  readonly version: 2;
   readonly nonce: string;
+  readonly browserBindingDigest: string;
   readonly returnTo: string;
   readonly issuedAt: string;
   readonly expiresAt: string;
@@ -106,9 +116,11 @@ export class CasClient {
     const safeReturnTo = parseReturnPath(returnTo);
     const now = this.#now();
     const expiresAt = new Date(now.getTime() + stateLifetimeMs).toISOString();
+    const browserBinding = randomBytes(browserBindingByteLength).toString("base64url");
     const payload: CasStatePayload = {
-      version: 1,
+      version: 2,
       nonce: randomBytes(24).toString("base64url"),
+      browserBindingDigest: digestBrowserBinding(browserBinding),
       returnTo: safeReturnTo,
       issuedAt: now.toISOString(),
       expiresAt
@@ -118,17 +130,55 @@ export class CasClient {
 
     const serviceUrl = withQuery(this.#configuration.callbackUrl, "state", state);
     const loginUrl = withQuery(this.#configuration.loginUrl, "service", serviceUrl);
-    return { loginUrl, state, serviceUrl, expiresAt };
+    return {
+      loginUrl,
+      state,
+      serviceUrl,
+      expiresAt,
+      browserBindingCookie: {
+        name: casBrowserBindingCookieName(state),
+        value: browserBinding,
+        maxAgeSeconds: stateLifetimeSeconds
+      }
+    };
   }
 
   public async finishLogin(input: {
     state: string;
     ticket: string;
+    browserBinding: string | undefined;
   }): Promise<{ identity: CasIdentity; returnTo: string }> {
     const payload = verifyState(input.state, this.#stateSecret);
     const now = this.#now();
     if (Date.parse(payload.expiresAt) <= now.getTime()) {
       throw new CasAuthenticationError("统一身份认证登录已过期，请重新开始。", "state_expired");
+    }
+
+    const browserBinding = browserBindingSchema.safeParse(input.browserBinding);
+    if (!browserBinding.success) {
+      throw new CasAuthenticationError(
+        "统一身份认证登录浏览器校验失败，请重新开始。",
+        "browser_binding_invalid"
+      );
+    }
+    const expectedBindingDigest = Buffer.from(payload.browserBindingDigest, "base64url");
+    const actualBindingDigest = Buffer.from(
+      digestBrowserBinding(browserBinding.data),
+      "base64url"
+    );
+    if (
+      actualBindingDigest.byteLength !== expectedBindingDigest.byteLength ||
+      !timingSafeEqual(actualBindingDigest, expectedBindingDigest)
+    ) {
+      throw new CasAuthenticationError(
+        "统一身份认证登录浏览器校验失败，请重新开始。",
+        "browser_binding_invalid"
+      );
+    }
+
+    const ticket = z.string().trim().min(1).max(2_000).safeParse(input.ticket);
+    if (!ticket.success) {
+      throw new CasAuthenticationError("统一身份认证登录票据无效。", "invalid_ticket");
     }
     if (!(await this.#states.consume(digestNonce(payload.nonce), now.toISOString()))) {
       throw new CasAuthenticationError(
@@ -137,11 +187,10 @@ export class CasClient {
       );
     }
 
-    const ticket = z.string().trim().min(1).max(2_000).parse(input.ticket);
     const serviceUrl = withQuery(this.#configuration.callbackUrl, "state", input.state);
     const validateUrl = new URL(this.#configuration.validateUrl);
     validateUrl.searchParams.set("service", serviceUrl);
-    validateUrl.searchParams.set("ticket", ticket);
+    validateUrl.searchParams.set("ticket", ticket.data);
     const response = await this.#fetch(validateUrl, {
       method: "GET",
       headers: { Accept: "application/xml, text/xml" },
@@ -156,6 +205,11 @@ export class CasClient {
       returnTo: payload.returnTo
     };
   }
+}
+
+export function casBrowserBindingCookieName(state: string): string {
+  const stateDigest = createHash("sha256").update(state, "utf8").digest("base64url");
+  return `__Host-urmotiv_cas_binding_${stateDigest}`;
 }
 
 export function parseCasIdentity(xml: string, configuration: CasConfiguration): CasIdentity {
@@ -245,8 +299,9 @@ function verifyState(state: string, secret: Uint8Array): CasStatePayload {
   }
   const schema = z
     .object({
-      version: z.literal(1),
+      version: z.literal(2),
       nonce: z.string().min(24).max(200),
+      browserBindingDigest: browserBindingSchema,
       returnTo: z.string().max(2_000),
       issuedAt: z.string().datetime(),
       expiresAt: z.string().datetime()
@@ -283,6 +338,13 @@ function withQuery(url: string, name: string, value: string): string {
 
 function digestNonce(nonce: string): string {
   return createHash("sha256").update(nonce, "utf8").digest("hex");
+}
+
+function digestBrowserBinding(browserBinding: string): string {
+  return createHash("sha256")
+    .update(browserBindingDigestContext, "utf8")
+    .update(browserBinding, "utf8")
+    .digest("base64url");
 }
 
 function readRecord(value: unknown): Record<string, unknown> | undefined {

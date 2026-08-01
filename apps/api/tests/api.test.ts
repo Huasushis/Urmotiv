@@ -217,10 +217,23 @@ describe("题目 API", () => {
     const loginLocation = new URL(start.headers.location as string);
     const serviceUrl = new URL(loginLocation.searchParams.get("service") as string);
     const state = serviceUrl.searchParams.get("state") as string;
-    const callback = await app.inject({ method: "GET", url: `/api/v1/auth/cas/callback?state=${encodeURIComponent(state)}&ticket=ticket-1` });
+    const bindingCookieHeader = Array.isArray(start.headers["set-cookie"])
+      ? start.headers["set-cookie"][0]
+      : start.headers["set-cookie"];
+    expect(bindingCookieHeader).toBeTypeOf("string");
+    const bindingCookie = bindingCookieHeader!.split(";", 1)[0]!;
+    const callback = await app.inject({
+      method: "GET",
+      url: `/api/v1/auth/cas/callback?state=${encodeURIComponent(state)}&ticket=ticket-1`,
+      headers: { cookie: bindingCookie }
+    });
     expect(callback.statusCode).toBe(302);
     expect(callback.headers.location).toBe("/problems");
-    const replay = await app.inject({ method: "GET", url: `/api/v1/auth/cas/callback?state=${encodeURIComponent(state)}&ticket=ticket-2` });
+    const replay = await app.inject({
+      method: "GET",
+      url: `/api/v1/auth/cas/callback?state=${encodeURIComponent(state)}&ticket=ticket-2`,
+      headers: { cookie: bindingCookie }
+    });
     expect(replay.statusCode).toBe(401);
   });
 

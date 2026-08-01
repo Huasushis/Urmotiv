@@ -40,6 +40,7 @@ import {
 } from "@urmotiv/contracts";
 import {
   CasAuthenticationError,
+  casBrowserBindingCookieName,
   createEmailVerificationToken,
   digestSecretToken,
   type CasClient,
@@ -110,6 +111,12 @@ import { ReviewPolicyService } from "./review-policy-service";
 const sessionCookieName = "urmotiv_session";
 const sessionLifetimeSeconds = 60 * 60 * 12;
 const emailVerificationLifetimeSeconds = 30 * 60;
+const casBrowserBindingCookieOptions = {
+  httpOnly: true,
+  secure: true,
+  sameSite: "lax" as const,
+  path: "/"
+};
 const problemFileUploadRouteBodyLimitBytes = 512 * 1024 * 1024;
 const problemIdSchema = z.string().refine(
   (value) => /^(0|[1-9]\d*)$/.test(value) || z.string().uuid().safeParse(value).success
@@ -222,6 +229,24 @@ function parseContestId(request: FastifyRequest): string {
     throw notFound();
   }
   return result.data;
+}
+
+function readUnambiguousCookie(
+  request: FastifyRequest,
+  cookieName: string
+): string | undefined {
+  const rawCookieHeader = request.headers.cookie;
+  if (rawCookieHeader === undefined) {
+    return undefined;
+  }
+  let occurrences = 0;
+  for (const segment of rawCookieHeader.split(";")) {
+    const equalsIndex = segment.indexOf("=");
+    if (equalsIndex > 0 && segment.slice(0, equalsIndex).trim() === cookieName) {
+      occurrences += 1;
+    }
+  }
+  return occurrences === 1 ? request.cookies[cookieName] : undefined;
 }
 
 function parseFileId(request: FastifyRequest): string {
@@ -859,6 +884,8 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   if (dependencies.casClient !== undefined) {
     app.get("/api/v1/auth/cas/start", async (request, reply) => {
+      reply.header("cache-control", "no-store");
+      reply.header("referrer-policy", "no-referrer");
       const input = casStartQuerySchema.strict().parse(request.query);
       let start: Awaited<ReturnType<CasClient["startLogin"]>>;
       try {
@@ -869,53 +896,68 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
         }
         throw error;
       }
+      reply.setCookie(
+        start.browserBindingCookie.name,
+        start.browserBindingCookie.value,
+        {
+          ...casBrowserBindingCookieOptions,
+          maxAge: start.browserBindingCookie.maxAgeSeconds
+        }
+      );
       return reply.redirect(start.loginUrl);
     });
 
     app.get("/api/v1/auth/cas/callback", async (request, reply) => {
-      const input = casCallbackQuerySchema.strict().parse(request.query);
-      let completed: Awaited<ReturnType<CasClient["finishLogin"]>>;
+      reply.header("cache-control", "no-store");
+      reply.header("referrer-policy", "no-referrer");
       try {
-        completed = await dependencies.casClient!.finishLogin(input);
-      } catch (error) {
-        if (error instanceof CasAuthenticationError) {
+        const parsedInput = casCallbackQuerySchema.strict().safeParse(request.query);
+        if (!parsedInput.success) {
           throw unauthorized();
         }
-        throw error;
-      }
-      const subject = z.string().trim().min(1).max(255).safeParse(completed.identity.subject);
-      if (!subject.success) {
-        throw unauthorized();
-      }
-      const nickname = z.string().trim().min(1).max(120).safeParse(
-        completed.identity.nickname ?? "统一身份认证用户"
-      );
-      if (!nickname.success) {
-        throw unauthorized();
-      }
-      let email: string | undefined;
-      try {
-        email = completed.identity.email === undefined
-          ? undefined
-          : normalizeEmail(completed.identity.email);
+        const input = parsedInput.data;
+        const browserBindingCookieName = casBrowserBindingCookieName(input.state);
+        const completed = await dependencies.casClient!.finishLogin({
+          ...input,
+          browserBinding: readUnambiguousCookie(request, browserBindingCookieName)
+        });
+        const subject = z.string().trim().min(1).max(255).safeParse(completed.identity.subject);
+        if (!subject.success) {
+          throw unauthorized();
+        }
+        const nickname = z.string().trim().min(1).max(120).safeParse(
+          completed.identity.nickname ?? "统一身份认证用户"
+        );
+        if (!nickname.success) {
+          throw unauthorized();
+        }
+        let email: string | undefined;
+        try {
+          email = completed.identity.email === undefined
+            ? undefined
+            : normalizeEmail(completed.identity.email);
+        } catch {
+          throw unauthorized();
+        }
+        const studentIds = completed.identity.studentIds
+          .map((identifier) => ({
+            attribute: identifier.attribute,
+            value: identifier.value.trim()
+          }))
+          .filter((identifier) => identifier.value.length > 0 && identifier.value.length <= 255);
+        const user = await dependencies.store.findOrCreateExternalUser({
+          provider: completed.identity.provider,
+          subject: subject.data,
+          nickname: nickname.data,
+          ...(email === undefined ? {} : { email }),
+          ...(studentIds.length === 0 ? {} : { studentIds })
+        });
+        await beginSession(user, reply);
+        reply.clearCookie(browserBindingCookieName, casBrowserBindingCookieOptions);
+        return reply.redirect(completed.returnTo);
       } catch {
         throw unauthorized();
       }
-      const studentIds = completed.identity.studentIds
-        .map((identifier) => ({
-          attribute: identifier.attribute,
-          value: identifier.value.trim()
-        }))
-        .filter((identifier) => identifier.value.length > 0 && identifier.value.length <= 255);
-      const user = await dependencies.store.findOrCreateExternalUser({
-        provider: completed.identity.provider,
-        subject: subject.data,
-        nickname: nickname.data,
-        ...(email === undefined ? {} : { email }),
-        ...(studentIds.length === 0 ? {} : { studentIds })
-      });
-      await beginSession(user, reply);
-      return reply.redirect(completed.returnTo);
     });
   }
 
