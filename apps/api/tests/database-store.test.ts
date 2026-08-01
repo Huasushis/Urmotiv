@@ -4,15 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createLocalDatabase,
+  type DatabaseExecutor,
   type LocalDatabaseHandle,
   migrateDatabase,
   seedCoreDatabase,
 } from "@urmotiv/database";
-import { sql } from "drizzle-orm";
+import { type SQL, sql } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo";
-import { DatabaseDataStore } from "../src/database-store";
+import { DatabaseDataStore, loadUsers } from "../src/database-store";
 import type { ProblemListFilters, StoredProblem, StoredReview, StoredUser } from "../src/domain";
 import { createProblemVisibility } from "../src/permissions";
 import { ProblemService } from "../src/service";
@@ -99,6 +100,29 @@ function problem(overrides: Partial<StoredProblem> = {}): StoredProblem {
     ...overrides,
   };
 }
+
+describe("数据库用户加载", () => {
+  it("在同一执行器上顺序读取用户、角色和权限", async () => {
+    let activeQueries = 0;
+    let maximumActiveQueries = 0;
+    let queryCount = 0;
+    const executor: DatabaseExecutor = {
+      execute: async (_statement: SQL): Promise<unknown> => undefined,
+      query: async <Row extends Record<string, unknown>>(_statement: SQL): Promise<Row[]> => {
+        queryCount += 1;
+        activeQueries += 1;
+        maximumActiveQueries = Math.max(maximumActiveQueries, activeQueries);
+        await Promise.resolve();
+        activeQueries -= 1;
+        return [];
+      },
+    };
+
+    await expect(loadUsers(executor)).resolves.toEqual([]);
+    expect(queryCount).toBe(3);
+    expect(maximumActiveQueries).toBe(1);
+  });
+});
 
 describe("数据库题目仓库", () => {
   it("持久化邮箱凭据、一次性 CAS 状态和 authRevision 会话撤销", async () => {
@@ -352,6 +376,42 @@ describe("数据库题目仓库", () => {
     expect(await store.listReviews(pending.id, 1)).toEqual([
       expect.objectContaining({ id: historicalReview.id, originalityLevel: null }),
     ]);
+  });
+
+  it("临时服务账号不会被加载成人类或机器人，也不会生成可见审核身份", async () => {
+    const database = await openDatabase(true);
+    const store = new DatabaseDataStore(database);
+    const serviceUserId = 8_000_000_000_000_099n;
+    await database.execute(sql`
+      INSERT INTO users (id, nickname, account_type)
+      VALUES (${serviceUserId}, '临时服务账号', 'service')
+    `);
+
+    expect(await store.getUser(serviceUserId.toString())).toBeUndefined();
+    expect((await store.listUsers()).some((user) => user.id === serviceUserId.toString())).toBe(false);
+
+    const pending = await store.createProblem(
+      problem({ status: "pending_review", reviewRound: 1 }),
+    );
+    const rounds = await database.query<{ id: string }>(sql`
+      SELECT id::text AS id
+      FROM review_rounds
+      WHERE problem_id = ${BigInt(pending.id)} AND round = 1
+    `);
+    const roundId = rounds[0]?.id;
+    if (roundId === undefined) throw new Error("缺少测试审核轮次。");
+    await database.execute(sql`
+      INSERT INTO review_opinions (
+        id, round_id, reviewer_user_id, source, verdict,
+        codeforces_difficulty, quality_level, originality_level,
+        thinking_level, coding_level, improvements, public_comment, private_note
+      ) VALUES (
+        ${randomUUID()}::uuid, ${roundId}::uuid, ${serviceUserId}, 'fermata', 'approve',
+        1200, 3, 3, 2, 2, '临时服务账号意见不应被加载。', '', ''
+      )
+    `);
+
+    expect(await store.listReviews(pending.id, 1)).toEqual([]);
   });
 
   it("审核建议写回在数据库事务中创建修订和安全审计", async () => {

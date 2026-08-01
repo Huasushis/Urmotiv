@@ -55,7 +55,11 @@ import { InMemoryContestStore, type ContestStore } from "./contest-store";
 import { createDemoUsers, demoTags } from "./demo-data";
 import { ApiError, conflict, forbidden, notFound, unauthorized } from "./errors";
 import type { StoredUser } from "./domain";
-import { hasPermission } from "./permissions";
+import {
+  createProblemPermissionFilter,
+  createProblemVisibility,
+  hasPermission,
+} from "./permissions";
 import { InMemoryDataStore, type DataStore } from "./repository";
 import {
   createEmailVerificationUrl,
@@ -88,7 +92,7 @@ import {
   type PluginUpdateFailureReason
 } from "./plugin-host";
 import { computeProblemContentHash } from "./database-store";
-import { createProblemVisibility } from "./permissions";
+import { resolveClientAddress } from "./client-address";
 import type { DatabaseRobotStore } from "./robot-store";
 import { PluginReviewDecisionRunner } from "./review-decision";
 import { ReviewPolicyService } from "./review-policy-service";
@@ -995,19 +999,14 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       if (token === undefined || token.length === 0) {
         throw unauthorized();
       }
-      const identity = await robots.authenticateToken(token);
+      const identity = await robots.authenticateToken(
+        token,
+        resolveClientAddress(request, dependencies.trustedProxyCidrs),
+      );
       if (identity === undefined) {
         throw unauthorized();
       }
-      const user = await dependencies.store.getUser(identity.userId);
-      if (
-        user === undefined ||
-        user.accountType !== "robot" ||
-        !hasPermission(user, "auth.login", {}, dependencies.now())
-      ) {
-        throw unauthorized();
-      }
-      return user;
+      return identity.user;
     };
 
     const robotTaskFor = async (
@@ -1021,7 +1020,13 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       if (
         problem === undefined ||
         problem.status !== "pending_review" ||
-        problem.reviewRound !== assignment.round
+        problem.reviewRound !== assignment.round ||
+        !hasPermission(
+          robotUser,
+          "problem.review",
+          { ownerId: problem.ownerId, objectId: problem.id },
+          dependencies.now(),
+        )
       ) {
         return undefined;
       }
@@ -1056,27 +1061,53 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
     app.post("/api/v1/robot/review-tasks/claim", async (request) => {
       const robotUser = await requireRobot(request);
-      if (!hasPermission(robotUser, "problem.review", {}, dependencies.now())) {
+      const permissionEvaluatedAt = dependencies.now();
+      const reviewPermission = createProblemPermissionFilter(
+        robotUser,
+        "problem.review",
+        permissionEvaluatedAt,
+      );
+      if (reviewPermission === undefined) {
         throw forbidden();
       }
       const input = claimRobotReviewTasksInputSchema.parse(request.body ?? {});
       const supported = input.supportedProblemTypes === undefined
         ? undefined
         : new Set(input.supportedProblemTypes);
-      const candidates = await robots.listOpenRoundCandidates(robotUser.id, 50);
+      const visibility = createProblemVisibility(robotUser, permissionEvaluatedAt);
+      const candidates = await robots.listOpenRoundCandidates(
+        robotUser.id,
+        50,
+        visibility,
+        reviewPermission,
+      );
       const tasks = [];
       for (const candidate of candidates) {
         if (tasks.length >= input.maximumTasks) {
           break;
         }
+        if (!hasPermission(
+          robotUser,
+          "problem.review",
+          { ownerId: candidate.ownerId, objectId: candidate.problemId },
+          dependencies.now(),
+        )) {
+          continue;
+        }
         const problem = await dependencies.store.findVisibleProblem(
           candidate.problemId,
-          createProblemVisibility(robotUser, dependencies.now())
+          visibility,
         );
         if (
           problem === undefined ||
           problem.status !== "pending_review" ||
           problem.reviewRound !== candidate.round ||
+          !hasPermission(
+            robotUser,
+            "problem.review",
+            { ownerId: problem.ownerId, objectId: problem.id },
+            dependencies.now(),
+          ) ||
           (supported !== undefined && !supported.has(problem.type))
         ) {
           continue;
@@ -1103,6 +1134,27 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       const robotUser = await requireRobot(request);
       const assignmentId = parseAssignmentId(request);
       const input = renewRobotReviewTaskInputSchema.parse(request.body ?? {});
+      const assignment = await robots.findAssignment(assignmentId, robotUser.id);
+      if (assignment === undefined) {
+        throw notFound();
+      }
+      const problem = await dependencies.store.findVisibleProblem(
+        assignment.problemId,
+        createProblemVisibility(robotUser, dependencies.now()),
+      );
+      if (
+        problem === undefined ||
+        problem.status !== "pending_review" ||
+        problem.reviewRound !== assignment.round ||
+        !hasPermission(
+          robotUser,
+          "problem.review",
+          { ownerId: problem.ownerId, objectId: problem.id },
+          dependencies.now(),
+        )
+      ) {
+        throw notFound();
+      }
       const renewed = await robots.renewAssignment(
         assignmentId,
         robotUser.id,
@@ -1126,18 +1178,28 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       if (assignment === undefined) {
         throw notFound();
       }
+      const problem = await dependencies.store.findVisibleProblem(
+        assignment.problemId,
+        createProblemVisibility(robotUser, dependencies.now())
+      );
+      if (
+        problem === undefined ||
+        problem.status !== "pending_review" ||
+        problem.reviewRound !== assignment.round ||
+        !hasPermission(
+          robotUser,
+          "problem.review",
+          { ownerId: problem.ownerId, objectId: problem.id },
+          dependencies.now(),
+        )
+      ) {
+        throw notFound();
+      }
       if (
         assignment.expiresAt !== input.expectedLeaseExpiresAt ||
         Date.parse(assignment.expiresAt) <= dependencies.now().getTime()
       ) {
         throw conflict("任务租约已变化或过期，请重新领取。");
-      }
-      const problem = await dependencies.store.findVisibleProblem(
-        assignment.problemId,
-        createProblemVisibility(robotUser, dependencies.now())
-      );
-      if (problem === undefined) {
-        throw notFound();
       }
       if (problem.revision !== input.expectedProblemRevision) {
         throw conflict("题目内容已更新，本次分析结果不再适用。");

@@ -4,8 +4,11 @@ import {
   canEditProblem,
   canExportProblem,
   canViewProblem,
+  createProblemPermissionFilter,
   createProblemVisibility,
-  hasPermission
+  hasPermission,
+  mayHavePermissionForTarget,
+  restrictRobotUserToTokenPermissions,
 } from "../src/permissions";
 
 describe("权限计算", () => {
@@ -20,6 +23,84 @@ describe("权限计算", () => {
       grants: [...robot.grants, { permission: "system.manage" as const, effect: "allow" as const, scope: "global" as const }]
     };
     expect(hasPermission(wronglyConfiguredRobot, "system.manage")).toBe(false);
+  });
+
+  it("机器人令牌只缩小账号允许项并保留全部明确拒绝", () => {
+    const robot = createDemoUsers().find((user) => user.id === "robot");
+    if (robot === undefined) {
+      throw new Error("缺少机器人演示账号");
+    }
+    const configured = {
+      ...robot,
+      grants: [
+        ...robot.grants,
+        {
+          permission: "problem.view.all" as const,
+          effect: "deny" as const,
+          scope: "object" as const,
+          objectId: "blocked",
+        },
+        {
+          permission: "system.manage" as const,
+          effect: "allow" as const,
+          scope: "global" as const,
+        },
+      ],
+    };
+    const narrowed = restrictRobotUserToTokenPermissions(
+      configured,
+      new Set(["auth.login", "problem.view.all", "problem.review", "system.manage"]),
+    );
+    if (narrowed === undefined) throw new Error("机器人令牌权限收窄失败");
+    expect(hasPermission(narrowed, "problem.review", { objectId: "allowed" })).toBe(true);
+    expect(hasPermission(narrowed, "system.manage")).toBe(false);
+    expect(
+      canViewProblem(createProblemVisibility(narrowed), {
+        id: "blocked",
+        ownerId: "another-user",
+      }),
+    ).toBe(false);
+
+    const loginOnly = restrictRobotUserToTokenPermissions(robot, new Set(["auth.login"]));
+    if (loginOnly === undefined) throw new Error("机器人登录权限收窄失败");
+    expect(hasPermission(loginOnly, "auth.login")).toBe(true);
+    expect(hasPermission(loginOnly, "problem.review", { objectId: "allowed" })).toBe(false);
+    expect(mayHavePermissionForTarget(loginOnly, "problem.review")).toBe(false);
+  });
+
+  it("令牌不能增加账号没有的权限，具体对象仍要再次检查", () => {
+    const robot = createDemoUsers().find((user) => user.id === "robot");
+    if (robot === undefined) {
+      throw new Error("缺少机器人演示账号");
+    }
+    const objectOnly = {
+      ...robot,
+      grants: [
+        ...robot.grants.filter((grant) => grant.permission !== "problem.review"),
+        {
+          permission: "problem.review" as const,
+          effect: "allow" as const,
+          scope: "object" as const,
+          objectId: "one",
+        },
+      ],
+    };
+    const narrowed = restrictRobotUserToTokenPermissions(
+      objectOnly,
+      new Set(["auth.login", "problem.review", "problem.status.change"]),
+    );
+    if (narrowed === undefined) throw new Error("机器人对象权限收窄失败");
+    expect(mayHavePermissionForTarget(narrowed, "problem.review")).toBe(true);
+    expect(createProblemPermissionFilter(narrowed, "problem.review")).toEqual({
+      viewerId: narrowed.id,
+      rule: expect.objectContaining({
+        globalAllow: false,
+        allowedObjectIds: ["one"],
+      }),
+    });
+    expect(hasPermission(narrowed, "problem.review", { objectId: "one" })).toBe(true);
+    expect(hasPermission(narrowed, "problem.review", { objectId: "two" })).toBe(false);
+    expect(hasPermission(narrowed, "problem.status.change")).toBe(false);
   });
 
   it("同一权限的明确拒绝压过允许", () => {

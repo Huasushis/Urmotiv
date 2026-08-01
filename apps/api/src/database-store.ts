@@ -18,7 +18,7 @@ import type {
   StoredUser,
   VisibleProblemPage,
 } from "./domain";
-import type { ProblemVisibility } from "./permissions";
+import type { ProblemPermissionFilter, ProblemVisibility } from "./permissions";
 import type {
   DataStore,
   EmailCredential,
@@ -35,7 +35,7 @@ const maximumDatabaseId = 9_223_372_036_854_775_807n;
 interface UserRow extends Record<string, unknown> {
   id: string;
   nickname: string;
-  account_type: "human" | "robot" | "service";
+  account_type: "human" | "robot";
   disabled: boolean;
 }
 
@@ -97,7 +97,7 @@ interface ReviewRow extends Record<string, unknown> {
   expected_round: number;
   reviewer_id: string;
   reviewer_nickname: string;
-  reviewer_account_type: "human" | "robot" | "service";
+  reviewer_account_type: "human" | "robot";
   source: StoredReview["source"];
   verdict: StoredReview["verdict"];
   codeforces_difficulty: number;
@@ -248,7 +248,7 @@ async function upsertStudentIdentifiers(
   }
 }
 
-async function loadUsers(
+export async function loadUsers(
   executor: DatabaseExecutor,
   requestedIds?: readonly bigint[],
 ): Promise<StoredUser[]> {
@@ -256,8 +256,9 @@ async function loadUsers(
     return [];
   }
 
-  const userFilter =
-    requestedIds === undefined ? sql`` : sql`WHERE u.id IN (${sqlList(requestedIds)})`;
+  const userFilter = requestedIds === undefined
+    ? sql`WHERE u.account_type IN ('human', 'robot')`
+    : sql`WHERE u.account_type IN ('human', 'robot') AND u.id IN (${sqlList(requestedIds)})`;
   const membershipFilter =
     requestedIds === undefined ? sql`` : sql`AND membership.user_id IN (${sqlList(requestedIds)})`;
   const directGrantFilter =
@@ -267,8 +268,10 @@ async function loadUsers(
   const roleGrantFilter =
     requestedIds === undefined ? sql`` : sql`AND membership.user_id IN (${sqlList(requestedIds)})`;
 
-  const [userRows, roleRows, grantRows] = await Promise.all([
-    executor.query<UserRow>(sql`
+  // A transaction executor is backed by one node-postgres client. Its queries
+  // must be awaited in order; concurrent client.query calls are deprecated and
+  // can make authentication observe or complete statements unpredictably.
+  const userRows = await executor.query<UserRow>(sql`
       SELECT
         u.id::text AS id,
         u.nickname,
@@ -277,17 +280,20 @@ async function loadUsers(
       FROM users u
       ${userFilter}
       ORDER BY u.id
-    `),
-    executor.query<RoleRow>(sql`
+    `);
+  const roleRows = await executor.query<RoleRow>(sql`
       SELECT membership.user_id::text AS user_id, role.display_name
       FROM role_memberships membership
+      JOIN users user_record
+        ON user_record.id = membership.user_id
+       AND user_record.account_type IN ('human', 'robot')
       JOIN roles role ON role.id = membership.role_id
       WHERE membership.revoked_at IS NULL
         AND (membership.expires_at IS NULL OR membership.expires_at > now())
         ${membershipFilter}
       ORDER BY role.display_name, role.id
-    `),
-    executor.query<GrantRow>(sql`
+    `);
+  const grantRows = await executor.query<GrantRow>(sql`
       SELECT
         grant_record.subject_user_id::text AS user_id,
         grant_record.permission_name,
@@ -297,6 +303,9 @@ async function loadUsers(
         grant_record.object_id,
         grant_record.expires_at
       FROM permission_grants grant_record
+      JOIN users user_record
+        ON user_record.id = grant_record.subject_user_id
+       AND user_record.account_type IN ('human', 'robot')
       WHERE grant_record.subject_user_id IS NOT NULL
         AND grant_record.revoked_at IS NULL
         ${directGrantFilter}
@@ -310,13 +319,15 @@ async function loadUsers(
         grant_record.object_id,
         grant_record.expires_at
       FROM role_memberships membership
+      JOIN users user_record
+        ON user_record.id = membership.user_id
+       AND user_record.account_type IN ('human', 'robot')
       JOIN permission_grants grant_record ON grant_record.subject_role_id = membership.role_id
       WHERE membership.revoked_at IS NULL
         AND (membership.expires_at IS NULL OR membership.expires_at > now())
         AND grant_record.revoked_at IS NULL
         ${roleGrantFilter}
-    `),
-  ]);
+    `);
 
   const rolesByUser = new Map<string, string[]>();
   for (const row of roleRows) {
@@ -352,7 +363,7 @@ async function loadUsers(
   return userRows.map((row) => ({
     id: row.id,
     nickname: row.nickname,
-    accountType: row.account_type === "human" ? "human" : "robot",
+    accountType: row.account_type,
     disabled: row.disabled,
     roles: rolesByUser.get(row.id) ?? [],
     grants: grantsByUser.get(row.id) ?? [],
@@ -529,7 +540,7 @@ function objectIdCondition(column: SQL, ids: readonly bigint[]): SQL | undefined
   return ids.length === 0 ? undefined : sql`${column} IN (${sqlList(ids)})`;
 }
 
-function visibilityCondition(visibility: ProblemVisibility): SQL | undefined {
+export function visibilityCondition(visibility: ProblemVisibility): SQL | undefined {
   const viewerId = parseDatabaseId(visibility.viewerId);
   if (viewerId === undefined || visibility.viewAll.globalDeny || visibility.viewOwn.globalDeny) {
     return undefined;
@@ -575,6 +586,47 @@ function visibilityCondition(visibility: ProblemVisibility): SQL | undefined {
   }
 
   if (visibility.viewAll.ownDeny || visibility.viewOwn.ownDeny) {
+    denyConditions.push(sql`problem.owner_id <> ${viewerId}`);
+  }
+
+  const allowed = sql`(${sql.join(allowConditions, sql` OR `)})`;
+  return denyConditions.length === 0
+    ? allowed
+    : sql`${allowed} AND (${sql.join(denyConditions, sql` AND `)})`;
+}
+
+export function problemPermissionCondition(
+  permission: ProblemPermissionFilter,
+): SQL | undefined {
+  const viewerId = parseDatabaseId(permission.viewerId);
+  const rule = permission.rule;
+  if (viewerId === undefined || rule.globalDeny) {
+    return undefined;
+  }
+
+  const allowConditions: SQL[] = [];
+  if (rule.globalAllow) {
+    allowConditions.push(sql`true`);
+  }
+  const allowedObjectIds = numericObjectIds(rule.allowedObjectIds);
+  const objectAllow = objectIdCondition(sql`problem.id`, allowedObjectIds);
+  if (objectAllow !== undefined) {
+    allowConditions.push(objectAllow);
+  }
+  if (rule.ownAllow) {
+    allowConditions.push(sql`problem.owner_id = ${viewerId}`);
+  }
+  if (allowConditions.length === 0) {
+    return undefined;
+  }
+
+  const denyConditions: SQL[] = [];
+  const deniedObjectIds = numericObjectIds(rule.deniedObjectIds);
+  const objectDeny = objectIdCondition(sql`problem.id`, deniedObjectIds);
+  if (objectDeny !== undefined) {
+    denyConditions.push(sql`NOT (${objectDeny})`);
+  }
+  if (rule.ownDeny) {
     denyConditions.push(sql`problem.owner_id <> ${viewerId}`);
   }
 
@@ -909,6 +961,7 @@ async function loadReviews(
     JOIN users reviewer ON reviewer.id = opinion.reviewer_user_id
     WHERE review_round.problem_id = ${problemId}
       AND opinion.is_active = true
+      AND reviewer.account_type IN ('human', 'robot')
       ${roundFilter}
     ORDER BY opinion.created_at, opinion.id
   `);
@@ -937,7 +990,7 @@ async function loadReviews(
     reviewer: {
       id: row.reviewer_id,
       nickname: row.reviewer_nickname,
-      accountType: row.reviewer_account_type === "human" ? "human" : "robot",
+      accountType: row.reviewer_account_type,
     },
     source: row.source,
     verdict: row.verdict,

@@ -1,8 +1,8 @@
 import {
-  corePermissions,
-  robotHardDeniedPermissions,
   type CorePermission,
-  type PermissionGrant
+  corePermissions,
+  type PermissionGrant,
+  robotHardDeniedPermissions
 } from "@urmotiv/contracts";
 import type { StoredProblem, StoredUser } from "./domain";
 
@@ -26,6 +26,11 @@ export interface ProblemVisibility {
   viewerId: string;
   viewAll: ProblemVisibilityRule;
   viewOwn: ProblemVisibilityRule;
+}
+
+export interface ProblemPermissionFilter {
+  viewerId: string;
+  rule: ProblemVisibilityRule;
 }
 
 function isGrantActive(grant: PermissionGrant, now: Date): boolean {
@@ -104,6 +109,57 @@ export function hasPermission(
   return hasRawPermission(user, permission, target, now);
 }
 
+/**
+ * Restrict a robot account to the permission names carried by one API token.
+ * Token permissions are a ceiling: they can remove account allows, but never
+ * add an allow or erase an account-level deny.
+ */
+export function restrictRobotUserToTokenPermissions(
+  user: StoredUser,
+  tokenPermissions: ReadonlySet<string>,
+): StoredUser | undefined {
+  if (user.accountType !== "robot") {
+    return undefined;
+  }
+
+  return {
+    ...user,
+    grants: user.grants.filter(
+      (grant) => grant.effect === "deny" || tokenPermissions.has(grant.permission),
+    ),
+  };
+}
+
+/**
+ * Check whether an account can possibly use a permission for at least one
+ * target. The concrete target must still be checked with hasPermission.
+ */
+export function mayHavePermissionForTarget(
+  user: StoredUser,
+  permission: CorePermission | string,
+  now = new Date(),
+): boolean {
+  if (
+    user.disabled ||
+    !hasRawPermission(user, "auth.login", {}, now) ||
+    (user.accountType === "robot" && robotHardDeniedPermissionSet.has(permission))
+  ) {
+    return false;
+  }
+
+  const matchingGrants = user.grants.filter(
+    (grant) => grant.permission === permission && isGrantActive(grant, now),
+  );
+  if (
+    matchingGrants.some(
+      (grant) => grant.effect === "deny" && grant.scope === "global",
+    )
+  ) {
+    return false;
+  }
+  return matchingGrants.some((grant) => grant.effect === "allow");
+}
+
 function emptyRule(): ProblemVisibilityRule {
   return {
     globalAllow: false,
@@ -117,7 +173,7 @@ function emptyRule(): ProblemVisibilityRule {
 
 function buildVisibilityRule(
   user: StoredUser,
-  permission: "problem.view.all" | "problem.view.own",
+  permission: CorePermission | string,
   now: Date
 ): ProblemVisibilityRule {
   const rule = emptyRule();
@@ -157,6 +213,30 @@ function buildVisibilityRule(
   }
 
   return rule;
+}
+
+/** Build the SQL-safe allow/deny scopes for one permission on a problem. */
+export function createProblemPermissionFilter(
+  user: StoredUser,
+  permission: CorePermission | string,
+  now = new Date(),
+): ProblemPermissionFilter | undefined {
+  if (
+    user.disabled ||
+    !hasRawPermission(user, "auth.login", {}, now) ||
+    (user.accountType === "robot" && robotHardDeniedPermissionSet.has(permission))
+  ) {
+    return undefined;
+  }
+
+  const rule = buildVisibilityRule(user, permission, now);
+  if (
+    rule.globalDeny ||
+    (!rule.globalAllow && !rule.ownAllow && rule.allowedObjectIds.length === 0)
+  ) {
+    return undefined;
+  }
+  return { viewerId: user.id, rule };
 }
 
 export function createProblemVisibility(user: StoredUser, now = new Date()): ProblemVisibility {
