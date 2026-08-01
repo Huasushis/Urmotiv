@@ -10,7 +10,7 @@ import {
   Table2,
   Undo2
 } from "lucide-react";
-import { useRef, useState } from "react";
+import { type ClipboardEvent as ReactClipboardEvent, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -30,6 +30,11 @@ type MarkdownEditorProps = {
 };
 
 type EditorMode = "edit" | "preview";
+
+const supportedImageTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const unsupportedImageMessage = "仅支持 PNG、JPEG、GIF 或 WebP 图片。";
+const multipleImagesMessage = "剪贴板中包含多张图片，请一次只粘贴一张。";
+const imageUploadFailedMessage = "图片上传失败，请稍后重试。";
 
 export function MarkdownPreview({ value, problemId }: { value: string; problemId?: string | undefined }) {
   if (!value.trim()) {
@@ -74,6 +79,7 @@ export function MarkdownEditor({
   const [imageUploadError, setImageUploadError] = useState<string | null>(null);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const imageUploadPendingRef = useRef(false);
 
   const insert = (prefix: string, suffix: string, placeholder: string) => {
     const field = textAreaRef.current;
@@ -111,11 +117,17 @@ export function MarkdownEditor({
 
   const uploadSelectedImage = async (file: File) => {
     const field = textAreaRef.current;
-    if (field === null || onUploadImage === undefined) {
+    if (
+      field === null ||
+      onUploadImage === undefined ||
+      readOnly ||
+      uploadDisabled ||
+      imageUploadPendingRef.current
+    ) {
       return;
     }
-    if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.type.trim().toLowerCase())) {
-      setImageUploadError("仅支持 PNG、JPEG、GIF 或 WebP 图片。");
+    if (!isSupportedImage(file)) {
+      setImageUploadError(unsupportedImageMessage);
       return;
     }
     const start = field.selectionStart;
@@ -124,6 +136,7 @@ export function MarkdownEditor({
     const alt = (selected || "题面图片")
       .replace(/[\r\n]+/g, " ")
       .replace(/([\\\[\]])/g, "\\$1");
+    imageUploadPendingRef.current = true;
     setUploadingImage(true);
     setImageUploadError(null);
     try {
@@ -135,11 +148,38 @@ export function MarkdownEditor({
         field.focus();
         field.setSelectionRange(start + markdown.length, start + markdown.length);
       });
-    } catch (error) {
-      setImageUploadError(error instanceof Error ? error.message : "图片上传失败，请稍后重试。");
+    } catch {
+      setImageUploadError(imageUploadFailedMessage);
     } finally {
+      imageUploadPendingRef.current = false;
       setUploadingImage(false);
     }
+  };
+
+  const pasteImage = (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
+    if (readOnly || uploadDisabled || onUploadImage === undefined || imageUploadPendingRef.current) {
+      return;
+    }
+
+    const imageItems = Array.from(event.clipboardData.items).filter(
+      (item) => item.kind === "file" && item.type.trim().toLowerCase().startsWith("image/")
+    );
+
+    if (imageItems.length > 1) {
+      setImageUploadError(multipleImagesMessage);
+      return;
+    }
+    const image = imageItems[0]?.getAsFile();
+    if (image === undefined || image === null) {
+      return;
+    }
+    if (!isSupportedImage(image)) {
+      setImageUploadError(unsupportedImageMessage);
+      return;
+    }
+
+    event.preventDefault();
+    void uploadSelectedImage(image);
   };
 
   const toolButtons = [
@@ -226,6 +266,7 @@ export function MarkdownEditor({
             ref={textAreaRef}
             value={value}
             onChange={(event) => onChange(event.target.value)}
+            onPaste={pasteImage}
             placeholder="使用 Markdown 编写内容"
             readOnly={readOnly || uploadingImage}
             rows={minRows}
@@ -238,6 +279,10 @@ export function MarkdownEditor({
       </div>
     </section>
   );
+}
+
+function isSupportedImage(file: File): boolean {
+  return supportedImageTypes.has(file.type.trim().toLowerCase());
 }
 
 function isControlledProblemFileSource(

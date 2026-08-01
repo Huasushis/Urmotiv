@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 const localOrigin = "http://127.0.0.1:5173";
 
@@ -25,6 +25,32 @@ async function postJson(page: Page, path: string, data: unknown) {
   const body = await response.text();
   expect(response.ok(), `${path}: ${body}`).toBe(true);
   return JSON.parse(body) as Record<string, unknown>;
+}
+
+async function pasteImage(
+  field: Locator,
+  file: { name: string; mimeType: string; buffer: Buffer }
+) {
+  return field.evaluate(
+    (element, payload) => {
+      if (!(element instanceof HTMLTextAreaElement)) {
+        throw new Error("找不到 Markdown 编辑框。");
+      }
+      element.focus();
+      element.setSelectionRange(element.value.length, element.value.length);
+      const bytes = Uint8Array.from(atob(payload.base64), (character) => character.charCodeAt(0));
+      const clipboard = new DataTransfer();
+      clipboard.items.add(new File([bytes], payload.name, { type: payload.mimeType }));
+      const event = new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: clipboard
+      });
+      element.dispatchEvent(event);
+      return event.defaultPrevented;
+    },
+    { name: file.name, mimeType: file.mimeType, base64: file.buffer.toString("base64") }
+  );
 }
 
 test("邮箱验证链接在桌面和手机上显示可操作的确认页", async ({ page }) => {
@@ -71,7 +97,7 @@ test("题面图片与公开附件可以上传、预览和下载", async ({ page 
       basicStatement: "给定一个整数，原样输出。",
       basicSolution: "直接输出输入值。",
       background: "",
-      statement: "",
+      statement: "粘贴前正文",
       inputFormat: "",
       outputFormat: "",
       constraints: "",
@@ -97,9 +123,17 @@ test("题面图片与公开附件可以上传、预览和下载", async ({ page 
   await expect(editor.getByRole("alert")).toContainText("仅支持 PNG、JPEG、GIF 或 WebP 图片");
   await expect(editor.locator("textarea")).not.toHaveValue(/\/api\/v1\/problems\//);
 
-  const imageFileChooser = page.waitForEvent("filechooser");
-  await imageButton.click();
-  await (await imageFileChooser).setFiles({
+  const statementField = editor.locator("textarea");
+  const forgedPasteHandled = await pasteImage(statementField, {
+    name: "forged.png",
+    mimeType: "image/png",
+    buffer: Buffer.from("synthetic text", "utf8")
+  });
+  expect(forgedPasteHandled).toBe(true);
+  await expect(editor.getByRole("alert")).toHaveText("图片上传失败，请稍后重试。");
+  await expect(statementField).toHaveValue("粘贴前正文");
+
+  const validPasteHandled = await pasteImage(statementField, {
     name: "synthetic.png",
     mimeType: "image/png",
     buffer: Buffer.from(
@@ -107,9 +141,10 @@ test("题面图片与公开附件可以上传、预览和下载", async ({ page 
       "base64"
     )
   });
+  expect(validPasteHandled).toBe(true);
 
-  await expect(editor.locator("textarea")).toHaveValue(
-    new RegExp(`!\\[题面图片\\]\\(/api/v1/problems/${problemId}/files/[0-9a-f-]+\\)`)
+  await expect(statementField).toHaveValue(
+    new RegExp(`^粘贴前正文!\\[题面图片\\]\\(/api/v1/problems/${problemId}/files/[0-9a-f-]+\\)$`)
   );
   await expect(imageButton).toBeEnabled();
   if (testInfo.project.name === "mobile-chromium") {
