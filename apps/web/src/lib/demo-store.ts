@@ -520,6 +520,8 @@ export async function createDemoReview(id: string, input: ReviewInput): Promise<
   const current = await listDemoReviews(id);
   const item = {
     ...input,
+    originalityLevel: input.originalityLevel ?? null,
+    publicComment: input.publicComment ?? "",
     id: `review-${Date.now()}`,
     problemId: id,
     reviewer: { id: user.id, nickname: user.nickname, accountType: user.accountType },

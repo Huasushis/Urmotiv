@@ -853,6 +853,7 @@ export const reviewOpinions = pgTable(
     verdict: reviewVerdict("verdict").notNull(),
     codeforcesDifficulty: smallint("codeforces_difficulty").notNull(),
     qualityLevel: smallint("quality_level").notNull(),
+    originalityLevel: smallint("originality_level"),
     thinkingLevel: smallint("thinking_level").notNull(),
     codingLevel: smallint("coding_level").notNull(),
     improvements: text("improvements").notNull(),
@@ -874,6 +875,10 @@ export const reviewOpinions = pgTable(
       sql`${table.codeforcesDifficulty} BETWEEN 800 AND 3500 AND ${table.codeforcesDifficulty} % 100 = 0`
     ),
     check("review_opinions_quality_level_ck", sql`${table.qualityLevel} BETWEEN 1 AND 5`),
+    check(
+      "review_opinions_originality_level_ck",
+      sql`${table.originalityLevel} IS NULL OR ${table.originalityLevel} BETWEEN 1 AND 5`
+    ),
     check("review_opinions_thinking_level_ck", sql`${table.thinkingLevel} BETWEEN 1 AND 5`),
     check("review_opinions_coding_level_ck", sql`${table.codingLevel} BETWEEN 1 AND 5`),
     check("review_opinions_improvements_ck", sql`length(btrim(${table.improvements})) > 0`),

@@ -422,6 +422,7 @@ describe("题目 API", () => {
       verdict: "approve",
       codeforcesDifficulty: 1200,
       qualityLevel: 3,
+      originalityLevel: 3,
       thinkingLevel: 2,
       codingLevel: 1,
       tagIds: ["algorithm.implementation"],
@@ -475,7 +476,7 @@ describe("题目 API", () => {
     expect(approved.json()).toEqual(expect.objectContaining({ status: "approved" }));
   });
 
-  it("按作者、审题人和最终决定者身份隐藏或显示审核私密备注", async () => {
+  it("公开评论对作者可见，私密备注只对审核相关成员可见", async () => {
     const app = await makeApp();
     const authorCookie = await login(app, "author");
     const problem = await createDraft(app, authorCookie);
@@ -489,38 +490,62 @@ describe("题目 API", () => {
     expect(submit.statusCode).toBe(200);
 
     const reviewerCookie = await login(app, "reviewer");
+    const reviewPayload = {
+      verdict: "request_changes",
+      codeforcesDifficulty: 1200,
+      qualityLevel: 3,
+      originalityLevel: 3,
+      thinkingLevel: 2,
+      codingLevel: 1,
+      tagIds: [],
+      improvements: "补充边界说明。",
+      publicComment: "这条公开评论可供作者修改题目时参考。",
+      privateNote: "仅审核相关成员可见",
+      expectedRound: 1
+    };
     const review = await app.inject({
       method: "POST",
       url: `/api/v1/problems/${problemId}/reviews`,
       headers: { cookie: reviewerCookie, origin: localOrigin },
-      payload: {
-        verdict: "request_changes",
-        codeforcesDifficulty: 1200,
-        qualityLevel: 3,
-        thinkingLevel: 2,
-        codingLevel: 1,
-        tagIds: [],
-        improvements: "补充边界说明。",
-        privateNote: "仅审核相关成员可见",
-        expectedRound: 1
-      }
+      payload: reviewPayload
     });
     expect(review.statusCode).toBe(200);
+    const updatedReview = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${problemId}/reviews`,
+      headers: { cookie: reviewerCookie, origin: localOrigin },
+      payload: {
+        ...reviewPayload,
+        publicComment: "更新后的公开评论仍然对作者可见。"
+      }
+    });
+    expect(updatedReview.statusCode).toBe(200);
+    expect(updatedReview.json().reviews).toEqual([
+      expect.objectContaining({ publicComment: "更新后的公开评论仍然对作者可见。" })
+    ]);
 
-    const readNote = async (cookie: string): Promise<string> => {
+    const readReview = async (cookie: string): Promise<{
+      publicComment: string;
+      privateNote: string;
+    }> => {
       const response = await app.inject({
         method: "GET",
         url: `/api/v1/problems/${problemId}/reviews`,
         headers: { cookie }
       });
       expect(response.statusCode).toBe(200);
-      return response.json().reviews[0].privateNote as string;
+      return response.json().reviews[0] as { publicComment: string; privateNote: string };
     };
 
-    expect(await readNote(authorCookie)).toBe("");
-    expect(await readNote(reviewerCookie)).toBe("仅审核相关成员可见");
-    expect(await readNote(await login(app, "member"))).toBe("仅审核相关成员可见");
-    expect(await readNote(await login(app, "leader"))).toBe("仅审核相关成员可见");
+    expect(await readReview(authorCookie)).toEqual(expect.objectContaining({
+      publicComment: "更新后的公开评论仍然对作者可见。",
+      privateNote: ""
+    }));
+    expect((await readReview(reviewerCookie)).privateNote).toBe("仅审核相关成员可见");
+    expect((await readReview(await login(app, "member"))).privateNote)
+      .toBe("仅审核相关成员可见");
+    expect((await readReview(await login(app, "leader"))).privateNote)
+      .toBe("仅审核相关成员可见");
   });
 
   it("拒绝浏览器提交的状态字段和过期修订号", async () => {

@@ -50,6 +50,13 @@
       "when": 1785513600000,
       "tag": "0006_review_round_counted_opinions",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1785600000000,
+      "tag": "0007_review_opinion_originality",
+      "breakpoints": true
     }
   ]
 }

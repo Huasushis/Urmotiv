@@ -142,6 +142,7 @@ export const reviewOpinionSchema = z
     verdict: reviewVerdictSchema,
     codeforcesDifficulty: codeforcesDifficultySchema,
     qualityLevel: difficultyLevelSchema,
+    originalityLevel: difficultyLevelSchema.nullable().optional(),
     thinkingLevel: difficultyLevelSchema,
     codingLevel: difficultyLevelSchema,
     tagIds: z.array(z.string().min(1).max(120)).max(30),

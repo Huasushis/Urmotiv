@@ -3,6 +3,7 @@ import { Readable } from "node:stream";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import {
+  applyReviewSuggestionsInputSchema,
   casCallbackQuerySchema,
   casStartQuerySchema,
   claimRobotReviewTasksInputSchema,
@@ -1325,6 +1326,22 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   app.get("/api/v1/problems/:problemId/reviews", async (request) => {
     const user = await requireUser(request);
     return dependencies.service.getReviewSummary(user, parseProblemId(request));
+  });
+
+  app.get("/api/v1/problems/:problemId/review-suggestions", async (request) => {
+    const user = await requireUser(request);
+    return dependencies.service.getReviewSuggestions(user, parseProblemId(request));
+  });
+
+  app.post("/api/v1/problems/:problemId/review-suggestions/apply", async (request) => {
+    const user = await requireUser(request);
+    const input = applyReviewSuggestionsInputSchema.parse(request.body);
+    return dependencies.service.applyReviewSuggestions(
+      user,
+      parseProblemId(request),
+      input,
+      request.id
+    );
   });
 
   app.post("/api/v1/problems/:problemId/reviews", async (request) => {

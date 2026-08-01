@@ -102,9 +102,11 @@ interface ReviewRow extends Record<string, unknown> {
   verdict: StoredReview["verdict"];
   codeforces_difficulty: number;
   quality_level: number;
+  originality_level: number | null;
   thinking_level: number;
   coding_level: number;
   improvements: string;
+  public_comment: string;
   private_note: string;
   created_at: Date | string;
   updated_at: Date | string;
@@ -179,6 +181,22 @@ function sqlList(values: readonly (bigint | string)[], cast?: "uuid"): SQL {
     values.map((value) => (cast === "uuid" ? sql`${value}::uuid` : sql`${value}`)),
     sql`, `,
   );
+}
+
+async function hasActiveTags(
+  executor: DatabaseExecutor,
+  tagIds: readonly string[],
+): Promise<boolean> {
+  const uniqueTagIds = [...new Set(tagIds)];
+  if (uniqueTagIds.length === 0) {
+    return true;
+  }
+  const rows = await executor.query<{ count: number | string }>(sql`
+    SELECT count(*)::integer AS count
+    FROM tags
+    WHERE is_active = true AND id IN (${sqlList(uniqueTagIds)})
+  `);
+  return Number(rows[0]?.count ?? 0) === uniqueTagIds.length;
 }
 
 export function computeProblemContentHash(problem: StoredProblem): string {
@@ -878,9 +896,11 @@ async function loadReviews(
       opinion.verdict,
       opinion.codeforces_difficulty,
       opinion.quality_level,
+      opinion.originality_level,
       opinion.thinking_level,
       opinion.coding_level,
       opinion.improvements,
+      opinion.public_comment,
       opinion.private_note,
       opinion.created_at,
       opinion.updated_at
@@ -923,10 +943,12 @@ async function loadReviews(
     verdict: row.verdict,
     codeforcesDifficulty: Number(row.codeforces_difficulty),
     qualityLevel: Number(row.quality_level),
+    originalityLevel: toNullableNumber(row.originality_level),
     thinkingLevel: Number(row.thinking_level),
     codingLevel: Number(row.coding_level),
     tagIds: tagsByOpinion.get(row.id) ?? [],
     improvements: row.improvements,
+    publicComment: row.public_comment,
     privateNote: row.private_note,
     expectedRound: Number(row.expected_round),
     createdAt: toIso(row.created_at),
@@ -954,7 +976,7 @@ async function writeReview(
     throw new Error("审核轮次不存在。");
   }
 
-  await executor.execute(sql`
+  const written = await executor.query<{ id: string }>(sql`
     INSERT INTO review_opinions (
       id,
       round_id,
@@ -963,6 +985,7 @@ async function writeReview(
       verdict,
       codeforces_difficulty,
       quality_level,
+      originality_level,
       thinking_level,
       coding_level,
       improvements,
@@ -978,10 +1001,11 @@ async function writeReview(
       ${review.verdict}::review_verdict,
       ${review.codeforcesDifficulty},
       ${review.qualityLevel},
+      ${review.originalityLevel},
       ${review.thinkingLevel},
       ${review.codingLevel},
       ${review.improvements},
-      '',
+      ${review.publicComment},
       ${review.privateNote},
       ${review.createdAt}::timestamptz,
       ${review.updatedAt}::timestamptz
@@ -991,12 +1015,21 @@ async function writeReview(
         verdict = EXCLUDED.verdict,
         codeforces_difficulty = EXCLUDED.codeforces_difficulty,
         quality_level = EXCLUDED.quality_level,
+        originality_level = EXCLUDED.originality_level,
         thinking_level = EXCLUDED.thinking_level,
         coding_level = EXCLUDED.coding_level,
         improvements = EXCLUDED.improvements,
+        public_comment = EXCLUDED.public_comment,
         private_note = EXCLUDED.private_note,
         updated_at = EXCLUDED.updated_at
+    WHERE review_opinions.round_id = EXCLUDED.round_id
+      AND review_opinions.reviewer_user_id = EXCLUDED.reviewer_user_id
+      AND review_opinions.is_active = true
+    RETURNING id::text AS id
   `);
+  if (written.length !== 1) {
+    throw new Error("审核意见只能由原提交者在原审核轮次内更新。");
+  }
   await executor.execute(sql`
     DELETE FROM review_opinion_tags WHERE opinion_id = ${review.id}::uuid
   `);
@@ -1344,16 +1377,7 @@ export class DatabaseDataStore implements DataStore {
   }
 
   public async hasTags(tagIds: string[]): Promise<boolean> {
-    const uniqueTagIds = [...new Set(tagIds)];
-    if (uniqueTagIds.length === 0) {
-      return true;
-    }
-    const rows = await this.handle.query<{ count: number | string }>(sql`
-      SELECT count(*)::integer AS count
-      FROM tags
-      WHERE is_active = true AND id IN (${sqlList(uniqueTagIds)})
-    `);
-    return Number(rows[0]?.count ?? 0) === uniqueTagIds.length;
+    return hasActiveTags(this.handle, tagIds);
   }
 
   public async createProblem(problem: StoredProblem): Promise<StoredProblem> {
@@ -1615,10 +1639,12 @@ export class DatabaseDataStore implements DataStore {
         getProblem: () => undefined,
         listUsers: () => [],
         listReviews: () => [],
+        hasTags: async (tagIds) => tagIds.length === 0,
         upsertReview: () => {
           throw new Error("审核意见与当前题目不匹配。");
         },
         replaceProblem: () => false,
+        writeReviewSuggestionAudit: async () => undefined,
       });
     }
 
@@ -1653,6 +1679,7 @@ export class DatabaseDataStore implements DataStore {
             .filter((review) => review.expectedRound === round)
             .map(copy)
             .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
+        hasTags: (tagIds) => hasActiveTags(executor, tagIds),
         upsertReview: (review) => {
           if (review.problemId !== problemId) {
             throw new Error("审核意见与当前题目不匹配。");
@@ -1676,6 +1703,31 @@ export class DatabaseDataStore implements DataStore {
             ...(changedByUserId === undefined ? {} : { changedByUserId }),
           };
           return true;
+        },
+        writeReviewSuggestionAudit: async (event) => {
+          if (event.problemId !== problemId) {
+            throw new Error("审核建议审计与当前题目不匹配。");
+          }
+          const actorId = requireDatabaseId(event.actorUserId, "审核建议操作者编号");
+          await executor.execute(sql`
+            INSERT INTO audit_events (
+              actor_user_id, request_id, action, object_type, object_id, result, metadata
+            ) VALUES (
+              ${actorId},
+              ${event.requestId}::uuid,
+              'problem.review.suggestions.apply',
+              'problem',
+              ${event.problemId},
+              'success',
+              ${JSON.stringify({
+                round: event.round,
+                previousRevision: event.previousRevision,
+                nextRevision: event.nextRevision,
+                fields: event.fields,
+                opinionCount: event.opinionCount,
+              })}::jsonb
+            )
+          `);
         },
       };
 

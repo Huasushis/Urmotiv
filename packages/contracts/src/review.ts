@@ -9,10 +9,14 @@ export const reviewInputSchema = z.object({
   verdict: reviewVerdictSchema,
   codeforcesDifficulty: codeforcesDifficultySchema,
   qualityLevel: difficultyLevelSchema,
+  // v1 robot clients did not send this field. The API requires it for human
+  // submissions while keeping an omitted legacy value distinguishable as null.
+  originalityLevel: difficultyLevelSchema.nullable().optional(),
   thinkingLevel: difficultyLevelSchema,
   codingLevel: difficultyLevelSchema,
   tagIds: z.array(z.string().min(1).max(120)).max(30).default([]),
   improvements: z.string().trim().min(1, "请填写主要改进点").max(20_000),
+  publicComment: z.string().trim().max(20_000).optional(),
   privateNote: z.string().trim().max(20_000).default(""),
   expectedRound: z.number().int().positive()
 });
@@ -20,6 +24,8 @@ export const reviewInputSchema = z.object({
 export type ReviewInput = z.infer<typeof reviewInputSchema>;
 
 export const reviewSchema = reviewInputSchema.extend({
+  originalityLevel: difficultyLevelSchema.nullable(),
+  publicComment: z.string().trim().max(20_000),
   id: z.string(),
   problemId: z.string(),
   reviewer: userSummarySchema,
@@ -29,6 +35,67 @@ export const reviewSchema = reviewInputSchema.extend({
 });
 
 export type Review = z.infer<typeof reviewSchema>;
+
+export const reviewSuggestionFields = [
+  "codeforcesDifficulty",
+  "thinkingLevel",
+  "codingLevel",
+  "tagIds"
+] as const;
+
+export const reviewSuggestionFieldSchema = z.enum(reviewSuggestionFields);
+export type ReviewSuggestionField = z.infer<typeof reviewSuggestionFieldSchema>;
+
+export const reviewSuggestionViewSchema = z
+  .object({
+    round: z.number().int().positive(),
+    opinionCount: z.number().int().positive(),
+    current: z
+      .object({
+        codeforcesDifficulty: codeforcesDifficultySchema.nullable(),
+        thinkingLevel: difficultyLevelSchema.nullable(),
+        codingLevel: difficultyLevelSchema.nullable(),
+        tagIds: z.array(z.string().min(1).max(120)).max(30)
+      })
+      .strict(),
+    suggested: z
+      .object({
+        codeforcesDifficulty: codeforcesDifficultySchema,
+        thinkingLevel: difficultyLevelSchema,
+        codingLevel: difficultyLevelSchema,
+        tagIds: z.array(z.string().min(1).max(120)).max(30),
+        qualityLevel: difficultyLevelSchema,
+        originalityLevel: difficultyLevelSchema.nullable()
+      })
+      .strict(),
+    canApply: z.boolean()
+  })
+  .strict();
+
+export type ReviewSuggestionView = z.infer<typeof reviewSuggestionViewSchema>;
+
+export const applyReviewSuggestionsInputSchema = z
+  .object({
+    expectedRound: z.number().int().positive(),
+    expectedRevision: z.number().int().positive(),
+    fields: z.array(reviewSuggestionFieldSchema).min(1).max(reviewSuggestionFields.length)
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const seen = new Set<ReviewSuggestionField>();
+    value.fields.forEach((field, index) => {
+      if (seen.has(field)) {
+        context.addIssue({
+          code: "custom",
+          message: "同一个建议字段不能重复选择。",
+          path: ["fields", index]
+        });
+      }
+      seen.add(field);
+    });
+  });
+
+export type ApplyReviewSuggestionsInput = z.infer<typeof applyReviewSuggestionsInputSchema>;
 
 export const reviewRoundSummarySchema = z.object({
   round: z.number().int().positive(),

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseExecutor } from "@urmotiv/database";
-import type { ProblemTag } from "@urmotiv/contracts";
+import type { ProblemTag, ReviewSuggestionField } from "@urmotiv/contracts";
 import type {
   ProblemListFilters,
   StoredProblem,
@@ -23,16 +23,29 @@ export type ProblemRevisionAction = (
   executor: DatabaseExecutor
 ) => Promise<void>;
 
+export interface ReviewSuggestionAuditEvent {
+  readonly actorUserId: string;
+  readonly requestId: string;
+  readonly problemId: string;
+  readonly round: number;
+  readonly previousRevision: number;
+  readonly nextRevision: number;
+  readonly fields: readonly ReviewSuggestionField[];
+  readonly opinionCount: number;
+}
+
 export interface ProblemTransaction {
   getProblem(): StoredProblem | undefined;
   listUsers(): StoredUser[];
   listReviews(round: number): StoredReview[];
+  hasTags(tagIds: readonly string[]): Promise<boolean>;
   upsertReview(review: StoredReview): void;
   replaceProblem(
     problem: StoredProblem,
     expectedRevision: number,
     changedByUserId?: string
   ): boolean;
+  writeReviewSuggestionAudit(event: ReviewSuggestionAuditEvent): Promise<void>;
   /** Database transactions expose their executor only so related core stores can share it. */
   readonly executor?: DatabaseExecutor;
 }
@@ -430,6 +443,7 @@ export class InMemoryDataStore implements DataStore {
             .filter((review) => review.expectedRound === round)
             .map(copy)
             .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
+        hasTags: async (tagIds) => tagIds.every((tagId) => this.tags.has(tagId)),
         upsertReview: (review) => {
           if (review.problemId !== problemId) {
             throw new Error("审核意见与当前题目不匹配。");
@@ -447,7 +461,8 @@ export class InMemoryDataStore implements DataStore {
           }
           problem = copy(nextProblem);
           return true;
-        }
+        },
+        writeReviewSuggestionAudit: async () => undefined
       };
 
       const result = await operation(transaction);

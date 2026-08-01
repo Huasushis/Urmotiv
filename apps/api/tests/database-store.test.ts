@@ -15,6 +15,7 @@ import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo"
 import { DatabaseDataStore } from "../src/database-store";
 import type { ProblemListFilters, StoredProblem, StoredReview, StoredUser } from "../src/domain";
 import { createProblemVisibility } from "../src/permissions";
+import { ProblemService } from "../src/service";
 
 const createdAt = "2026-07-26T00:00:00.000Z";
 const listFilters: ProblemListFilters = {
@@ -313,6 +314,148 @@ describe("数据库题目仓库", () => {
     expect(stored).toEqual(expect.objectContaining({ title: "第一次修改", revision: 2 }));
   });
 
+  it("迁移前审核意见缺少原创性时按 null 持久化和读取", async () => {
+    const database = await openDatabase(true);
+    const store = new DatabaseDataStore(database);
+    const pending = await store.createProblem(
+      problem({ status: "pending_review", reviewRound: 1 }),
+    );
+    const historicalReview: StoredReview = {
+      id: randomUUID(),
+      problemId: pending.id,
+      reviewerId: databaseDemoUserIds.reviewer,
+      reviewer: {
+        id: databaseDemoUserIds.reviewer,
+        nickname: "审题人演示账号",
+        accountType: "human",
+      },
+      source: "human",
+      verdict: "approve",
+      codeforcesDifficulty: 1200,
+      qualityLevel: 3,
+      originalityLevel: null,
+      thinkingLevel: 2,
+      codingLevel: 1,
+      tagIds: ["algorithm.implementation"],
+      improvements: "历史审核意见没有原创性字段。",
+      publicComment: "历史公开评论。",
+      privateNote: "",
+      expectedRound: 1,
+      createdAt,
+      updatedAt: createdAt,
+    };
+
+    await store.runProblemTransaction(pending.id, (transaction) => {
+      transaction.upsertReview(historicalReview);
+    });
+
+    expect(await store.listReviews(pending.id, 1)).toEqual([
+      expect.objectContaining({ id: historicalReview.id, originalityLevel: null }),
+    ]);
+  });
+
+  it("审核建议写回在数据库事务中创建修订和安全审计", async () => {
+    const database = await openDatabase(true);
+    const store = new DatabaseDataStore(database);
+    const service = new ProblemService(store, {
+      now: () => new Date("2026-08-01T01:00:00.000Z")
+    });
+    const author = requireUser(await store.getUser(databaseDemoUserIds.author));
+    const reviewer = requireUser(await store.getUser(databaseDemoUserIds.reviewer));
+    const member = requireUser(await store.getUser(databaseDemoUserIds.member));
+    const leader = requireUser(await store.getUser(databaseDemoUserIds.leader));
+    const draft = await service.createProblem(author, {
+      title: "公开构造的数据库审核建议测试题",
+      type: "traditional",
+      tagIds: ["string"],
+      codeforcesDifficulty: 800,
+      thinkingLevel: 1,
+      codingLevel: 5,
+      content: {
+        basicStatement: "给定一个整数，输出它本身。",
+        basicSolution: "直接输出输入即可。",
+        background: "",
+        statement: "",
+        inputFormat: "",
+        outputFormat: "",
+        constraints: "",
+        solution: "",
+        hints: ""
+      }
+    });
+    const pending = await service.submitProblem(author, draft.id, draft.revision);
+    const baseReview = {
+      verdict: "approve" as const,
+      qualityLevel: 2,
+      originalityLevel: 2,
+      thinkingLevel: 2,
+      codingLevel: 1,
+      tagIds: ["algorithm.implementation"],
+      improvements: "补充公开构造的边界说明。",
+      publicComment: "公开评论。",
+      privateNote: "数据库事务测试私密备注。",
+      expectedRound: pending.reviewRound
+    };
+    await service.submitReview(reviewer, draft.id, {
+      ...baseReview,
+      codeforcesDifficulty: 1200
+    });
+    await service.submitReview(member, draft.id, {
+      ...baseReview,
+      codeforcesDifficulty: 1300,
+      qualityLevel: 3,
+      originalityLevel: 3,
+      thinkingLevel: 3,
+      codingLevel: 2,
+      tagIds: ["dynamic-programming"]
+    });
+    const approved = await service.getProblem(leader, draft.id);
+    expect(approved.status).toBe("approved");
+
+    const applied = await service.applyReviewSuggestions(
+      leader,
+      draft.id,
+      {
+        expectedRound: approved.reviewRound,
+        expectedRevision: approved.revision,
+        fields: ["codeforcesDifficulty", "tagIds"]
+      },
+      randomUUID()
+    );
+    expect(applied).toEqual(expect.objectContaining({
+      revision: approved.revision + 1,
+      codeforcesDifficulty: 1300,
+      tagIds: ["algorithm.implementation", "dynamic-programming"]
+    }));
+
+    const auditRows = await database.query<{
+      action: string;
+      object_id: string | null;
+      metadata: unknown;
+    }>(sql`
+      SELECT action, object_id, metadata
+      FROM audit_events
+      WHERE action = 'problem.review.suggestions.apply'
+    `);
+    expect(auditRows).toHaveLength(1);
+    const rawMetadata = auditRows[0]?.metadata;
+    const metadata = typeof rawMetadata === "string"
+      ? JSON.parse(rawMetadata) as unknown
+      : rawMetadata;
+    expect(auditRows[0]).toEqual(expect.objectContaining({ object_id: draft.id }));
+    expect(metadata).toEqual({
+      round: approved.reviewRound,
+      previousRevision: approved.revision,
+      nextRevision: approved.revision + 1,
+      fields: ["codeforcesDifficulty", "tagIds"],
+      opinionCount: 2
+    });
+    const serializedMetadata = JSON.stringify(metadata);
+    expect(serializedMetadata).not.toContain("algorithm.implementation");
+    expect(serializedMetadata).not.toContain(baseReview.privateNote);
+    expect(serializedMetadata).not.toContain(baseReview.publicComment);
+  });
+
   it("审核写入失败时同时回滚审核意见和题目状态", async () => {
     const database = await openDatabase(true);
     const store = new DatabaseDataStore(database);
@@ -332,10 +475,12 @@ describe("数据库题目仓库", () => {
       verdict: "approve",
       codeforcesDifficulty: 1200,
       qualityLevel: 3,
+      originalityLevel: null,
       thinkingLevel: 2,
       codingLevel: 1,
       tagIds: ["not-a-real-tag"],
       improvements: "补充边界说明。",
+      publicComment: "公开评论",
       privateNote: "人工构造的私密备注",
       expectedRound: 1,
       createdAt,

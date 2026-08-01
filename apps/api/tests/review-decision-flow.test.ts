@@ -155,6 +155,7 @@ function reviewInput(
     verdict,
     codeforcesDifficulty: 1200,
     qualityLevel: 3,
+    originalityLevel: 3,
     thinkingLevel: 2,
     codingLevel: 1,
     tagIds: ["algorithm.implementation"],
@@ -739,6 +740,7 @@ describe("可配置审核决定流程", () => {
         verdict: "approve",
         codeforcesDifficulty: 2300,
         qualityLevel: 4,
+        originalityLevel: 5,
         thinkingLevel: 5,
         codingLevel: 3,
         tagIds: ["algorithm.implementation"],
@@ -771,6 +773,7 @@ describe("可配置审核决定流程", () => {
       verdict: "approve",
       codeforcesDifficulty: 2300,
       qualityLevel: 4,
+      originalityLevel: 5,
       thinkingLevel: 5,
       codingLevel: 3,
       tagIds: ["algorithm.implementation"],
@@ -781,6 +784,7 @@ describe("可配置审核决定流程", () => {
       "codingLevel",
       "id",
       "improvements",
+      "originalityLevel",
       "qualityLevel",
       "reviewRound",
       "reviewerAccountType",
@@ -895,6 +899,64 @@ describe("可配置审核决定流程", () => {
     }
   });
 
+  it("人工意见强制填写原创性，v1 机器人缺失时明确保存为 null", async () => {
+    const { app } = await makeApp();
+    const authorCookie = await login(app, "author");
+    const reviewerCookie = await login(app, "reviewer");
+    const robotCookie = await login(app, "robot");
+    const problem = await submitProblem(app, authorCookie, await createDraft(app, authorCookie));
+    const legacyInput = reviewInput(problem.reviewRound, "request_changes");
+    delete legacyInput.originalityLevel;
+
+    const missingHumanOriginality = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${problem.id}/reviews`,
+      headers: { cookie: reviewerCookie, origin },
+      payload: legacyInput
+    });
+    expect(missingHumanOriginality.statusCode).toBe(422);
+    expect(missingHumanOriginality.json()).toEqual({
+      error: expect.objectContaining({
+        code: "ORIGINALITY_LEVEL_REQUIRED",
+        fieldErrors: { originalityLevel: expect.any(Array) }
+      })
+    });
+
+    const legacyRobot = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${problem.id}/reviews`,
+      headers: { cookie: robotCookie, origin },
+      payload: legacyInput
+    });
+    expect(legacyRobot.statusCode).toBe(200);
+    expect(legacyRobot.json()).toEqual(expect.objectContaining({
+      reviews: [expect.objectContaining({
+        source: "fermata",
+        originalityLevel: null,
+        publicComment: ""
+      })]
+    }));
+
+    const human = await submitReview(
+      app,
+      reviewerCookie,
+      problem.id,
+      problem.reviewRound,
+      "request_changes"
+    );
+    expect(human.statusCode).toBe(200);
+    expect((human.json() as ReviewSummaryResult).reviews).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        reviewer: expect.objectContaining({ id: "reviewer" }),
+        originalityLevel: 3
+      }),
+      expect.objectContaining({
+        reviewer: expect.objectContaining({ id: "robot" }),
+        originalityLevel: null
+      })
+    ]));
+  });
+
   it("同一审题人修改自己的意见时重新判定题目，轮次结束后不能再改", async () => {
     for (const expected of [
       {
@@ -1005,6 +1067,7 @@ describe("可配置审核决定流程", () => {
       await createDraft(app, authorCookie)
     );
     const privateNote = "只允许审题人查看的测试备注。";
+    const publicComment = "作者和其他可见用户都可以读取的公开评论。";
 
     const review = await app.inject({
       method: "POST",
@@ -1012,6 +1075,7 @@ describe("可配置审核决定流程", () => {
       headers: { cookie: reviewerCookie, origin },
       payload: {
         ...reviewInput(problem.reviewRound, "request_changes"),
+        publicComment,
         privateNote
       }
     });
@@ -1029,6 +1093,7 @@ describe("可配置审核决定流程", () => {
         expect.objectContaining({
           verdict: "request_changes",
           improvements: "请补充边界情况说明。",
+          publicComment,
           privateNote: ""
         })
       ]
@@ -1050,6 +1115,76 @@ describe("可配置审核决定流程", () => {
     });
     expect(hidden.statusCode).toBe(404);
     expect(hidden.body).not.toContain("审核规则测试题");
+    expect(hidden.body).not.toContain(publicComment);
+    expect(hidden.body).not.toContain(privateNote);
+  });
+
+  it("作者兼任当前有效审题人时可读私密备注，明确拒绝审题权限后不可读", async () => {
+    const { app } = await makeApp();
+    const reviewingAuthorCookie = await login(app, "member");
+    const reviewerCookie = await login(app, "reviewer");
+    const problem = await submitProblem(
+      app,
+      reviewingAuthorCookie,
+      await createDraft(app, reviewingAuthorCookie)
+    );
+    const privateNote = "作者只有兼任有效审题人时才能看到这段测试备注。";
+    const reviewed = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${problem.id}/reviews`,
+      headers: { cookie: reviewerCookie, origin },
+      payload: {
+        ...reviewInput(problem.reviewRound, "request_changes"),
+        privateNote
+      }
+    });
+    expect(reviewed.statusCode).toBe(200);
+    const visible = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${problem.id}/reviews`,
+      headers: { cookie: reviewingAuthorCookie }
+    });
+    expect(visible.statusCode).toBe(200);
+    expect(visible.json().reviews).toEqual([
+      expect.objectContaining({ privateNote })
+    ]);
+
+    const member = demoUser("member");
+    const deniedReviewingAuthor: StoredUser = {
+      ...member,
+      id: "reviewing-author-denied",
+      nickname: "明确拒绝审题权限的作者",
+      grants: [...member.grants, deny("problem.review")]
+    };
+    const deniedContext = await makeApp({
+      users: [...createDemoUsers(), deniedReviewingAuthor]
+    });
+    const deniedAuthorCookie = await login(deniedContext.app, deniedReviewingAuthor.id);
+    const deniedReviewerCookie = await login(deniedContext.app, "reviewer");
+    const deniedProblem = await submitProblem(
+      deniedContext.app,
+      deniedAuthorCookie,
+      await createDraft(deniedContext.app, deniedAuthorCookie)
+    );
+    const deniedReview = await deniedContext.app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${deniedProblem.id}/reviews`,
+      headers: { cookie: deniedReviewerCookie, origin },
+      payload: {
+        ...reviewInput(deniedProblem.reviewRound, "request_changes"),
+        privateNote
+      }
+    });
+    expect(deniedReview.statusCode).toBe(200);
+    const hidden = await deniedContext.app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${deniedProblem.id}/reviews`,
+      headers: { cookie: deniedAuthorCookie }
+    });
+    expect(hidden.statusCode).toBe(200);
+    expect(hidden.json().reviews).toEqual([
+      expect.objectContaining({ privateNote: "" })
+    ]);
     expect(hidden.body).not.toContain(privateNote);
   });
 

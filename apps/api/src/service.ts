@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  type ApplyReviewSuggestionsInput,
   problemDraftSchema,
   type CreateProblemInput,
   type ManualReviewDecisionInput,
@@ -15,6 +16,7 @@ import {
   type ReviewItemListResponse,
   type ReviewItemView,
   type ReviewRoundSummary,
+  type ReviewSuggestionView,
   type SessionUser,
   type SimilarityCheckResponse,
   type UpdateProblemInput
@@ -105,6 +107,97 @@ function emptyContent(): ProblemContent {
 
 function asIso(now: Date): string {
   return now.toISOString();
+}
+
+type SuggestedReviewValues = ReviewSuggestionView["suggested"];
+
+function reviewSuggestionUnavailable(): ApiError {
+  return conflict("当前审核轮次没有可用的冻结建议，请刷新后重试。");
+}
+
+function isDifficultyLevel(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 5;
+}
+
+function medianLevel(values: readonly number[]): number {
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) {
+    return sorted[middle] as number;
+  }
+  return Math.floor(((sorted[middle - 1] as number) + (sorted[middle] as number)) / 2 + 0.5);
+}
+
+function aggregateFrozenReviewSuggestions(
+  problem: StoredProblem,
+  roundState: StoredReviewRoundState,
+  reviews: readonly StoredReview[]
+): SuggestedReviewValues & { readonly opinionCount: number } {
+  const countedOpinionIds = roundState.countedOpinionIds;
+  if (
+    countedOpinionIds.length === 0 ||
+    countedOpinionIds.length > 10_000 ||
+    new Set(countedOpinionIds).size !== countedOpinionIds.length
+  ) {
+    throw reviewSuggestionUnavailable();
+  }
+
+  const reviewsById = new Map<string, StoredReview>();
+  for (const review of reviews) {
+    if (reviewsById.has(review.id)) {
+      throw reviewSuggestionUnavailable();
+    }
+    reviewsById.set(review.id, review);
+  }
+
+  const countedReviews = countedOpinionIds.map((id) => {
+    const review = reviewsById.get(id);
+    if (
+      review === undefined ||
+      review.problemId !== problem.id ||
+      review.expectedRound !== problem.reviewRound
+    ) {
+      throw reviewSuggestionUnavailable();
+    }
+    if (
+      !Number.isInteger(review.codeforcesDifficulty) ||
+      review.codeforcesDifficulty < 800 ||
+      review.codeforcesDifficulty > 3500 ||
+      review.codeforcesDifficulty % 100 !== 0 ||
+      !isDifficultyLevel(review.qualityLevel) ||
+      (review.originalityLevel !== null && !isDifficultyLevel(review.originalityLevel)) ||
+      !isDifficultyLevel(review.thinkingLevel) ||
+      !isDifficultyLevel(review.codingLevel)
+    ) {
+      throw reviewSuggestionUnavailable();
+    }
+    return review;
+  });
+
+  const tagIds = [...new Set(countedReviews.flatMap((review) => review.tagIds))].sort();
+  if (
+    tagIds.length > 30 ||
+    tagIds.some((tagId) => tagId.length === 0 || tagId.length > 120)
+  ) {
+    throw reviewSuggestionUnavailable();
+  }
+
+  const averageCodeforcesDifficulty = countedReviews.reduce(
+    (sum, review) => sum + review.codeforcesDifficulty,
+    0
+  ) / countedReviews.length;
+  const originalityLevels = countedReviews.flatMap((review) =>
+    review.originalityLevel === null ? [] : [review.originalityLevel]
+  );
+  return {
+    codeforcesDifficulty: Math.floor(averageCodeforcesDifficulty / 100 + 0.5) * 100,
+    thinkingLevel: medianLevel(countedReviews.map((review) => review.thinkingLevel)),
+    codingLevel: medianLevel(countedReviews.map((review) => review.codingLevel)),
+    tagIds,
+    qualityLevel: medianLevel(countedReviews.map((review) => review.qualityLevel)),
+    originalityLevel: originalityLevels.length === 0 ? null : medianLevel(originalityLevels),
+    opinionCount: countedReviews.length
+  };
 }
 
 function frozenFieldErrors(
@@ -693,6 +786,128 @@ export class ProblemService {
     return this.aggregateReviewRound(problem, user);
   }
 
+  public async getReviewSuggestions(
+    user: StoredUser,
+    problemId: string
+  ): Promise<ReviewSuggestionView> {
+    await this.findVisibleProblem(user, problemId);
+    return this.store.runProblemTransaction(problemId, async (transaction) => {
+      const problem = transaction.getProblem();
+      const actor = transaction.listUsers().find((candidate) => candidate.id === user.id);
+      const evaluatedAt = this.now();
+      if (
+        problem === undefined ||
+        actor === undefined ||
+        !canViewProblem(createProblemVisibility(actor, evaluatedAt), problem)
+      ) {
+        throw notFound();
+      }
+
+      const roundState = this.requireApprovedSuggestionRound(problem);
+      const aggregate = aggregateFrozenReviewSuggestions(
+        problem,
+        roundState,
+        transaction.listReviews(problem.reviewRound)
+      );
+      if (!(await transaction.hasTags(aggregate.tagIds))) {
+        throw reviewSuggestionUnavailable();
+      }
+      const target = { ownerId: problem.ownerId, objectId: problem.id };
+      const { opinionCount, ...suggested } = aggregate;
+      return {
+        round: problem.reviewRound,
+        opinionCount,
+        current: {
+          codeforcesDifficulty: problem.codeforcesDifficulty,
+          thinkingLevel: problem.thinkingLevel,
+          codingLevel: problem.codingLevel,
+          tagIds: [...problem.tagIds]
+        },
+        suggested,
+        canApply:
+          actor.accountType === "human" &&
+          hasPermission(actor, "problem.status.change", target, evaluatedAt) &&
+          canEditProblem(actor, problem, evaluatedAt)
+      };
+    });
+  }
+
+  public async applyReviewSuggestions(
+    user: StoredUser,
+    problemId: string,
+    input: ApplyReviewSuggestionsInput,
+    requestId: string
+  ): Promise<Problem> {
+    await this.findVisibleProblem(user, problemId);
+    const updated = await this.store.runProblemTransaction(problemId, async (transaction) => {
+      const problem = transaction.getProblem();
+      const actor = transaction.listUsers().find((candidate) => candidate.id === user.id);
+      const evaluatedAt = this.now();
+      if (
+        problem === undefined ||
+        actor === undefined ||
+        !canViewProblem(createProblemVisibility(actor, evaluatedAt), problem)
+      ) {
+        throw notFound();
+      }
+
+      const target = { ownerId: problem.ownerId, objectId: problem.id };
+      if (
+        actor.accountType !== "human" ||
+        !hasPermission(actor, "problem.status.change", target, evaluatedAt) ||
+        !canEditProblem(actor, problem, evaluatedAt)
+      ) {
+        throw forbidden();
+      }
+      const roundState = this.requireApprovedSuggestionRound(problem);
+      if (input.expectedRound !== problem.reviewRound) {
+        throw conflict("审核轮次已变化，请刷新后重试。");
+      }
+      this.assertExpectedRevision(problem, input.expectedRevision);
+
+      const aggregate = aggregateFrozenReviewSuggestions(
+        problem,
+        roundState,
+        transaction.listReviews(problem.reviewRound)
+      );
+      if (!(await transaction.hasTags(aggregate.tagIds))) {
+        throw reviewSuggestionUnavailable();
+      }
+
+      const selectedFields = new Set(input.fields);
+      const next: StoredProblem = {
+        ...problem,
+        codeforcesDifficulty: selectedFields.has("codeforcesDifficulty")
+          ? aggregate.codeforcesDifficulty
+          : problem.codeforcesDifficulty,
+        thinkingLevel: selectedFields.has("thinkingLevel")
+          ? aggregate.thinkingLevel
+          : problem.thinkingLevel,
+        codingLevel: selectedFields.has("codingLevel")
+          ? aggregate.codingLevel
+          : problem.codingLevel,
+        tagIds: selectedFields.has("tagIds") ? [...aggregate.tagIds] : [...problem.tagIds],
+        revision: problem.revision + 1,
+        updatedAt: asIso(evaluatedAt)
+      };
+      if (!transaction.replaceProblem(next, problem.revision, actor.id)) {
+        throw conflict("题目已被其他操作修改，请刷新后重试。");
+      }
+      await transaction.writeReviewSuggestionAudit({
+        actorUserId: actor.id,
+        requestId,
+        problemId: problem.id,
+        round: problem.reviewRound,
+        previousRevision: problem.revision,
+        nextRevision: next.revision,
+        fields: [...input.fields],
+        opinionCount: aggregate.opinionCount
+      });
+      return next;
+    });
+    return this.toProblem(updated, user);
+  }
+
   public async submitReview(
     user: StoredUser,
     problemId: string,
@@ -700,7 +915,6 @@ export class ProblemService {
     requestId?: string
   ): Promise<ReviewRoundSummary> {
     await this.findVisibleProblem(user, problemId);
-    await this.assertKnownTags(input.tagIds);
     return this.store.runProblemTransaction(problemId, async (transaction) => {
       const problem = transaction.getProblem();
       const users = transaction.listUsers();
@@ -723,6 +937,22 @@ export class ProblemService {
       if (input.expectedRound !== problem.reviewRound) {
         throw conflict("审核轮次已变化，请刷新后重试。");
       }
+      if (actor.accountType === "human" && input.originalityLevel == null) {
+        throw new ApiError(
+          422,
+          "ORIGINALITY_LEVEL_REQUIRED",
+          "人工审核意见必须填写原创性等级。",
+          { originalityLevel: ["请选择 1 至 5 的原创性等级。"] }
+        );
+      }
+      if (
+        new Set(input.tagIds).size !== input.tagIds.length ||
+        !(await transaction.hasTags(input.tagIds))
+      ) {
+        throw new ApiError(422, "INVALID_TAGS", "知识点中包含无效或重复项。", {
+          tagIds: ["请选择存在且不重复的知识点。"]
+        });
+      }
 
       const existing = transaction
         .listReviews(problem.reviewRound)
@@ -730,6 +960,8 @@ export class ProblemService {
       const now = asIso(this.now());
       const review: StoredReview = {
         ...input,
+        originalityLevel: input.originalityLevel ?? null,
+        publicComment: input.publicComment ?? "",
         id: existing?.id ?? randomUUID(),
         problemId: problem.id,
         reviewer: {
@@ -986,7 +1218,7 @@ export class ProblemService {
       this.now()
     );
     const canReadAllPrivateNotes =
-      viewerCanChangeStatus || (viewer.id !== problem.ownerId && viewerCanReview);
+      viewerCanChangeStatus || viewerCanReview;
     const canReadDecisionReason =
       roundState.status !== "open" &&
       (viewer.id === problem.ownerId || canReadAllPrivateNotes);
@@ -1079,6 +1311,7 @@ export class ProblemService {
         verdict: review.verdict,
         codeforcesDifficulty: review.codeforcesDifficulty,
         qualityLevel: review.qualityLevel,
+        originalityLevel: review.originalityLevel,
         thinkingLevel: review.thinkingLevel,
         codingLevel: review.codingLevel,
         tagIds: [...review.tagIds],
@@ -1125,6 +1358,20 @@ export class ProblemService {
     const roundState = this.requireRoundState(problem);
     if (roundState.status !== "open") {
       throw conflict("审核轮次已经结束，请刷新后重试。");
+    }
+    return roundState;
+  }
+
+  private requireApprovedSuggestionRound(problem: StoredProblem): StoredReviewRoundState {
+    const roundState = problem.reviewRoundState;
+    if (
+      problem.status !== "approved" ||
+      problem.reviewRound <= 0 ||
+      roundState === undefined ||
+      roundState.round !== problem.reviewRound ||
+      roundState.status !== "approved"
+    ) {
+      throw conflict("只有当前审核轮次已经通过并关闭的题目可以使用审核建议。");
     }
     return roundState;
   }
