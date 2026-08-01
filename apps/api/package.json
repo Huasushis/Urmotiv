@@ -25,6 +25,7 @@
     "@urmotiv/storage": "workspace:*",
     "drizzle-orm": "latest",
     "fastify": "latest",
+    "undici": "7.29.0",
     "zod": "latest"
   },
   "devDependencies": {

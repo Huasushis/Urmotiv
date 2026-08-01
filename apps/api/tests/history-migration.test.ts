@@ -669,27 +669,26 @@ describe("历史题目迁移安全核心", () => {
 });
 
 describe("历史题目模型整理响应限制", () => {
-  it("响应头已经返回但正文不结束时仍按统一时限停止", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        return new Response(
-          new ReadableStream<Uint8Array>({
-            start() {
-              // 故意只返回响应头，让正文保持未完成。
-            }
-          }),
-          { status: 200 }
-        );
-      })
-    );
+  it("响应头已经返回但正文没有首段有效输出时按首段时限停止", async () => {
+    const fetch = vi.fn(async () => {
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start() {
+            // 故意只返回响应头，让正文保持未完成。
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      );
+    });
     const normalizer = createLlmHistoryNormalizer({
       baseUrl: "https://synthetic.invalid/v1/",
       apiKey: "synthetic-key",
       model: "synthetic-model",
-      requestTimeoutMs: 20,
+      firstOutputTimeoutMs: 20,
+      outputIdleTimeoutMs: 20,
       maximumAttempts: 1,
-      maximumResponseBytes: 1_000
+      maximumResponseBytes: 1_000,
+      fetch
     });
 
     await expect(
@@ -701,25 +700,24 @@ describe("历史题目模型整理响应限制", () => {
       })
     ).rejects.toMatchObject({
       code: "NORMALIZATION_FAILED",
-      message: "source-000001 的模型请求失败。"
+      message: "source-000001 的模型请求在首段有效输出前超时。"
     });
   });
 
   it("模型响应正文超过字节上限时停止且错误不含响应内容", async () => {
     const privateMarker = "SYNTHETIC-PRIVATE-RESPONSE-MARKER";
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        return new Response(privateMarker.repeat(4), { status: 200 });
-      })
-    );
+    const fetch = vi.fn(async () => {
+      return new Response(privateMarker.repeat(4), { status: 200 });
+    });
     const normalizer = createLlmHistoryNormalizer({
       baseUrl: "https://synthetic.invalid/v1/",
       apiKey: "synthetic-key",
       model: "synthetic-model",
-      requestTimeoutMs: 1_000,
+      firstOutputTimeoutMs: 1_000,
+      outputIdleTimeoutMs: 1_000,
       maximumAttempts: 1,
-      maximumResponseBytes: 32
+      maximumResponseBytes: 32,
+      fetch
     });
 
     let caught: unknown;
