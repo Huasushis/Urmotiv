@@ -4,9 +4,12 @@
  * 具体校验、候选生成和题目包生成都在 src/history-migration 中。本文件只读取参数，
  * 这样安全规则可以用合成数据做单元测试。所有输入和输出都必须位于服务器非 Git 私有目录。
  */
+import { join } from "node:path";
 import {
+  assertHistoryMaterializationComplete,
   createLlmHistoryNormalizer,
   HistoryMigrationError,
+  initializeHistoryGroupingWorksheet,
   inventoryHistorySources,
   materializeHistoryGrouping,
   packageApprovedCandidates,
@@ -23,6 +26,14 @@ type Command =
       readonly outputDirectory: string;
     }
   | {
+      readonly phase: "init-grouping";
+      readonly privateRootDirectory: string;
+      readonly sourceInventoryFile: string;
+      readonly sourceLocationsFile: string;
+      readonly metadataFile: string;
+      readonly outputDirectory: string;
+    }
+  | {
       readonly phase: "seal-grouping";
       readonly privateRootDirectory: string;
       readonly sourceDirectory: string;
@@ -30,14 +41,15 @@ type Command =
       readonly sourceLocationsFile: string;
       readonly metadataFile: string;
       readonly groupingPlanFile: string;
-      readonly outputFile: string;
+      readonly outputDirectory: string;
     }
   | {
       readonly phase: "confirm-grouping";
       readonly privateRootDirectory: string;
       readonly sourceInventoryFile: string;
+      readonly sourceLocationsFile: string;
       readonly metadataFile: string;
-      readonly groupingFile: string;
+      readonly groupingDirectory: string;
       readonly outputFile: string;
       readonly confirmed: true;
     }
@@ -48,16 +60,15 @@ type Command =
       readonly sourceInventoryFile: string;
       readonly sourceLocationsFile: string;
       readonly metadataFile: string;
-      readonly groupingFile: string;
+      readonly groupingDirectory: string;
       readonly groupingConfirmationFile: string;
       readonly outputDirectory: string;
     }
   | {
       readonly phase: "prepare";
       readonly privateRootDirectory: string;
-      readonly sourceDirectory: string;
+      readonly materializedDirectory: string;
       readonly metadataFile: string;
-      readonly sourceConfirmationFile: string;
       readonly outputDirectory: string;
     }
   | {
@@ -81,10 +92,17 @@ async function main(): Promise<void> {
     );
     return;
   }
+  if (command.phase === "init-grouping") {
+    await initializeHistoryGroupingWorksheet(command);
+    process.stdout.write(
+      "已生成只含安全编号和计数的空白分组工作表；没有生成任何映射建议或人工确认。\n",
+    );
+    return;
+  }
   if (command.phase === "seal-grouping") {
     const result = await sealHistoryGrouping(command);
     process.stdout.write(
-      `已为 ${result.fragmentCount} 个人工选择片段计算摘要，形成 ${result.groupCount} 个待单独确认的题目分组。\n`,
+      `已为 ${result.fragmentCount} 个人工选择片段计算摘要，形成 ${result.groupCount} 个完整且待单独确认的题目分组。\n`,
     );
     return;
   }
@@ -96,11 +114,15 @@ async function main(): Promise<void> {
   if (command.phase === "materialize") {
     const result = await materializeHistoryGrouping(command);
     process.stdout.write(
-      `已物化 ${result.sourceCount} 份一题一文件文本，共使用 ${result.fragmentCount} 个片段；另有 ${result.unreferencedSourceCount} 个源文件尚未进入本批分组。\n`,
+      `已物化 ${result.sourceCount} 份一题一文件文本，共使用 ${result.fragmentCount} 个片段；完整性报告没有未处置项目。\n`,
     );
     return;
   }
   if (command.phase === "prepare") {
+    await assertHistoryMaterializationComplete({
+      privateRootDirectory: command.privateRootDirectory,
+      materializedDirectory: command.materializedDirectory,
+    });
     const baseUrl = process.env.AETHER_BASE_URL;
     const apiKey = process.env.AETHER_API_KEY;
     if (baseUrl === undefined || apiKey === undefined) {
@@ -108,9 +130,12 @@ async function main(): Promise<void> {
     }
     const result = await prepareHistoryCandidates({
       privateRootDirectory: command.privateRootDirectory,
-      sourceDirectory: command.sourceDirectory,
+      sourceDirectory: join(command.materializedDirectory, "sources"),
       metadataFile: command.metadataFile,
-      sourceConfirmationFile: command.sourceConfirmationFile,
+      sourceConfirmationFile: join(
+        command.materializedDirectory,
+        "source-confirmation.private.json",
+      ),
       outputDirectory: command.outputDirectory,
       normalizer: createLlmHistoryNormalizer({
         baseUrl,
@@ -149,6 +174,16 @@ function parseCommand(argv: readonly string[]): Command {
       outputDirectory: requiredOption(argv, "--out"),
     };
   }
+  if (phase === "init-grouping") {
+    return {
+      phase,
+      privateRootDirectory: requiredOption(argv, "--private-root"),
+      sourceInventoryFile: requiredOption(argv, "--inventory"),
+      sourceLocationsFile: requiredOption(argv, "--source-locations"),
+      metadataFile: requiredOption(argv, "--metadata"),
+      outputDirectory: requiredOption(argv, "--out"),
+    };
+  }
   if (phase === "seal-grouping") {
     return {
       phase,
@@ -158,7 +193,7 @@ function parseCommand(argv: readonly string[]): Command {
       sourceLocationsFile: requiredOption(argv, "--source-locations"),
       metadataFile: requiredOption(argv, "--metadata"),
       groupingPlanFile: requiredOption(argv, "--plan"),
-      outputFile: requiredOption(argv, "--out"),
+      outputDirectory: requiredOption(argv, "--out"),
     };
   }
   if (phase === "confirm-grouping") {
@@ -167,8 +202,9 @@ function parseCommand(argv: readonly string[]): Command {
       phase,
       privateRootDirectory: requiredOption(argv, "--private-root"),
       sourceInventoryFile: requiredOption(argv, "--inventory"),
+      sourceLocationsFile: requiredOption(argv, "--source-locations"),
       metadataFile: requiredOption(argv, "--metadata"),
-      groupingFile: requiredOption(argv, "--grouping"),
+      groupingDirectory: requiredOption(argv, "--grouping"),
       outputFile: requiredOption(argv, "--out"),
       confirmed: true,
     };
@@ -181,7 +217,7 @@ function parseCommand(argv: readonly string[]): Command {
       sourceInventoryFile: requiredOption(argv, "--inventory"),
       sourceLocationsFile: requiredOption(argv, "--source-locations"),
       metadataFile: requiredOption(argv, "--metadata"),
-      groupingFile: requiredOption(argv, "--grouping"),
+      groupingDirectory: requiredOption(argv, "--grouping"),
       groupingConfirmationFile: requiredOption(argv, "--grouping-confirmation"),
       outputDirectory: requiredOption(argv, "--out"),
     };
@@ -190,9 +226,8 @@ function parseCommand(argv: readonly string[]): Command {
     return {
       phase,
       privateRootDirectory: requiredOption(argv, "--private-root"),
-      sourceDirectory: requiredOption(argv, "--source"),
+      materializedDirectory: requiredOption(argv, "--materialized"),
       metadataFile: requiredOption(argv, "--metadata"),
-      sourceConfirmationFile: requiredOption(argv, "--source-confirmation"),
       outputDirectory: requiredOption(argv, "--out"),
     };
   }
@@ -211,7 +246,7 @@ function parseCommand(argv: readonly string[]): Command {
   }
   throw new HistoryMigrationError(
     "INVALID_ARGUMENTS",
-    "必须明确选择 inventory、seal-grouping、confirm-grouping、materialize、prepare 或 package 阶段。",
+    "必须明确选择 inventory、init-grouping、seal-grouping、confirm-grouping、materialize、prepare 或 package 阶段。",
   );
 }
 

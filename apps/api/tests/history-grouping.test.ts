@@ -2,13 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   assertHistoryGroupingConfirmation,
   createHistoryGroupingConfirmation,
+  type HistoryGroupingDraft,
+  type HistoryGroupingInput,
+  type HistorySourceInventory,
   historyGroupingDraftSchema,
   historySourceInventorySchema,
   sha256Hex,
   validateHistoryGrouping,
-  type HistoryGroupingDraft,
-  type HistoryGroupingInput,
-  type HistorySourceInventory,
 } from "../src/history-migration/index";
 
 const encoder = new TextEncoder();
@@ -81,7 +81,7 @@ function sourceInventory(): HistorySourceInventory {
 
 function groupingDraft(): HistoryGroupingDraft {
   return historyGroupingDraftSchema.parse({
-    version: 1,
+    version: 2,
     fragments: [
       {
         fragmentId: "fragment-000001",
@@ -107,37 +107,24 @@ function groupingDraft(): HistoryGroupingDraft {
         selection: { kind: "zip_entry", entryId: "entry-000001" },
         contentSha256: digest(firstZipEntry),
       },
-      {
-        fragmentId: "fragment-000005",
-        sourceId: "source-000004",
-        selection: { kind: "pdf_pages", firstPage: 2, lastPage: 4 },
-        contentSha256: digest("synthetic extracted pdf pages 2-4"),
-      },
-      {
-        fragmentId: "fragment-000006",
-        sourceId: "source-000005",
-        selection: { kind: "whole_file" },
-        contentSha256: digest("synthetic whole file bytes"),
-      },
     ],
     groups: [
       {
         groupId: "group-000001",
-        metadataNumber: "metadata-1",
+        metadataId: "metadata-000001",
         fragmentIds: ["fragment-000001", "fragment-000003"],
       },
       {
         groupId: "group-000002",
-        metadataNumber: "metadata-2",
+        metadataId: "metadata-000002",
         fragmentIds: ["fragment-000002", "fragment-000004"],
-      },
-      {
-        groupId: "group-000003",
-        metadataNumber: "metadata-3",
-        fragmentIds: ["fragment-000005", "fragment-000006"],
       },
     ],
     sharingConfirmations: [],
+    metadataDispositions: [],
+    zipEntryDispositions: [],
+    textRangeDispositions: [],
+    manualSourceDispositions: [],
   });
 }
 
@@ -147,9 +134,12 @@ function groupingInput(
 ): HistoryGroupingInput {
   return {
     sourceInventory: inventory,
+    sourceLocationsSha256: digest("synthetic locations"),
+    manualReviewSha256: digest("synthetic manual review"),
     metadataFileSha256: digest("synthetic metadata file"),
     metadataNumbers: ["metadata-1", "metadata-2", "metadata-3"],
     grouping,
+    completenessReportSha256: digest("synthetic completeness report"),
   };
 }
 
@@ -171,27 +161,26 @@ describe("历史题目人工分组", () => {
 
     expect(checked.grouping.groups).toEqual([
       expect.objectContaining({
-        metadataNumber: "metadata-1",
+        metadataId: "metadata-000001",
         fragmentIds: ["fragment-000001", "fragment-000003"],
       }),
       expect.objectContaining({
-        metadataNumber: "metadata-2",
+        metadataId: "metadata-000002",
         fragmentIds: ["fragment-000002", "fragment-000004"],
-      }),
-      expect.objectContaining({
-        metadataNumber: "metadata-3",
-        fragmentIds: ["fragment-000005", "fragment-000006"],
       }),
     ]);
 
     const confirmation = createHistoryGroupingConfirmation(input);
     expect(confirmation).toEqual({
-      version: 1,
+      version: 2,
       confirmed: true,
       sourceInventorySha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      sourceLocationsSha256: input.sourceLocationsSha256,
+      manualReviewSha256: input.manualReviewSha256,
       metadataFileSha256: input.metadataFileSha256,
       fragmentSetSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
       groupingSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      completenessReportSha256: input.completenessReportSha256,
       batchSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
     });
     expect(assertHistoryGroupingConfirmation(input, confirmation)).toEqual(confirmation);
@@ -215,7 +204,7 @@ describe("历史题目人工分组", () => {
 
     grouping.groups.push({
       groupId: "group-000004",
-      metadataNumber: "metadata-4",
+      metadataId: "metadata-000004",
       fragmentIds: ["fragment-000003"],
     });
     const withFourthMetadata = {
@@ -257,7 +246,7 @@ describe("历史题目人工分组", () => {
       selection: { kind: "whole_file" },
       contentSha256: digest(firstText),
     });
-    grouping.groups[2]?.fragmentIds.push("fragment-000007");
+    grouping.groups[0]?.fragmentIds.push("fragment-000007");
 
     expectFailureCode(
       () => validateHistoryGrouping(groupingInput(grouping)),
@@ -291,11 +280,13 @@ describe("历史题目人工分组", () => {
     );
 
     const pdfOutOfRange = groupingDraft();
-    const pdfFragment = pdfOutOfRange.fragments[4];
-    if (pdfFragment?.selection.kind !== "pdf_pages") {
-      throw new Error("合成片段类型不正确。");
-    }
-    pdfFragment.selection.lastPage = 9;
+    pdfOutOfRange.fragments.push({
+      fragmentId: "fragment-000005",
+      sourceId: "source-000004",
+      selection: { kind: "pdf_pages", firstPage: 2, lastPage: 9 },
+      contentSha256: digest("synthetic extracted pdf pages"),
+    });
+    pdfOutOfRange.groups[0]?.fragmentIds.push("fragment-000005");
     expectFailureCode(
       () => validateHistoryGrouping(groupingInput(pdfOutOfRange)),
       "FRAGMENT_OUT_OF_RANGE",
@@ -339,12 +330,29 @@ describe("历史题目人工分组", () => {
 
   it("完整文件片段必须使用源文件的完整内容摘要", () => {
     const grouping = groupingDraft();
-    const wholeFileFragment = grouping.fragments[5];
-    if (wholeFileFragment === undefined) {
-      throw new Error("合成片段不存在。");
-    }
-    wholeFileFragment.contentSha256 = digest("changed whole file bytes");
+    grouping.fragments.push({
+      fragmentId: "fragment-000005",
+      sourceId: "source-000002",
+      selection: { kind: "whole_file" },
+      contentSha256: digest("changed whole file bytes"),
+    });
+    grouping.groups[0]?.fragmentIds.push("fragment-000005");
     expectFailureCode(() => validateHistoryGrouping(groupingInput(grouping)), "GROUPING_CHANGED");
+  });
+
+  it("人工或不透明文件不能用 whole_file 绕过文本转换", () => {
+    const grouping = groupingDraft();
+    grouping.fragments.push({
+      fragmentId: "fragment-000005",
+      sourceId: "source-000005",
+      selection: { kind: "whole_file" },
+      contentSha256: digest("synthetic whole file bytes"),
+    });
+    grouping.groups[0]?.fragmentIds.push("fragment-000005");
+    expectFailureCode(
+      () => validateHistoryGrouping(groupingInput(grouping)),
+      "FRAGMENT_OUT_OF_RANGE",
+    );
   });
 
   it("拒绝不存在的来源、片段、元数据以及没有归组的片段", () => {
@@ -368,7 +376,7 @@ describe("历史题目人工分组", () => {
 
     const unknownMetadata = groupingDraft();
     if (unknownMetadata.groups[0] !== undefined) {
-      unknownMetadata.groups[0].metadataNumber = "metadata-999";
+      unknownMetadata.groups[0].metadataId = "metadata-999999";
     }
     expectFailureCode(
       () => validateHistoryGrouping(groupingInput(unknownMetadata)),
@@ -383,36 +391,46 @@ describe("历史题目人工分组", () => {
   it("拒绝重复的安全编号、元数据、组内片段和共用确认", () => {
     const duplicateSource = sourceInventory();
     const firstSource = duplicateSource.sources[0];
-    expect(firstSource).toBeDefined();
-    duplicateSource.sources.push(structuredClone(firstSource!));
+    if (firstSource === undefined) {
+      throw new Error("合成源清单为空。");
+    }
+    duplicateSource.sources.push(structuredClone(firstSource));
     expectFailureCode(
       () => validateHistoryGrouping(groupingInput(groupingDraft(), duplicateSource)),
       "INVALID_GROUPING",
     );
 
     const duplicateGroup = groupingDraft();
-    duplicateGroup.groups[1]!.groupId = "group-000001";
+    const secondGroup = duplicateGroup.groups[1];
+    if (secondGroup === undefined) {
+      throw new Error("合成分组缺少第二组。");
+    }
+    secondGroup.groupId = "group-000001";
     expectFailureCode(
       () => validateHistoryGrouping(groupingInput(duplicateGroup)),
       "INVALID_GROUPING",
     );
 
     const duplicateMetadata = groupingDraft();
-    duplicateMetadata.groups[1]!.metadataNumber = "metadata-1";
+    const secondMetadataGroup = duplicateMetadata.groups[1];
+    if (secondMetadataGroup === undefined) {
+      throw new Error("合成分组缺少第二组。");
+    }
+    secondMetadataGroup.metadataId = "metadata-000001";
     expectFailureCode(
       () => validateHistoryGrouping(groupingInput(duplicateMetadata)),
       "INVALID_GROUPING",
     );
 
     const duplicateFragment = groupingDraft();
-    duplicateFragment.groups[0]!.fragmentIds.push("fragment-000001");
+    duplicateFragment.groups[0]?.fragmentIds.push("fragment-000001");
     expectFailureCode(
       () => validateHistoryGrouping(groupingInput(duplicateFragment)),
       "INVALID_GROUPING",
     );
 
     const duplicateConfirmation = groupingDraft();
-    duplicateConfirmation.groups[1]!.fragmentIds.push("fragment-000003");
+    duplicateConfirmation.groups[1]?.fragmentIds.push("fragment-000003");
     const confirmation = {
       kind: "shared_fragment" as const,
       fragmentId: "fragment-000003",
@@ -439,12 +457,61 @@ describe("历史题目人工分组", () => {
     );
   });
 
+  it("共用或重叠确认超过十万项时在展开前停止", () => {
+    const itemCount = 449;
+    const metadataNumbers = Array.from(
+      { length: itemCount },
+      (_, index) => `metadata-${index + 1}`,
+    );
+
+    const shared = groupingDraft();
+    shared.groups = Array.from({ length: itemCount }, (_, index) => ({
+      groupId: `group-${(index + 1).toString().padStart(6, "0")}`,
+      metadataId: `metadata-${(index + 1).toString().padStart(6, "0")}`,
+      fragmentIds:
+        index === 0 ? shared.fragments.map((fragment) => fragment.fragmentId) : ["fragment-000001"],
+    }));
+    expectFailureCode(
+      () =>
+        validateHistoryGrouping({
+          ...groupingInput(shared),
+          metadataNumbers,
+        }),
+      "INVALID_GROUPING",
+    );
+
+    const overlapping = groupingDraft();
+    overlapping.fragments = Array.from({ length: itemCount }, (_, index) => ({
+      fragmentId: `fragment-${(index + 1).toString().padStart(6, "0")}`,
+      sourceId: "source-000001",
+      selection: { kind: "text_range" as const, start: 0, end: 1 },
+      contentSha256: digest(firstText.slice(0, 1)),
+    }));
+    overlapping.groups = overlapping.fragments.map((fragment, index) => ({
+      groupId: `group-${(index + 1).toString().padStart(6, "0")}`,
+      metadataId: `metadata-${(index + 1).toString().padStart(6, "0")}`,
+      fragmentIds: [fragment.fragmentId],
+    }));
+    expectFailureCode(
+      () =>
+        validateHistoryGrouping({
+          ...groupingInput(overlapping),
+          metadataNumbers,
+        }),
+      "INVALID_GROUPING",
+    );
+  });
+
   it("源清单、元数据、片段或分组变化都会让旧确认失效", () => {
     const input = groupingInput();
     const confirmation = createHistoryGroupingConfirmation(input);
 
     const changedInventory = sourceInventory();
-    changedInventory.sources[0]!.byteLength += 1;
+    const changedSource = changedInventory.sources[0];
+    if (changedSource === undefined) {
+      throw new Error("合成源清单为空。");
+    }
+    changedSource.byteLength += 1;
     expectFailureCode(
       () =>
         assertHistoryGroupingConfirmation(
@@ -463,8 +530,23 @@ describe("历史题目人工分组", () => {
       "GROUPING_CHANGED",
     );
 
+    for (const changedInput of [
+      { ...input, sourceLocationsSha256: digest("changed locations") },
+      { ...input, manualReviewSha256: digest("changed manual review") },
+      { ...input, completenessReportSha256: digest("changed completeness report") },
+    ]) {
+      expectFailureCode(
+        () => assertHistoryGroupingConfirmation(changedInput, confirmation),
+        "GROUPING_CHANGED",
+      );
+    }
+
     const changedFragment = groupingDraft();
-    changedFragment.fragments[0]!.contentSha256 = digest("changed fragment");
+    const firstChangedFragment = changedFragment.fragments[0];
+    if (firstChangedFragment === undefined) {
+      throw new Error("合成分组没有片段。");
+    }
+    firstChangedFragment.contentSha256 = digest("changed fragment");
     expectFailureCode(
       () => assertHistoryGroupingConfirmation(groupingInput(changedFragment), confirmation),
       "GROUPING_CHANGED",

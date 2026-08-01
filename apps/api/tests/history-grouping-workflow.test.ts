@@ -1,16 +1,18 @@
-import { afterEach, describe, expect, it } from "vitest";
 import { lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { writeZipArchive } from "@urmotiv/problem-package";
+import { afterEach, describe, expect, it } from "vitest";
 import {
+  assertHistoryMaterializationComplete,
+  type HistoryGroupingPlan,
+  type HistorySourceInventory,
+  type HistorySourceLocations,
+  initializeHistoryGroupingWorksheet,
   inventoryHistorySources,
   materializeHistoryGrouping,
   sealHistoryGrouping,
   writeHistoryGroupingConfirmation,
-  type HistoryGroupingPlan,
-  type HistorySourceInventory,
-  type HistorySourceLocations,
 } from "../src/history-migration/index";
 
 const temporaryDirectories: string[] = [];
@@ -38,13 +40,15 @@ describe("历史题目人工分组文件工作流", () => {
       sourceCount: 4,
       fragmentCount: 4,
       groupCount: 2,
+      unresolvedItemCount: 0,
     });
 
     await writeHistoryGroupingConfirmation({
       privateRootDirectory: fixture.privateRoot,
       sourceInventoryFile: fixture.inventoryFile,
+      sourceLocationsFile: fixture.locationsFile,
       metadataFile: fixture.metadataFile,
-      groupingFile: sealed.groupingFile,
+      groupingDirectory: sealed.groupingDirectory,
       outputFile: fixture.confirmationFile,
       confirmed: true,
     });
@@ -54,7 +58,7 @@ describe("历史题目人工分组文件工作流", () => {
       sourceInventoryFile: fixture.inventoryFile,
       sourceLocationsFile: fixture.locationsFile,
       metadataFile: fixture.metadataFile,
-      groupingFile: sealed.groupingFile,
+      groupingDirectory: sealed.groupingDirectory,
       groupingConfirmationFile: fixture.confirmationFile,
       outputDirectory: fixture.materializedDirectory,
     });
@@ -62,7 +66,7 @@ describe("历史题目人工分组文件工作流", () => {
     expect(result).toEqual({
       sourceCount: 2,
       fragmentCount: 4,
-      unreferencedSourceCount: 1,
+      unresolvedItemCount: 0,
     });
     const first = await readFile(
       join(fixture.materializedDirectory, "sources", "source-000001.md"),
@@ -169,11 +173,16 @@ describe("历史题目人工分组文件工作流", () => {
 
   it("确认后分组顺序变化会使确认失效", async () => {
     const fixture = await createConfirmedFixture();
-    const grouping = JSON.parse(await readFile(fixture.groupingFile, "utf8")) as {
+    const groupingFile = join(fixture.groupingDirectory, "grouping.private.json");
+    const grouping = JSON.parse(await readFile(groupingFile, "utf8")) as {
       groups: Array<{ fragmentIds: string[] }>;
     };
-    grouping.groups[0]!.fragmentIds.reverse();
-    await writeFile(fixture.groupingFile, `${JSON.stringify(grouping, null, 2)}\n`, "utf8");
+    const firstGroup = grouping.groups[0];
+    if (firstGroup === undefined) {
+      throw new Error("合成分组缺少第一组。");
+    }
+    firstGroup.fragmentIds.reverse();
+    await writeFile(groupingFile, `${JSON.stringify(grouping, null, 2)}\n`, "utf8");
 
     await expect(materializeHistoryGrouping(materializeOptions(fixture))).rejects.toMatchObject({
       code: "GROUPING_CHANGED",
@@ -197,7 +206,7 @@ describe("历史题目人工分组文件工作流", () => {
         sourceLocationsFile: fixture.locationsFile,
         metadataFile: fixture.metadataFile,
         groupingPlanFile: planFile,
-        outputFile: join(fixture.privateRoot, "grouping.private.json"),
+        outputDirectory: join(fixture.privateRoot, "grouping-attempt"),
       }),
     ).rejects.toMatchObject({ code: "GROUPING_CHANGED" });
   });
@@ -248,7 +257,7 @@ describe("历史题目人工分组文件工作流", () => {
       }>;
     };
     expect(manualReview).toEqual({
-      version: 1,
+      version: 2,
       phase: "inventory",
       sourceCount: 1,
       manualSourceCount: 1,
@@ -322,7 +331,7 @@ describe("历史题目人工分组文件工作流", () => {
       planFile,
       `${JSON.stringify(
         {
-          version: 1,
+          version: 2,
           fragments: [
             {
               fragmentId: "fragment-000001",
@@ -333,18 +342,29 @@ describe("历史题目人工分组文件工作流", () => {
           groups: [
             {
               groupId: "group-000001",
-              metadataNumber: "metadata-1",
+              metadataId: "metadata-000001",
               fragmentIds: ["fragment-000001"],
             },
           ],
           sharingConfirmations: [],
+          metadataDispositions: [
+            {
+              metadataId: "metadata-000002",
+              action: "deferred",
+              reason: "synthetic manual decision",
+              confirmed: true,
+            },
+          ],
+          zipEntryDispositions: [],
+          textRangeDispositions: [],
+          manualSourceDispositions: [],
         },
         null,
         2,
       )}\n`,
       "utf8",
     );
-    const outputFile = join(fixture.privateRoot, "binary-grouping.private.json");
+    const outputDirectory = join(fixture.privateRoot, "binary-grouping");
 
     await expect(
       sealHistoryGrouping({
@@ -354,10 +374,10 @@ describe("历史题目人工分组文件工作流", () => {
         sourceLocationsFile: fixture.locationsFile,
         metadataFile: fixture.metadataFile,
         groupingPlanFile: planFile,
-        outputFile,
+        outputDirectory,
       }),
     ).rejects.toMatchObject({ code: "SOURCE_FILE_INVALID" });
-    await expect(lstat(outputFile)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(lstat(outputDirectory)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("没有明确人工确认或输出目录已存在时拒绝继续", async () => {
@@ -367,8 +387,9 @@ describe("历史题目人工分组文件工作流", () => {
       writeHistoryGroupingConfirmation({
         privateRootDirectory: fixture.privateRoot,
         sourceInventoryFile: fixture.inventoryFile,
+        sourceLocationsFile: fixture.locationsFile,
         metadataFile: fixture.metadataFile,
-        groupingFile: sealed.groupingFile,
+        groupingDirectory: sealed.groupingDirectory,
         outputFile: fixture.confirmationFile,
         confirmed: false,
       }),
@@ -377,25 +398,342 @@ describe("历史题目人工分组文件工作流", () => {
     await writeHistoryGroupingConfirmation({
       privateRootDirectory: fixture.privateRoot,
       sourceInventoryFile: fixture.inventoryFile,
+      sourceLocationsFile: fixture.locationsFile,
       metadataFile: fixture.metadataFile,
-      groupingFile: sealed.groupingFile,
+      groupingDirectory: sealed.groupingDirectory,
       outputFile: fixture.confirmationFile,
       confirmed: true,
     });
     await materializeHistoryGrouping(
       materializeOptions({
         ...fixture,
-        groupingFile: sealed.groupingFile,
+        groupingDirectory: sealed.groupingDirectory,
       }),
     );
     await expect(
       materializeHistoryGrouping(
         materializeOptions({
           ...fixture,
-          groupingFile: sealed.groupingFile,
+          groupingDirectory: sealed.groupingDirectory,
         }),
       ),
     ).rejects.toMatchObject({ code: "OUTPUT_ALREADY_EXISTS" });
+  });
+
+  it("完整性报告逐类列出未分组元数据、文本空档、ZIP 条目和人工源", async () => {
+    const fixture = await createCatalogFixture();
+    const metadata = JSON.parse(await readFile(fixture.metadataFile, "utf8")) as {
+      records: Array<{ number: string; name: string }>;
+    };
+    metadata.records.push({ number: "metadata-3", name: "Synthetic metadata title three" });
+    await writeFile(fixture.metadataFile, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+    const planFile = await writePlan(fixture);
+    const plan = JSON.parse(await readFile(planFile, "utf8")) as {
+      zipEntryDispositions: unknown[];
+      textRangeDispositions: unknown[];
+      manualSourceDispositions: unknown[];
+    };
+    plan.zipEntryDispositions = [];
+    plan.textRangeDispositions = [];
+    plan.manualSourceDispositions = [];
+    await writeFile(planFile, `${JSON.stringify(plan, null, 2)}\n`, "utf8");
+    const outputDirectory = join(fixture.privateRoot, "grouping-incomplete");
+
+    await expect(
+      sealHistoryGrouping({
+        privateRootDirectory: fixture.privateRoot,
+        sourceDirectory: fixture.sourceDirectory,
+        sourceInventoryFile: fixture.inventoryFile,
+        sourceLocationsFile: fixture.locationsFile,
+        metadataFile: fixture.metadataFile,
+        groupingPlanFile: planFile,
+        outputDirectory,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_GROUPING" });
+    const reportText = await readFile(join(outputDirectory, "grouping-validation.json"), "utf8");
+    const report = JSON.parse(reportText) as {
+      status: string;
+      unresolvedMetadataIds: string[];
+      uncoveredTextRanges: Array<{ sourceId: string; start: number; end: number }>;
+      unresolvedZipEntries: Array<{ sourceId: string; entryId: string }>;
+      unresolvedManualSourceIds: string[];
+      unresolvedItemCount: number;
+    };
+    expect(report).toMatchObject({
+      status: "incomplete",
+      unresolvedMetadataIds: ["metadata-000003"],
+      unresolvedItemCount: 4,
+    });
+    expect(report.uncoveredTextRanges).toHaveLength(1);
+    expect(report.unresolvedZipEntries).toHaveLength(1);
+    expect(report.unresolvedManualSourceIds).toHaveLength(1);
+    for (const privateMarker of [
+      combinedSourceName,
+      archiveSourceName,
+      manualSourceName,
+      archiveEntryName,
+      alphaText,
+      "metadata-3",
+    ]) {
+      expect(reportText).not.toContain(privateMarker);
+    }
+    await expect(lstat(join(outputDirectory, "GROUPING_COMPLETE"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("清单标记没有绑定当前人工队列时拒绝 seal", async () => {
+    const fixture = await createCatalogFixture();
+    const manualReviewFile = join(fixture.catalogDirectory, "manual-review.json");
+    const manualReview = JSON.parse(await readFile(manualReviewFile, "utf8")) as {
+      sources: Array<{ reasons: string[] }>;
+    };
+    const firstManualSource = manualReview.sources[0];
+    if (firstManualSource === undefined) {
+      throw new Error("合成人工队列为空。");
+    }
+    firstManualSource.reasons.push("synthetic_changed_reason");
+    await writeFile(manualReviewFile, `${JSON.stringify(manualReview, null, 2)}\n`, "utf8");
+
+    await expect(
+      sealHistoryGrouping({
+        privateRootDirectory: fixture.privateRoot,
+        sourceDirectory: fixture.sourceDirectory,
+        sourceInventoryFile: fixture.inventoryFile,
+        sourceLocationsFile: fixture.locationsFile,
+        metadataFile: fixture.metadataFile,
+        groupingPlanFile: await writePlan(fixture),
+        outputDirectory: join(fixture.privateRoot, "grouping-marker-mismatch"),
+      }),
+    ).rejects.toMatchObject({ code: "GROUPING_CHANGED" });
+  });
+
+  it("人工源标为已转换时必须指向实际进入分组的文本源", async () => {
+    const fixture = await createCatalogFixture();
+    const planFile = await writePlan(fixture);
+    const plan = JSON.parse(await readFile(planFile, "utf8")) as {
+      manualSourceDispositions: Array<Record<string, unknown>>;
+    };
+    const locations = await readLocations(fixture.locationsFile);
+    plan.manualSourceDispositions = [
+      {
+        sourceId: sourceIdForPath(locations, manualSourceName),
+        action: "converted",
+        convertedSourceId: sourceIdForPath(locations, extraSourceName),
+        reason: "synthetic reviewed conversion",
+        confirmed: true,
+      },
+    ];
+    await writeFile(planFile, `${JSON.stringify(plan, null, 2)}\n`, "utf8");
+    const convertedOutputDirectory = join(fixture.privateRoot, "grouping-converted");
+    await expect(
+      sealHistoryGrouping({
+        privateRootDirectory: fixture.privateRoot,
+        sourceDirectory: fixture.sourceDirectory,
+        sourceInventoryFile: fixture.inventoryFile,
+        sourceLocationsFile: fixture.locationsFile,
+        metadataFile: fixture.metadataFile,
+        groupingPlanFile: planFile,
+        outputDirectory: convertedOutputDirectory,
+      }),
+    ).resolves.toMatchObject({ unresolvedItemCount: 0 });
+    const convertedReport = JSON.parse(
+      await readFile(join(convertedOutputDirectory, "grouping-validation.json"), "utf8"),
+    ) as {
+      dispositionSummary: Array<{
+        itemId: string;
+        action: string;
+        convertedSourceId?: string;
+      }>;
+    };
+    expect(convertedReport.dispositionSummary).toContainEqual(
+      expect.objectContaining({
+        itemId: sourceIdForPath(locations, manualSourceName),
+        action: "converted",
+        convertedSourceId: sourceIdForPath(locations, extraSourceName),
+      }),
+    );
+
+    const convertedDisposition = plan.manualSourceDispositions[0];
+    if (convertedDisposition === undefined) {
+      throw new Error("合成转换处置不存在。");
+    }
+    convertedDisposition.convertedSourceId = "source-999999";
+    const invalidPlanFile = join(fixture.privateRoot, "grouping-converted-invalid.private.json");
+    await writeFile(invalidPlanFile, `${JSON.stringify(plan, null, 2)}\n`, "utf8");
+    await expect(
+      sealHistoryGrouping({
+        privateRootDirectory: fixture.privateRoot,
+        sourceDirectory: fixture.sourceDirectory,
+        sourceInventoryFile: fixture.inventoryFile,
+        sourceLocationsFile: fixture.locationsFile,
+        metadataFile: fixture.metadataFile,
+        groupingPlanFile: invalidPlanFile,
+        outputDirectory: join(fixture.privateRoot, "grouping-converted-invalid"),
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_GROUPING" });
+  });
+
+  it("片段与人工处置范围都不能切开 Unicode 代理项对", async () => {
+    const privateRoot = await createPrivateRoot();
+    const sourceDirectory = join(privateRoot, "unicode-sources");
+    await mkdir(sourceDirectory, { mode: 0o700 });
+    await writeFile(join(sourceDirectory, "synthetic-unicode.txt"), "A😀B", "utf8");
+    const catalogDirectory = join(privateRoot, "unicode-catalog");
+    await inventoryHistorySources({
+      privateRootDirectory: privateRoot,
+      sourceDirectory,
+      outputDirectory: catalogDirectory,
+    });
+    const metadataFile = join(privateRoot, "unicode-metadata.private.json");
+    await writeFile(
+      metadataFile,
+      `${JSON.stringify({ records: [{ number: "metadata-1", name: "Synthetic Unicode" }] })}\n`,
+      "utf8",
+    );
+    const planFile = join(privateRoot, "unicode-plan.private.json");
+    await writeFile(
+      planFile,
+      `${JSON.stringify({
+        version: 2,
+        fragments: [
+          {
+            fragmentId: "fragment-000001",
+            sourceId: "source-000001",
+            selection: { kind: "text_range", start: 0, end: 2 },
+          },
+        ],
+        groups: [
+          {
+            groupId: "group-000001",
+            metadataId: "metadata-000001",
+            fragmentIds: ["fragment-000001"],
+          },
+        ],
+        sharingConfirmations: [],
+        metadataDispositions: [],
+        zipEntryDispositions: [],
+        textRangeDispositions: [],
+        manualSourceDispositions: [],
+      })}\n`,
+      "utf8",
+    );
+    await expect(
+      sealHistoryGrouping({
+        privateRootDirectory: privateRoot,
+        sourceDirectory,
+        sourceInventoryFile: join(catalogDirectory, "inventory.json"),
+        sourceLocationsFile: join(catalogDirectory, "source-locations.private.json"),
+        metadataFile,
+        groupingPlanFile: planFile,
+        outputDirectory: join(privateRoot, "unicode-grouping"),
+      }),
+    ).rejects.toMatchObject({ code: "FRAGMENT_OUT_OF_RANGE" });
+
+    const dispositionPlanFile = join(privateRoot, "unicode-disposition-plan.private.json");
+    await writeFile(
+      dispositionPlanFile,
+      `${JSON.stringify({
+        version: 2,
+        fragments: [
+          {
+            fragmentId: "fragment-000001",
+            sourceId: "source-000001",
+            selection: { kind: "text_range", start: 0, end: 1 },
+          },
+        ],
+        groups: [
+          {
+            groupId: "group-000001",
+            metadataId: "metadata-000001",
+            fragmentIds: ["fragment-000001"],
+          },
+        ],
+        sharingConfirmations: [],
+        metadataDispositions: [],
+        zipEntryDispositions: [],
+        textRangeDispositions: [
+          {
+            sourceId: "source-000001",
+            start: 1,
+            end: 2,
+            action: "ignored",
+            reason: "synthetic invalid unicode boundary",
+            confirmed: true,
+          },
+        ],
+        manualSourceDispositions: [],
+      })}\n`,
+      "utf8",
+    );
+    await expect(
+      sealHistoryGrouping({
+        privateRootDirectory: privateRoot,
+        sourceDirectory,
+        sourceInventoryFile: join(catalogDirectory, "inventory.json"),
+        sourceLocationsFile: join(catalogDirectory, "source-locations.private.json"),
+        metadataFile,
+        groupingPlanFile: dispositionPlanFile,
+        outputDirectory: join(privateRoot, "unicode-disposition-grouping"),
+      }),
+    ).rejects.toMatchObject({ code: "FRAGMENT_OUT_OF_RANGE" });
+  });
+
+  it("空白工作表只列安全编号，不自动建议映射或代替确认", async () => {
+    const fixture = await createCatalogFixture();
+    const outputDirectory = join(fixture.privateRoot, "worksheet-001");
+    await initializeHistoryGroupingWorksheet({
+      privateRootDirectory: fixture.privateRoot,
+      sourceInventoryFile: fixture.inventoryFile,
+      sourceLocationsFile: fixture.locationsFile,
+      metadataFile: fixture.metadataFile,
+      outputDirectory,
+    });
+    const worksheetText = await readFile(join(outputDirectory, "worksheet.json"), "utf8");
+    const skeleton = JSON.parse(
+      await readFile(join(outputDirectory, "grouping-plan.skeleton.private.json"), "utf8"),
+    ) as { fragments: unknown[]; groups: unknown[]; manualSourceDispositions: unknown[] };
+    const marker = JSON.parse(
+      await readFile(join(outputDirectory, "WORKSHEET_COMPLETE"), "utf8"),
+    ) as { reviewed: boolean };
+    expect(skeleton).toMatchObject({
+      fragments: [],
+      groups: [],
+      manualSourceDispositions: [],
+    });
+    expect(marker.reviewed).toBe(false);
+    expect(worksheetText).toContain("metadata-000001");
+    for (const privateMarker of [
+      combinedSourceName,
+      archiveSourceName,
+      manualSourceName,
+      archiveEntryName,
+      alphaText,
+      "metadata-1",
+    ]) {
+      expect(worksheetText).not.toContain(privateMarker);
+    }
+  });
+
+  it("prepare 前会重新核对 MATERIALIZE_COMPLETE 及报告摘要", async () => {
+    const fixture = await createConfirmedFixture();
+    await materializeHistoryGrouping(materializeOptions(fixture));
+    await expect(
+      assertHistoryMaterializationComplete({
+        privateRootDirectory: fixture.privateRoot,
+        materializedDirectory: fixture.materializedDirectory,
+      }),
+    ).resolves.toBeUndefined();
+    const reportFile = join(fixture.materializedDirectory, "report.json");
+    const report = JSON.parse(await readFile(reportFile, "utf8")) as { fragmentCount: number };
+    report.fragmentCount += 1;
+    await writeFile(reportFile, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    await expect(
+      assertHistoryMaterializationComplete({
+        privateRootDirectory: fixture.privateRoot,
+        materializedDirectory: fixture.materializedDirectory,
+      }),
+    ).rejects.toMatchObject({ code: "GROUPING_CHANGED" });
   });
 });
 
@@ -411,7 +749,7 @@ interface CatalogFixture {
 }
 
 interface ConfirmedFixture extends CatalogFixture {
-  readonly groupingFile: string;
+  readonly groupingDirectory: string;
 }
 
 async function createPrivateRoot(): Promise<string> {
@@ -486,11 +824,11 @@ async function createCatalogFixture(): Promise<CatalogFixture> {
 }
 
 async function sealFixture(fixture: CatalogFixture): Promise<{
-  readonly groupingFile: string;
+  readonly groupingDirectory: string;
   readonly result: Awaited<ReturnType<typeof sealHistoryGrouping>>;
 }> {
   const groupingPlanFile = await writePlan(fixture);
-  const groupingFile = join(fixture.privateRoot, "grouping.private.json");
+  const groupingDirectory = join(fixture.privateRoot, "grouping-001");
   const result = await sealHistoryGrouping({
     privateRootDirectory: fixture.privateRoot,
     sourceDirectory: fixture.sourceDirectory,
@@ -498,9 +836,9 @@ async function sealFixture(fixture: CatalogFixture): Promise<{
     sourceLocationsFile: fixture.locationsFile,
     metadataFile: fixture.metadataFile,
     groupingPlanFile,
-    outputFile: groupingFile,
+    outputDirectory: groupingDirectory,
   });
-  return { groupingFile, result };
+  return { groupingDirectory, result };
 }
 
 async function createConfirmedFixture(): Promise<ConfirmedFixture> {
@@ -509,12 +847,13 @@ async function createConfirmedFixture(): Promise<ConfirmedFixture> {
   await writeHistoryGroupingConfirmation({
     privateRootDirectory: fixture.privateRoot,
     sourceInventoryFile: fixture.inventoryFile,
+    sourceLocationsFile: fixture.locationsFile,
     metadataFile: fixture.metadataFile,
-    groupingFile: sealed.groupingFile,
+    groupingDirectory: sealed.groupingDirectory,
     outputFile: fixture.confirmationFile,
     confirmed: true,
   });
-  return { ...fixture, groupingFile: sealed.groupingFile };
+  return { ...fixture, groupingDirectory: sealed.groupingDirectory };
 }
 
 async function writePlan(fixture: CatalogFixture): Promise<string> {
@@ -527,17 +866,27 @@ async function writePlan(fixture: CatalogFixture): Promise<string> {
   const archiveLocation = locations.sources.find(
     (source) => source.sourcePath === archiveSourceName,
   );
-  expect(archiveLocation).toBeDefined();
-  const archiveEntry = archiveLocation!.entries.find(
+  if (archiveLocation === undefined) {
+    throw new Error("合成压缩包来源不存在。");
+  }
+  const archiveEntry = archiveLocation.entries.find(
     (entry) => entry.entryPath === archiveEntryName,
   );
-  expect(archiveEntry).toBeDefined();
+  if (archiveEntry === undefined) {
+    throw new Error("合成压缩包条目不存在。");
+  }
+  const unusedArchiveEntry = archiveLocation.entries.find(
+    (entry) => entry.entryPath === "private/synthetic-unused.md",
+  );
+  if (unusedArchiveEntry === undefined) {
+    throw new Error("合成未使用压缩包条目不存在。");
+  }
   expect(inventory.sources.some((source) => source.sourceId === combinedSourceId)).toBe(true);
 
   const combined = `${alphaText}\n${betaText}`;
   const betaStart = combined.indexOf(betaText);
   const plan: HistoryGroupingPlan = {
-    version: 1,
+    version: 2,
     fragments: [
       {
         fragmentId: "fragment-000001",
@@ -560,23 +909,51 @@ async function writePlan(fixture: CatalogFixture): Promise<string> {
       },
       {
         fragmentId: "fragment-000004",
-        sourceId: archiveLocation!.sourceId,
-        selection: { kind: "zip_entry", entryId: archiveEntry!.entryId },
+        sourceId: archiveLocation.sourceId,
+        selection: { kind: "zip_entry", entryId: archiveEntry.entryId },
       },
     ],
     groups: [
       {
         groupId: "group-000001",
-        metadataNumber: "metadata-1",
+        metadataId: "metadata-000001",
         fragmentIds: ["fragment-000001", "fragment-000002"],
       },
       {
         groupId: "group-000002",
-        metadataNumber: "metadata-2",
+        metadataId: "metadata-000002",
         fragmentIds: ["fragment-000003", "fragment-000004"],
       },
     ],
     sharingConfirmations: [],
+    metadataDispositions: [],
+    zipEntryDispositions: [
+      {
+        sourceId: archiveLocation.sourceId,
+        entryId: unusedArchiveEntry.entryId,
+        action: "ignored",
+        reason: "synthetic unused archive material",
+        confirmed: true,
+      },
+    ],
+    textRangeDispositions: [
+      {
+        sourceId: combinedSourceId,
+        start: alphaText.length,
+        end: betaStart,
+        action: "ignored",
+        reason: "synthetic separator",
+        confirmed: true,
+      },
+    ],
+    manualSourceDispositions: [
+      {
+        sourceId: sourceIdForPath(locations, manualSourceName),
+        action: "ignored",
+        reason: "synthetic opaque fixture",
+        confirmed: true,
+      },
+    ],
   };
   const planFile = join(fixture.privateRoot, "grouping-plan.private.json");
   await writeFile(planFile, `${JSON.stringify(plan, null, 2)}\n`, "utf8");
@@ -589,8 +966,10 @@ async function readLocations(path: string): Promise<HistorySourceLocations> {
 
 function sourceIdForPath(locations: HistorySourceLocations, sourcePath: string): string {
   const source = locations.sources.find((candidate) => candidate.sourcePath === sourcePath);
-  expect(source).toBeDefined();
-  return source!.sourceId;
+  if (source === undefined) {
+    throw new Error("合成来源路径没有安全编号。");
+  }
+  return source.sourceId;
 }
 
 function materializeOptions(fixture: ConfirmedFixture) {
@@ -600,7 +979,7 @@ function materializeOptions(fixture: ConfirmedFixture) {
     sourceInventoryFile: fixture.inventoryFile,
     sourceLocationsFile: fixture.locationsFile,
     metadataFile: fixture.metadataFile,
-    groupingFile: fixture.groupingFile,
+    groupingDirectory: fixture.groupingDirectory,
     groupingConfirmationFile: fixture.confirmationFile,
     outputDirectory: fixture.materializedDirectory,
   };

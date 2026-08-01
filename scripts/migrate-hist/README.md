@@ -21,7 +21,7 @@
   整理流程的单题文本最多 2,000,000 个 UTF-8 存储字节、500,000 个 JavaScript 字符单位；超限直接
   拒绝，不截断。
 - 所有输出都要求新路径。工具先写私有临时文件再发布，遇到同名文件立即停止，不覆盖上次结果。只有带
-  `*_COMPLETE` 标记的目录才是完整结果。
+  `*_COMPLETE` 标记且标记内摘要与同阶段报告、清单和文本重新计算结果一致的目录才是完整结果。
 - 作者学号只写入 `--author-map-out` 指定的独立私有文件。如果模型结果或难度文字带出已知学号或原文件
   路径，工具会停止。
 
@@ -55,7 +55,11 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts inventory \
 - `inventory.json`：安全编号、类型、字节数、字符数或 ZIP 条目安全编号及摘要，不含原路径；
 - `source-locations.private.json`：安全编号到原相对路径的私有对照，只供人工查看和后续复核；
 - `manual-review.json`：只含仍需人工处理的安全编号和固定原因码，不含原路径或正文；
-- `INVENTORY_COMPLETE`：完整写完标记及安全计数。
+- `INVENTORY_COMPLETE`：完整写完标记、三份文件各自的摘要和安全计数。
+
+后续每一步都会先重新计算 `inventory.json`、`source-locations.private.json` 和 `manual-review.json` 的摘要，
+并与 `INVENTORY_COMPLETE` 比较。只复制其中一份文件、手工修改人工队列或使用旧版不含这些摘要的标记都
+会失败；不能把不同清单目录中的文件拼成一次登记结果。
 
 `.md`、`.txt` 会作为 UTF-8 文本登记；通过完整安全检查的 ZIP 会按条目登记；PDF、图片和其他二进制文件
 只登记为待人工处理的完整文件，不会自动提取或猜题目。扩展名虽然是 ZIP、但未通过严格安全检查的旧文件
@@ -67,14 +71,35 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts inventory \
 原路径、固定错误码和不含正文的失败原因码只写在权限收紧的私有失败清单中，供人工定位后换一个新输出
 目录重试。
 
-## 2. 人工编写分组计划
+## 2. init-grouping：生成空白核对材料
+
+先生成一个新的空白工作目录：
+
+```bash
+apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts init-grouping \
+  --private-root <private-root> \
+  --inventory <private-root>/history/catalog-001/inventory.json \
+  --source-locations <private-root>/history/catalog-001/source-locations.private.json \
+  --metadata <private-root>/history/metadata.json \
+  --out <private-root>/history/worksheet-001
+```
+
+输出的 `worksheet.json` 只列元数据、文本源、压缩包及条目的安全编号和必要计数；
+`grouping-plan.skeleton.private.json` 是所有数组均为空的计划骨架；
+`grouping-validation.initial.json` 用安全编号列出尚未处理的类别和范围。三者都不含原路径、题号、题名、
+正文或自动匹配建议。`WORKSHEET_COMPLETE` 固定写有 `reviewed: false`，不能代替之后的
+`--i-have-reviewed`。把骨架复制到新的私有计划文件后再人工填写，保留空白原件便于对照。
+`metadata-000001` 等编号严格按当前 `metadata.json` 的记录顺序生成；人工对照原元数据确认，不能据此猜测
+与同序号源文件相配。元数据重排会改变整文件摘要，使旧分组完成标记和确认失效。
+
+## 3. 人工编写分组计划
 
 对照私有位置清单、原资料和 `metadata.json`，新建 `grouping-plan.private.json`。计划只写选择范围，不用
 人手计算摘要：
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "fragments": [
     {
       "fragmentId": "fragment-000001",
@@ -90,17 +115,37 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts inventory \
   "groups": [
     {
       "groupId": "group-000001",
-      "metadataNumber": "元数据中的题号",
+      "metadataId": "metadata-000001",
       "fragmentIds": ["fragment-000001", "fragment-000002"]
     }
   ],
-  "sharingConfirmations": []
+  "sharingConfirmations": [],
+  "metadataDispositions": [],
+  "zipEntryDispositions": [],
+  "textRangeDispositions": [],
+  "manualSourceDispositions": []
 }
 ```
 
 文本范围从 0 开始，左闭右开；计数方式与页面编辑器一致，通常一个汉字算 1，大多数表情符号算 2。
-`whole_file` 只适用于能够完整解码为非空 UTF-8 文本的普通文件。当前不自动执行 `pdf_pages`；PDF 或图片
-必须先在私有目录人工转成经过复核的文本，再重新建立清单。
+`whole_file` 只适用于清单中 `kind` 明确为 `text` 的非空 UTF-8 文本。人工队列中的 `file`、PDF、图片、
+旧 ZIP 或其他不透明文件即使字节碰巧能解码，也不能用 `whole_file` 绕过转换。需要导入其中的文本时，先
+在私有目录人工转成并复核新的 `.md`/`.txt`，把原件和转换件一起重新建立清单，再用
+`manualSourceDispositions` 的 `convertedSourceId` 明确关联。当前不自动执行 `pdf_pages`。
+
+所有项目必须恰好被选入分组或明确处置：
+
+- 每条元数据必须进入一个组，或用 `metadataDispositions` 明确标为 `deferred`/`ignored`；
+- 每个 ZIP 条目必须由 `zip_entry` 选择，或在 `zipEntryDispositions` 中标为
+  `deferred`/`attachment`/`ignored`；
+- 每个文本字符单位必须落在已选片段或 `textRangeDispositions` 的明确范围内；范围不能重叠，也不能切开
+  一个表情等 Unicode 字符的代理项对；
+- 每个 `file`/PDF 人工源都必须在 `manualSourceDispositions` 中选择
+  `converted`/`deferred`/`attachment`/`ignored`，填写人工理由并写 `confirmed: true`。
+
+每项处置都必须有非空人工理由。安全校验报告只保存理由摘要，不保存理由原文；正式分组和最终人工确认会
+绑定理由原文及处置顺序的摘要。`converted` 还要求 `convertedSourceId` 指向本次清单里的文本源，而且该
+文本必须实际进入一个题目组，不能只写一个没有使用的安全编号。
 
 如果同一片段确实要用于两个题目组，加入：
 
@@ -126,7 +171,7 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts inventory \
 每项真实共用都要有且只能有一条确认；多余确认同样会被拒绝。每个已定义片段必须进入至少一个组，同一条
 元数据不能分给多个组。
 
-## 3. seal-grouping：由当前内容补齐片段摘要
+## 4. seal-grouping：由当前内容补齐片段摘要并验证完整性
 
 ```bash
 apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts seal-grouping \
@@ -136,13 +181,18 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts seal-grouping \
   --source-locations <private-root>/history/catalog-001/source-locations.private.json \
   --metadata <private-root>/history/metadata.json \
   --plan <private-root>/history/grouping-plan.private.json \
-  --out <private-root>/history/grouping-001.private.json
+  --out <private-root>/history/grouping-001
 ```
 
-这一步重新扫描整个源目录、复核源文件与 ZIP 条目摘要，并验证每个选择范围。输出正式分组文件，给每个片段
-补上由实际内容计算的摘要；它仍未得到人工确认。
+这一步先验证 `INVENTORY_COMPLETE`，再重新扫描整个源目录、复核源文件与 ZIP 条目摘要，并验证每个选择
+范围和人工处置。成功目录包括 `grouping.private.json`、只含安全编号的
+`grouping-validation.json` 和绑定二者摘要的 `GROUPING_COMPLETE`；正式分组仍未得到人工确认。
 
-## 4. confirm-grouping：单独确认正式分组
+只要有未分组元数据、未覆盖文本范围、未选且未处置的 ZIP 条目、未处置人工源，或者根本没有题目组，
+命令就失败。失败目录只写安全校验报告与 `GROUPING_INCOMPLETE`，不会写
+`GROUPING_COMPLETE`。因此不能再用“未引用源文件数量为 0”代替逐条完整性检查。
+
+## 5. confirm-grouping：单独确认正式分组
 
 完整阅读正式分组并与原资料、元数据逐项核对后，才运行：
 
@@ -150,15 +200,18 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts seal-grouping \
 apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts confirm-grouping \
   --private-root <private-root> \
   --inventory <private-root>/history/catalog-001/inventory.json \
+  --source-locations <private-root>/history/catalog-001/source-locations.private.json \
   --metadata <private-root>/history/metadata.json \
-  --grouping <private-root>/history/grouping-001.private.json \
+  --grouping <private-root>/history/grouping-001 \
   --out <private-root>/history/grouping-confirmation-001.private.json \
   --i-have-reviewed
 ```
 
-`--i-have-reviewed` 不能省略。确认同时锁定源清单、完整元数据文件、片段集合、分组与片段顺序。
+`--i-have-reviewed` 不能省略。命令先重新验证 `GROUPING_COMPLETE` 和安全报告，再把源清单、私有位置清单、
+人工队列、完整元数据文件、片段集合、分组、所有人工处置及完整性报告摘要一起写入确认。任一项变化都会
+使确认失效。
 
-## 5. materialize：生成一题一文件的确认文本
+## 6. materialize：生成一题一文件的确认文本
 
 ```bash
 apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts materialize \
@@ -167,7 +220,7 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts materialize \
   --inventory <private-root>/history/catalog-001/inventory.json \
   --source-locations <private-root>/history/catalog-001/source-locations.private.json \
   --metadata <private-root>/history/metadata.json \
-  --grouping <private-root>/history/grouping-001.private.json \
+  --grouping <private-root>/history/grouping-001 \
   --grouping-confirmation <private-root>/history/grouping-confirmation-001.private.json \
   --out <private-root>/history/materialized-001
 ```
@@ -177,11 +230,12 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts materialize \
 - `sources/source-000001.md`：按人工顺序合并的一题一文件文本，只使用安全文件名；
 - `source-confirmation.private.json`：后续 `prepare`/`package` 使用的第一份源映射确认；
 - `report.json`：只含安全编号、摘要、长度、计数和状态；
-- `MATERIALIZE_COMPLETE`：完整写完标记。
+- `MATERIALIZE_COMPLETE`：绑定安全报告、源映射、全部输出文本集合和分组确认的完整写完标记。
 
-报告会明确给出仍未进入任何片段的源文件数量。只要数量不为零，就不能声称这一批历史资料已全部处理。
+物化前再次验证 `GROUPING_COMPLETE`、完整性报告及人工确认。报告固定要求 `unresolvedItemCount: 0`；延期、
+作为附件或忽略的项目仍保留在之前已确认的处置摘要中，不会因为没有进入输出文本而消失。
 
-## 6. prepare：调用模型生成待批准候选
+## 7. prepare：调用模型生成待批准候选
 
 在把私有题面或题解发送给外部模型前，必须先取得用户明确许可。不要用 shell 解释环境文件；使用 Fermata
 仓库的安全启动脚本：
@@ -190,17 +244,22 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts materialize \
 node ../Fermata/scripts/run-with-env.mjs <private-model-env> \
   apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts prepare \
     --private-root <private-root> \
-    --source <private-root>/history/materialized-001/sources \
+    --materialized <private-root>/history/materialized-001 \
     --metadata <private-root>/history/metadata.json \
-    --source-confirmation <private-root>/history/materialized-001/source-confirmation.private.json \
     --out <private-root>/history/prepared-001
 ```
 
-该阶段只产生候选 JSON、只含安全摘要的 `review.json` 和 `PREPARE_COMPLETE`，不会产生 ZIP。模型置信度
-只帮助安排复核顺序，不代表批准。每次请求最多等待 600 秒，失败最多尝试 3 次；响应和单个候选 JSON
-超过 10,000,000 字节会拒绝，不截断。
+在创建模型客户端和发出任何请求前，CLI 会重新读取全部物化文本，并验证 `MATERIALIZE_COMPLETE` 与
+`report.json`、`source-confirmation.private.json`、输出文件集合的摘要和计数完全一致。缺少标记、报告被
+改写、增加/删除文本或混用另一次物化结果都会停止。
 
-## 7. 人工批准候选内容
+该阶段只产生候选 JSON、只含安全摘要的 `review.json` 和 `PREPARE_COMPLETE`，不会产生 ZIP。模型置信度
+只帮助安排复核顺序，不代表批准。等待首段有效输出的默认上限为 30 分钟；已经收到有效输出后，连续
+10 分钟没有新有效内容才判为停顿。只要仍在持续输出就没有总时限，并一直读取到服务端 HTTP 响应真正
+结束。只有明确的 429 限流响应会重试；499、主动取消、输出中断或缺少完整结束都直接判失败且不重试，
+不能拿不完整候选继续。响应和单个候选 JSON 超过 10,000,000 字节会拒绝，不截断。
+
+## 8. 人工批准候选内容
 
 逐题阅读候选后，把 `candidateId` 与 `contentSha256` 原样写入第二份确认文件：
 
@@ -220,7 +279,7 @@ node ../Fermata/scripts/run-with-env.mjs <private-model-env> \
 
 修改候选后摘要会变化，必须重新阅读并填写新摘要。分组确认、源映射确认和候选批准不能共用。
 
-## 8. package：批准后生成题目包
+## 9. package：批准后生成题目包
 
 ```bash
 apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts package \

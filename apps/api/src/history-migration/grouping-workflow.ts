@@ -1,13 +1,13 @@
-import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { Dirent } from "node:fs";
 import { lstat, mkdir, readdir, realpath, rename, rm, rmdir } from "node:fs/promises";
+import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import {
+  type ArchiveIssue,
   defaultArchiveSafetyLimits,
   isSafeArchivePath,
   looksLikeZipArchive,
   readZipArchive,
   UnsafeArchiveError,
-  type ArchiveIssue,
 } from "@urmotiv/problem-package";
 import { z } from "zod";
 import { sha256Hex } from "./digests";
@@ -15,14 +15,16 @@ import { HistoryMigrationError } from "./errors";
 import {
   assertHistoryGroupingConfirmation,
   createHistoryGroupingConfirmation,
+  type HistoryGroupingDraft,
+  type HistorySourceInventory,
   historyFragmentIdSchema,
   historyFragmentSelectionSchema,
+  historyGroupIdSchema,
   historyGroupingDraftSchema,
+  historyMetadataIdSchema,
   historySourceInventorySchema,
   historyZipEntryIdSchema,
   validateHistoryGrouping,
-  type HistoryGroupingDraft,
-  type HistorySourceInventory,
 } from "./grouping";
 import {
   assertNewOutputPath,
@@ -30,6 +32,7 @@ import {
   createNewPrivateDirectory,
   maximumHistorySourceBytes,
   maximumHistorySourceTextUnits,
+  readConfirmedSource,
   readPrivateJson,
   readPrivateJsonWithDigest,
   readPrivateRegularBytes,
@@ -37,10 +40,11 @@ import {
   writeNewPrivateJson,
 } from "./private-files";
 import {
+  type HistoryMetadataFile,
+  historyContentDigestSchema,
   historyMetadataFileSchema,
   historySourceIdSchema,
   historySourceMappingSchema,
-  type HistoryMetadataFile,
 } from "./schema";
 
 const maximumCatalogFiles = 10_000;
@@ -127,6 +131,158 @@ export const historySourceLocationsSchema = z
     );
   });
 
+const historyManualReviewSchema = z
+  .object({
+    version: z.literal(2),
+    phase: z.literal("inventory"),
+    sourceCount: z.number().int().positive(),
+    manualSourceCount: z.number().int().nonnegative(),
+    sources: z
+      .array(
+        z
+          .object({
+            sourceId: historySourceIdSchema,
+            reasons: z.array(z.string().min(1).max(100)).min(1).max(100),
+          })
+          .strict(),
+      )
+      .max(maximumCatalogFiles),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    addDuplicateIssues(
+      value.sources.map((source) => source.sourceId),
+      context,
+      ["sources"],
+      "同一个人工源文件安全编号不能重复。",
+    );
+  });
+
+const historyInventoryCompleteSchema = z
+  .object({
+    version: z.literal(2),
+    phase: z.literal("inventory"),
+    inventorySha256: historyContentDigestSchema,
+    sourceLocationsSha256: historyContentDigestSchema,
+    manualReviewSha256: historyContentDigestSchema,
+    catalogSha256: historyContentDigestSchema,
+    sourceCount: z.number().int().positive(),
+    archiveEntryCount: z.number().int().nonnegative(),
+    manualSourceCount: z.number().int().nonnegative(),
+    totalSourceBytes: z.number().int().nonnegative(),
+  })
+  .strict();
+
+const safeRangeSchema = z
+  .object({
+    sourceId: historySourceIdSchema,
+    start: z.number().int().nonnegative(),
+    end: z.number().int().positive(),
+  })
+  .strict();
+
+const safeZipEntryReferenceSchema = z
+  .object({
+    sourceId: historySourceIdSchema,
+    entryId: historyZipEntryIdSchema,
+  })
+  .strict();
+
+const historyGroupingValidationReportSchema = z
+  .object({
+    version: z.literal(1),
+    phase: z.literal("grouping_validation"),
+    status: z.enum(["complete", "incomplete"]),
+    metadataCount: z.number().int().nonnegative(),
+    groupedMetadataCount: z.number().int().nonnegative(),
+    disposedMetadataCount: z.number().int().nonnegative(),
+    unresolvedMetadataIds: z.array(historyMetadataIdSchema).max(10_000),
+    textSourceCount: z.number().int().nonnegative(),
+    uncoveredTextRanges: z.array(safeRangeSchema).max(100_000),
+    zipEntryCount: z.number().int().nonnegative(),
+    selectedZipEntryCount: z.number().int().nonnegative(),
+    disposedZipEntryCount: z.number().int().nonnegative(),
+    unresolvedZipEntries: z.array(safeZipEntryReferenceSchema).max(100_000),
+    manualSourceCount: z.number().int().nonnegative(),
+    disposedManualSourceCount: z.number().int().nonnegative(),
+    unresolvedManualSourceIds: z.array(historySourceIdSchema).max(10_000),
+    missingGroupCount: z.union([z.literal(0), z.literal(1)]),
+    dispositionSummary: z
+      .array(
+        z
+          .object({
+            itemId: z.string().min(1).max(100),
+            action: z.enum(["converted", "deferred", "attachment", "ignored"]),
+            reasonSha256: historyContentDigestSchema,
+            convertedSourceId: historySourceIdSchema.optional(),
+          })
+          .strict()
+          .refine(
+            (value) => (value.action === "converted") === (value.convertedSourceId !== undefined),
+            "只有已转换处置需要记录转换后文本的安全编号。",
+          ),
+      )
+      .max(220_000),
+    unresolvedItemCount: z.number().int().nonnegative(),
+  })
+  .strict();
+
+const historyGroupingCompleteSchema = z
+  .object({
+    version: z.literal(1),
+    phase: z.literal("grouping"),
+    catalogSha256: historyContentDigestSchema,
+    metadataFileSha256: historyContentDigestSchema,
+    groupingSha256: historyContentDigestSchema,
+    validationReportSha256: historyContentDigestSchema,
+    fragmentCount: z.number().int().nonnegative(),
+    groupCount: z.number().int().nonnegative(),
+    unresolvedItemCount: z.literal(0),
+  })
+  .strict();
+
+const historyMaterializeReportSchema = z
+  .object({
+    version: z.literal(2),
+    phase: z.literal("materialize"),
+    sourceInventorySha256: historyContentDigestSchema,
+    groupingBatchSha256: historyContentDigestSchema,
+    fragmentCount: z.number().int().nonnegative(),
+    sourceCount: z.number().int().positive(),
+    unresolvedItemCount: z.literal(0),
+    sources: z
+      .array(
+        z
+          .object({
+            groupId: historyGroupIdSchema,
+            sourceId: historySourceIdSchema,
+            sourceSha256: historyContentDigestSchema,
+            fragmentCount: z.number().int().positive(),
+            byteLength: z.number().int().positive(),
+            characterCount: z.number().int().positive(),
+            status: z.literal("ready_for_prepare"),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(10_000),
+  })
+  .strict();
+
+const historyMaterializeCompleteSchema = z
+  .object({
+    version: z.literal(2),
+    phase: z.literal("materialize"),
+    reportSha256: historyContentDigestSchema,
+    sourceConfirmationSha256: historyContentDigestSchema,
+    sourceSetSha256: historyContentDigestSchema,
+    groupingBatchSha256: historyContentDigestSchema,
+    sourceCount: z.number().int().positive(),
+    fragmentCount: z.number().int().nonnegative(),
+    unresolvedItemCount: z.literal(0),
+  })
+  .strict();
+
 const historyGroupingPlanFragmentSchema = z
   .object({
     fragmentId: historyFragmentIdSchema,
@@ -141,10 +297,14 @@ const historyGroupingPlanFragmentSchema = z
  */
 export const historyGroupingPlanSchema = z
   .object({
-    version: z.literal(1),
-    fragments: z.array(historyGroupingPlanFragmentSchema).min(1).max(100_000),
+    version: z.literal(2),
+    fragments: z.array(historyGroupingPlanFragmentSchema).max(100_000),
     groups: historyGroupingDraftSchema.shape.groups,
     sharingConfirmations: historyGroupingDraftSchema.shape.sharingConfirmations,
+    metadataDispositions: historyGroupingDraftSchema.shape.metadataDispositions,
+    zipEntryDispositions: historyGroupingDraftSchema.shape.zipEntryDispositions,
+    textRangeDispositions: historyGroupingDraftSchema.shape.textRangeDispositions,
+    manualSourceDispositions: historyGroupingDraftSchema.shape.manualSourceDispositions,
   })
   .strict();
 
@@ -174,20 +334,22 @@ export interface SealHistoryGroupingOptions {
   readonly sourceLocationsFile: string;
   readonly metadataFile: string;
   readonly groupingPlanFile: string;
-  readonly outputFile: string;
+  readonly outputDirectory: string;
 }
 
 export interface SealHistoryGroupingResult {
   readonly sourceCount: number;
   readonly fragmentCount: number;
   readonly groupCount: number;
+  readonly unresolvedItemCount: 0;
 }
 
 export interface WriteHistoryGroupingConfirmationOptions {
   readonly privateRootDirectory: string;
   readonly sourceInventoryFile: string;
+  readonly sourceLocationsFile: string;
   readonly metadataFile: string;
-  readonly groupingFile: string;
+  readonly groupingDirectory: string;
   readonly outputFile: string;
   readonly confirmed: boolean;
 }
@@ -198,7 +360,7 @@ export interface MaterializeHistoryGroupingOptions {
   readonly sourceInventoryFile: string;
   readonly sourceLocationsFile: string;
   readonly metadataFile: string;
-  readonly groupingFile: string;
+  readonly groupingDirectory: string;
   readonly groupingConfirmationFile: string;
   readonly outputDirectory: string;
 }
@@ -206,7 +368,20 @@ export interface MaterializeHistoryGroupingOptions {
 export interface MaterializeHistoryGroupingResult {
   readonly sourceCount: number;
   readonly fragmentCount: number;
-  readonly unreferencedSourceCount: number;
+  readonly unresolvedItemCount: 0;
+}
+
+export interface InitializeHistoryGroupingWorksheetOptions {
+  readonly privateRootDirectory: string;
+  readonly sourceInventoryFile: string;
+  readonly sourceLocationsFile: string;
+  readonly metadataFile: string;
+  readonly outputDirectory: string;
+}
+
+export interface AssertHistoryMaterializationCompleteOptions {
+  readonly privateRootDirectory: string;
+  readonly materializedDirectory: string;
 }
 
 interface CatalogSourceLocation {
@@ -228,6 +403,16 @@ interface LoadedHistorySource {
 interface MaterializedFragment {
   readonly text: string;
   readonly contentSha256: string;
+}
+
+interface VerifiedCatalog {
+  readonly inventory: HistorySourceInventory;
+  readonly locations: HistorySourceLocations;
+  readonly manualReview: z.infer<typeof historyManualReviewSchema>;
+  readonly inventorySha256: string;
+  readonly sourceLocationsSha256: string;
+  readonly manualReviewSha256: string;
+  readonly catalogSha256: string;
 }
 
 /**
@@ -328,7 +513,29 @@ export async function inventoryHistorySources(
     "INVALID_GROUPING",
     "生成的私有源位置清单格式不正确。",
   );
+  const manualReview = parsePrivateInput(
+    historyManualReviewSchema,
+    {
+      version: 2,
+      phase: "inventory",
+      sourceCount: inventory.sources.length,
+      manualSourceCount: manualReviews.length,
+      sources: manualReviews,
+    },
+    "INVALID_GROUPING",
+    "生成的人工处理清单格式不正确。",
+  );
   const inventorySha256 = sha256Hex(JSON.stringify(inventory));
+  const sourceLocationsSha256 = sha256Hex(JSON.stringify(sourceLocations));
+  const manualReviewSha256 = sha256Hex(JSON.stringify(manualReview));
+  const catalogSha256 = sha256Hex(
+    JSON.stringify({
+      version: 2,
+      inventorySha256,
+      sourceLocationsSha256,
+      manualReviewSha256,
+    }),
+  );
 
   await createNewPrivateDirectory(options.outputDirectory);
   const stagingDirectory = join(options.outputDirectory, ".inventory-incomplete");
@@ -339,17 +546,14 @@ export async function inventoryHistorySources(
       join(stagingDirectory, "source-locations.private.json"),
       sourceLocations,
     );
-    await writeNewPrivateJson(join(stagingDirectory, "manual-review.json"), {
-      version: 1,
-      phase: "inventory",
-      sourceCount: inventory.sources.length,
-      manualSourceCount: manualReviews.length,
-      sources: manualReviews,
-    });
+    await writeNewPrivateJson(join(stagingDirectory, "manual-review.json"), manualReview);
     await writeNewPrivateJson(join(stagingDirectory, "INVENTORY_COMPLETE"), {
-      version: 1,
+      version: 2,
       phase: "inventory",
       inventorySha256,
+      sourceLocationsSha256,
+      manualReviewSha256,
+      catalogSha256,
       sourceCount: inventory.sources.length,
       archiveEntryCount,
       manualSourceCount: manualReviews.length,
@@ -389,12 +593,11 @@ export async function sealHistoryGrouping(
     { path: options.sourceLocationsFile, kind: "existing" },
     { path: options.metadataFile, kind: "existing" },
     { path: options.groupingPlanFile, kind: "existing" },
-    { path: options.outputFile, kind: "new" },
+    { path: options.outputDirectory, kind: "new" },
   ]);
-  await assertNewOutputPath(options.outputFile);
-  assertOutputOutsideSource(options.sourceDirectory, options.outputFile);
+  assertOutputOutsideSource(options.sourceDirectory, options.outputDirectory);
 
-  const { inventory, sourcesById } = await loadCurrentCatalogSources(options);
+  const { inventory, sourcesById, catalog } = await loadCurrentCatalogSources(options);
   const metadata = await loadMetadata(options.metadataFile);
   const plan = parsePrivateInput(
     historyGroupingPlanSchema,
@@ -418,23 +621,80 @@ export async function sealHistoryGrouping(
     };
   });
   const grouping: HistoryGroupingDraft = {
-    version: 1,
+    version: 2,
     fragments,
     groups: plan.groups,
     sharingConfirmations: plan.sharingConfirmations,
+    metadataDispositions: plan.metadataDispositions,
+    zipEntryDispositions: plan.zipEntryDispositions,
+    textRangeDispositions: plan.textRangeDispositions,
+    manualSourceDispositions: plan.manualSourceDispositions,
   };
-  validateHistoryGrouping({
+  const placeholderDigest = "0".repeat(64);
+  const checked = validateHistoryGrouping({
     sourceInventory: inventory,
+    sourceLocationsSha256: catalog.sourceLocationsSha256,
+    manualReviewSha256: catalog.manualReviewSha256,
     metadataFileSha256: metadata.sha256,
     metadataNumbers: metadata.value.records.map((record) => record.number),
     grouping,
+    completenessReportSha256: placeholderDigest,
   });
-  await writeNewPrivateJson(options.outputFile, grouping);
+  validateDispositionUnicodeBoundaries(checked.grouping, sourcesById);
+  const validationReport = createGroupingValidationReport(
+    inventory,
+    metadata.value.records.length,
+    checked.grouping,
+  );
+  const validationReportSha256 = sha256Hex(JSON.stringify(validationReport));
+
+  await createNewPrivateDirectory(options.outputDirectory);
+  if (validationReport.status === "incomplete") {
+    await writeNewPrivateJson(
+      join(options.outputDirectory, "grouping-validation.json"),
+      validationReport,
+    );
+    await writeNewPrivateJson(join(options.outputDirectory, "GROUPING_INCOMPLETE"), {
+      version: 1,
+      phase: "grouping",
+      status: "incomplete",
+      catalogSha256: catalog.catalogSha256,
+      metadataFileSha256: metadata.sha256,
+      validationReportSha256,
+      unresolvedItemCount: validationReport.unresolvedItemCount,
+    });
+    throw new HistoryMigrationError(
+      "INVALID_GROUPING",
+      "人工分组仍有未分组或未明确处置的项目；安全编号只写入私有校验报告。",
+    );
+  }
+
+  const groupingSha256 = sha256Hex(JSON.stringify(checked.grouping));
+  await writeNewPrivateJson(
+    join(options.outputDirectory, "grouping.private.json"),
+    checked.grouping,
+  );
+  await writeNewPrivateJson(
+    join(options.outputDirectory, "grouping-validation.json"),
+    validationReport,
+  );
+  await writeNewPrivateJson(join(options.outputDirectory, "GROUPING_COMPLETE"), {
+    version: 1,
+    phase: "grouping",
+    catalogSha256: catalog.catalogSha256,
+    metadataFileSha256: metadata.sha256,
+    groupingSha256,
+    validationReportSha256,
+    fragmentCount: checked.grouping.fragments.length,
+    groupCount: checked.grouping.groups.length,
+    unresolvedItemCount: 0,
+  });
 
   return {
     sourceCount: inventory.sources.length,
     fragmentCount: grouping.fragments.length,
     groupCount: grouping.groups.length,
+    unresolvedItemCount: 0,
   };
 }
 
@@ -453,20 +713,35 @@ export async function writeHistoryGroupingConfirmation(
   }
   await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
     { path: options.sourceInventoryFile, kind: "existing" },
+    { path: options.sourceLocationsFile, kind: "existing" },
     { path: options.metadataFile, kind: "existing" },
-    { path: options.groupingFile, kind: "existing" },
+    { path: options.groupingDirectory, kind: "existing" },
+    { path: join(options.groupingDirectory, "grouping.private.json"), kind: "existing" },
+    { path: join(options.groupingDirectory, "grouping-validation.json"), kind: "existing" },
+    { path: join(options.groupingDirectory, "GROUPING_COMPLETE"), kind: "existing" },
     { path: options.outputFile, kind: "new" },
   ]);
   await assertNewOutputPath(options.outputFile);
 
-  const inventory = await loadSourceInventory(options.sourceInventoryFile);
+  const catalog = await loadVerifiedCatalogArtifacts(
+    options.sourceInventoryFile,
+    options.sourceLocationsFile,
+  );
   const metadata = await loadMetadata(options.metadataFile);
-  const grouping = await readPrivateJson(options.groupingFile);
+  const verifiedGrouping = await loadVerifiedGrouping(
+    options.groupingDirectory,
+    catalog,
+    metadata.value.records.length,
+    metadata.sha256,
+  );
   const confirmation = createHistoryGroupingConfirmation({
-    sourceInventory: inventory,
+    sourceInventory: catalog.inventory,
+    sourceLocationsSha256: catalog.sourceLocationsSha256,
+    manualReviewSha256: catalog.manualReviewSha256,
     metadataFileSha256: metadata.sha256,
     metadataNumbers: metadata.value.records.map((record) => record.number),
-    grouping,
+    grouping: verifiedGrouping.grouping,
+    completenessReportSha256: verifiedGrouping.validationReportSha256,
   });
   await writeNewPrivateJson(options.outputFile, confirmation);
 }
@@ -483,27 +758,42 @@ export async function materializeHistoryGrouping(
     { path: options.sourceInventoryFile, kind: "existing" },
     { path: options.sourceLocationsFile, kind: "existing" },
     { path: options.metadataFile, kind: "existing" },
-    { path: options.groupingFile, kind: "existing" },
+    { path: options.groupingDirectory, kind: "existing" },
+    { path: join(options.groupingDirectory, "grouping.private.json"), kind: "existing" },
+    { path: join(options.groupingDirectory, "grouping-validation.json"), kind: "existing" },
+    { path: join(options.groupingDirectory, "GROUPING_COMPLETE"), kind: "existing" },
     { path: options.groupingConfirmationFile, kind: "existing" },
     { path: options.outputDirectory, kind: "new" },
   ]);
   assertOutputOutsideSource(options.sourceDirectory, options.outputDirectory);
 
-  const { inventory, sourcesById } = await loadCurrentCatalogSources(options);
+  const { inventory, sourcesById, catalog } = await loadCurrentCatalogSources(options);
   const metadata = await loadMetadata(options.metadataFile);
-  const groupingInput = await readPrivateJson(options.groupingFile);
+  const verifiedGrouping = await loadVerifiedGrouping(
+    options.groupingDirectory,
+    catalog,
+    metadata.value.records.length,
+    metadata.sha256,
+  );
   const checked = validateHistoryGrouping({
     sourceInventory: inventory,
+    sourceLocationsSha256: catalog.sourceLocationsSha256,
+    manualReviewSha256: catalog.manualReviewSha256,
     metadataFileSha256: metadata.sha256,
     metadataNumbers: metadata.value.records.map((record) => record.number),
-    grouping: groupingInput,
+    grouping: verifiedGrouping.grouping,
+    completenessReportSha256: verifiedGrouping.validationReportSha256,
   });
-  await assertHistoryGroupingConfirmation(
+  validateDispositionUnicodeBoundaries(checked.grouping, sourcesById);
+  const groupingConfirmation = assertHistoryGroupingConfirmation(
     {
       sourceInventory: inventory,
+      sourceLocationsSha256: catalog.sourceLocationsSha256,
+      manualReviewSha256: catalog.manualReviewSha256,
       metadataFileSha256: metadata.sha256,
       metadataNumbers: metadata.value.records.map((record) => record.number),
       grouping: checked.grouping,
+      completenessReportSha256: verifiedGrouping.validationReportSha256,
     },
     await readPrivateJson(options.groupingConfirmationFile),
   );
@@ -535,9 +825,13 @@ export async function materializeHistoryGrouping(
     });
     const text = joinMaterializedFragments(pieces);
     assertMaterializedTextSize(text);
+    const metadataNumber = metadata.value.records[metadataIndexFromId(group.metadataId)]?.number;
+    if (metadataNumber === undefined) {
+      throw new HistoryMigrationError("GROUPING_CHANGED", "题目分组的元数据安全编号已经变化。");
+    }
     return {
       groupId: group.groupId,
-      metadataNumber: group.metadataNumber,
+      metadataNumber,
       fragmentCount: pieces.length,
       sourceId: materializedSourceId,
       sourcePath: `${materializedSourceId}.md`,
@@ -563,12 +857,7 @@ export async function materializeHistoryGrouping(
     "INVALID_SOURCE_CONFIRMATION",
     "物化后的源映射确认格式不正确。",
   );
-  const referencedSourceIds = new Set(
-    checked.grouping.fragments.map((fragment) => fragment.sourceId),
-  );
-  const unreferencedSourceCount = inventory.sources.filter(
-    (source) => !referencedSourceIds.has(source.sourceId),
-  ).length;
+  const groupingBatchSha256 = groupingConfirmation.batchSha256;
 
   await createNewPrivateDirectory(options.outputDirectory);
   const stagingDirectory = join(options.outputDirectory, ".materialize-incomplete");
@@ -579,33 +868,56 @@ export async function materializeHistoryGrouping(
     for (const output of outputs) {
       await writeNewPrivateFile(join(stagedSources, output.sourcePath), output.text);
     }
+    const sourceConfirmationSha256 = sha256Hex(JSON.stringify(sourceConfirmation));
+    const report = parsePrivateInput(
+      historyMaterializeReportSchema,
+      {
+        version: 2,
+        phase: "materialize",
+        sourceInventorySha256: sha256Hex(JSON.stringify(inventory)),
+        groupingBatchSha256,
+        fragmentCount: checked.grouping.fragments.length,
+        sourceCount: outputs.length,
+        unresolvedItemCount: 0,
+        sources: outputs.map((output) => ({
+          groupId: output.groupId,
+          sourceId: output.sourceId,
+          sourceSha256: output.sourceSha256,
+          fragmentCount: output.fragmentCount,
+          byteLength: output.byteLength,
+          characterCount: output.characterCount,
+          status: "ready_for_prepare",
+        })),
+      },
+      "INVALID_GROUPING",
+      "生成的物化安全报告格式不正确。",
+    );
+    const reportSha256 = sha256Hex(JSON.stringify(report));
+    const sourceSetSha256 = sha256Hex(
+      JSON.stringify({
+        version: 1,
+        sources: outputs.map((output) => ({
+          sourceId: output.sourceId,
+          sourceSha256: output.sourceSha256,
+          byteLength: output.byteLength,
+        })),
+      }),
+    );
     await writeNewPrivateJson(
       join(stagingDirectory, "source-confirmation.private.json"),
       sourceConfirmation,
     );
-    await writeNewPrivateJson(join(stagingDirectory, "report.json"), {
-      version: 1,
-      phase: "materialize",
-      sourceInventorySha256: sha256Hex(JSON.stringify(inventory)),
-      fragmentCount: checked.grouping.fragments.length,
-      sourceCount: outputs.length,
-      unreferencedSourceCount,
-      sources: outputs.map((output) => ({
-        groupId: output.groupId,
-        sourceId: output.sourceId,
-        sourceSha256: output.sourceSha256,
-        fragmentCount: output.fragmentCount,
-        byteLength: output.byteLength,
-        characterCount: output.characterCount,
-        status: "ready_for_prepare",
-      })),
-    });
+    await writeNewPrivateJson(join(stagingDirectory, "report.json"), report);
     await writeNewPrivateJson(join(stagingDirectory, "MATERIALIZE_COMPLETE"), {
-      version: 1,
+      version: 2,
       phase: "materialize",
+      reportSha256,
+      sourceConfirmationSha256,
+      sourceSetSha256,
+      groupingBatchSha256,
       sourceCount: outputs.length,
       fragmentCount: checked.grouping.fragments.length,
-      unreferencedSourceCount,
+      unresolvedItemCount: 0,
     });
     await rename(stagedSources, join(options.outputDirectory, "sources"));
     await publishStagedEntries(options.outputDirectory, stagingDirectory, [
@@ -621,8 +933,546 @@ export async function materializeHistoryGrouping(
   return {
     sourceCount: outputs.length,
     fragmentCount: checked.grouping.fragments.length,
-    unreferencedSourceCount,
+    unresolvedItemCount: 0,
   };
+}
+
+/**
+ * 生成不含路径、题号和正文的空白人工计划与核对工作表。它只列安全编号和范围，
+ * 不给出任何来源到元数据的映射建议，也不代表人工确认。
+ */
+export async function initializeHistoryGroupingWorksheet(
+  options: InitializeHistoryGroupingWorksheetOptions,
+): Promise<void> {
+  await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+    { path: options.sourceInventoryFile, kind: "existing" },
+    { path: options.sourceLocationsFile, kind: "existing" },
+    { path: options.metadataFile, kind: "existing" },
+    { path: options.outputDirectory, kind: "new" },
+  ]);
+  const catalog = await loadVerifiedCatalogArtifacts(
+    options.sourceInventoryFile,
+    options.sourceLocationsFile,
+  );
+  const metadata = await loadMetadata(options.metadataFile);
+  const skeleton: HistoryGroupingPlan = {
+    version: 2,
+    fragments: [],
+    groups: [],
+    sharingConfirmations: [],
+    metadataDispositions: [],
+    zipEntryDispositions: [],
+    textRangeDispositions: [],
+    manualSourceDispositions: [],
+  };
+  const emptyGrouping = historyGroupingDraftSchema.parse({ ...skeleton, fragments: [] });
+  const validationReport = createGroupingValidationReport(
+    catalog.inventory,
+    metadata.value.records.length,
+    emptyGrouping,
+  );
+  const worksheet = {
+    version: 1,
+    phase: "grouping_worksheet",
+    metadataIds: metadata.value.records.map((_, index) => makeMetadataId(index + 1)),
+    textSources: catalog.inventory.sources
+      .filter((source) => source.kind === "text")
+      .map((source) => ({ sourceId: source.sourceId, characterCount: source.characterCount })),
+    zipSources: catalog.inventory.sources
+      .filter((source) => source.kind === "zip")
+      .map((source) => ({
+        sourceId: source.sourceId,
+        entryIds: source.entries.map((entry) => entry.entryId),
+      })),
+    manualSourceIds: catalog.manualReview.sources.map((source) => source.sourceId),
+  };
+  const worksheetSha256 = sha256Hex(JSON.stringify(worksheet));
+  const skeletonSha256 = sha256Hex(JSON.stringify(skeleton));
+  const validationReportSha256 = sha256Hex(JSON.stringify(validationReport));
+
+  await createNewPrivateDirectory(options.outputDirectory);
+  const stagingDirectory = join(options.outputDirectory, ".worksheet-incomplete");
+  try {
+    await mkdir(stagingDirectory, { recursive: false, mode: 0o700 });
+    await writeNewPrivateJson(join(stagingDirectory, "worksheet.json"), worksheet);
+    await writeNewPrivateJson(
+      join(stagingDirectory, "grouping-plan.skeleton.private.json"),
+      skeleton,
+    );
+    await writeNewPrivateJson(
+      join(stagingDirectory, "grouping-validation.initial.json"),
+      validationReport,
+    );
+    await writeNewPrivateJson(join(stagingDirectory, "WORKSHEET_COMPLETE"), {
+      version: 1,
+      phase: "grouping_worksheet",
+      catalogSha256: catalog.catalogSha256,
+      metadataFileSha256: metadata.sha256,
+      worksheetSha256,
+      skeletonSha256,
+      validationReportSha256,
+      reviewed: false,
+    });
+    await publishStagedEntries(options.outputDirectory, stagingDirectory, [
+      "worksheet.json",
+      "grouping-plan.skeleton.private.json",
+      "grouping-validation.initial.json",
+      "WORKSHEET_COMPLETE",
+    ]);
+  } catch (error) {
+    await rm(options.outputDirectory, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+/** 在 prepare 发出任何模型请求前，重新核对物化标记、报告、映射和全部文本。 */
+export async function assertHistoryMaterializationComplete(
+  options: AssertHistoryMaterializationCompleteOptions,
+): Promise<void> {
+  const sourceDirectory = join(options.materializedDirectory, "sources");
+  const reportFile = join(options.materializedDirectory, "report.json");
+  const sourceConfirmationFile = join(
+    options.materializedDirectory,
+    "source-confirmation.private.json",
+  );
+  const completeFile = join(options.materializedDirectory, "MATERIALIZE_COMPLETE");
+  await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+    { path: options.materializedDirectory, kind: "existing" },
+    { path: sourceDirectory, kind: "existing" },
+    { path: reportFile, kind: "existing" },
+    { path: sourceConfirmationFile, kind: "existing" },
+    { path: completeFile, kind: "existing" },
+  ]);
+  const report = parsePrivateInput(
+    historyMaterializeReportSchema,
+    await readPrivateJson(reportFile),
+    "INVALID_GROUPING",
+    "物化目录的安全报告格式不正确。",
+  );
+  const sourceConfirmation = parsePrivateInput(
+    historySourceMappingSchema,
+    await readPrivateJson(sourceConfirmationFile),
+    "INVALID_SOURCE_CONFIRMATION",
+    "物化目录的源映射确认格式不正确。",
+  );
+  const marker = parsePrivateInput(
+    historyMaterializeCompleteSchema,
+    await readPrivateJson(completeFile),
+    "INVALID_GROUPING",
+    "物化目录没有可验证的完整完成标记。",
+  );
+  if (
+    report.sources.length !== sourceConfirmation.mappings.length ||
+    report.sourceCount !== report.sources.length ||
+    marker.sourceCount !== report.sourceCount ||
+    marker.fragmentCount !== report.fragmentCount ||
+    marker.groupingBatchSha256 !== report.groupingBatchSha256 ||
+    marker.reportSha256 !== sha256Hex(JSON.stringify(report)) ||
+    marker.sourceConfirmationSha256 !== sha256Hex(JSON.stringify(sourceConfirmation))
+  ) {
+    throw new HistoryMigrationError("GROUPING_CHANGED", "物化报告、源映射或完成标记已经不一致。");
+  }
+
+  const actualSources: Array<{
+    readonly sourceId: string;
+    readonly sourceSha256: string;
+    readonly byteLength: number;
+  }> = [];
+  for (const [index, mapping] of sourceConfirmation.mappings.entries()) {
+    const sourceId = makeSafeId("source", index + 1);
+    const reportSource = report.sources[index];
+    if (
+      reportSource === undefined ||
+      reportSource.sourceId !== sourceId ||
+      reportSource.sourceSha256 !== mapping.sourceSha256
+    ) {
+      throw new HistoryMigrationError("GROUPING_CHANGED", "物化报告中的安全源编号已经变化。");
+    }
+    const loaded = await readConfirmedSource(
+      sourceDirectory,
+      mapping.sourcePath,
+      mapping.sourceSha256,
+      sourceId,
+    );
+    const byteLength = new TextEncoder().encode(loaded.text).byteLength;
+    if (
+      reportSource.byteLength !== byteLength ||
+      reportSource.characterCount !== loaded.text.length
+    ) {
+      throw new HistoryMigrationError("GROUPING_CHANGED", "物化报告中的文本计数已经变化。");
+    }
+    actualSources.push({
+      sourceId,
+      sourceSha256: loaded.sha256,
+      byteLength,
+    });
+  }
+  const confirmedPaths = sourceConfirmation.mappings
+    .map((mapping) => mapping.sourcePath)
+    .sort(compareCodeUnits);
+  if (!arraysEqual(confirmedPaths, await listPrivateSourcePaths(sourceDirectory))) {
+    throw new HistoryMigrationError("GROUPING_CHANGED", "物化源目录的文件集合已经变化。");
+  }
+  const sourceSetSha256 = sha256Hex(JSON.stringify({ version: 1, sources: actualSources }));
+  if (marker.sourceSetSha256 !== sourceSetSha256) {
+    throw new HistoryMigrationError("GROUPING_CHANGED", "物化文本集合与完成标记已经不一致。");
+  }
+}
+
+function createGroupingValidationReport(
+  inventory: HistorySourceInventory,
+  metadataCount: number,
+  grouping: HistoryGroupingDraft,
+): z.infer<typeof historyGroupingValidationReportSchema> {
+  const sourcesById = new Map(
+    inventory.sources.map((source) => [source.sourceId, source] as const),
+  );
+  const metadataIds = Array.from({ length: metadataCount }, (_, index) =>
+    makeMetadataId(index + 1),
+  );
+  const groupedMetadataIds = new Set(grouping.groups.map((group) => group.metadataId));
+  const disposedMetadataIds = new Set(grouping.metadataDispositions.map((item) => item.metadataId));
+  if ([...groupedMetadataIds].some((metadataId) => disposedMetadataIds.has(metadataId))) {
+    throw new HistoryMigrationError("INVALID_GROUPING", "已分组元数据不能同时标为延期或忽略。");
+  }
+  const unresolvedMetadataIds = metadataIds.filter(
+    (metadataId) => !groupedMetadataIds.has(metadataId) && !disposedMetadataIds.has(metadataId),
+  );
+
+  const selectedZipEntries = new Set<string>();
+  const selectedTextRanges = new Map<string, Array<{ start: number; end: number }>>();
+  const referencedTextSourceIds = new Set<string>();
+  for (const fragment of grouping.fragments) {
+    const source = sourcesById.get(fragment.sourceId);
+    if (source === undefined) {
+      throw new HistoryMigrationError("INVALID_GROUPING", "片段指向的源文件安全编号不存在。");
+    }
+    if (fragment.selection.kind === "zip_entry") {
+      selectedZipEntries.add(zipEntryKey(fragment.sourceId, fragment.selection.entryId));
+    } else if (fragment.selection.kind === "text_range") {
+      referencedTextSourceIds.add(fragment.sourceId);
+      addRange(
+        selectedTextRanges,
+        fragment.sourceId,
+        fragment.selection.start,
+        fragment.selection.end,
+      );
+    } else if (fragment.selection.kind === "whole_file") {
+      if (source.kind !== "text") {
+        throw new HistoryMigrationError("INVALID_GROUPING", "完整文件片段只能指向文本源文件。");
+      }
+      referencedTextSourceIds.add(fragment.sourceId);
+      addRange(selectedTextRanges, fragment.sourceId, 0, source.characterCount);
+    }
+  }
+
+  const disposedZipEntries = new Set<string>();
+  const dispositionSummary: Array<{
+    itemId: string;
+    action: "converted" | "deferred" | "attachment" | "ignored";
+    reasonSha256: string;
+    convertedSourceId?: string;
+  }> = [];
+  for (const disposition of grouping.metadataDispositions) {
+    dispositionSummary.push(dispositionSummaryItem(disposition.metadataId, disposition));
+  }
+  for (const disposition of grouping.zipEntryDispositions) {
+    const source = sourcesById.get(disposition.sourceId);
+    const key = zipEntryKey(disposition.sourceId, disposition.entryId);
+    if (
+      source?.kind !== "zip" ||
+      !source.entries.some((entry) => entry.entryId === disposition.entryId) ||
+      selectedZipEntries.has(key)
+    ) {
+      throw new HistoryMigrationError(
+        "INVALID_GROUPING",
+        "压缩包条目处置指向不存在或已经选入题目分组的条目。",
+      );
+    }
+    disposedZipEntries.add(key);
+    dispositionSummary.push(dispositionSummaryItem(key, disposition));
+  }
+
+  const disposedTextRanges = new Map<string, Array<{ start: number; end: number }>>();
+  for (const disposition of grouping.textRangeDispositions) {
+    const source = sourcesById.get(disposition.sourceId);
+    if (
+      source?.kind !== "text" ||
+      disposition.end > source.characterCount ||
+      rangesOverlapAny(
+        { start: disposition.start, end: disposition.end },
+        selectedTextRanges.get(disposition.sourceId) ?? [],
+      ) ||
+      rangesOverlapAny(
+        { start: disposition.start, end: disposition.end },
+        disposedTextRanges.get(disposition.sourceId) ?? [],
+      )
+    ) {
+      throw new HistoryMigrationError(
+        "INVALID_GROUPING",
+        "文本处置范围越界、重复或与已选片段重叠。",
+      );
+    }
+    addRange(disposedTextRanges, disposition.sourceId, disposition.start, disposition.end);
+    dispositionSummary.push(
+      dispositionSummaryItem(
+        `${disposition.sourceId}:${disposition.start}:${disposition.end}`,
+        disposition,
+      ),
+    );
+  }
+
+  const manualSources = inventory.sources.filter(
+    (source) => source.kind === "file" || source.kind === "pdf",
+  );
+  const disposedManualSourceIds = new Set<string>();
+  for (const disposition of grouping.manualSourceDispositions) {
+    const source = sourcesById.get(disposition.sourceId);
+    if (source === undefined || (source.kind !== "file" && source.kind !== "pdf")) {
+      throw new HistoryMigrationError("INVALID_GROUPING", "人工源文件处置指向了非人工源文件。");
+    }
+    if (disposition.action === "converted") {
+      const converted = sourcesById.get(disposition.convertedSourceId);
+      if (
+        converted?.kind !== "text" ||
+        !referencedTextSourceIds.has(disposition.convertedSourceId)
+      ) {
+        throw new HistoryMigrationError(
+          "INVALID_GROUPING",
+          "标为已转换的人工源文件必须指向已实际进入分组的文本源文件。",
+        );
+      }
+    }
+    disposedManualSourceIds.add(disposition.sourceId);
+    dispositionSummary.push(dispositionSummaryItem(disposition.sourceId, disposition));
+  }
+
+  const uncoveredTextRanges: Array<{ sourceId: string; start: number; end: number }> = [];
+  for (const source of inventory.sources) {
+    if (source.kind !== "text") {
+      continue;
+    }
+    const covered = mergeRanges([
+      ...(selectedTextRanges.get(source.sourceId) ?? []),
+      ...(disposedTextRanges.get(source.sourceId) ?? []),
+    ]);
+    let cursor = 0;
+    for (const range of covered) {
+      if (range.start > cursor) {
+        uncoveredTextRanges.push({ sourceId: source.sourceId, start: cursor, end: range.start });
+      }
+      cursor = Math.max(cursor, range.end);
+    }
+    if (cursor < source.characterCount) {
+      uncoveredTextRanges.push({
+        sourceId: source.sourceId,
+        start: cursor,
+        end: source.characterCount,
+      });
+    }
+  }
+
+  const unresolvedZipEntries: Array<{ sourceId: string; entryId: string }> = [];
+  let zipEntryCount = 0;
+  for (const source of inventory.sources) {
+    if (source.kind !== "zip") {
+      continue;
+    }
+    zipEntryCount += source.entries.length;
+    for (const entry of source.entries) {
+      const key = zipEntryKey(source.sourceId, entry.entryId);
+      if (!selectedZipEntries.has(key) && !disposedZipEntries.has(key)) {
+        unresolvedZipEntries.push({ sourceId: source.sourceId, entryId: entry.entryId });
+      }
+    }
+  }
+  const unresolvedManualSourceIds = manualSources
+    .map((source) => source.sourceId)
+    .filter((sourceId) => !disposedManualSourceIds.has(sourceId));
+  const unresolvedItemCount =
+    unresolvedMetadataIds.length +
+    uncoveredTextRanges.length +
+    unresolvedZipEntries.length +
+    unresolvedManualSourceIds.length +
+    (grouping.groups.length === 0 ? 1 : 0);
+  return historyGroupingValidationReportSchema.parse({
+    version: 1,
+    phase: "grouping_validation",
+    status: unresolvedItemCount === 0 ? "complete" : "incomplete",
+    metadataCount,
+    groupedMetadataCount: groupedMetadataIds.size,
+    disposedMetadataCount: disposedMetadataIds.size,
+    unresolvedMetadataIds,
+    textSourceCount: inventory.sources.filter((source) => source.kind === "text").length,
+    uncoveredTextRanges,
+    zipEntryCount,
+    selectedZipEntryCount: selectedZipEntries.size,
+    disposedZipEntryCount: disposedZipEntries.size,
+    unresolvedZipEntries,
+    manualSourceCount: manualSources.length,
+    disposedManualSourceCount: disposedManualSourceIds.size,
+    unresolvedManualSourceIds,
+    missingGroupCount: grouping.groups.length === 0 ? 1 : 0,
+    dispositionSummary: dispositionSummary.sort((first, second) =>
+      compareCodeUnits(first.itemId, second.itemId),
+    ),
+    unresolvedItemCount,
+  });
+}
+
+async function loadVerifiedGrouping(
+  groupingDirectory: string,
+  catalog: VerifiedCatalog,
+  metadataCount: number,
+  metadataFileSha256: string,
+): Promise<{
+  readonly grouping: HistoryGroupingDraft;
+  readonly validationReportSha256: string;
+}> {
+  const grouping = parsePrivateInput(
+    historyGroupingDraftSchema,
+    await readPrivateJson(join(groupingDirectory, "grouping.private.json")),
+    "INVALID_GROUPING",
+    "正式分组文件格式不正确。",
+  );
+  const validationReport = parsePrivateInput(
+    historyGroupingValidationReportSchema,
+    await readPrivateJson(join(groupingDirectory, "grouping-validation.json")),
+    "INVALID_GROUPING",
+    "分组完整性报告格式不正确。",
+  );
+  const marker = parsePrivateInput(
+    historyGroupingCompleteSchema,
+    await readPrivateJson(join(groupingDirectory, "GROUPING_COMPLETE")),
+    "INVALID_GROUPING",
+    "分组目录没有可验证的完整完成标记。",
+  );
+  const currentReport = createGroupingValidationReport(catalog.inventory, metadataCount, grouping);
+  const groupingSha256 = sha256Hex(JSON.stringify(grouping));
+  const validationReportSha256 = sha256Hex(JSON.stringify(validationReport));
+  if (
+    currentReport.status !== "complete" ||
+    JSON.stringify(currentReport) !== JSON.stringify(validationReport) ||
+    marker.catalogSha256 !== catalog.catalogSha256 ||
+    marker.metadataFileSha256 !== metadataFileSha256 ||
+    marker.groupingSha256 !== groupingSha256 ||
+    marker.validationReportSha256 !== validationReportSha256 ||
+    marker.fragmentCount !== grouping.fragments.length ||
+    marker.groupCount !== grouping.groups.length
+  ) {
+    throw new HistoryMigrationError(
+      "GROUPING_CHANGED",
+      "正式分组、完整性报告或完成标记已经不一致。",
+    );
+  }
+  return { grouping, validationReportSha256 };
+}
+
+function validateDispositionUnicodeBoundaries(
+  grouping: HistoryGroupingDraft,
+  sourcesById: ReadonlyMap<string, LoadedHistorySource>,
+): void {
+  for (const disposition of grouping.textRangeDispositions) {
+    const source = sourcesById.get(disposition.sourceId);
+    if (
+      source?.inventory.kind !== "text" ||
+      source.text === undefined ||
+      !isUnicodeRangeBoundary(source.text, disposition.start) ||
+      !isUnicodeRangeBoundary(source.text, disposition.end)
+    ) {
+      throw new HistoryMigrationError(
+        "FRAGMENT_OUT_OF_RANGE",
+        "文本处置范围不能切开 Unicode 代理项对。",
+      );
+    }
+  }
+}
+
+function isUnicodeRangeBoundary(text: string, position: number): boolean {
+  if (position <= 0 || position >= text.length) {
+    return position >= 0 && position <= text.length;
+  }
+  const before = text.charCodeAt(position - 1);
+  const after = text.charCodeAt(position);
+  return !(before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff);
+}
+
+function dispositionSummaryItem(
+  itemId: string,
+  disposition: {
+    readonly action: "converted" | "deferred" | "attachment" | "ignored";
+    readonly reason: string;
+    readonly convertedSourceId?: string;
+  },
+): {
+  readonly itemId: string;
+  readonly action: "converted" | "deferred" | "attachment" | "ignored";
+  readonly reasonSha256: string;
+  readonly convertedSourceId?: string;
+} {
+  return {
+    itemId,
+    action: disposition.action,
+    reasonSha256: sha256Hex(disposition.reason),
+    ...(disposition.convertedSourceId === undefined
+      ? {}
+      : { convertedSourceId: disposition.convertedSourceId }),
+  };
+}
+
+function addRange(
+  rangesBySource: Map<string, Array<{ start: number; end: number }>>,
+  sourceId: string,
+  start: number,
+  end: number,
+): void {
+  const ranges = rangesBySource.get(sourceId) ?? [];
+  ranges.push({ start, end });
+  rangesBySource.set(sourceId, ranges);
+}
+
+function rangesOverlapAny(
+  candidate: { readonly start: number; readonly end: number },
+  ranges: readonly { readonly start: number; readonly end: number }[],
+): boolean {
+  return ranges.some((range) => candidate.start < range.end && range.start < candidate.end);
+}
+
+function mergeRanges(
+  ranges: readonly { readonly start: number; readonly end: number }[],
+): Array<{ readonly start: number; readonly end: number }> {
+  const sorted = [...ranges].sort(
+    (first, second) => first.start - second.start || first.end - second.end,
+  );
+  const merged: Array<{ start: number; end: number }> = [];
+  for (const range of sorted) {
+    const previous = merged.at(-1);
+    if (previous === undefined || range.start > previous.end) {
+      merged.push({ start: range.start, end: range.end });
+    } else {
+      previous.end = Math.max(previous.end, range.end);
+    }
+  }
+  return merged;
+}
+
+function zipEntryKey(sourceId: string, entryId: string): string {
+  return `${sourceId}:${entryId}`;
+}
+
+function makeMetadataId(sequence: number): string {
+  if (!Number.isSafeInteger(sequence) || sequence <= 0 || sequence > 999_999) {
+    throw new HistoryMigrationError("INVALID_GROUPING", "元数据数量超过工具支持的范围。");
+  }
+  return `metadata-${sequence.toString().padStart(6, "0")}`;
+}
+
+function metadataIndexFromId(metadataId: string): number {
+  const parsed = historyMetadataIdSchema.safeParse(metadataId);
+  if (!parsed.success) {
+    throw new HistoryMigrationError("INVALID_GROUPING", "元数据安全编号格式不正确。");
+  }
+  return Number.parseInt(metadataId.slice("metadata-".length), 10) - 1;
 }
 
 async function inspectSourceForInventory(
@@ -745,14 +1595,13 @@ async function loadCurrentCatalogSources(options: {
 }): Promise<{
   readonly inventory: HistorySourceInventory;
   readonly sourcesById: ReadonlyMap<string, LoadedHistorySource>;
+  readonly catalog: VerifiedCatalog;
 }> {
-  const inventory = await loadSourceInventory(options.sourceInventoryFile);
-  const locations = parsePrivateInput(
-    historySourceLocationsSchema,
-    await readPrivateJson(options.sourceLocationsFile),
-    "INVALID_GROUPING",
-    "私有源位置清单格式不正确。",
+  const catalog = await loadVerifiedCatalogArtifacts(
+    options.sourceInventoryFile,
+    options.sourceLocationsFile,
   );
+  const { inventory, locations } = catalog;
   if (inventory.sources.length !== locations.sources.length) {
     throw new HistoryMigrationError("GROUPING_CHANGED", "源清单与私有源位置清单已经不一致。");
   }
@@ -789,7 +1638,93 @@ async function loadCurrentCatalogSources(options: {
   if (sourcesById.size !== locations.sources.length) {
     throw new HistoryMigrationError("GROUPING_CHANGED", "私有源位置清单包含未确认的安全编号。");
   }
-  return { inventory, sourcesById };
+  return { inventory, sourcesById, catalog };
+}
+
+async function loadVerifiedCatalogArtifacts(
+  sourceInventoryFile: string,
+  sourceLocationsFile: string,
+): Promise<VerifiedCatalog> {
+  const catalogDirectory = dirname(resolve(sourceInventoryFile));
+  if (resolve(sourceLocationsFile) !== join(catalogDirectory, "source-locations.private.json")) {
+    throw new HistoryMigrationError(
+      "GROUPING_CHANGED",
+      "源清单与私有源位置清单不是同一次完整登记结果。",
+    );
+  }
+  const inventory = await loadSourceInventory(sourceInventoryFile);
+  const locations = parsePrivateInput(
+    historySourceLocationsSchema,
+    await readPrivateJson(sourceLocationsFile),
+    "INVALID_GROUPING",
+    "私有源位置清单格式不正确。",
+  );
+  const manualReview = parsePrivateInput(
+    historyManualReviewSchema,
+    await readPrivateJson(join(catalogDirectory, "manual-review.json")),
+    "INVALID_GROUPING",
+    "人工处理清单格式不正确。",
+  );
+  const marker = parsePrivateInput(
+    historyInventoryCompleteSchema,
+    await readPrivateJson(join(catalogDirectory, "INVENTORY_COMPLETE")),
+    "INVALID_GROUPING",
+    "源清单目录没有可验证的完整登记标记。",
+  );
+  const inventorySha256 = sha256Hex(JSON.stringify(inventory));
+  const sourceLocationsSha256 = sha256Hex(JSON.stringify(locations));
+  const manualReviewSha256 = sha256Hex(JSON.stringify(manualReview));
+  const catalogSha256 = sha256Hex(
+    JSON.stringify({
+      version: 2,
+      inventorySha256,
+      sourceLocationsSha256,
+      manualReviewSha256,
+    }),
+  );
+  const manualSourceIds = inventory.sources
+    .filter((source) => source.kind === "file" || source.kind === "pdf")
+    .map((source) => source.sourceId)
+    .sort(compareCodeUnits);
+  const reviewedSourceIds = manualReview.sources
+    .map((source) => source.sourceId)
+    .sort(compareCodeUnits);
+  const archiveEntryCount = inventory.sources.reduce(
+    (count, source) => count + (source.kind === "zip" ? source.entries.length : 0),
+    0,
+  );
+  const totalSourceBytes = inventory.sources.reduce(
+    (count, source) => count + source.byteLength,
+    0,
+  );
+  if (
+    inventory.sources.length !== locations.sources.length ||
+    manualReview.sourceCount !== inventory.sources.length ||
+    manualReview.manualSourceCount !== manualSourceIds.length ||
+    !arraysEqual(manualSourceIds, reviewedSourceIds) ||
+    marker.inventorySha256 !== inventorySha256 ||
+    marker.sourceLocationsSha256 !== sourceLocationsSha256 ||
+    marker.manualReviewSha256 !== manualReviewSha256 ||
+    marker.catalogSha256 !== catalogSha256 ||
+    marker.sourceCount !== inventory.sources.length ||
+    marker.archiveEntryCount !== archiveEntryCount ||
+    marker.manualSourceCount !== manualSourceIds.length ||
+    marker.totalSourceBytes !== totalSourceBytes
+  ) {
+    throw new HistoryMigrationError(
+      "GROUPING_CHANGED",
+      "源清单、私有位置、人工处理清单或完整登记标记已经不一致。",
+    );
+  }
+  return {
+    inventory,
+    locations,
+    manualReview,
+    inventorySha256,
+    sourceLocationsSha256,
+    manualReviewSha256,
+    catalogSha256,
+  };
 }
 
 async function loadCurrentSource(
@@ -866,12 +1801,6 @@ async function loadCurrentSource(
   if (location.entries.length !== 0) {
     throw new HistoryMigrationError("GROUPING_CHANGED", "普通源文件不能带有压缩包条目位置。");
   }
-  if (expected.kind === "pdf") {
-    throw new HistoryMigrationError(
-      "SOURCE_FILE_INVALID",
-      "当前分组工作流不自动提取 PDF 页；必须先在私有目录人工转成文本。",
-    );
-  }
   return { inventory: expected, bytes };
 }
 
@@ -884,7 +1813,9 @@ function materializeFragment(
       if (
         source.inventory.kind !== "text" ||
         source.text === undefined ||
-        selection.end > source.text.length
+        selection.end > source.text.length ||
+        !isUnicodeRangeBoundary(source.text, selection.start) ||
+        !isUnicodeRangeBoundary(source.text, selection.end)
       ) {
         throw new HistoryMigrationError(
           "FRAGMENT_OUT_OF_RANGE",
@@ -913,17 +1844,13 @@ function materializeFragment(
       return { text, contentSha256: expectedEntry.contentSha256 };
     }
     case "whole_file": {
-      if (source.inventory.kind === "zip" || source.inventory.kind === "pdf") {
+      if (source.inventory.kind !== "text" || source.text === undefined) {
         throw new HistoryMigrationError(
           "SOURCE_FILE_INVALID",
-          "压缩包或 PDF 不能作为整段文本；必须明确选择可复核的文本片段。",
+          "完整文件片段只允许使用已经登记并复核为 UTF-8 文本的源文件。",
         );
       }
-      const text =
-        source.inventory.kind === "text" && source.text !== undefined
-          ? source.text
-          : decodeMaterializableText(source.bytes);
-      return { text, contentSha256: source.inventory.contentSha256 };
+      return { text: source.text, contentSha256: source.inventory.contentSha256 };
     }
     case "pdf_pages":
       throw new HistoryMigrationError(
