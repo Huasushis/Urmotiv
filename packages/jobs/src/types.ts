@@ -80,6 +80,7 @@ export type JobLease = z.infer<typeof jobLeaseSchema>;
 
 export const enqueueJobSchema = z
   .object({
+    jobId: z.string().uuid(),
     type: jobTypeSchema,
     payload: jsonValueSchema.default({}),
     idempotencyScope: z.string().min(1).max(200).regex(/^[^\u0000-\u001f\u007f]+$/),

@@ -12,6 +12,7 @@ class MemoryLogger implements JobLogger {
 
 function request(overrides: Record<string, unknown> = {}) {
   return {
+    jobId: "11111111-1111-4111-8111-111111111111",
     type: "problem.import",
     payload: { sourceFileId: "file-1" },
     idempotencyScope: "user-1",

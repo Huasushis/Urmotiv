@@ -32,7 +32,10 @@ export interface LocalJobQueueOptions {
 
 export class LocalJobQueue implements JobQueue {
   readonly #jobs = new Map<string, JobRecord>();
-  readonly #idempotencyIndex = new Map<string, string>();
+  readonly #idempotencyIndex = new Map<
+    string,
+    { readonly jobId: string; readonly requestDigest: string }
+  >();
   readonly #now: () => Date;
   readonly #retryDelayMs: number;
   #closed = false;
@@ -50,24 +53,37 @@ export class LocalJobQueue implements JobQueue {
     this.#assertOpen();
     const request = enqueueJobSchema.parse(input);
     const indexKey = idempotencyIndexKey(request.idempotencyScope, request.idempotencyKey);
-    const existingId = this.#idempotencyIndex.get(indexKey);
-    if (existingId !== undefined) {
-      const existing = this.#jobs.get(existingId);
+    const requestDigest = digestJobRequest(request);
+    const existingIndex = this.#idempotencyIndex.get(indexKey);
+    if (existingIndex !== undefined) {
+      if (
+        existingIndex.jobId !== request.jobId ||
+        existingIndex.requestDigest !== requestDigest
+      ) {
+        throw idempotencyConflict();
+      }
+      const existing = this.#jobs.get(existingIndex.jobId);
       if (existing === undefined) {
         throw new JobQueueError("JOB_NOT_FOUND", "幂等记录指向的任务不存在。");
       }
-      if (existing.requestDigest !== digestJobRequest(request)) {
-        throw new JobQueueError(
-          "IDEMPOTENCY_CONFLICT",
-          "同一个幂等键不能用于不同的任务内容。"
-        );
+      if (!sameJobIdentity(existing, request, requestDigest)) {
+        throw idempotencyConflict();
       }
+      return clone(existing);
+    }
+
+    const existing = this.#jobs.get(request.jobId);
+    if (existing !== undefined) {
+      if (!sameJobIdentity(existing, request, requestDigest)) {
+        throw idempotencyConflict();
+      }
+      this.#idempotencyIndex.set(indexKey, { jobId: request.jobId, requestDigest });
       return clone(existing);
     }
 
     const job = createJobRecord(request, this.#now());
     this.#jobs.set(job.id, job);
-    this.#idempotencyIndex.set(indexKey, job.id);
+    this.#idempotencyIndex.set(indexKey, { jobId: job.id, requestDigest: job.requestDigest });
     return clone(job);
   }
 
@@ -297,4 +313,24 @@ export class LocalJobQueue implements JobQueue {
 
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+function sameJobIdentity(
+  job: JobRecord,
+  request: ReturnType<typeof enqueueJobSchema.parse>,
+  requestDigest: string
+): boolean {
+  return (
+    job.id === request.jobId &&
+    job.requestDigest === requestDigest &&
+    job.idempotencyScope === request.idempotencyScope &&
+    job.idempotencyKey === request.idempotencyKey
+  );
+}
+
+function idempotencyConflict(): JobQueueError {
+  return new JobQueueError(
+    "IDEMPOTENCY_CONFLICT",
+    "同一个幂等键或任务编号不能用于不同的任务内容。"
+  );
 }

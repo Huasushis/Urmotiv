@@ -3,6 +3,7 @@ import { LocalJobQueue } from "../src";
 
 function request(overrides: Record<string, unknown> = {}) {
   return {
+    jobId: "11111111-1111-4111-8111-111111111111",
     type: "problem.import",
     payload: { sourceFileId: "file-1" },
     idempotencyScope: "user-1",
@@ -19,9 +20,16 @@ describe("本地任务队列", () => {
     const first = await queue.enqueue(request());
     const duplicate = await queue.enqueue(request());
     expect(duplicate.id).toBe(first.id);
+    expect(first.id).toBe("11111111-1111-4111-8111-111111111111");
 
     await expect(
       queue.enqueue(request({ payload: { sourceFileId: "file-2" } }))
+    ).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+    await expect(
+      queue.enqueue(request({ jobId: "22222222-2222-4222-8222-222222222222" }))
+    ).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+    await expect(
+      queue.enqueue(request({ idempotencyKey: "request-2" }))
     ).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
   });
 

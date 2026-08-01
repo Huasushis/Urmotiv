@@ -434,6 +434,7 @@ describe("题目包任务协调器", () => {
     const queued = await queue.leaseNext({ workerId: "test-worker", leaseMs: 1_000 });
     expect(queued).toEqual(
       expect.objectContaining({
+        id: job.id,
         type: problemImportJobType,
         payload: { importJobId: job.id }
       })

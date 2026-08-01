@@ -130,6 +130,7 @@ export class ProblemPackageJobCoordinator {
   ): Promise<ProblemPackageImportJob> {
     const task = await this.store.createImportJob(input);
     await this.queue.enqueue({
+      jobId: task.id,
       type: problemImportJobType,
       payload: { importJobId: task.id },
       idempotencyScope: "problem-package-import",
@@ -145,6 +146,7 @@ export class ProblemPackageJobCoordinator {
   ): Promise<ProblemPackageExportJob> {
     const task = await this.store.createExportJob(input);
     await this.queue.enqueue({
+      jobId: task.id,
       type: problemExportJobType,
       payload: { exportJobId: task.id },
       idempotencyScope: "problem-package-export",

@@ -24,7 +24,7 @@ S3 是保存文件的服务；Redis 是保存排队状态并协调多个 worker 
 | 字段 | 含义 |
 | --- | --- |
 | `REDIS_URL` | Redis 连接地址；生产 worker 必填 |
-| `JOB_REDIS_PREFIX` | Redis 中任务键的共同前缀，默认 `urmotiv:jobs` |
+| `JOB_REDIS_PREFIX` | Redis 中任务键的共同前缀，默认 `urmotiv:jobs`；当前布局实际使用其下的 `v2` 命名空间 |
 | `JOB_LEASE_MS` | 一次领取任务的有效时间，默认 30000 毫秒 |
 | `JOB_RETRY_DELAY_MS` | 可重试失败后再次领取前的等待时间，默认 1000 毫秒 |
 | `WORKER_ID` | worker 实例编号；未设置时运行时随机生成 |
@@ -50,6 +50,13 @@ S3 是保存文件的服务；Redis 是保存排队状态并协调多个 worker 
 worker 失败时只记录稳定错误编号和普通说明。逐项报告可以保存来源条目编号、导入后的题目编号或导出文件编号，但不得保存
 题面全文、题解、测试数据、原始压缩包内容、密码、令牌或密钥。
 
+生产任务编号必须由业务数据库或 API 在入队前生成，并在重投时保持不变。Redis 会在一个脚本中同时核对任务编号、请求摘要
+和幂等索引；只允许相同任务修复单边缺失的索引或任务记录，不能把运行中或已结束的任务覆盖成新任务。Redis 的租约与重试
+时间只使用 Redis 服务器时钟，API 和 worker 的本地时钟偏移不参与到期判断。当前队列只直接连接单个 Redis 主节点；如果
+部署层或 Sentinel 对外提供一个当前主节点的连接地址，可以使用该地址，但客户端本身不发现或管理 Sentinel，也不支持
+Redis Cluster。切换前缀或从旧键布局升级时必须先让旧 worker 停止领取，并明确处理旧队列，不能直接假定旧键会被 `v2`
+worker 消费。
+
 ## USTC 服务器检查
 
 依赖安装和所有执行都在 `ssh ustc` 指向的服务器完成。本机只编辑和静态检查。服务器同步代码后运行：
@@ -68,4 +75,5 @@ pnpm --filter @urmotiv/worker build
 ```
 
 S3 和 Redis 的单元测试使用内存或假实现，不需要连接真实服务。正式接线完成后，再在 USTC 的隔离测试桶和 Redis 测试库做
-连接检查；不能使用协会真实题目作为测试文件。
+连接检查；不能使用协会真实题目作为测试文件。Redis 集成测试设置 `URMOTIV_REDIS_TEST_URL` 后运行
+`pnpm --filter @urmotiv/jobs test -- redis.integration.test.ts`；测试只删除自己的随机前缀，不能使用 `FLUSHDB` 或 `FLUSHALL`。

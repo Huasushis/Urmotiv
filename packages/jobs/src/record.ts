@@ -1,10 +1,10 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { EnqueueJob, JobRecord, JsonValue } from "./types";
 
 export function createJobRecord(input: EnqueueJob, now: Date): JobRecord {
   const timestamp = now.toISOString();
   return {
-    id: randomUUID(),
+    id: input.jobId,
     type: input.type,
     payload: structuredClone(input.payload),
     idempotencyScope: input.idempotencyScope,

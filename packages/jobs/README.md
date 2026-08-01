@@ -15,9 +15,11 @@
 
 ## 幂等与重试
 
-幂等是指同一个请求重复到达时只产生一次结果。入队时必须传 `idempotencyScope` 和 `idempotencyKey`：前者通常是用户编号，
-后者是该用户这次请求的编号。队列还会计算任务类型、参数、超时和重试上限的 SHA-256。相同范围和键再次入队会返回已有
-任务；内容不同则报 `IDEMPOTENCY_CONFLICT`，不能悄悄复用。
+幂等是指同一个请求重复到达时只产生一次结果。入队调用方必须先生成 UUID 格式的 `jobId`，并在请求结果丢失后的重投中
+继续使用这个编号；同时必须传 `idempotencyScope` 和 `idempotencyKey`，前者通常是用户编号，后者是该用户这次请求的编号。
+队列会计算任务类型、参数、超时和重试上限的 SHA-256。任务编号、请求摘要、幂等范围和键全部相同才返回已有任务，任一项
+冲突都固定报 `IDEMPOTENCY_CONFLICT`，不能悄悄复用。Redis 中的幂等索引原子保存任务编号与请求摘要；索引或任务记录单边
+缺失时只按相同编号、相同摘要和相同幂等身份修复。已有任务处于运行中或结束状态时，重投不会把它覆盖回排队状态。
 
 导入和导出分别使用 `problem.import`、`problem.export`。队列参数只保存 `importJobId` 或 `exportJobId`，也就是数据库任务编号；
 worker 根据编号读取已经固定的来源文件、题目版本和选项。不要把题面、题解、测试数据或完整导入选择复制进队列参数。
@@ -36,6 +38,7 @@ import { LocalJobQueue } from "@urmotiv/jobs";
 
 const queue = new LocalJobQueue({ retryDelayMs: 1000 });
 const job = await queue.enqueue({
+  jobId: "11111111-1111-4111-8111-111111111111",
   type: "problem.export",
   payload: { exportJobId: "11111111-1111-4111-8111-111111111111" },
   idempotencyScope: "user-42",
@@ -49,4 +52,11 @@ const job = await queue.enqueue({
 多个 worker 协调领取任务的服务。实现使用 Redis 官方 Node.js 客户端，并通过 Redis 内的一次性脚本操作保证同一任务不会被
 两个 worker 同时领取。任务参数、结果和逐项报告在 Redis 内保持原始 JSON 字符串，续租不会改变空数组等数据形状。
 
-测试使用本地队列，不要求本机或测试环境提供真实 Redis。Redis 集成测试应在 USTC 服务器的独立测试库执行。
+Redis 键统一放在 `${JOB_REDIS_PREFIX}:v2:` 命名空间；升级时不会把旧布局误当成当前任务。租约截止时间、续租、失败后的再次
+可领取时间和过期回收都使用 Redis 服务器的 `TIME`，不采信 API 或 worker 所在机器的时钟。一次过期回收最多在单段脚本中
+检查 100 个租约，调用方会继续分批直到当时已过期的项目处理完。部署边界是单个 Redis 主节点；如果部署层或 Sentinel
+对外提供一个当前主节点的连接地址，也可以使用该地址，但本客户端不发现或管理 Sentinel。当前脚本不支持 Redis Cluster，
+不能把这些键分散到多个槽位。
+
+普通单元测试使用本地队列，不要求 Redis。真实 Redis 集成测试必须使用隔离实例或隔离数据库，并显式设置
+`URMOTIV_REDIS_TEST_URL`；未设置时该测试文件会标记为跳过。测试使用每个用例独有的前缀，不能清空共享数据库。
