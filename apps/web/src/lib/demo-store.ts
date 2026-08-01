@@ -1,4 +1,5 @@
 import type {
+  ApplyReviewSuggestionsInput,
   CreateProblemInput,
   Problem,
   ProblemCapabilities,
@@ -7,6 +8,7 @@ import type {
   ProblemStatus,
   ReviewInput,
   ReviewRoundSummary,
+  ReviewSuggestionView,
   SessionResponse,
   UpdateProblemInput
 } from "@urmotiv/contracts";
@@ -560,4 +562,93 @@ export async function createDemoReview(id: string, input: ReviewInput): Promise<
     saveProblems(all);
   }
   return summary;
+}
+
+function medianLevel(values: number[]): number {
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) {
+    return sorted[middle] ?? 1;
+  }
+  return Math.floor(((sorted[middle - 1] ?? 1) + (sorted[middle] ?? 1)) / 2 + 0.5);
+}
+
+export async function getDemoReviewSuggestions(id: string): Promise<ReviewSuggestionView> {
+  const { problem } = findProblem(id);
+  if (!decorate(problem).capabilities.canView) {
+    throw new ApiError("题目不存在或你没有查看权限。", 404);
+  }
+  const summary = await listDemoReviews(id);
+  if (
+    problem.status !== "approved" ||
+    summary.status !== "approved" ||
+    summary.round !== problem.reviewRound ||
+    summary.reviews.length === 0
+  ) {
+    throw new ApiError("当前审核轮次没有可用的冻结建议，请刷新后重试。", 409);
+  }
+  const reviews = summary.reviews;
+  const originalityLevels = reviews.flatMap((review) =>
+    review.originalityLevel === null ? [] : [review.originalityLevel]
+  );
+  return {
+    round: problem.reviewRound,
+    opinionCount: reviews.length,
+    current: {
+      codeforcesDifficulty: problem.codeforcesDifficulty,
+      thinkingLevel: problem.thinkingLevel,
+      codingLevel: problem.codingLevel,
+      tagIds: [...problem.tagIds]
+    },
+    suggested: {
+      codeforcesDifficulty:
+        Math.floor(
+          reviews.reduce((sum, review) => sum + review.codeforcesDifficulty, 0) /
+            reviews.length /
+            100 +
+            0.5
+        ) * 100,
+      thinkingLevel: medianLevel(reviews.map((review) => review.thinkingLevel)),
+      codingLevel: medianLevel(reviews.map((review) => review.codingLevel)),
+      tagIds: [...new Set(reviews.flatMap((review) => review.tagIds))].sort(),
+      qualityLevel: medianLevel(reviews.map((review) => review.qualityLevel)),
+      originalityLevel:
+        originalityLevels.length === 0 ? null : medianLevel(originalityLevels)
+    },
+    canApply: currentUserId() === "leader"
+  };
+}
+
+export async function applyDemoReviewSuggestions(
+  id: string,
+  input: ApplyReviewSuggestionsInput
+): Promise<Problem> {
+  const { problem, index, all } = findProblem(id);
+  if (currentUserId() !== "leader") {
+    throw new ApiError("当前账号没有执行这项操作的权限。", 403);
+  }
+  if (input.expectedRound !== problem.reviewRound) {
+    throw new ApiError("审核轮次已变化，请刷新后重试。", 409);
+  }
+  requireRevision(problem, input.expectedRevision);
+  const suggestions = await getDemoReviewSuggestions(id);
+  const selected = new Set(input.fields);
+  const updated: Problem = {
+    ...problem,
+    codeforcesDifficulty: selected.has("codeforcesDifficulty")
+      ? suggestions.suggested.codeforcesDifficulty
+      : problem.codeforcesDifficulty,
+    thinkingLevel: selected.has("thinkingLevel")
+      ? suggestions.suggested.thinkingLevel
+      : problem.thinkingLevel,
+    codingLevel: selected.has("codingLevel")
+      ? suggestions.suggested.codingLevel
+      : problem.codingLevel,
+    tagIds: selected.has("tagIds") ? [...suggestions.suggested.tagIds] : [...problem.tagIds],
+    revision: problem.revision + 1,
+    updatedAt: now()
+  };
+  all[index] = updated;
+  saveProblems(all);
+  return decorate(updated);
 }

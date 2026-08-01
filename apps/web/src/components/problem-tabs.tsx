@@ -19,9 +19,19 @@ import type {
   ProblemJudgeConfig,
   ProblemSample,
   ReviewInput,
-  ReviewItemView
+  ReviewItemView,
+  ReviewSuggestionField
 } from "@urmotiv/contracts";
-import { createReview, listReviewItems, listReviews, listTags } from "../lib/api";
+import {
+  ApiError,
+  applyReviewSuggestions,
+  createReview,
+  getProblem,
+  getReviewSuggestions,
+  listReviewItems,
+  listReviews,
+  listTags
+} from "../lib/api";
 import { dateTime, isFrozen, reviewVerdictText, statusText, typeText } from "../lib/presentation";
 import { MarkdownEditor } from "./markdown-editor";
 import {
@@ -903,12 +913,14 @@ export function ReviewTab({
   problem,
   currentUserId,
   submissionBlocked = false,
-  onStatusChange
+  onStatusChange,
+  onProblemChange
 }: {
   problem: Problem;
   currentUserId: string;
   submissionBlocked?: boolean;
   onStatusChange?: (status: Problem["status"]) => void;
+  onProblemChange?: (problem: Problem) => void;
 }) {
   const client = useQueryClient();
   const reviews = useQuery({
@@ -916,6 +928,7 @@ export function ReviewTab({
     queryFn: () => listReviews(problem.id),
     enabled: problem.reviewRound > 0
   });
+  const summary = reviews.data;
   const reviewItems = useQuery({
     queryKey: ["review-items", problem.id, problem.reviewRound, currentUserId],
     queryFn: () => listReviewItems(problem.id),
@@ -927,16 +940,25 @@ export function ReviewTab({
     staleTime: 5 * 60_000,
     enabled: problem.reviewRound > 0
   });
+  const suggestions = useQuery({
+    queryKey: ["review-suggestions", problem.id, problem.reviewRound, problem.revision],
+    queryFn: () => getReviewSuggestions(problem.id),
+    enabled: problem.status === "approved" && summary?.status === "approved"
+  });
   const [verdict, setVerdict] = useState<ReviewInput["verdict"]>("request_changes");
   const [difficulty, setDifficulty] = useState(problem.codeforcesDifficulty ?? 1600);
   const [quality, setQuality] = useState(3);
+  const [originality, setOriginality] = useState<number | "">("");
   const [thinking, setThinking] = useState(3);
   const [coding, setCoding] = useState(3);
   const [tagIds, setTagIds] = useState<string[]>([]);
   const [improvements, setImprovements] = useState("");
+  const [publicComment, setPublicComment] = useState("");
   const [privateNote, setPrivateNote] = useState("");
+  const [selectedSuggestionFields, setSelectedSuggestionFields] = useState<ReviewSuggestionField[]>([]);
+  const [suggestionConfirmationOpen, setSuggestionConfirmationOpen] = useState(false);
+  const [suggestionNotice, setSuggestionNotice] = useState<string | null>(null);
   const [loadedReviewVersion, setLoadedReviewVersion] = useState<string | null>(null);
-  const summary = reviews.data;
   const ownReview = summary?.reviews.find((review) => review.reviewer.id === currentUserId);
   const reviewVersion = summary === undefined
     ? null
@@ -949,10 +971,12 @@ export function ReviewTab({
         ownReview?.verdict ?? "",
         ownReview?.codeforcesDifficulty ?? null,
         ownReview?.qualityLevel ?? null,
+        ownReview?.originalityLevel ?? null,
         ownReview?.thinkingLevel ?? null,
         ownReview?.codingLevel ?? null,
         ownReview?.tagIds ?? [],
         ownReview?.improvements ?? "",
+        ownReview?.publicComment ?? "",
         ownReview?.privateNote ?? ""
       ]);
 
@@ -963,13 +987,28 @@ export function ReviewTab({
     setVerdict(ownReview?.verdict ?? "request_changes");
     setDifficulty(ownReview?.codeforcesDifficulty ?? problem.codeforcesDifficulty ?? 1600);
     setQuality(ownReview?.qualityLevel ?? 3);
+    setOriginality(ownReview?.originalityLevel ?? "");
     setThinking(ownReview?.thinkingLevel ?? 3);
     setCoding(ownReview?.codingLevel ?? 3);
     setTagIds(ownReview?.tagIds ?? []);
     setImprovements(ownReview?.improvements ?? "");
+    setPublicComment(ownReview?.publicComment ?? "");
     setPrivateNote(ownReview?.privateNote ?? "");
     setLoadedReviewVersion(reviewVersion);
   }, [loadedReviewVersion, ownReview, problem.codeforcesDifficulty, reviewVersion]);
+
+  const suggestionVersion = suggestions.data === undefined
+    ? null
+    : `${problem.id}:${problem.revision}:${suggestions.data.round}`;
+
+  useEffect(() => {
+    setSelectedSuggestionFields([]);
+    setSuggestionConfirmationOpen(false);
+  }, [suggestionVersion]);
+
+  useEffect(() => {
+    setSuggestionNotice(null);
+  }, [problem.id]);
 
   const submit = useMutation({
     mutationFn: (input: ReviewInput) => createReview(problem.id, input),
@@ -986,6 +1025,48 @@ export function ReviewTab({
     }
   });
 
+  const applySuggestions = useMutation({
+    mutationFn: (fields: ReviewSuggestionField[]) =>
+      applyReviewSuggestions(problem.id, {
+        expectedRound: problem.reviewRound,
+        expectedRevision: problem.revision,
+        fields
+      }),
+    onSuccess: (updated) => {
+      client.setQueryData(["problem", updated.id, currentUserId], updated);
+      client.invalidateQueries({ queryKey: ["problem", updated.id] });
+      client.invalidateQueries({ queryKey: ["problems"] });
+      client.invalidateQueries({ queryKey: ["review-suggestions", updated.id] });
+      setSelectedSuggestionFields([]);
+      setSuggestionConfirmationOpen(false);
+      setSuggestionNotice("所选字段已经写回题目，请按最新值继续工作。");
+      onProblemChange?.(updated);
+    },
+    onError: async (error) => {
+      setSuggestionConfirmationOpen(false);
+      if (error instanceof ApiError && error.status === 409) {
+        setSelectedSuggestionFields([]);
+        try {
+          const latest = await getProblem(problem.id);
+          client.setQueryData(["problem", latest.id, currentUserId], latest);
+          onProblemChange?.(latest);
+          setSuggestionNotice("题目刚刚发生了变化，已经重新读取最新版本。请重新核对后再确认。");
+        } catch {
+          // 刷新失败时仍保持当前页面的真实旧值，不做任何本地写回。
+          setSuggestionNotice("题目刚刚发生了变化，但最新版本暂时无法读取。当前页面没有写回任何修改，请刷新后重新核对。");
+        }
+        await client.invalidateQueries({ queryKey: ["problem", problem.id] });
+        await client.invalidateQueries({ queryKey: ["review-suggestions", problem.id] });
+        return;
+      }
+      setSuggestionNotice(
+        error instanceof ApiError && (error.status === 403 || error.status === 404)
+          ? "当前无法执行这项操作。请刷新后重试。"
+          : "写回失败，题目没有被修改。请稍后重试。"
+      );
+    }
+  });
+
   if (problem.reviewRound === 0) {
     return (
       <div className="workspace-section permission-empty">
@@ -997,6 +1078,50 @@ export function ReviewTab({
   }
 
   const tagNameById = new Map((tags.data?.items ?? []).map((tag) => [tag.id, tag.name]));
+  const tagListText = (ids: string[]) =>
+    ids.length === 0 ? "未设置" : ids.map((id) => tagNameById.get(id) ?? id).join("、");
+  const editableSuggestionRows: Array<{
+    field: ReviewSuggestionField;
+    label: string;
+    current: string;
+    suggested: string;
+  }> = suggestions.data === undefined
+    ? []
+    : [
+        {
+          field: "codeforcesDifficulty",
+          label: "CF 难度",
+          current: suggestions.data.current.codeforcesDifficulty?.toString() ?? "未设置",
+          suggested: suggestions.data.suggested.codeforcesDifficulty.toString()
+        },
+        {
+          field: "thinkingLevel",
+          label: "思维难度",
+          current: suggestions.data.current.thinkingLevel?.toString() ?? "未设置",
+          suggested: suggestions.data.suggested.thinkingLevel.toString()
+        },
+        {
+          field: "codingLevel",
+          label: "代码难度",
+          current: suggestions.data.current.codingLevel?.toString() ?? "未设置",
+          suggested: suggestions.data.suggested.codingLevel.toString()
+        },
+        {
+          field: "tagIds",
+          label: "知识点",
+          current: tagListText(suggestions.data.current.tagIds),
+          suggested: tagListText(suggestions.data.suggested.tagIds)
+        }
+      ];
+  const toggleSuggestionField = (field: ReviewSuggestionField) => {
+    setSelectedSuggestionFields((current) =>
+      current.includes(field)
+        ? current.filter((candidate) => candidate !== field)
+        : [...current, field]
+    );
+    setSuggestionConfirmationOpen(false);
+    setSuggestionNotice(null);
+  };
   const canEditOwnReview =
     problem.capabilities.canReview &&
     problem.status === "pending_review" &&
@@ -1044,6 +1169,118 @@ export function ReviewTab({
         ) : null}
       </section>
 
+      {problem.status === "approved" && summary?.status === "approved" ? (
+        <section className="review-suggestions plain-panel" aria-labelledby="review-suggestions-title">
+          <div className="section-title">
+            <div>
+              <p className="eyebrow">轮次结束后汇总</p>
+              <h2 id="review-suggestions-title">审核建议</h2>
+            </div>
+            <ShieldCheck size={21} aria-hidden="true" />
+          </div>
+          {suggestions.isLoading ? <p className="empty-state">正在汇总本轮审核建议…</p> : null}
+          {suggestions.isError ? (
+            <div className="inline-error" role="alert">审核建议暂时无法读取。</div>
+          ) : null}
+          {suggestions.data ? (
+            <>
+              <p className="review-suggestion-intro">
+                以下结果来自本轮结束时计入决定的 {suggestions.data.opinionCount} 份评价。请逐项核对，系统不会默认写回任何字段。
+              </p>
+              <div className="review-suggestion-list">
+                {editableSuggestionRows.map((row) => {
+                  const selected = selectedSuggestionFields.includes(row.field);
+                  return (
+                    <div className="review-suggestion-row" key={row.field}>
+                      <div className="review-suggestion-label">
+                        {suggestions.data.canApply ? (
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={selected}
+                              disabled={submissionBlocked || applySuggestions.isPending}
+                              onChange={() => toggleSuggestionField(row.field)}
+                              aria-label={`写回${row.label}`}
+                            />
+                            <span>{row.label}</span>
+                          </label>
+                        ) : (
+                          <strong>{row.label}</strong>
+                        )}
+                      </div>
+                      <div><span>当前值</span><strong>{row.current}</strong></div>
+                      <div><span>建议值</span><strong>{row.suggested}</strong></div>
+                    </div>
+                  );
+                })}
+                <div className="review-suggestion-row readonly">
+                  <div className="review-suggestion-label"><strong>题目质量</strong><span>只读汇总</span></div>
+                  <div><span>当前值</span><strong>无对应题目字段</strong></div>
+                  <div><span>建议值</span><strong>{suggestions.data.suggested.qualityLevel}</strong></div>
+                </div>
+                <div className="review-suggestion-row readonly">
+                  <div className="review-suggestion-label"><strong>原创性</strong><span>只读汇总</span></div>
+                  <div><span>当前值</span><strong>无对应题目字段</strong></div>
+                  <div>
+                    <span>建议值</span>
+                    <strong>{suggestions.data.suggested.originalityLevel ?? "未提供"}</strong>
+                  </div>
+                </div>
+              </div>
+              {!suggestions.data.canApply ? (
+                <p className="field-help review-suggestion-permission" role="note">
+                  你可以查看这些建议，但当前账号不能把它们写回题目。
+                </p>
+              ) : suggestionConfirmationOpen ? (
+                <div className="review-suggestion-confirmation" role="group" aria-label="确认写回审核建议">
+                  <p>确认后只会写回已经勾选的字段，并生成新的题目修订。是否继续？</p>
+                  <div className="inline-actions">
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      disabled={submissionBlocked || applySuggestions.isPending}
+                      onClick={() => setSuggestionConfirmationOpen(false)}
+                    >
+                      取消
+                    </button>
+                    <button
+                      className="primary-button"
+                      type="button"
+                      disabled={submissionBlocked || selectedSuggestionFields.length === 0 || applySuggestions.isPending}
+                      onClick={() => applySuggestions.mutate(selectedSuggestionFields)}
+                    >
+                      {applySuggestions.isPending ? "正在写回…" : "确认写回"}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  className="primary-button review-suggestion-continue"
+                  type="button"
+                  disabled={submissionBlocked || selectedSuggestionFields.length === 0 || applySuggestions.isPending}
+                  onClick={() => setSuggestionConfirmationOpen(true)}
+                >
+                  继续确认所选字段
+                </button>
+              )}
+              {suggestions.data.canApply && submissionBlocked ? (
+                <p className="field-help review-suggestion-permission" role="note">
+                  请先保存题目工作区中的修改，再写回审核建议。
+                </p>
+              ) : null}
+              {suggestionNotice ? (
+                <p
+                  className={applySuggestions.isError ? "inline-error" : "notice-line"}
+                  role={applySuggestions.isError ? "alert" : "status"}
+                >
+                  {suggestionNotice}
+                </p>
+              ) : null}
+            </>
+          ) : null}
+        </section>
+      ) : null}
+
       {reviews.isError ? <div className="inline-error">{reviews.error.message}</div> : null}
       <div className="review-layout">
         <section className="review-history">
@@ -1064,6 +1301,7 @@ export function ReviewTab({
                 <dl>
                   <div><dt>CF 难度</dt><dd>{review.codeforcesDifficulty}</dd></div>
                   <div><dt>题目质量</dt><dd>{review.qualityLevel}</dd></div>
+                  <div><dt>原创性</dt><dd>{review.originalityLevel ?? "未提供"}</dd></div>
                   <div><dt>思维难度</dt><dd>{review.thinkingLevel}</dd></div>
                   <div><dt>代码难度</dt><dd>{review.codingLevel}</dd></div>
                 </dl>
@@ -1075,6 +1313,12 @@ export function ReviewTab({
                   </div>
                 ) : null}
                 <p>{review.improvements}</p>
+                {review.publicComment ? (
+                  <div className="review-public-comment">
+                    <strong>公开评论</strong>
+                    <p>{review.publicComment}</p>
+                  </div>
+                ) : null}
                 {review.privateNote ? <p className="private-note"><LockKeyhole size={14} />{review.privateNote}</p> : null}
                 <footer>{dateTime(review.updatedAt)}</footer>
               </article>
@@ -1104,6 +1348,21 @@ export function ReviewTab({
               <LevelSelect label="思维难度" value={thinking} onChange={setThinking} />
               <LevelSelect label="代码难度" value={coding} onChange={setCoding} />
             </div>
+            <label className="field">
+              <span>原创性（必填）</span>
+              <select
+                value={originality}
+                onChange={(event) => setOriginality(event.target.value === "" ? "" : Number(event.target.value))}
+              >
+                <option value="" disabled>请选择 1–5</option>
+                <option value={1}>1</option>
+                <option value={2}>2</option>
+                <option value={3}>3</option>
+                <option value={4}>4</option>
+                <option value={5}>5</option>
+              </select>
+              <small>根据目前查到的资料，评价题目想法的新颖程度；这不等于认定题目抄袭或未抄袭。</small>
+            </label>
             <div className="field">
               <span>建议知识点（可选）</span>
               <TagPicker
@@ -1115,23 +1374,33 @@ export function ReviewTab({
               {tags.isError ? <small>知识点暂时无法读取，原有选择会继续保留。</small> : null}
             </div>
             <label className="field"><span>主要改进点</span><textarea rows={6} value={improvements} onChange={(e) => setImprovements(e.target.value)} placeholder="说明需要修改的内容；如果通过，说明判断依据。" /></label>
+            <label className="field">
+              <span>公开评论（可选）</span>
+              <textarea rows={3} value={publicComment} onChange={(event) => setPublicComment(event.target.value)} />
+              <small>所有能查看题目的人都能看到，请不要填写只供审题人查看的内容。</small>
+            </label>
             <label className="field"><span>仅审题人可见备注（可选）</span><textarea rows={3} value={privateNote} onChange={(e) => setPrivateNote(e.target.value)} /></label>
             {submit.error ? <p className="form-error">{submit.error.message}</p> : null}
             <button
               className="primary-button"
               type="button"
-              disabled={!improvements.trim() || submit.isPending || submissionBlocked}
-              onClick={() => submit.mutate({
-                verdict,
-                codeforcesDifficulty: difficulty,
-                qualityLevel: quality,
-                thinkingLevel: thinking,
-                codingLevel: coding,
-                tagIds,
-                improvements,
-                privateNote,
-                expectedRound: problem.reviewRound
-              })}
+              disabled={!improvements.trim() || originality === "" || submit.isPending || submissionBlocked}
+              onClick={() => {
+                if (originality === "") return;
+                submit.mutate({
+                  verdict,
+                  codeforcesDifficulty: difficulty,
+                  qualityLevel: quality,
+                  originalityLevel: originality,
+                  thinkingLevel: thinking,
+                  codingLevel: coding,
+                  tagIds,
+                  improvements,
+                  publicComment,
+                  privateNote,
+                  expectedRound: problem.reviewRound
+                });
+              }}
             >
               {submit.isPending ? "正在保存…" : ownReview ? "保存修改" : "提交审核意见"}
             </button>

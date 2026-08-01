@@ -16,6 +16,7 @@ import {
   problemSchema,
   reviewItemListResponseSchema,
   reviewPolicyViewSchema,
+  reviewSuggestionViewSchema,
   reviewRoundSummarySchema,
   sessionResponseSchema,
   similarityCheckResponseSchema,
@@ -43,9 +44,11 @@ import {
   type ProblemListQuery,
   type ProblemListResponse,
   type ReviewInput,
+  type ApplyReviewSuggestionsInput,
   type ReviewPolicyView,
   type ReviewItemListResponse,
   type ReviewRoundSummary,
+  type ReviewSuggestionView,
   type SessionResponse,
   type SimilarityCheckResponse,
   type UpdateContestInput,
@@ -356,6 +359,33 @@ export function createReview(id: string, input: ReviewInput): Promise<ReviewRoun
   return fallback(
     () => request(`/problems/${encodeURIComponent(id)}/reviews`, json(input), reviewRoundSummarySchema),
     async () => (await import("./demo-store")).createDemoReview(id, input)
+  );
+}
+
+export function getReviewSuggestions(id: string): Promise<ReviewSuggestionView> {
+  return fallback(
+    () =>
+      request(
+        `/problems/${encodeURIComponent(id)}/review-suggestions`,
+        { method: "GET" },
+        reviewSuggestionViewSchema
+      ),
+    async () => (await import("./demo-store")).getDemoReviewSuggestions(id)
+  );
+}
+
+export function applyReviewSuggestions(
+  id: string,
+  input: ApplyReviewSuggestionsInput
+): Promise<Problem> {
+  return fallback(
+    () =>
+      request(
+        `/problems/${encodeURIComponent(id)}/review-suggestions/apply`,
+        json(input),
+        problemSchema
+      ),
+    async () => (await import("./demo-store")).applyDemoReviewSuggestions(id, input)
   );
 }
 

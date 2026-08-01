@@ -423,6 +423,11 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
             onStatusChange={(status) => {
               setWorking((current) => current === null ? current : { ...current, status });
             }}
+            onProblemChange={(updated) => {
+              setWorking(updated);
+              setDirty(false);
+              setSaveState("saved");
+            }}
           />
         ) : null}
       </div>

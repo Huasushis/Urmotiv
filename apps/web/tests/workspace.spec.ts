@@ -311,14 +311,20 @@ test("评价公开字段、本人修改和状态联动在桌面与手机上保�
   await expect(page.getByRole("heading", { name: "提交我的评价" })).toBeVisible();
   await page.getByLabel("结论").selectOption("request_changes");
   await page.getByLabel("主要改进点").fill("请补充负数输入的说明。");
+  const initialSubmit = page.getByRole("button", { name: "提交审核意见" });
+  await expect(initialSubmit).toBeDisabled();
+  await page.getByLabel("原创性（必填）").selectOption("3");
+  await page.getByLabel("公开评论（可选）").fill("负数输入的处理方式需要向作者说明。");
   await page.getByLabel("仅审题人可见备注（可选）").fill("内部复核备注，不向作者公开。");
-  await page.getByRole("button", { name: "提交审核意见" }).click();
+  await expect(initialSubmit).toBeEnabled();
+  await initialSubmit.click();
   await expect(page.getByText("我的评价 · 人工审核")).toBeVisible();
   await expect(page.locator(".review-item").getByText("请补充负数输入的说明。")).toBeVisible();
 
   await loginAs(page, /投稿人/);
   await page.goto(`/problems/${problemId}?tab=reviews`);
   await expect(page.getByText("请补充负数输入的说明。")).toBeVisible();
+  await expect(page.getByText("负数输入的处理方式需要向作者说明。")).toBeVisible();
   await expect(page.getByText("内部复核备注，不向作者公开。")).toHaveCount(0);
   await expect(page.locator(".review-form")).toHaveCount(0);
 
@@ -326,6 +332,7 @@ test("评价公开字段、本人修改和状态联动在桌面与手机上保�
   await page.goto(`/problems/${problemId}?tab=reviews`);
   await expect(page.getByRole("heading", { name: "修改我的评价" })).toBeVisible();
   await expect(page.getByLabel("主要改进点")).toHaveValue("请补充负数输入的说明。");
+  await expect(page.getByLabel("原创性（必填）")).toHaveValue("3");
   await page.getByLabel("结论").selectOption("reject");
   await page.getByLabel("主要改进点").fill("题面缺少必要约束，暂不通过。");
   await page.getByRole("button", { name: "保存修改" }).click();
@@ -339,6 +346,150 @@ test("评价公开字段、本人修改和状态联动在桌面与手机上保�
   );
   expect(pageFitsViewport).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("review-workflow.png"), fullPage: true });
+});
+
+test("审核建议在真实 API 中只读展示、明确写回并诚实处理并发冲突", async ({ page }, testInfo) => {
+  test.slow();
+  await loginAsAuthor(page);
+  const problem = await postJson(page, "/api/v1/problems", {
+    title: `审核建议联调题-${testInfo.project.name}-${Date.now()}`,
+    type: "traditional",
+    tagIds: ["algorithm.implementation"],
+    codeforcesDifficulty: 1600,
+    content: {
+      basicStatement: "给定一个整数，输出它的两倍。",
+      basicSolution: "读取整数后乘二输出。",
+      background: "",
+      statement: "",
+      inputFormat: "",
+      outputFormat: "",
+      constraints: "",
+      solution: "",
+      hints: ""
+    },
+    samples: []
+  });
+  const problemId = problem.id as string;
+  const submitted = await postJson(page, `/api/v1/problems/${problemId}/submit`, {
+    expectedRevision: problem.revision
+  });
+
+  await loginAs(page, /审题人/);
+  await postJson(page, `/api/v1/problems/${problemId}/reviews`, {
+    verdict: "approve",
+    codeforcesDifficulty: 1800,
+    qualityLevel: 4,
+    originalityLevel: 3,
+    thinkingLevel: 3,
+    codingLevel: 2,
+    tagIds: ["algorithm.implementation"],
+    improvements: "题意、题解和边界情况已经核对。",
+    publicComment: "第一份公开审核说明。",
+    privateNote: "第一份内部说明。",
+    expectedRound: submitted.reviewRound
+  });
+
+  await loginAs(page, /命题组成员/);
+  const approvedSummary = await postJson(page, `/api/v1/problems/${problemId}/reviews`, {
+    verdict: "approve",
+    codeforcesDifficulty: 2000,
+    qualityLevel: 5,
+    originalityLevel: 4,
+    thinkingLevel: 4,
+    codingLevel: 3,
+    tagIds: ["dynamic-programming"],
+    improvements: "同意通过，并补充建议知识点。",
+    publicComment: "第二份公开审核说明。",
+    privateNote: "第二份内部说明。",
+    expectedRound: submitted.reviewRound
+  });
+  expect(approvedSummary.status).toBe("approved");
+
+  await loginAs(page, /投稿人/);
+  await page.goto(`/problems/${problemId}?tab=reviews`);
+  await expect(page.getByRole("heading", { name: "审核建议", exact: true })).toBeVisible();
+  await expect(page.getByText("你可以查看这些建议，但当前账号不能把它们写回题目。")).toBeVisible();
+  await expect(page.locator('.review-suggestions input[type="checkbox"]')).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "继续确认所选字段" })).toHaveCount(0);
+  await expect(page.locator(".review-suggestion-row", { hasText: "题目质量" })).toContainText("只读汇总");
+  await expect(page.locator(".review-suggestion-row", { hasText: "原创性" })).toContainText("只读汇总");
+
+  await loginAs(page, /组长/);
+  await page.goto(`/problems/${problemId}?tab=reviews`);
+  await expect(page.getByRole("heading", { name: "审核建议", exact: true })).toBeVisible();
+  const suggestionCheckboxes = page.locator('.review-suggestions input[type="checkbox"]');
+  await expect(suggestionCheckboxes).toHaveCount(4);
+  for (let index = 0; index < 4; index += 1) {
+    await expect(suggestionCheckboxes.nth(index)).not.toBeChecked();
+  }
+  const continueButton = page.getByRole("button", { name: "继续确认所选字段" });
+  await expect(continueButton).toBeDisabled();
+
+  await page.getByLabel("写回CF 难度").check();
+  await expect(continueButton).toBeEnabled();
+  await continueButton.click();
+  await expect(page.getByRole("group", { name: "确认写回审核建议" })).toBeVisible();
+
+  const beforeConflictResponse = await page.request.get(`/api/v1/problems/${problemId}`);
+  expect(beforeConflictResponse.ok()).toBe(true);
+  const beforeConflict = await beforeConflictResponse.json() as {
+    revision: number;
+    codeforcesDifficulty: number | null;
+  };
+  const concurrentUpdate = await page.request.patch(`/api/v1/problems/${problemId}`, {
+    data: {
+      expectedRevision: beforeConflict.revision,
+      codeforcesDifficulty: 1700
+    },
+    headers: { Origin: localOrigin }
+  });
+  expect(concurrentUpdate.ok(), await concurrentUpdate.text()).toBe(true);
+
+  await page.getByRole("button", { name: "确认写回", exact: true }).click();
+  await expect(page.locator('.review-suggestions [role="alert"]')).toContainText("已经重新读取最新版本");
+  await expect(page.getByLabel("写回CF 难度")).not.toBeChecked();
+  await expect(page.getByText("所选字段已经写回题目")).toHaveCount(0);
+
+  const afterConflictResponse = await page.request.get(`/api/v1/problems/${problemId}`);
+  expect(afterConflictResponse.ok()).toBe(true);
+  const afterConflict = await afterConflictResponse.json() as {
+    revision: number;
+    codeforcesDifficulty: number | null;
+    thinkingLevel: number | null;
+    codingLevel: number | null;
+    tagIds: string[];
+  };
+  expect(afterConflict.revision).toBe(beforeConflict.revision + 1);
+  expect(afterConflict.codeforcesDifficulty).toBe(1700);
+  expect(afterConflict.thinkingLevel).toBeNull();
+  expect(afterConflict.codingLevel).toBeNull();
+  expect(afterConflict.tagIds).toEqual(["algorithm.implementation"]);
+
+  await page.getByLabel("写回CF 难度").check();
+  await page.getByLabel("写回知识点").check();
+  await page.getByRole("button", { name: "继续确认所选字段" }).click();
+  await page.getByRole("button", { name: "确认写回", exact: true }).click();
+  await expect(page.locator('.review-suggestions [role="status"]')).toContainText("所选字段已经写回题目");
+
+  const afterApplyResponse = await page.request.get(`/api/v1/problems/${problemId}`);
+  expect(afterApplyResponse.ok()).toBe(true);
+  const afterApply = await afterApplyResponse.json() as {
+    revision: number;
+    codeforcesDifficulty: number | null;
+    thinkingLevel: number | null;
+    codingLevel: number | null;
+    tagIds: string[];
+  };
+  expect(afterApply.revision).toBe(afterConflict.revision + 1);
+  expect(afterApply.codeforcesDifficulty).toBe(1900);
+  expect(afterApply.thinkingLevel).toBeNull();
+  expect(afterApply.codingLevel).toBeNull();
+  expect(afterApply.tagIds).toEqual(["algorithm.implementation", "dynamic-programming"]);
+
+  expect(await page.evaluate(
+    () => document.documentElement.scrollWidth <= document.documentElement.clientWidth
+  )).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("review-suggestions.png"), fullPage: true });
 });
 
 test("组长把审核通过的固定题目版本加入组题方案", async ({ page }, testInfo) => {
@@ -371,6 +522,7 @@ test("组长把审核通过的固定题目版本加入组题方案", async ({ pa
     verdict: "approve",
     codeforcesDifficulty: 1200,
     qualityLevel: 4,
+    originalityLevel: 4,
     thinkingLevel: 2,
     codingLevel: 2,
     tagIds: [],
@@ -384,6 +536,7 @@ test("组长把审核通过的固定题目版本加入组题方案", async ({ pa
     verdict: "approve",
     codeforcesDifficulty: 1200,
     qualityLevel: 4,
+    originalityLevel: 4,
     thinkingLevel: 2,
     codingLevel: 2,
     tagIds: [],
