@@ -40,6 +40,12 @@ import {
   ProblemPackageJobCoordinator
 } from "../src/problem-package-job-store";
 import {
+  DatabaseProblemPackageAuditWriter,
+  ProblemPackageAuditWriteError,
+  type ProblemPackageAuditEvent,
+  type ProblemPackageAuditWriter
+} from "../src/problem-package-audit";
+import {
   DatabaseFixedRevisionExportReader,
   DatabaseImportedProblemWriter,
   ServiceExportReadAuthorization,
@@ -62,6 +68,7 @@ const silentLogger: JobLogger = { write: () => undefined };
 interface TransferTestContext {
   readonly app: FastifyInstance;
   readonly artifacts: StorageExportArtifactWriter;
+  readonly audit: ProblemPackageAuditWriter;
   readonly database: LocalDatabaseHandle;
   readonly jobs: DatabaseProblemPackageJobStore;
   readonly metadata: ProblemFileStore;
@@ -76,8 +83,31 @@ interface TransferTestContext {
 
 interface TransferTestAppOptions {
   readonly adapters?: ReadonlyMap<string, ProblemFormatAdapter>;
+  readonly audit?: ProblemPackageAuditWriter;
+  readonly failingAuditActions?: ReadonlySet<ProblemPackageAuditEvent["action"]>;
   readonly multiProblemOuterArchiveMaxBytes?: number;
   readonly problemPackageArchiveMaxBytes?: number;
+}
+
+class SelectiveProblemPackageAuditWriter implements ProblemPackageAuditWriter {
+  readonly #delegate: DatabaseProblemPackageAuditWriter;
+
+  public constructor(
+    database: LocalDatabaseHandle,
+    private readonly failingActions: ReadonlySet<ProblemPackageAuditEvent["action"]>
+  ) {
+    this.#delegate = new DatabaseProblemPackageAuditWriter(database);
+  }
+
+  public async append(
+    event: ProblemPackageAuditEvent,
+    executor?: DatabaseExecutor
+  ): Promise<void> {
+    if (this.failingActions.has(event.action)) {
+      throw new ProblemPackageAuditWriteError();
+    }
+    await this.#delegate.append(event, executor);
+  }
 }
 
 const openApps: FastifyInstance[] = [];
@@ -114,7 +144,12 @@ async function makeTransferApp(
   const store = new DatabaseDataStore(database);
   const metadata = new ProblemFileStore(database);
   const service = new ProblemService(store);
-  const jobStore = new DatabaseProblemPackageJobStore(database);
+  const audit =
+    options.audit ??
+    (options.failingAuditActions === undefined
+      ? new DatabaseProblemPackageAuditWriter(database)
+      : new SelectiveProblemPackageAuditWriter(database, options.failingAuditActions));
+  const jobStore = new DatabaseProblemPackageJobStore(database, audit);
   const queue = new LocalJobQueue();
   const coordinator = new ProblemPackageJobCoordinator(jobStore, queue);
   const exportReader = new DatabaseFixedRevisionExportReader({ database, metadata, storage });
@@ -122,11 +157,18 @@ async function makeTransferApp(
     database,
     metadata,
     storage,
+    audit,
     ...(options.multiProblemOuterArchiveMaxBytes === undefined
       ? {}
       : { multiProblemOuterArchiveMaxBytes: options.multiProblemOuterArchiveMaxBytes })
   });
-  const writer = new DatabaseImportedProblemWriter({ database, store, metadata, storage });
+  const writer = new DatabaseImportedProblemWriter({
+    database,
+    store,
+    metadata,
+    storage,
+    audit
+  });
   const worker = new JobWorker(queue, { workerId: "test-worker", logger: silentLogger });
   registerProblemPackageHandlers(worker, {
     import: {
@@ -145,9 +187,11 @@ async function makeTransferApp(
     }
   });
   const transfer = new TransferService({
+    database,
     service,
     metadata,
     storage,
+    audit,
     jobs: jobStore,
     coordinator,
     exportReader,
@@ -170,6 +214,7 @@ async function makeTransferApp(
   return {
     app,
     artifacts,
+    audit,
     database,
     jobs: jobStore,
     metadata,
@@ -344,7 +389,7 @@ async function revokeExportPermissions(
 
 describe("题目包导入", () => {
   it("组长上传原生包、预览并导入成新题目，随后可以整包导出往返", async () => {
-    const { app, worker } = await makeTransferApp();
+    const { app, database, worker } = await makeTransferApp();
     const leader = await login(app, databaseDemoUserIds.leader);
     const zipBytes = await nativeZipOf(fixtureProblem());
 
@@ -500,16 +545,130 @@ describe("题目包导入", () => {
       "judge/testdata/001.out"
     ]);
     expect(new TextDecoder().decode(roundTripped.files[0]?.content)).toBe("5\n");
+
+    const auditRows = await database.query<{
+      actor_user_id: string;
+      request_id: string;
+      action: string;
+      object_type: string;
+      object_id: string | null;
+      result: string;
+      reason_code: string | null;
+      metadata: Record<string, unknown>;
+    }>(sql`
+      SELECT actor_user_id::text AS actor_user_id, request_id::text AS request_id,
+             action, object_type, object_id, result, reason_code, metadata
+      FROM audit_events
+      WHERE action LIKE 'problem.package.%'
+      ORDER BY id
+    `);
+    expect(auditRows.map((row) => row.action)).toEqual([
+      "problem.package.upload",
+      "problem.package.import.preview",
+      "problem.package.import.create",
+      "problem.package.import.item.complete",
+      "problem.package.export.preview",
+      "problem.package.export.create",
+      "problem.package.export.complete",
+      "problem.package.export.download"
+    ]);
+    expect(auditRows).toEqual([
+      expect.objectContaining({
+        actor_user_id: databaseDemoUserIds.leader,
+        object_type: "stored_file",
+        object_id: upload.fileId,
+        result: "success",
+        reason_code: null,
+        metadata: { inputKind: "zip" }
+      }),
+      expect.objectContaining({
+        actor_user_id: databaseDemoUserIds.leader,
+        object_type: "stored_file",
+        object_id: upload.fileId,
+        result: "success",
+        reason_code: null,
+        metadata: { formatId: "urmotiv", problemCount: 1, issueCount: 0 }
+      }),
+      expect.objectContaining({
+        actor_user_id: databaseDemoUserIds.leader,
+        object_type: "import_job",
+        object_id: createdJob.id,
+        result: "success",
+        reason_code: null,
+        metadata: { formatId: "urmotiv", itemCount: 1 }
+      }),
+      expect.objectContaining({
+        actor_user_id: databaseDemoUserIds.leader,
+        request_id: createdJob.id,
+        object_type: "problem",
+        object_id: importedProblemId,
+        result: "success",
+        reason_code: null,
+        metadata: { importJobId: createdJob.id, position: 0 }
+      }),
+      expect.objectContaining({
+        actor_user_id: databaseDemoUserIds.leader,
+        object_type: "problem_package",
+        object_id: null,
+        result: "success",
+        reason_code: null,
+        metadata: { formatId: "urmotiv", problemCount: 1, canExport: true }
+      }),
+      expect.objectContaining({
+        actor_user_id: databaseDemoUserIds.leader,
+        object_type: "export_job",
+        object_id: exportJob.id,
+        result: "success",
+        reason_code: null,
+        metadata: { formatId: "urmotiv", problemCount: 1 }
+      }),
+      expect.objectContaining({
+        actor_user_id: databaseDemoUserIds.leader,
+        request_id: exportJob.id,
+        object_type: "export_job",
+        object_id: exportJob.id,
+        result: "success",
+        reason_code: null,
+        metadata: {
+          formatId: "urmotiv",
+          outputFileCount: expect.any(Number)
+        }
+      }),
+      expect.objectContaining({
+        actor_user_id: databaseDemoUserIds.leader,
+        object_type: "export_job",
+        object_id: exportJob.id,
+        result: "success",
+        reason_code: null,
+        metadata: {}
+      })
+    ]);
+    for (const row of auditRows) {
+      expect(row.request_id).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+      );
+    }
+    const serializedAudit = JSON.stringify(auditRows);
+    expect(serializedAudit).not.toContain(statementText);
+    expect(serializedAudit).not.toContain(solutionText);
+    expect(serializedAudit).not.toContain("导入的演示题目");
+    expect(serializedAudit).not.toContain("problem.zip");
   });
 
   it("没有导入权限的用户不能上传，任务对其他用户不可见", async () => {
-    const { app, worker } = await makeTransferApp();
+    const { app, database, worker } = await makeTransferApp();
     const author = await login(app, databaseDemoUserIds.author);
     const leader = await login(app, databaseDemoUserIds.leader);
     const zipBytes = await nativeZipOf(fixtureProblem());
 
     const rejected = await uploadPackage(app, author, zipBytes);
     expect(rejected.statusCode).toBe(403);
+    const deniedAuditRows = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM audit_events
+      WHERE action LIKE 'problem.package.%'
+    `);
+    expect(deniedAuditRows).toEqual([{ count: 0 }]);
 
     const uploaded = await uploadPackage(app, leader, zipBytes);
     const upload = uploaded.json() as { fileId: string; sha256: string };
@@ -746,7 +905,7 @@ describe("题目包导入", () => {
     }
 
     await expect(
-      transfer.uploadPackage(leaderUser, "stream.zip", oversizedChunks())
+      transfer.uploadPackage(leaderUser, randomUUID(), "stream.zip", oversizedChunks())
     ).rejects.toMatchObject({
       statusCode: 413,
       code: "FILE_TOO_LARGE"
@@ -1688,7 +1847,7 @@ describe("题目包导出权限", () => {
 
     let failure: unknown;
     try {
-      await transfer.previewExport(leader, {
+      await transfer.previewExport(leader, randomUUID(), {
         targetFormat: "urmotiv",
         problems: [{ problemId: "1", includeFileCategories: [] }]
       });
@@ -1706,7 +1865,7 @@ describe("题目包导出权限", () => {
   });
 
   it("无权用户的导出预览统一显示不存在，创建导出任务返回不存在", async () => {
-    const { app, worker } = await makeTransferApp();
+    const { app, database, worker } = await makeTransferApp();
     const leader = await login(app, databaseDemoUserIds.leader);
     const denied = await login(app, databaseDemoUserIds.denied);
     const importedProblemId = await importFixtureProblem(app, worker, leader);
@@ -1746,6 +1905,31 @@ describe("题目包导出权限", () => {
       }
     });
     expect(created.statusCode).toBe(404);
+    const auditRows = await database.query<{
+      actor_user_id: string;
+      action: string;
+      object_id: string | null;
+      metadata: Record<string, unknown>;
+    }>(sql`
+      SELECT actor_user_id::text AS actor_user_id, action, object_id, metadata
+      FROM audit_events
+      WHERE action IN (
+        'problem.package.export.preview',
+        'problem.package.export.create'
+      )
+        AND actor_user_id = ${BigInt(databaseDemoUserIds.denied)}
+      ORDER BY id
+    `);
+    expect(auditRows).toEqual([
+      {
+        actor_user_id: databaseDemoUserIds.denied,
+        action: "problem.package.export.preview",
+        object_id: null,
+        metadata: { formatId: "urmotiv", problemCount: 2, canExport: false }
+      }
+    ]);
+    expect(JSON.stringify(auditRows)).not.toContain(importedProblemId);
+    expect(JSON.stringify(auditRows)).not.toContain("导入的演示题目");
   });
 
   it("导出任务创建后权限被撤销：后台任务失败，已完成任务不能下载", async () => {
@@ -1785,6 +1969,13 @@ describe("题目包导出权限", () => {
       headers: { cookie: leader }
     });
     expect(blockedDownload.statusCode).toBe(404);
+    const downloadAudit = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM audit_events
+      WHERE action = 'problem.package.export.download'
+        AND object_id = ${firstJob}
+    `);
+    expect(downloadAudit).toEqual([{ count: 0 }]);
   });
 
   it("下载前会分别拒绝导出文件的摘要变化和实际大小变化", async () => {
@@ -1830,6 +2021,402 @@ describe("题目包导出权限", () => {
     });
     expect(truncated.statusCode).toBe(404);
     expect(truncated.body).not.toContain(record.originalName);
+  });
+});
+
+describe("题目包审计与提交恢复", () => {
+  it("上传文件记录和审计已提交但响应丢失时保留对象并正常返回", async () => {
+    const { app, database, metadata, storage } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const deleted = vi.spyOn(storage, "delete");
+    const originalTransaction = database.transaction.bind(database);
+    vi.spyOn(database, "transaction").mockImplementationOnce(
+      async <T>(work: (executor: DatabaseExecutor) => Promise<T>): Promise<T> => {
+        await originalTransaction(work);
+        throw new Error("database response lost after upload commit");
+      }
+    );
+
+    const uploaded = await uploadPackage(
+      app,
+      leader,
+      await nativeZipOf(fixtureProblem()),
+      "response-lost.zip"
+    );
+
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string };
+    expect(await metadata.findStoredFile(upload.fileId)).toEqual(
+      expect.objectContaining({ id: upload.fileId, purpose: "import_input" })
+    );
+    expect(deleted).not.toHaveBeenCalled();
+    const auditRows = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM audit_events
+      WHERE action = 'problem.package.upload'
+        AND object_id = ${upload.fileId}
+    `);
+    expect(auditRows).toEqual([{ count: 1 }]);
+  });
+
+  it("上传保存状态不完整时返回固定错误并保留可能已被引用的对象", async () => {
+    const { database, storage, store, transfer } = await makeTransferApp();
+    const leader = await store.getUser(databaseDemoUserIds.leader);
+    if (leader === undefined) {
+      throw new Error("测试组长账号不存在。");
+    }
+    const deleted = vi.spyOn(storage, "delete");
+    vi.spyOn(database, "transaction").mockImplementationOnce(
+      async <T>(_work: (executor: DatabaseExecutor) => Promise<T>): Promise<T> => {
+        throw new Error("database unavailable before upload transaction");
+      }
+    );
+    vi.spyOn(database, "query").mockResolvedValueOnce([
+      { has_file: true, has_audit: false }
+    ]);
+    const bytes = await nativeZipOf(fixtureProblem());
+    async function* content(): AsyncGenerator<Uint8Array> {
+      yield bytes;
+    }
+
+    let failure: unknown;
+    try {
+      await transfer.uploadPackage(
+        leader,
+        randomUUID(),
+        "uncertain-private-marker.zip",
+        content()
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toMatchObject({
+      statusCode: 503,
+      code: "UPLOAD_SAVE_UNCONFIRMED",
+      message: "系统暂时无法确认题目包是否保存成功，请稍后重试。"
+    });
+    expect(JSON.stringify(failure)).not.toContain("uncertain-private-marker.zip");
+    expect(JSON.stringify(failure)).not.toContain("database unavailable");
+    expect(deleted).not.toHaveBeenCalled();
+  });
+
+  it("上传审计失败时回滚文件记录并删除已经发布的对象", async () => {
+    const failingActions = new Set<ProblemPackageAuditEvent["action"]>([
+      "problem.package.upload"
+    ]);
+    const { app, database, storage } = await makeTransferApp({
+      failingAuditActions: failingActions
+    });
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const deleted = vi.spyOn(storage, "delete");
+
+    const rejected = await uploadPackage(
+      app,
+      leader,
+      await nativeZipOf(fixtureProblem()),
+      "private-marker.zip"
+    );
+
+    expect(rejected.statusCode).toBe(503);
+    expect(rejected.json()).toEqual({
+      error: expect.objectContaining({ code: "AUDIT_UNAVAILABLE" })
+    });
+    expect(rejected.body).not.toContain("private-marker.zip");
+    expect(rejected.body).not.toContain("导入的演示题目");
+    expect(deleted).toHaveBeenCalledTimes(1);
+    const saved = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'import_input'
+    `);
+    expect(saved).toEqual([{ count: 0 }]);
+    const audited = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM audit_events
+      WHERE action = 'problem.package.upload'
+    `);
+    expect(audited).toEqual([{ count: 0 }]);
+  });
+
+  it("导入预览和任务创建在审计失败时不返回内容也不留下任务", async () => {
+    const failingActions = new Set<ProblemPackageAuditEvent["action"]>();
+    const { app, database } = await makeTransferApp({
+      failingAuditActions: failingActions
+    });
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const uploaded = await uploadPackage(app, leader, await nativeZipOf(fixtureProblem()));
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+
+    failingActions.add("problem.package.import.preview");
+    const preview = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports/preview",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: { fileId: upload.fileId, formatId: "urmotiv" }
+    });
+    expect(preview.statusCode).toBe(503);
+    expect(preview.json()).toEqual({
+      error: expect.objectContaining({ code: "AUDIT_UNAVAILABLE" })
+    });
+    expect(preview.body).not.toContain("导入的演示题目");
+
+    failingActions.delete("problem.package.import.preview");
+    failingActions.add("problem.package.import.create");
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: upload.fileId,
+        sha256: upload.sha256,
+        formatId: "urmotiv",
+        idempotencyKey: "audit-failed-import-create"
+      }
+    });
+    expect(created.statusCode).toBe(503);
+    expect(created.json()).toEqual({
+      error: expect.objectContaining({ code: "AUDIT_UNAVAILABLE" })
+    });
+    const jobs = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM import_jobs
+      WHERE idempotency_key = 'audit-failed-import-create'
+    `);
+    expect(jobs).toEqual([{ count: 0 }]);
+    const auditRows = await database.query<{ action: string }>(sql`
+      SELECT action
+      FROM audit_events
+      WHERE action IN (
+        'problem.package.import.preview',
+        'problem.package.import.create'
+      )
+    `);
+    expect(auditRows).toEqual([]);
+  });
+
+  it("导入项目完成审计失败时回滚题目和文件，并允许安全重试", async () => {
+    const failingActions = new Set<ProblemPackageAuditEvent["action"]>();
+    const { app, database, jobs, storage, writer } = await makeTransferApp({
+      failingAuditActions: failingActions
+    });
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const uploaded = await uploadPackage(app, leader, await nativeZipOf(fixtureProblem()));
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: upload.fileId,
+        sha256: upload.sha256,
+        formatId: "urmotiv",
+        idempotencyKey: "audit-failed-import-item"
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const jobId = (created.json() as { id: string }).id;
+    await jobs.startImportJob(jobId);
+    const beforeProblems = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count FROM problems
+    `);
+    const beforeFiles = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'problem' AND deleted_at IS NULL
+    `);
+    const deleted = vi.spyOn(storage, "delete");
+    failingActions.add("problem.package.import.item.complete");
+    const writeInput = {
+      importJobId: jobId,
+      position: 0,
+      requestedByUserId: databaseDemoUserIds.leader,
+      choices: { conflictAction: "create" as const },
+      problem: fixtureProblem(),
+      signal: new AbortController().signal
+    };
+
+    await expect(writer.write(writeInput)).rejects.toMatchObject({
+      name: "ImportResultSaveError",
+      message: "导入结果的保存状态暂时无法确认。"
+    });
+    expect(deleted).toHaveBeenCalledTimes(fixtureProblem().files.length);
+    expect(await jobs.getImportItems(jobId)).toEqual([
+      expect.objectContaining({ state: "queued", importedProblemId: null })
+    ]);
+    const rejectedProblems = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count FROM problems
+    `);
+    const rejectedFiles = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'problem' AND deleted_at IS NULL
+    `);
+    expect(rejectedProblems).toEqual(beforeProblems);
+    expect(rejectedFiles).toEqual(beforeFiles);
+    const rejectedAudit = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM audit_events
+      WHERE action = 'problem.package.import.item.complete'
+        AND request_id = ${jobId}::uuid
+    `);
+    expect(rejectedAudit).toEqual([{ count: 0 }]);
+
+    failingActions.clear();
+    const retried = await writer.write(writeInput);
+    expect(retried.problemId).toMatch(/^\d+$/);
+    expect(await jobs.getImportItems(jobId)).toEqual([
+      expect.objectContaining({
+        state: "succeeded",
+        importedProblemId: retried.problemId
+      })
+    ]);
+    const completedAudit = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM audit_events
+      WHERE action = 'problem.package.import.item.complete'
+        AND request_id = ${jobId}::uuid
+    `);
+    expect(completedAudit).toEqual([{ count: 1 }]);
+  });
+
+  it("导出预览和任务创建在审计失败时不返回内容也不留下任务", async () => {
+    const failingActions = new Set<ProblemPackageAuditEvent["action"]>();
+    const { app, database, worker } = await makeTransferApp({
+      failingAuditActions: failingActions
+    });
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const problemId = await importFixtureProblem(app, worker, leader);
+
+    failingActions.add("problem.package.export.preview");
+    const preview = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports/preview",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "urmotiv",
+        problems: [{ problemId, includeFileCategories: ["testdata"] }]
+      }
+    });
+    expect(preview.statusCode).toBe(503);
+    expect(preview.json()).toEqual({
+      error: expect.objectContaining({ code: "AUDIT_UNAVAILABLE" })
+    });
+    expect(preview.body).not.toContain("导入的演示题目");
+
+    failingActions.delete("problem.package.export.preview");
+    failingActions.add("problem.package.export.create");
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "urmotiv",
+        problems: [{ problemId, includeFileCategories: ["testdata"] }],
+        idempotencyKey: "audit-failed-export-create"
+      }
+    });
+    expect(created.statusCode).toBe(503);
+    expect(created.json()).toEqual({
+      error: expect.objectContaining({ code: "AUDIT_UNAVAILABLE" })
+    });
+    const jobs = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM export_jobs
+      WHERE idempotency_key = 'audit-failed-export-create'
+    `);
+    expect(jobs).toEqual([{ count: 0 }]);
+    const auditRows = await database.query<{ action: string }>(sql`
+      SELECT action
+      FROM audit_events
+      WHERE action IN (
+        'problem.package.export.preview',
+        'problem.package.export.create'
+      )
+    `);
+    expect(auditRows).toEqual([]);
+  });
+
+  it("导出完成审计失败时回滚文件，重试后下载审计失败也不返回文件", async () => {
+    const failingActions = new Set<ProblemPackageAuditEvent["action"]>();
+    const { app, artifacts, database, jobs, metadata, storage, worker } =
+      await makeTransferApp({ failingAuditActions: failingActions });
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const problemId = await importFixtureProblem(app, worker, leader);
+    const exportJobId = await createExportJob(
+      app,
+      leader,
+      problemId,
+      "audit-failed-export-complete"
+    );
+    await jobs.startExportJob(exportJobId);
+    const archive = syntheticGeneratedArchive("problem.zip", false);
+    const writeInput = {
+      exportJobId,
+      requestedByUserId: databaseDemoUserIds.leader,
+      targetFormat: "urmotiv",
+      archives: [archive],
+      outputFileCount: archive.files.length,
+      signal: new AbortController().signal
+    };
+    const deleted = vi.spyOn(storage, "delete");
+    failingActions.add("problem.package.export.complete");
+
+    await expect(artifacts.writeAndComplete(writeInput)).rejects.toMatchObject({
+      name: "ExportResultSaveError",
+      message: "导出结果的保存状态暂时无法确认。"
+    });
+    expect(deleted).toHaveBeenCalledTimes(1);
+    expect(await jobs.getExportJob(exportJobId)).toEqual(
+      expect.objectContaining({ state: "running", resultFileId: null })
+    );
+    const rejectedFiles = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'export_output' AND deleted_at IS NULL
+    `);
+    expect(rejectedFiles).toEqual([{ count: 0 }]);
+    const rejectedAudit = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM audit_events
+      WHERE action = 'problem.package.export.complete'
+        AND request_id = ${exportJobId}::uuid
+    `);
+    expect(rejectedAudit).toEqual([{ count: 0 }]);
+
+    failingActions.clear();
+    const written = await artifacts.writeAndComplete(writeInput);
+    expect(await jobs.getExportJob(exportJobId)).toEqual(
+      expect.objectContaining({
+        state: "succeeded",
+        resultFileId: written.fileId
+      })
+    );
+    const stored = await metadata.findStoredFile(written.fileId);
+    if (stored === undefined) {
+      throw new Error("重试后的导出文件不存在。");
+    }
+
+    failingActions.add("problem.package.export.download");
+    const downloaded = await app.inject({
+      method: "GET",
+      url: `/api/v1/transfer/exports/${exportJobId}/download`,
+      headers: { cookie: leader }
+    });
+    expect(downloaded.statusCode).toBe(503);
+    expect(downloaded.json()).toEqual({
+      error: expect.objectContaining({ code: "AUDIT_UNAVAILABLE" })
+    });
+    expect(downloaded.body).not.toContain(stored.originalName);
+    const downloadAudit = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM audit_events
+      WHERE action = 'problem.package.export.download'
+        AND object_id = ${exportJobId}
+    `);
+    expect(downloadAudit).toEqual([{ count: 0 }]);
   });
 });
 

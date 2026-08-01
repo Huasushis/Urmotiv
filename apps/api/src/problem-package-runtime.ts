@@ -45,6 +45,10 @@ import {
   ProblemPackageJobStoreError,
   completeDatabaseExportJob
 } from "./problem-package-job-store";
+import {
+  DatabaseProblemPackageAuditWriter,
+  type ProblemPackageAuditWriter
+} from "./problem-package-audit";
 import type { ProblemService } from "./service";
 
 /**
@@ -281,6 +285,7 @@ export interface DatabaseImportedProblemWriterDependencies {
   readonly store: DatabaseDataStore;
   readonly metadata: ProblemFileStore;
   readonly storage: FileStorage;
+  readonly audit?: ProblemPackageAuditWriter;
   readonly now?: () => Date;
 }
 
@@ -294,6 +299,7 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
   readonly #store: DatabaseDataStore;
   readonly #metadata: ProblemFileStore;
   readonly #storage: FileStorage;
+  readonly #audit: ProblemPackageAuditWriter;
   readonly #now: () => Date;
 
   public constructor(dependencies: DatabaseImportedProblemWriterDependencies) {
@@ -301,6 +307,8 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
     this.#store = dependencies.store;
     this.#metadata = dependencies.metadata;
     this.#storage = dependencies.storage;
+    this.#audit =
+      dependencies.audit ?? new DatabaseProblemPackageAuditWriter(dependencies.database);
     this.#now = dependencies.now ?? (() => new Date());
   }
 
@@ -470,6 +478,22 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
           if (recorded.length !== 1) {
             throw new ImportItemAlreadyCommitted();
           }
+          await this.#audit.append(
+            {
+              actorUserId: input.requestedByUserId,
+              requestId: input.importJobId,
+              action: "problem.package.import.item.complete",
+              objectType: "problem",
+              objectId: importedProblemId,
+              result: "success",
+              reasonCode: null,
+              metadata: {
+                importJobId: input.importJobId,
+                position: input.position
+              }
+            },
+            executor
+          );
           transactionWritesFinished = true;
         }
       );
@@ -847,6 +871,7 @@ export interface StorageExportArtifactWriterDependencies {
   readonly database: DatabaseHandle;
   readonly metadata: ProblemFileStore;
   readonly storage: FileStorage;
+  readonly audit?: ProblemPackageAuditWriter;
   /**
    * 多题导出外层包可以使用更小的内存上限，但不能超过固定的 128 MiB。
    * 主要供内存较小的部署和自动化测试使用。
@@ -866,6 +891,7 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
   readonly #database: DatabaseHandle;
   readonly #metadata: ProblemFileStore;
   readonly #storage: FileStorage;
+  readonly #audit: ProblemPackageAuditWriter;
   readonly #multiProblemOuterArchiveMaxBytes: number;
   readonly #multiProblemOuterArchiveLimits: Partial<ArchiveSafetyLimits>;
   readonly #timeToLiveMs: number;
@@ -886,6 +912,8 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
     this.#database = dependencies.database;
     this.#metadata = dependencies.metadata;
     this.#storage = dependencies.storage;
+    this.#audit =
+      dependencies.audit ?? new DatabaseProblemPackageAuditWriter(dependencies.database);
     this.#multiProblemOuterArchiveMaxBytes = outerMaxBytes;
     this.#multiProblemOuterArchiveLimits = {
       // 单个内层题目包和所有内层包的总量使用同一个上限，避免更小的
@@ -1054,6 +1082,7 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
           await this.#metadata.createStoredFile(metadataInput, transaction);
           await completeDatabaseExportJob(
             transaction,
+            this.#audit,
             this.#now,
             input.exportJobId,
             {
@@ -1099,13 +1128,30 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
     const rows = await this.#database.query<{
       state: string;
       result_file_id: string | null;
+      has_audit: boolean;
     }>(sql`
-      SELECT state::text AS state, result_file_id::text AS result_file_id
-      FROM export_jobs
-      WHERE id = ${exportJobId}::uuid
+      SELECT
+        job.state::text AS state,
+        job.result_file_id::text AS result_file_id,
+        EXISTS (
+          SELECT 1
+          FROM audit_events
+          WHERE request_id = job.id
+            AND actor_user_id = job.requested_by_user_id
+            AND action = 'problem.package.export.complete'
+            AND object_type = 'export_job'
+            AND object_id = job.id::text
+            AND result = 'success'
+        ) AS has_audit
+      FROM export_jobs job
+      WHERE job.id = ${exportJobId}::uuid
     `);
     const row = rows[0];
-    return row?.state === "succeeded" && row.result_file_id === fileId;
+    return (
+      row?.state === "succeeded" &&
+      row.result_file_id === fileId &&
+      row.has_audit === true
+    );
   }
 
   public async discard(fileId: string): Promise<void> {

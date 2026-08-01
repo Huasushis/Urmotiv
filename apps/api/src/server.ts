@@ -22,6 +22,7 @@ import {
   DatabaseProblemPackageJobStore,
   ProblemPackageJobCoordinator
 } from "./problem-package-job-store";
+import { DatabaseProblemPackageAuditWriter } from "./problem-package-audit";
 import {
   DatabaseFixedRevisionExportReader,
   DatabaseImportedProblemWriter,
@@ -92,7 +93,8 @@ try {
   const store = new DatabaseDataStore(database);
   const problemFileStore = new ProblemFileStore(database);
   const problemService = new ProblemService(store);
-  const packageJobStore = new DatabaseProblemPackageJobStore(database);
+  const packageAudit = new DatabaseProblemPackageAuditWriter(database);
+  const packageJobStore = new DatabaseProblemPackageJobStore(database, packageAudit);
   const packageQueue = new LocalJobQueue();
   const packageCoordinator = new ProblemPackageJobCoordinator(packageJobStore, packageQueue);
   const exportReader = new DatabaseFixedRevisionExportReader({
@@ -111,7 +113,8 @@ try {
         database,
         store,
         metadata: problemFileStore,
-        storage: fileStorage
+        storage: fileStorage,
+        audit: packageAudit
       })
     },
     export: {
@@ -124,14 +127,17 @@ try {
       artifacts: new StorageExportArtifactWriter({
         database,
         metadata: problemFileStore,
-        storage: fileStorage
+        storage: fileStorage,
+        audit: packageAudit
       })
     }
   });
   const transferService = new TransferService({
+    database,
     service: problemService,
     metadata: problemFileStore,
     storage: fileStorage,
+    audit: packageAudit,
     jobs: packageJobStore,
     coordinator: packageCoordinator,
     exportReader

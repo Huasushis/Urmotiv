@@ -178,7 +178,8 @@ export const createProblemPackageImportJobSchema = z
     selectedFormat: identifierSchema,
     choices: problemPackageImportChoicesSchema,
     itemCount: z.number().int().min(1).max(1_000).default(1),
-    idempotencyKey: idempotencyKeySchema
+    idempotencyKey: idempotencyKeySchema,
+    auditRequestId: uuidSchema.optional()
   })
   .strict();
 
@@ -191,7 +192,8 @@ export const createProblemPackageExportJobSchema = z
     options: z.record(z.string().min(1).max(120), jsonValueSchema).default({}),
     lossSummary: problemPackageLossSummarySchema,
     problems: z.array(problemPackageExportSelectionSchema).min(1).max(100),
-    idempotencyKey: idempotencyKeySchema
+    idempotencyKey: idempotencyKeySchema,
+    auditRequestId: uuidSchema.optional()
   })
   .strict()
   .superRefine((value, context) => {

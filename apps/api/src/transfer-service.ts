@@ -22,6 +22,7 @@ import {
   type ProblemPackageJobStore,
   type FixedRevisionExportReader
 } from "@urmotiv/jobs";
+import type { DatabaseHandle } from "@urmotiv/database";
 import {
   ProblemPackageJobCoordinator,
   ProblemPackageJobStoreError
@@ -36,10 +37,16 @@ import {
   type SafeProblemPackageInput
 } from "@urmotiv/problem-package";
 import type { FileStorage, StoredFile } from "@urmotiv/storage";
+import { sql } from "drizzle-orm";
 import { ApiError, conflict, forbidden, notFound } from "./errors";
 import type { StoredProblem, StoredUser } from "./domain";
 import { hasPermission } from "./permissions";
 import { ProblemFileStore } from "./problem-file-store";
+import {
+  ProblemPackageAuditWriteError,
+  type ProblemPackageAuditEvent,
+  type ProblemPackageAuditWriter
+} from "./problem-package-audit";
 import type { ProblemService } from "./service";
 
 /**
@@ -62,9 +69,11 @@ const internalPackageCategories: ReadonlySet<PackageFileCategory> = new Set([
 ]);
 
 export interface TransferServiceDependencies {
+  readonly database: DatabaseHandle;
   readonly service: ProblemService;
   readonly metadata: ProblemFileStore;
   readonly storage: FileStorage;
+  readonly audit: ProblemPackageAuditWriter;
   readonly jobs: ProblemPackageJobStore;
   readonly coordinator: ProblemPackageJobCoordinator;
   readonly exportReader: FixedRevisionExportReader;
@@ -79,9 +88,11 @@ export interface TransferServiceDependencies {
 }
 
 export class TransferService {
+  readonly #database: DatabaseHandle;
   readonly #service: ProblemService;
   readonly #metadata: ProblemFileStore;
   readonly #storage: FileStorage;
+  readonly #audit: ProblemPackageAuditWriter;
   readonly #jobs: ProblemPackageJobStore;
   readonly #coordinator: ProblemPackageJobCoordinator;
   readonly #exportReader: FixedRevisionExportReader;
@@ -102,9 +113,11 @@ export class TransferService {
         `题目包上限必须是 1 到 ${maximumProblemPackageArchiveBytes} 之间的整数。`
       );
     }
+    this.#database = dependencies.database;
     this.#service = dependencies.service;
     this.#metadata = dependencies.metadata;
     this.#storage = dependencies.storage;
+    this.#audit = dependencies.audit;
     this.#jobs = dependencies.jobs;
     this.#coordinator = dependencies.coordinator;
     this.#exportReader = dependencies.exportReader;
@@ -120,6 +133,7 @@ export class TransferService {
    */
   public async uploadPackage(
     user: StoredUser,
+    requestId: string,
     rawOriginalName: string,
     content: AsyncIterable<Uint8Array>
   ): Promise<PackageUploadResponse> {
@@ -145,20 +159,59 @@ export class TransferService {
 
     const expiresAt = new Date(this.#now().getTime() + this.#uploadTimeToLiveMs).toISOString();
     try {
-      await this.#metadata.createStoredFile({
-        id: stored.id,
-        purpose: "import_input",
-        storageKey: stored.storageKey,
-        originalName,
-        mediaType: packageInput.mediaType,
-        byteSize: stored.byteSize,
-        sha256: stored.sha256,
-        createdByUserId: user.id,
-        expiresAt
+      await this.#database.transaction(async (transaction) => {
+        await this.#metadata.createStoredFile(
+          {
+            id: stored.id,
+            purpose: "import_input",
+            storageKey: stored.storageKey,
+            originalName,
+            mediaType: packageInput.mediaType,
+            byteSize: stored.byteSize,
+            sha256: stored.sha256,
+            createdByUserId: user.id,
+            expiresAt
+          },
+          transaction
+        );
+        await this.#audit.append(
+          {
+            actorUserId: user.id,
+            requestId,
+            action: "problem.package.upload",
+            objectType: "stored_file",
+            objectId: stored.id,
+            result: "success",
+            reasonCode: null,
+            metadata: { inputKind: packageInput.kind }
+          },
+          transaction
+        );
       });
     } catch (error) {
-      await this.#storage.delete(stored).catch(() => undefined);
-      throw error;
+      let saved: "complete" | "absent" | "uncertain";
+      try {
+        saved = await this.#uploadSaveState(stored.id, user.id, requestId);
+      } catch {
+        throw new ApiError(
+          503,
+          "UPLOAD_SAVE_UNCONFIRMED",
+          "系统暂时无法确认题目包是否保存成功，请稍后重试。"
+        );
+      }
+      if (saved === "complete") {
+        // The database committed but its response was lost. Keep the referenced
+        // object and return the same successful upload response.
+      } else if (saved === "absent") {
+        await this.#storage.delete(stored).catch(() => undefined);
+        throw translateAuditError(error);
+      } else {
+        throw new ApiError(
+          503,
+          "UPLOAD_SAVE_UNCONFIRMED",
+          "系统暂时无法确认题目包是否保存成功，请稍后重试。"
+        );
+      }
     }
 
     const detected = [] as PackageUploadResponse["detected"];
@@ -197,6 +250,7 @@ export class TransferService {
 
   public async previewImport(
     user: StoredUser,
+    requestId: string,
     input: ImportPreviewRequest
   ): Promise<ImportPreviewResponse> {
     this.#requireImportPermission(user);
@@ -205,7 +259,7 @@ export class TransferService {
     const packageInput = await this.#readStoredPackageInput(record);
     this.#requireMatchingInputKind(adapter, packageInput);
     const preview = await adapter.inspect(packageInput.archive);
-    return {
+    const response: ImportPreviewResponse = {
       formatId: adapter.id,
       problemCount: Math.min(preview.problemCount, 1_000),
       ...(preview.title === undefined ? {} : { title: preview.title.slice(0, 200) }),
@@ -216,9 +270,28 @@ export class TransferService {
         message: issue.message.slice(0, 2_000)
       }))
     };
+    await this.#appendAudit({
+      actorUserId: user.id,
+      requestId,
+      action: "problem.package.import.preview",
+      objectType: "stored_file",
+      objectId: record.id,
+      result: "success",
+      reasonCode: null,
+      metadata: {
+        formatId: adapter.id,
+        problemCount: response.problemCount,
+        issueCount: response.issues.length
+      }
+    });
+    return response;
   }
 
-  public async createImport(user: StoredUser, input: CreateImportJobRequest): Promise<ImportJobView> {
+  public async createImport(
+    user: StoredUser,
+    requestId: string,
+    input: CreateImportJobRequest
+  ): Promise<ImportJobView> {
     this.#requireImportPermission(user);
     const record = await this.#requireOwnImportInput(user, input.fileId);
     if (record.sha256 !== input.sha256) {
@@ -236,7 +309,8 @@ export class TransferService {
         selectedFormat: input.formatId,
         choices: { conflictAction: "create" },
         itemCount: 1,
-        idempotencyKey: input.idempotencyKey
+        idempotencyKey: input.idempotencyKey,
+        auditRequestId: requestId
       });
       const items = await this.#jobs.getImportItems(job.id);
       return toImportJobView(job, items);
@@ -256,6 +330,7 @@ export class TransferService {
 
   public async previewExport(
     user: StoredUser,
+    requestId: string,
     input: ExportPreviewRequest
   ): Promise<ExportPreviewResponse> {
     const adapter = this.#requireAdapter(input.targetFormat);
@@ -273,10 +348,29 @@ export class TransferService {
       problems.push(evaluated.view);
     }
 
-    return { targetFormat: adapter.id, canExport, problems };
+    const response = { targetFormat: adapter.id, canExport, problems };
+    await this.#appendAudit({
+      actorUserId: user.id,
+      requestId,
+      action: "problem.package.export.preview",
+      objectType: "problem_package",
+      objectId: null,
+      result: "success",
+      reasonCode: null,
+      metadata: {
+        formatId: adapter.id,
+        problemCount: input.problems.length,
+        canExport
+      }
+    });
+    return response;
   }
 
-  public async createExport(user: StoredUser, input: CreateExportJobRequest): Promise<ExportJobView> {
+  public async createExport(
+    user: StoredUser,
+    requestId: string,
+    input: CreateExportJobRequest
+  ): Promise<ExportJobView> {
     const adapter = this.#requireAdapter(input.targetFormat);
     const selections: ProblemPackageExportSelection[] = [];
     const summary = { errorCount: 0, choiceCount: 0, warningCount: 0, infoCount: 0 };
@@ -321,7 +415,8 @@ export class TransferService {
           infoCount: Math.min(summary.infoCount, 10_000)
         },
         problems: selections,
-        idempotencyKey: input.idempotencyKey
+        idempotencyKey: input.idempotencyKey,
+        auditRequestId: requestId
       });
       return this.#toExportJobView(job);
     } catch (error) {
@@ -343,6 +438,7 @@ export class TransferService {
    */
   public async downloadExport(
     user: StoredUser,
+    requestId: string,
     jobId: string
   ): Promise<{
     readonly fileName: string;
@@ -399,12 +495,65 @@ export class TransferService {
     if (bytes.byteLength !== record.byteSize || sha256Hex(bytes) !== record.sha256) {
       throw notFound();
     }
+    await this.#appendAudit({
+      actorUserId: user.id,
+      requestId,
+      action: "problem.package.export.download",
+      objectType: "export_job",
+      objectId: job.id,
+      result: "success",
+      reasonCode: null,
+      metadata: {}
+    });
     return {
       fileName: record.originalName,
       mediaType: record.mediaType,
       byteSize: record.byteSize,
       stream: singleChunk(bytes)
     };
+  }
+
+  async #appendAudit(event: ProblemPackageAuditEvent): Promise<void> {
+    try {
+      await this.#audit.append(event);
+    } catch (error) {
+      throw translateAuditError(error);
+    }
+  }
+
+  async #uploadSaveState(
+    fileId: string,
+    actorUserId: string,
+    requestId: string
+  ): Promise<"complete" | "absent" | "uncertain"> {
+    const rows = await this.#database.query<{
+      has_file: boolean;
+      has_audit: boolean;
+    }>(sql`
+      SELECT
+        EXISTS (
+          SELECT 1
+          FROM stored_files
+          WHERE id = ${fileId}::uuid
+            AND purpose = 'import_input'
+            AND created_by_user_id = ${BigInt(actorUserId)}
+            AND deleted_at IS NULL
+        ) AS has_file,
+        EXISTS (
+          SELECT 1
+          FROM audit_events
+          WHERE request_id = ${requestId}::uuid
+            AND actor_user_id = ${BigInt(actorUserId)}
+            AND action = 'problem.package.upload'
+            AND object_type = 'stored_file'
+            AND object_id = ${fileId}
+            AND result = 'success'
+        ) AS has_audit
+    `);
+    const state = rows[0];
+    if (state?.has_file === true && state.has_audit === true) return "complete";
+    if (state?.has_file === false && state.has_audit === false) return "absent";
+    return "uncertain";
   }
 
   async #evaluateExportSelection(
@@ -661,6 +810,17 @@ function translateJobStoreError(error: unknown): unknown {
       return notFound();
     }
     return new ApiError(500, "TASK_CREATE_FAILED", "任务创建失败，请稍后重试。");
+  }
+  return translateAuditError(error);
+}
+
+function translateAuditError(error: unknown): unknown {
+  if (error instanceof ProblemPackageAuditWriteError) {
+    return new ApiError(
+      503,
+      "AUDIT_UNAVAILABLE",
+      "系统暂时无法记录这次操作，请稍后重试。"
+    );
   }
   return error;
 }

@@ -25,6 +25,10 @@ import {
 import type { DatabaseExecutor, DatabaseHandle } from "@urmotiv/database";
 import { sql } from "drizzle-orm";
 import { z } from "zod";
+import {
+  DatabaseProblemPackageAuditWriter,
+  type ProblemPackageAuditWriter
+} from "./problem-package-audit";
 
 type JsonObject = Record<string, unknown>;
 
@@ -457,6 +461,8 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
 export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
   public constructor(
     private readonly database: DatabaseHandle,
+    private readonly audit: ProblemPackageAuditWriter =
+      new DatabaseProblemPackageAuditWriter(database),
     private readonly now: () => Date = () => new Date()
   ) {}
 
@@ -506,6 +512,7 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
       }
       const created = await findImportById(transaction, id);
       if (created === undefined) throw new ProblemPackageJobStoreError("TASK_NOT_FOUND", "任务记录不存在。");
+      await this.writeImportCreationAudit(transaction, parsed, created);
       return created;
     });
   }
@@ -558,8 +565,57 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
       }
       const created = await findExportById(transaction, id);
       if (created === undefined) throw new ProblemPackageJobStoreError("TASK_NOT_FOUND", "任务记录不存在。");
+      await this.writeExportCreationAudit(transaction, parsed, created);
       return created;
     });
+  }
+
+  private async writeImportCreationAudit(
+    executor: DatabaseExecutor,
+    input: z.output<typeof createProblemPackageImportJobSchema>,
+    job: ProblemPackageImportJob
+  ): Promise<void> {
+    if (input.auditRequestId === undefined) return;
+    await this.audit.append(
+      {
+        actorUserId: input.requestedByUserId,
+        requestId: input.auditRequestId,
+        action: "problem.package.import.create",
+        objectType: "import_job",
+        objectId: job.id,
+        result: "success",
+        reasonCode: null,
+        metadata: {
+          formatId: job.selectedFormat,
+          itemCount: job.itemCount
+        }
+      },
+      executor
+    );
+  }
+
+  private async writeExportCreationAudit(
+    executor: DatabaseExecutor,
+    input: z.output<typeof createProblemPackageExportJobSchema>,
+    job: ProblemPackageExportJob
+  ): Promise<void> {
+    if (input.auditRequestId === undefined) return;
+    await this.audit.append(
+      {
+        actorUserId: input.requestedByUserId,
+        requestId: input.auditRequestId,
+        action: "problem.package.export.create",
+        objectType: "export_job",
+        objectId: job.id,
+        result: "success",
+        reasonCode: null,
+        metadata: {
+          formatId: job.targetFormat,
+          problemCount: job.problems.length
+        }
+      },
+      executor
+    );
   }
 
   public async getImportJob(jobId: string): Promise<ProblemPackageImportJob | undefined> {
@@ -693,7 +749,7 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
     result: CompleteProblemPackageExport
   ): Promise<void> {
     await this.database.transaction((transaction) =>
-      completeDatabaseExportJob(transaction, this.now, jobId, result)
+      completeDatabaseExportJob(transaction, this.audit, this.now, jobId, result)
     );
   }
 
@@ -798,6 +854,7 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
  */
 export async function completeDatabaseExportJob(
   executor: DatabaseExecutor,
+  audit: ProblemPackageAuditWriter,
   now: () => Date,
   jobId: string,
   result: CompleteProblemPackageExport
@@ -841,6 +898,22 @@ export async function completeDatabaseExportJob(
   if (updated.length !== 1) {
     throw new ProblemPackageJobStoreError("INVALID_STATE", "任务当前不能完成。");
   }
+  await audit.append(
+    {
+      actorUserId: current.requestedByUserId,
+      requestId: id,
+      action: "problem.package.export.complete",
+      objectType: "export_job",
+      objectId: id,
+      result: "success",
+      reasonCode: null,
+      metadata: {
+        formatId: current.targetFormat,
+        outputFileCount: parsed.outputFileCount
+      }
+    },
+    executor
+  );
 }
 
 function initialReport(): ProblemPackageJobReport {

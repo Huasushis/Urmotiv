@@ -1231,18 +1231,26 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
             "上传题目包时请求正文必须是二进制内容（application/octet-stream）。"
           );
         }
-        return transfer.uploadPackage(user, query.originalName, request.body);
+        return transfer.uploadPackage(user, request.id, query.originalName, request.body);
       }
     );
 
     app.post("/api/v1/transfer/imports/preview", async (request) => {
       const user = await requireUser(request);
-      return transfer.previewImport(user, importPreviewRequestSchema.parse(request.body));
+      return transfer.previewImport(
+        user,
+        request.id,
+        importPreviewRequestSchema.parse(request.body)
+      );
     });
 
     app.post("/api/v1/transfer/imports", async (request) => {
       const user = await requireUser(request);
-      return transfer.createImport(user, createImportJobRequestSchema.parse(request.body));
+      return transfer.createImport(
+        user,
+        request.id,
+        createImportJobRequestSchema.parse(request.body)
+      );
     });
 
     app.get("/api/v1/transfer/imports/:jobId", async (request) => {
@@ -1252,12 +1260,20 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
     app.post("/api/v1/transfer/exports/preview", async (request) => {
       const user = await requireUser(request);
-      return transfer.previewExport(user, exportPreviewRequestSchema.parse(request.body));
+      return transfer.previewExport(
+        user,
+        request.id,
+        exportPreviewRequestSchema.parse(request.body)
+      );
     });
 
     app.post("/api/v1/transfer/exports", async (request) => {
       const user = await requireUser(request);
-      return transfer.createExport(user, createExportJobRequestSchema.parse(request.body));
+      return transfer.createExport(
+        user,
+        request.id,
+        createExportJobRequestSchema.parse(request.body)
+      );
     });
 
     app.get("/api/v1/transfer/exports/:jobId", async (request) => {
@@ -1267,7 +1283,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
     app.get("/api/v1/transfer/exports/:jobId/download", async (request, reply) => {
       const user = await requireUser(request);
-      const download = await transfer.downloadExport(user, parseJobId(request));
+      const download = await transfer.downloadExport(user, request.id, parseJobId(request));
       reply.header("content-type", download.mediaType);
       reply.header("content-length", String(download.byteSize));
       reply.header("content-disposition", contentDispositionFor(download.fileName));
