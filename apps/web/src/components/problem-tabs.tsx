@@ -820,7 +820,13 @@ const reviewItemSourceLabel: Record<ReviewItemView["source"], string> = {
 /** anklang 原题相似度条目的 data 结构；其余来源的条目不假定这个形状。 */
 const anklangSimilarityType = "org.ustc.urmotiv.anklang.similarity";
 const anklangSimilarityDataSchema = z.object({
+  apiVersion: z.enum(["1", "2"]),
   checkedAt: z.string(),
+  completion: z
+    .object({
+      status: z.enum(["complete", "partial", "unavailable"])
+    })
+    .optional(),
   candidates: z.array(
     z.object({
       source: z.string(),
@@ -840,6 +846,7 @@ const anklangSimilarityDataSchema = z.object({
 type AnklangSimilarityData = z.infer<typeof anklangSimilarityDataSchema>;
 
 function AnklangCandidates({ data }: { data: AnklangSimilarityData }) {
+  const completionStatus = data.apiVersion === "1" ? "complete" : data.completion?.status;
   return (
     <div className="candidate-panel">
       {data.recommendation.message ? (
@@ -848,8 +855,16 @@ function AnklangCandidates({ data }: { data: AnklangSimilarityData }) {
           {data.recommendation.message}
         </p>
       ) : null}
+      {completionStatus === "partial" ? (
+        <p className="warning-note">本次检索只完成了一部分，不能把这些候选当作完整查重结果。</p>
+      ) : null}
+      {completionStatus === "unavailable" ? (
+        <p className="warning-note">本次检索未能形成可信候选，请稍后重试。</p>
+      ) : null}
       {data.candidates.length === 0 ? (
-        <p className="empty-state">没有发现相似的历史题目。</p>
+        completionStatus === "complete" ? (
+          <p className="empty-state">完整检索没有发现相似的历史题目。</p>
+        ) : null
       ) : (
         <ul className="candidate-list">
           {data.candidates.map((candidate, index) => (

@@ -64,6 +64,16 @@ export interface ReviewItemStore {
     items: readonly StoredReviewItemInput[],
     executor?: DatabaseExecutor
   ): Promise<void>;
+  /**
+   * 在活动轮次中替换同一插件、类型和内容摘要的旧结果。手动重试使用这个入口，
+   * 避免重复结果同时成为有效审核条目；关闭轮次固定拒绝。
+   */
+  replacePluginItems(
+    problemId: string,
+    round: number,
+    items: readonly StoredReviewItemInput[],
+    executor?: DatabaseExecutor
+  ): Promise<void>;
   /** 只返回指定可见级别集合内、未过期的条目。 */
   list(
     problemId: string,
@@ -157,6 +167,55 @@ export class DatabaseReviewItemStore implements ReviewItemStore {
     }
   }
 
+  public async replacePluginItems(
+    problemId: string,
+    round: number,
+    items: readonly StoredReviewItemInput[],
+    executor?: DatabaseExecutor
+  ): Promise<void> {
+    if (items.length === 0) {
+      return;
+    }
+    const problemDatabaseId = parseDatabaseId(problemId);
+    const parsedItems = items.map((item) => storedReviewItemInputSchema.parse(item));
+    if (
+      problemDatabaseId === undefined ||
+      !Number.isInteger(round) ||
+      round < 1 ||
+      parsedItems.some((item) => item.sourcePluginId === undefined)
+    ) {
+      throw new ReviewItemStoreError("ROUND_NOT_FOUND", "活动审核轮次不存在。");
+    }
+
+    const replace = async (activeExecutor: DatabaseExecutor): Promise<void> => {
+      const rows = await activeExecutor.query<{ id: string; status: string }>(sql`
+        SELECT id::text AS id, status::text AS status
+        FROM review_rounds
+        WHERE problem_id = ${problemDatabaseId} AND round = ${round}
+        FOR UPDATE
+      `);
+      const row = rows[0];
+      if (row === undefined || row.status !== "open") {
+        throw new ReviewItemStoreError("ROUND_NOT_FOUND", "活动审核轮次不存在。");
+      }
+      for (const item of parsedItems) {
+        await activeExecutor.execute(sql`
+          DELETE FROM review_items
+          WHERE round_id = ${row.id}::uuid
+            AND type = ${item.type}
+            AND source_plugin_id = ${item.sourcePluginId ?? null}
+            AND content_hash = ${item.contentHash}
+        `);
+      }
+      await this.append(problemId, round, parsedItems, activeExecutor);
+    };
+    if (executor !== undefined) {
+      await replace(executor);
+      return;
+    }
+    await this.database.transaction(replace);
+  }
+
   public async list(
     problemId: string,
     round: number,
@@ -233,6 +292,43 @@ export class InMemoryReviewItemStore implements ReviewItemStore {
         source: item.source,
         sourceUserId: item.sourceUserId ?? null,
         sourcePluginId: item.sourcePluginId ?? null,
+        visibility: item.visibility,
+        summary: item.summary,
+        data: structuredClone(item.data ?? null),
+        contentHash: item.contentHash,
+        expiresAt: item.expiresAt ?? null,
+        createdAt: this.#now().toISOString()
+      });
+    }
+    this.#items.set(key, bucket);
+  }
+
+  public async replacePluginItems(
+    problemId: string,
+    round: number,
+    items: readonly StoredReviewItemInput[],
+    _executor?: DatabaseExecutor
+  ): Promise<void> {
+    const key = `${problemId}:${round}`;
+    let bucket = this.#items.get(key) ?? [];
+    for (const rawItem of items) {
+      const item = storedReviewItemInputSchema.parse(rawItem);
+      if (item.sourcePluginId === undefined) {
+        throw new ReviewItemStoreError("WRITE_FAILED", "替换插件审核条目时缺少插件来源。");
+      }
+      bucket = bucket.filter(
+        (existing) =>
+          existing.type !== item.type ||
+          existing.sourcePluginId !== item.sourcePluginId ||
+          existing.contentHash !== item.contentHash
+      );
+      bucket.push({
+        id: randomUUID(),
+        round,
+        type: item.type,
+        source: item.source,
+        sourceUserId: item.sourceUserId ?? null,
+        sourcePluginId: item.sourcePluginId,
         visibility: item.visibility,
         summary: item.summary,
         data: structuredClone(item.data ?? null),

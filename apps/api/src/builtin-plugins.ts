@@ -3,6 +3,7 @@ import {
   anklangResultSchema,
   anklangReviewItemType,
   anklangSettingsSchema,
+  createAnklangUnavailableReviewItem,
   createAnklangCheck,
   type AnklangCache,
   type AnklangFetch
@@ -78,7 +79,7 @@ export function createBuiltinPluginDefinitions(
     {
       source: "builtin:anklang",
       manifest: {
-        id: anklangPluginId, name: "原题相似度检查", version: "0.1.0", apiVersion: "1",
+        id: anklangPluginId, name: "原题相似度检查", version: "0.2.0", apiVersion: "1",
         serverEntry: "dist/index.js", permissions: ["org.ustc.urmotiv.anklang.configure", "org.ustc.urmotiv.anklang.results.read"], settingsSchema: "settings.schema.json"
       },
       secretDefinitions: [{
@@ -92,6 +93,16 @@ export function createBuiltinPluginDefinitions(
           baseUrl: {
             type: "string", format: "uri", title: "Anklang 服务地址",
             description: "Urmotiv 调用原题检索服务的 HTTP 或 HTTPS 地址。认证令牌单独保存。"
+          },
+          apiVersion: {
+            type: "string",
+            oneOf: [
+              { const: "2", title: "v2（推荐）" },
+              { const: "1", title: "v1（仅迁移或回滚）" }
+            ],
+            default: "2",
+            title: "Anklang 接口版本",
+            description: "新配置使用 v2；只有迁移或短期回滚旧服务时才明确选择 v1。"
           },
           timeoutMs: {
             type: "integer", minimum: 1000, maximum: 120000, default: 120000,
@@ -116,7 +127,8 @@ export function createBuiltinPluginDefinitions(
           },
           cacheMinutes: {
             type: "integer", minimum: 1, maximum: 10080, default: 1440,
-            title: "相同内容复用时间（分钟）"
+            title: "本地最长复用时间（分钟）",
+            description: "v2 取服务绝对到期时间与这个本地上限中较早的时间；v1 只使用这个上限。"
           }
         }
       },
@@ -197,12 +209,29 @@ function createAnklangHookRegistrar(runtime: AnklangHookRuntime): (registry: Plu
         if (context.signal.aborted) {
           controller.abort();
         }
-        const timer = setTimeout(() => controller.abort(), settings.timeoutMs);
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, settings.timeoutMs);
         try {
           return await check.run(input, { signal: controller.signal });
         } catch (error) {
+          if (context.signal.aborted) {
+            throw error;
+          }
           if (settings.failureBehavior === "continue") {
-            return { decision: "continue" };
+            return settings.apiVersion === "2"
+              ? {
+                  decision: "continue",
+                  reviewItems: [
+                    createAnklangUnavailableReviewItem(
+                      input,
+                      timedOut ? "search_timeout" : "service_unavailable"
+                    )
+                  ]
+                }
+              : { decision: "continue" };
           }
           throw error;
         } finally {

@@ -436,7 +436,7 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
 }
 
 /** 手动"原题检索"的结果；不属于任何标签页，切换标签页时保持可见。 */
-function SimilarityCheckPanel({
+export function SimilarityCheckPanel({
   result,
   onDismiss
 }: {
@@ -454,26 +454,34 @@ function SimilarityCheckPanel({
           <X size={15} aria-hidden="true" />
         </button>
       </div>
+      {result.status === "partial" ? (
+        <p className="warning-note">
+          <TriangleAlert size={16} aria-hidden="true" />
+          本次检索只完成了一部分，候选仅供人工核对，不能视为完整查重。
+        </p>
+      ) : null}
       {result.status === "unavailable" ? (
-        <p className="empty-state">原题检索插件未启用。</p>
+        <p className="warning-note">
+          <TriangleAlert size={16} aria-hidden="true" />
+          原题检索未能形成可信结果，请稍后重试或联系管理员。
+        </p>
+      ) : null}
+      {result.blockedAdvice ? (
+        <p className="warning-note">
+          <TriangleAlert size={16} aria-hidden="true" />
+          建议不要提交：{result.blockedAdvice.message}
+        </p>
+      ) : null}
+      {result.items.length === 0 ? (
+        result.status === "completed" && result.blockedAdvice === null ? (
+          <p className="empty-state">完整检索未发现需要关注的相似题目。</p>
+        ) : null
       ) : (
-        <>
-          {result.blockedAdvice ? (
-            <p className="warning-note">
-              <TriangleAlert size={16} aria-hidden="true" />
-              建议不要提交：{result.blockedAdvice.message}
-            </p>
-          ) : null}
-          {result.items.length === 0 ? (
-            <p className="empty-state">未发现需要关注的相似题目。</p>
-          ) : (
-            <div className="analysis-item-list">
-              {result.items.map((item) => (
-                <ReviewItemCard key={item.id} item={item} defaultExpanded />
-              ))}
-            </div>
-          )}
-        </>
+        <div className="analysis-item-list">
+          {result.items.map((item) => (
+            <ReviewItemCard key={item.id} item={item} defaultExpanded />
+          ))}
+        </div>
       )}
     </div>
   );

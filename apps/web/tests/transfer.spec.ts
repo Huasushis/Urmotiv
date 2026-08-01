@@ -151,7 +151,7 @@ test("手机视口下导入导出页没有横向溢出", async ({ page }, testIn
   await page.screenshot({ path: testInfo.outputPath("transfer-mobile.png"), fullPage: true });
 });
 
-test("题目工作台提供原题检索按钮，插件未启用时给出明确提示", async ({ page }) => {
+test("题目工作台提供原题检索按钮，未形成可信结果时不会显示成阴性", async ({ page }) => {
   await loginAsLeader(page);
   await page.goto("/problems/new");
   await page.getByLabel("题目名称").fill("查重按钮联调题");
@@ -162,5 +162,6 @@ test("题目工作台提供原题检索按钮，插件未启用时给出明确�
   await expect(page.getByRole("heading", { name: "查重按钮联调题" })).toBeVisible();
 
   await page.getByRole("button", { name: /原题检索/ }).click();
-  await expect(page.getByText("原题检索插件未启用")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/原题检索未能形成可信结果/)).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(/未发现需要关注的相似题目/)).toHaveCount(0);
 });

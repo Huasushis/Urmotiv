@@ -1,7 +1,7 @@
 {
   "id": "org.ustc.urmotiv.anklang",
   "name": "原题相似度检查",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "apiVersion": "1",
   "serverEntry": "dist/index.js",
   "permissions": [

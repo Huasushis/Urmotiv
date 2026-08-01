@@ -1,16 +1,20 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import type { BeforeSubmitInput } from "@urmotiv/plugin-sdk";
+import { pluginManifestSchema, type BeforeSubmitInput } from "@urmotiv/plugin-sdk";
 import {
   AnklangClient,
-  anklangResultSchema,
+  anklangCompletionStatus,
   anklangSettingsSchema,
+  anklangV2ResultSchema,
   createAnklangCheck,
   type AnklangCache,
-  type AnklangResult
+  type AnklangResult,
+  type AnklangV2Result
 } from "../src/index";
 
 const contentHash = "a".repeat(64);
+const checkedAt = "2026-08-01T00:00:00.000Z";
+const expiresAt = "2026-08-01T01:00:00.000Z";
 const input: BeforeSubmitInput = {
   problemId: "42",
   revision: 3,
@@ -25,178 +29,539 @@ const input: BeforeSubmitInput = {
   }
 };
 
-function result(overrides: Partial<AnklangResult> = {}): AnklangResult {
-  return anklangResultSchema.parse({
-    apiVersion: "1",
-    contentHash,
-    checkedAt: "2026-07-26T00:00:00.000Z",
-    candidates: [
-      {
-        source: "公开题库",
-        externalId: "sample-1",
-        title: "相似的公开题",
-        similarity: 0.82,
-        sameProblemSuggestion: false
-      }
-    ],
-    recommendation: { blockSubmission: false, message: "可以继续人工审核。" },
-    ...overrides
+const candidate = {
+  source: "公开题库",
+  externalId: "sample-1",
+  title: "相似的公开题",
+  similarity: 0.82,
+  sameProblemSuggestion: false
+};
+
+function v2Result(options: {
+  status?: "complete" | "partial" | "unavailable";
+  reasonCode?: string;
+  retryable?: boolean;
+  retryAfterSeconds?: number;
+  candidates?: readonly Record<string, unknown>[];
+  blockSubmission?: boolean;
+  reuse?: Record<string, unknown>;
+  checkedAt?: string;
+  contentHash?: string;
+  extra?: Record<string, unknown>;
+} = {}): AnklangV2Result {
+  const status = options.status ?? "complete";
+  const completion: Record<string, unknown> =
+    status === "complete"
+      ? { status: "complete", reasonCode: "complete", retryable: false }
+      : {
+          status,
+          reasonCode: options.reasonCode ?? "search_partial",
+          retryable: options.retryable ?? true,
+          ...(options.retryAfterSeconds === undefined
+            ? {}
+            : { retryAfterSeconds: options.retryAfterSeconds })
+        };
+  return anklangV2ResultSchema.parse({
+    apiVersion: "2",
+    contentHash: options.contentHash ?? contentHash,
+    checkedAt: options.checkedAt ?? checkedAt,
+    completion,
+    candidates:
+      options.candidates ?? (status === "unavailable" ? [] : [candidate]),
+    recommendation: {
+      blockSubmission: options.blockSubmission ?? false,
+      message: "请继续人工核对。"
+    },
+    reuse:
+      options.reuse ??
+      (status === "complete"
+        ? { policy: "allowed", expiresAt }
+        : { policy: "no-store" }),
+    ...options.extra
   });
 }
 
-describe("Anklang 设置与 HTTP 边界", () => {
-  it("默认等待时间覆盖 Anklang 的重试与可选模型复核", () => {
+function v1Result(overrides: Record<string, unknown> = {}): AnklangResult {
+  return {
+    apiVersion: "1",
+    contentHash,
+    checkedAt,
+    candidates: [candidate],
+    recommendation: { blockSubmission: false, message: "请继续人工核对。" },
+    ...overrides
+  } as AnklangResult;
+}
+
+function jsonResponse(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "Content-Type": "application/json" }
+  });
+}
+
+function request(version: "1" | "2") {
+  return {
+    apiVersion: version,
+    requestId: "54b70dd8-5c21-4d31-84b7-6437b303c4f2",
+    contentHash,
+    problem: {
+      title: input.problem.title,
+      type: input.problem.type,
+      tagIds: input.problem.tagIds,
+      basicStatement: input.problem.basicStatement
+    }
+  } as const;
+}
+
+describe("Anklang 设置、清单与 HTTP 边界", () => {
+  it("新配置默认使用 v2，并保留显式 v1 迁移选项", () => {
+    expect(
+      anklangSettingsSchema.parse({ baseUrl: "https://anklang.example.test" })
+    ).toMatchObject({ apiVersion: "2", timeoutMs: 120_000 });
     expect(
       anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test"
-      }).timeoutMs
-    ).toBe(120_000);
+        baseUrl: "https://anklang.example.test",
+        apiVersion: "1"
+      }).apiVersion
+    ).toBe("1");
+
     const packagedSchema = JSON.parse(
       readFileSync(new URL("../settings.schema.json", import.meta.url), "utf8")
     ) as {
-      properties?: { timeoutMs?: { default?: unknown; maximum?: unknown } };
+      properties?: {
+        apiVersion?: { default?: unknown; enum?: unknown };
+        timeoutMs?: { default?: unknown; maximum?: unknown };
+      };
     };
-    expect(packagedSchema.properties?.timeoutMs?.default).toBe(120_000);
-    expect(packagedSchema.properties?.timeoutMs?.maximum).toBe(120_000);
+    expect(packagedSchema.properties?.apiVersion).toMatchObject({
+      default: "2",
+      enum: ["2", "1"]
+    });
+    expect(packagedSchema.properties?.timeoutMs).toMatchObject({
+      default: 120_000,
+      maximum: 120_000
+    });
     expect(() =>
       anklangSettingsSchema.parse({
         baseUrl: "https://anklang.example.test",
         timeoutMs: 120_001
       })
     ).toThrow();
+
+    const manifest = pluginManifestSchema.parse(
+      JSON.parse(readFileSync(new URL("../urmotiv-plugin.json", import.meta.url), "utf8"))
+    );
+    expect(manifest).toMatchObject({ version: "0.2.0", apiVersion: "1" });
   });
 
-  it("拒绝地址中夹带账号密码", () => {
+  it("拒绝服务地址中夹带账号密码", () => {
     expect(() =>
       anklangSettingsSchema.parse({ baseUrl: "https://user:secret@example.test" })
     ).toThrow();
   });
 
-  it("只发送查重需要的题目信息，不发送基础题解", async () => {
-    const fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      expect(JSON.stringify(body)).not.toContain("使用最短路算法");
+  it("v2 只发送查重所需字段，固定路径和版本且禁止重定向", async () => {
+    const fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      expect(String(url)).toBe("https://anklang.example.test/api/v2/checks/similarity");
+      expect(init?.redirect).toBe("error");
       expect(init?.headers).toEqual(
-        expect.objectContaining({ Authorization: "Bearer hidden-token" })
+        expect.objectContaining({
+          Authorization: "Bearer hidden-token",
+          "X-Urmotiv-API-Version": "2"
+        })
       );
-      return new Response(JSON.stringify(result()), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      expect(body.apiVersion).toBe("2");
+      expect(JSON.stringify(body)).not.toContain(input.problem.basicSolution);
+      return jsonResponse(v2Result());
     });
     const client = new AnklangClient({
       baseUrl: "https://anklang.example.test",
       token: "hidden-token",
       fetch
     });
-    await expect(
-      client.check(
-        {
-          apiVersion: "1",
-          requestId: "54b70dd8-5c21-4d31-84b7-6437b303c4f2",
-          contentHash,
-          problem: {
-            title: input.problem.title,
-            type: input.problem.type,
-            tagIds: input.problem.tagIds,
-            basicStatement: input.problem.basicStatement
-          }
-        },
-        new AbortController().signal
-      )
-    ).resolves.toEqual(result());
-  });
-
-  it("拒绝混用其他内容摘要的返回结果", async () => {
-    const client = new AnklangClient({
-      baseUrl: "https://anklang.example.test",
-      fetch: async () =>
-        new Response(JSON.stringify(result({ contentHash: "b".repeat(64) })), { status: 200 })
-    });
-    await expect(
-      client.check(
-        {
-          apiVersion: "1",
-          requestId: "54b70dd8-5c21-4d31-84b7-6437b303c4f2",
-          contentHash,
-          problem: {
-            title: input.problem.title,
-            type: input.problem.type,
-            tagIds: input.problem.tagIds,
-            basicStatement: input.problem.basicStatement
-          }
-        },
-        new AbortController().signal
-      )
-    ).rejects.toThrow("题目内容已经变化");
-  });
-});
-
-describe("提交前相似度检查", () => {
-  it("按内容摘要复用缓存并过滤低相似度候选", async () => {
-    const cached = result({
-      candidates: [
-        ...result().candidates,
-        {
-          source: "公开题库",
-          externalId: "sample-2",
-          title: "较弱候选",
-          similarity: 0.1
-        }
-      ]
-    });
-    const cache: AnklangCache = {
-      get: vi.fn(async () => cached),
-      set: vi.fn(async () => undefined)
-    };
-    const fetch = vi.fn(async () => new Response("should not run"));
-    const check = createAnklangCheck({
-      settings: {
-        baseUrl: "https://anklang.example.test",
-        timeoutMs: 30_000,
-        failureBehavior: "block",
-        blockWhenRecommended: true,
-        minimumSimilarityToShow: 0.3,
-        cacheMinutes: 60
-      },
-      cache,
-      fetch
-    });
-
-    const output = await check.run(input, { signal: new AbortController().signal });
-    expect(fetch).not.toHaveBeenCalled();
-    expect(output).toEqual(
-      expect.objectContaining({
-        decision: "continue",
-        reviewItems: [
-          expect.objectContaining({
-            data: expect.objectContaining({ candidates: [expect.objectContaining({ similarity: 0.82 })] })
-          })
-        ]
-      })
+    await expect(client.check(request("2"), new AbortController().signal)).resolves.toEqual(
+      v2Result()
     );
   });
 
-  it("服务明确建议拦截时只返回必要摘要", async () => {
-    const blocked = result({
-      recommendation: { blockSubmission: true, message: "请先说明与候选题的差异。" }
+  it("只有显式配置才调用 v1 路径并要求 v1 正文", async () => {
+    const fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      expect(String(url)).toBe("https://anklang.example.test/api/v1/checks/similarity");
+      expect(init?.headers).toEqual(
+        expect.objectContaining({ "X-Urmotiv-API-Version": "1" })
+      );
+      expect(JSON.parse(String(init?.body))).toMatchObject({ apiVersion: "1", contentHash });
+      return jsonResponse(v1Result());
     });
+    const client = new AnklangClient({
+      baseUrl: "https://anklang.example.test",
+      apiVersion: "1",
+      fetch
+    });
+    await expect(client.check(request("1"), new AbortController().signal)).resolves.toEqual(
+      v1Result()
+    );
+    await expect(client.check(request("2"), new AbortController().signal)).rejects.toThrow(
+      "已配置的接口版本"
+    );
+  });
+
+  it("拒绝非 JSON 媒体类型、串题摘要与响应额外字段，错误不含上游正文", async () => {
+    const marker = "upstream-body-must-not-leak";
+    const cases: Array<() => Promise<Response>> = [
+      async () => new Response(JSON.stringify(v2Result()), { status: 200 }),
+      async () => jsonResponse(v2Result({ contentHash: "b".repeat(64) })),
+      async () => jsonResponse({ ...v2Result(), extraField: marker }),
+      async () => new Response(marker, { status: 503, headers: { "Content-Type": "text/plain" } })
+    ];
+    for (const fetch of cases) {
+      const client = new AnklangClient({ baseUrl: "https://anklang.example.test", fetch });
+      const rejection = client.check(request("2"), new AbortController().signal);
+      await expect(rejection).rejects.toThrow();
+      await rejection.catch((error: unknown) => {
+        expect(String(error)).not.toContain(marker);
+        expect(String(error)).not.toContain("相似的公开题");
+      });
+    }
+  });
+
+  it("拒绝非法 UTF-8 与超过 2 MB 的响应体", async () => {
+    const cases: Array<() => Promise<Response>> = [
+      async () =>
+        new Response(new Uint8Array([0xc3, 0x28]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        }),
+      async () =>
+        new Response(new Uint8Array(2_000_001), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        })
+    ];
+    for (const fetch of cases) {
+      const client = new AnklangClient({ baseUrl: "https://anklang.example.test", fetch });
+      await expect(
+        client.check(request("2"), new AbortController().signal)
+      ).rejects.toThrow("格式不正确");
+    }
+  });
+});
+
+describe("v2 严格契约", () => {
+  it("接受全部固定非完整原因，并拒绝未知原因和非法重试字段", () => {
+    const reasons = [
+      "search_timeout",
+      "search_rate_limited",
+      "search_backend_unavailable",
+      "search_backend_invalid",
+      "search_partial",
+      "review_unavailable",
+      "service_unavailable",
+      "service_invalid_response",
+      "internal_error"
+    ];
+    for (const reasonCode of reasons) {
+      expect(
+        anklangV2ResultSchema.safeParse(
+          v2Result({ status: "partial", reasonCode, retryable: true })
+        ).success
+      ).toBe(true);
+    }
+
+    const base = v2Result({ status: "partial" }) as unknown as Record<string, unknown>;
+    expect(
+      anklangV2ResultSchema.safeParse({
+        ...base,
+        completion: { status: "partial", reasonCode: "unknown", retryable: true }
+      }).success
+    ).toBe(false);
+    expect(
+      anklangV2ResultSchema.safeParse({
+        ...base,
+        completion: {
+          status: "partial",
+          reasonCode: "search_partial",
+          retryable: false,
+          retryAfterSeconds: 30
+        }
+      }).success
+    ).toBe(false);
+  });
+
+  it("严格拒绝非 UTC、超过七天、跨分支字段和不可信 partial 拦截", () => {
+    const complete = v2Result() as unknown as Record<string, unknown>;
+    const partial = v2Result({ status: "partial" }) as unknown as Record<string, unknown>;
+    const unavailable = v2Result({
+      status: "unavailable",
+      reasonCode: "service_unavailable"
+    }) as unknown as Record<string, unknown>;
+    const invalid = [
+      { ...complete, checkedAt: "2026-08-01T00:00:00+00:00" },
+      { ...complete, reuse: { policy: "allowed", expiresAt: "2026-08-09T00:00:00.000Z" } },
+      {
+        ...partial,
+        recommendation: { blockSubmission: true, message: "不可信拦截" }
+      },
+      { ...partial, reuse: { policy: "allowed", expiresAt } },
+      { ...unavailable, candidates: [candidate] },
+      {
+        ...unavailable,
+        recommendation: { blockSubmission: true, message: "不可用时不能拦截" }
+      },
+      { ...complete, unknown: true },
+      {
+        ...complete,
+        completion: { status: "complete", reasonCode: "complete", retryable: false, extra: true }
+      },
+      { ...complete, candidates: [{ ...candidate, extra: true }] },
+      {
+        ...complete,
+        recommendation: { blockSubmission: false, message: "固定说明", extra: true }
+      },
+      {
+        ...complete,
+        reuse: { policy: "allowed", expiresAt, extra: true }
+      },
+      { ...complete, reuse: undefined }
+    ];
+    for (const value of invalid) {
+      expect(anklangV2ResultSchema.safeParse(value).success).toBe(false);
+    }
+  });
+});
+
+describe("提交前相似度检查与缓存", () => {
+  it("只缓存 complete + allowed，并严格使用服务的绝对到期时间", async () => {
+    let current = new Date(checkedAt);
+    let stored: { key: string; value: unknown; expiresAt: string } | undefined;
+    const cache: AnklangCache = {
+      get: vi.fn(async (key) =>
+        stored !== undefined && stored.key === key ? stored.value : undefined
+      ),
+      set: vi.fn(async (key, value, expiry) => {
+        stored = { key, value, expiresAt: expiry };
+      })
+    };
+    const fetch = vi.fn(async () => jsonResponse(v2Result()));
     const check = createAnklangCheck({
       settings: anklangSettingsSchema.parse({ baseUrl: "https://anklang.example.test" }),
-      fetch: async () => new Response(JSON.stringify(blocked), { status: 200 })
+      cache,
+      fetch,
+      now: () => current
     });
 
+    await check.run(input, { signal: new AbortController().signal });
+    expect(cache.set).toHaveBeenCalledTimes(1);
+    expect(stored?.expiresAt).toBe(expiresAt);
+    expect(stored?.key).toContain(`2:https://anklang.example.test/:1440:${contentHash}`);
+    await check.run(input, { signal: new AbortController().signal });
+    expect(fetch).toHaveBeenCalledTimes(1);
+
+    current = new Date("2026-08-01T01:00:00.001Z");
+    await check.run(input, { signal: new AbortController().signal });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("过期 allowed 结果仍可作为本次完整结果，但绝不写入缓存", async () => {
+    const cache: AnklangCache = {
+      get: vi.fn(async () => undefined),
+      set: vi.fn(async () => undefined)
+    };
+    const check = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({ baseUrl: "https://anklang.example.test" }),
+      cache,
+      fetch: async () => jsonResponse(v2Result()),
+      now: () => new Date("2026-08-01T02:00:00.000Z")
+    });
+    const output = await check.run(input, { signal: new AbortController().signal });
+    expect(output.decision).toBe("continue");
+    expect(cache.set).not.toHaveBeenCalled();
+  });
+
+  it("本地保留上限收紧服务期限，缓存读写故障不破坏本次可信结果", async () => {
+    const set = vi.fn(async () => {
+      throw new Error("cache-write-marker");
+    });
+    const cache: AnklangCache = {
+      get: vi.fn(async () => {
+        throw new Error("cache-read-marker");
+      }),
+      set
+    };
+    const fetch = vi.fn(async () =>
+      jsonResponse(
+        v2Result({
+          reuse: { policy: "allowed", expiresAt: "2026-08-08T00:00:00.000Z" }
+        })
+      )
+    );
+    const check = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        cacheMinutes: 60
+      }),
+      cache,
+      fetch,
+      now: () => new Date(checkedAt)
+    });
+    await expect(
+      check.run(input, { signal: new AbortController().signal })
+    ).resolves.toMatchObject({ decision: "continue" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(set).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(Object),
+      "2026-08-01T01:00:00.000Z"
+    );
+  });
+
+  it("设置从长缓存收紧为短缓存后不复用旧设置写入的结果", async () => {
+    const stored = new Map<string, unknown>();
+    const cache: AnklangCache = {
+      get: vi.fn(async (key) => stored.get(key)),
+      set: vi.fn(async (key, value) => {
+        stored.set(key, value);
+      })
+    };
+    const fetch = vi.fn(async () => jsonResponse(v2Result()));
+    const common = {
+      cache,
+      fetch,
+      now: () => new Date(checkedAt)
+    };
+
+    const longCacheCheck = createAnklangCheck({
+      ...common,
+      settings: anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        cacheMinutes: 1_440
+      })
+    });
+    const shortCacheCheck = createAnklangCheck({
+      ...common,
+      settings: anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        cacheMinutes: 1
+      })
+    });
+
+    await longCacheCheck.run(input, { signal: new AbortController().signal });
+    await shortCacheCheck.run(input, { signal: new AbortController().signal });
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(stored.size).toBe(2);
+  });
+
+  it("complete + no-store、partial 与 unavailable 都不写业务缓存", async () => {
+    for (const response of [
+      v2Result({ reuse: { policy: "no-store" } }),
+      v2Result({ status: "partial" }),
+      v2Result({ status: "unavailable", reasonCode: "service_unavailable" })
+    ]) {
+      const cache: AnklangCache = {
+        get: vi.fn(async () => undefined),
+        set: vi.fn(async () => undefined)
+      };
+      const check = createAnklangCheck({
+        settings: anklangSettingsSchema.parse({
+          baseUrl: "https://anklang.example.test",
+          failureBehavior: "continue"
+        }),
+        cache,
+        fetch: async () => jsonResponse(response),
+        now: () => new Date(checkedAt)
+      });
+      const output = await check.run(input, { signal: new AbortController().signal });
+      expect(output.decision).toBe("continue");
+      expect(cache.set).not.toHaveBeenCalled();
+      if (response.completion.status !== "complete") {
+        expect(anklangCompletionStatus(output.decision === "continue" ? output.reviewItems?.[0]?.data : null))
+          .toBe(response.completion.status);
+      }
+    }
+  });
+
+  it("partial 只有可信同题复核可拦截，并保留低于显示阈值的拦截依据", async () => {
+    const trusted = v2Result({
+      status: "partial",
+      candidates: [{ ...candidate, similarity: 0.1, sameProblemSuggestion: true }],
+      blockSubmission: true
+    });
+    const check = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        minimumSimilarityToShow: 0.9
+      }),
+      fetch: async () => jsonResponse(trusted)
+    });
     const output = await check.run(input, { signal: new AbortController().signal });
     expect(output).toEqual({
       decision: "block",
-      code: "anklang_similar_problem",
-      message: "请先说明与候选题的差异。",
-      details: {
-        candidateCount: 1,
-        maximumSimilarity: 0.82,
-        contentHash
-      }
+      code: "anklang_partial_same_problem",
+      message: "请继续人工核对。",
+      details: { candidateCount: 1, maximumSimilarity: 0.1, contentHash }
     });
     expect(JSON.stringify(output)).not.toContain("sample-1");
+    expect(JSON.stringify(output)).not.toContain(input.problem.basicStatement);
+  });
+
+  it("未完整结果按 failureBehavior 阻止或明确降级，不会伪装成完整空候选", async () => {
+    const partial = v2Result({ status: "partial", candidates: [] });
+    const blocking = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({ baseUrl: "https://anklang.example.test" }),
+      fetch: async () => jsonResponse(partial)
+    });
+    await expect(
+      blocking.run(input, { signal: new AbortController().signal })
+    ).rejects.toThrow("没有完整完成");
+
+    const continuing = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        failureBehavior: "continue"
+      }),
+      fetch: async () => jsonResponse(partial)
+    });
+    const output = await continuing.run(input, { signal: new AbortController().signal });
+    expect(output).toMatchObject({
+      decision: "continue",
+      reviewItems: [{ summary: expect.stringContaining("只完成了一部分") }]
+    });
+  });
+
+  it("网络与畸形响应在 continue 模式生成固定 unavailable 条目且不泄露原文", async () => {
+    const marker = "raw-upstream-secret-marker";
+    for (const fetch of [
+      async () => {
+        throw new Error(marker);
+      },
+      async () => jsonResponse({ ...v2Result(), extra: marker })
+    ]) {
+      const check = createAnklangCheck({
+        settings: anklangSettingsSchema.parse({
+          baseUrl: "https://anklang.example.test",
+          failureBehavior: "continue"
+        }),
+        fetch
+      });
+      const output = await check.run(input, { signal: new AbortController().signal });
+      expect(output).toMatchObject({
+        decision: "continue",
+        reviewItems: [
+          {
+            summary: expect.stringContaining("暂不可用"),
+            data: {
+              apiVersion: "2",
+              completion: { status: "unavailable" },
+              candidates: [],
+              reuse: { policy: "no-store" }
+            }
+          }
+        ]
+      });
+      expect(JSON.stringify(output)).not.toContain(marker);
+      expect(JSON.stringify(output)).not.toContain(input.problem.basicStatement);
+    }
   });
 });

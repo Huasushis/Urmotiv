@@ -22,7 +22,7 @@ import {
 import { DatabaseContestStore } from "../src/database-contest-store";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo";
 import { DatabaseDataStore } from "../src/database-store";
-import { TrustedPluginHost } from "../src/plugin-host";
+import { TrustedPluginHost, type TrustedPluginDefinition } from "../src/plugin-host";
 import { DatabasePluginStore } from "../src/database-plugin-store";
 import { DatabaseReviewItemStore } from "../src/review-item-store";
 
@@ -47,7 +47,10 @@ afterEach(async () => {
 interface FakeAnklang {
   calls: number;
   blockSubmission: boolean;
+  completionStatus?: "complete" | "partial" | "unavailable";
   failWith?: Error;
+  beforeResponse?: () => Promise<void>;
+  includeBlockingOtherCheck?: boolean;
 }
 
 function fakeAnklangFetch(state: FakeAnklang): AnklangFetch {
@@ -56,28 +59,54 @@ function fakeAnklangFetch(state: FakeAnklang): AnklangFetch {
     if (state.failWith !== undefined) {
       throw state.failWith;
     }
-    const request = JSON.parse(String(init?.body ?? "{}")) as { contentHash: string };
+    await state.beforeResponse?.();
+    const request = JSON.parse(String(init?.body ?? "{}")) as {
+      apiVersion: string;
+      contentHash: string;
+    };
+    expect(request.apiVersion).toBe("2");
+    const completionStatus = state.completionStatus ?? "complete";
+    const checkedAt = new Date();
     const result = {
-      apiVersion: "1",
+      apiVersion: "2",
       contentHash: request.contentHash,
-      checkedAt: new Date().toISOString(),
-      candidates: [
-        {
-          source: "yuantiji",
-          externalId: "cf-1234A",
-          title: "非常相似的公开题目",
-          url: "https://example.test/problem/1234A",
-          similarity: 0.92,
-          sameProblemSuggestion: state.blockSubmission,
-          explanation: "题面结构与数据范围几乎一致。"
-        }
-      ],
+      checkedAt: checkedAt.toISOString(),
+      completion:
+        completionStatus === "complete"
+          ? { status: "complete", reasonCode: "complete", retryable: false }
+          : {
+              status: completionStatus,
+              reasonCode:
+                completionStatus === "partial" ? "search_partial" : "service_unavailable",
+              retryable: true
+            },
+      candidates:
+        completionStatus === "unavailable"
+          ? []
+          : [
+              {
+                source: "yuantiji",
+                externalId: "cf-1234A",
+                title: "非常相似的公开题目",
+                url: "https://example.test/problem/1234A",
+                similarity: 0.92,
+                sameProblemSuggestion: state.blockSubmission,
+                explanation: "题面结构与数据范围几乎一致。"
+              }
+            ],
       recommendation: {
-        blockSubmission: state.blockSubmission,
+        blockSubmission: completionStatus === "unavailable" ? false : state.blockSubmission,
         message: state.blockSubmission
           ? "发现高度相似的公开题目，建议不要提交。"
           : "未发现需要拦截的相似题目。"
-      }
+      },
+      reuse:
+        completionStatus === "complete"
+          ? {
+              policy: "allowed",
+              expiresAt: new Date(checkedAt.getTime() + 60 * 60_000).toISOString()
+            }
+          : { policy: "no-store" }
     };
     return new Response(JSON.stringify(result), {
       status: 200,
@@ -121,10 +150,36 @@ async function makeHookedApp(state: FakeAnklang): Promise<{
     },
     fetch: fakeAnklangFetch(state)
   };
-  const host = new TrustedPluginHost(
-    createBuiltinPluginDefinitions({ anklang: runtime }),
-    new DatabasePluginStore(database)
-  );
+  const definitions: TrustedPluginDefinition[] = [
+    ...createBuiltinPluginDefinitions({ anklang: runtime })
+  ];
+  if (state.includeBlockingOtherCheck) {
+    definitions.push({
+      source: "builtin:test-other-check",
+      initialState: "enabled",
+      manifest: {
+        id: "org.example.other-check",
+        name: "合成的其他提交检查",
+        version: "1.0.0",
+        apiVersion: "1",
+        permissions: []
+      },
+      registerHooks(registry) {
+        registry.registerBeforeSubmitCheck({
+          id: "org.example.other-check.before-submit",
+          displayName: "合成的其他提交检查",
+          timeoutMs: 1_000,
+          failureBehavior: "block",
+          run: () => ({
+            decision: "block",
+            code: "other_check_blocked",
+            message: "其他提交检查的合成阻止。"
+          })
+        });
+      }
+    });
+  }
+  const host = new TrustedPluginHost(definitions, new DatabasePluginStore(database));
   hostReference = host;
 
   const store = new DatabaseDataStore(database);
@@ -271,6 +326,39 @@ describe("提交前查重链路", () => {
     expect((reloaded.json() as { revision: number }).revision).toBe(draft.revision);
   });
 
+  it("活动审核轮次的重复手动检查替换同源结果而不重复追加", async () => {
+    const state: FakeAnklang = { calls: 0, blockSubmission: false };
+    const { app, host } = await makeHookedApp(state);
+    await enableAnklang(host);
+    const author = await login(app, databaseDemoUserIds.author);
+    const draft = await createDraft(app, author);
+    const submitted = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${draft.id}/submit`,
+      headers: { cookie: author, origin: localOrigin },
+      payload: { expectedRevision: draft.revision }
+    });
+    expect(submitted.statusCode).toBe(200);
+
+    for (let index = 0; index < 2; index += 1) {
+      const checked = await app.inject({
+        method: "POST",
+        url: `/api/v1/problems/${draft.id}/similarity-check`,
+        headers: { cookie: author, origin: localOrigin },
+        payload: {}
+      });
+      expect(checked.statusCode).toBe(200);
+      expect(checked.json()).toMatchObject({ status: "completed" });
+    }
+    const items = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${draft.id}/review-items`,
+      headers: { cookie: author }
+    });
+    expect((items.json() as { items: unknown[] }).items).toHaveLength(1);
+    expect(state.calls).toBe(1);
+  });
+
   it("草稿阶段可以手动查重，结果不落库且第二次命中缓存", async () => {
     const state: FakeAnklang = { calls: 0, blockSubmission: false };
     const { app, host } = await makeHookedApp(state);
@@ -319,6 +407,211 @@ describe("提交前查重链路", () => {
       payload: {}
     });
     expect(deniedCheck.statusCode).toBe(404);
+  });
+
+  it("手动完整检索建议拦截时返回建议且不会伪造空候选阴性条目", async () => {
+    const state: FakeAnklang = { calls: 0, blockSubmission: true };
+    const { app, host } = await makeHookedApp(state);
+    await enableAnklang(host);
+    const author = await login(app, databaseDemoUserIds.author);
+    const draft = await createDraft(app, author);
+
+    const checked = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${draft.id}/similarity-check`,
+      headers: { cookie: author, origin: localOrigin },
+      payload: {}
+    });
+
+    expect(checked.statusCode).toBe(200);
+    expect(checked.json()).toEqual({
+      status: "completed",
+      blockedAdvice: {
+        code: "anklang_similar_problem",
+        message: "发现高度相似的公开题目，建议不要提交。"
+      },
+      items: []
+    });
+  });
+
+  it("手动查重只运行 Anklang，不受其他提交前检查冒充或阻止", async () => {
+    const state: FakeAnklang = {
+      calls: 0,
+      blockSubmission: false,
+      includeBlockingOtherCheck: true
+    };
+    const { app, host } = await makeHookedApp(state);
+    await enableAnklang(host);
+    const author = await login(app, databaseDemoUserIds.author);
+    const draft = await createDraft(app, author);
+
+    const checked = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${draft.id}/similarity-check`,
+      headers: { cookie: author, origin: localOrigin },
+      payload: {}
+    });
+    expect(checked.statusCode).toBe(200);
+    expect(checked.json()).toMatchObject({ status: "completed", blockedAdvice: null });
+    expect(checked.body).not.toContain("其他提交检查");
+    expect(state.calls).toBe(1);
+  });
+
+  it("手动查重严格区分 partial 与 unavailable，非完整结果不会伪装成阴性", async () => {
+    for (const completionStatus of ["partial", "unavailable"] as const) {
+      const state: FakeAnklang = { calls: 0, blockSubmission: false, completionStatus };
+      const { app, host } = await makeHookedApp(state);
+      await enableAnklang(host, { failureBehavior: "continue" });
+      const author = await login(app, databaseDemoUserIds.author);
+      const draft = await createDraft(app, author);
+
+      const checked = await app.inject({
+        method: "POST",
+        url: `/api/v1/problems/${draft.id}/similarity-check`,
+        headers: { cookie: author, origin: localOrigin },
+        payload: {}
+      });
+      expect(checked.statusCode).toBe(200);
+      expect(checked.json()).toMatchObject({
+        status: completionStatus,
+        blockedAdvice: null,
+        items: [
+          {
+            source: "anklang",
+            data: { completion: { status: completionStatus }, reuse: { policy: "no-store" } }
+          }
+        ]
+      });
+      expect(checked.body).not.toContain("完整检索没有发现");
+    }
+  });
+
+  it("continue 模式把网络失败记为固定 unavailable，且不泄露异常或题面", async () => {
+    const marker = "network-secret-marker";
+    const state: FakeAnklang = {
+      calls: 0,
+      blockSubmission: false,
+      failWith: new Error(marker)
+    };
+    const { app, host } = await makeHookedApp(state);
+    await enableAnklang(host, { failureBehavior: "continue" });
+    const author = await login(app, databaseDemoUserIds.author);
+    const draft = await createDraft(app, author);
+
+    const checked = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${draft.id}/similarity-check`,
+      headers: { cookie: author, origin: localOrigin },
+      payload: {}
+    });
+    expect(checked.statusCode).toBe(200);
+    expect(checked.json()).toMatchObject({
+      status: "unavailable",
+      blockedAdvice: null,
+      items: [{ data: { completion: { status: "unavailable" }, candidates: [] } }]
+    });
+    expect(checked.body).not.toContain(marker);
+    expect(checked.body).not.toContain(statementText);
+  });
+
+  it("手动长请求结束后发现修订变化就丢弃旧结果", async () => {
+    let markStarted: (() => void) | undefined;
+    let releaseResponse: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseResponse = resolve;
+    });
+    const state: FakeAnklang = {
+      calls: 0,
+      blockSubmission: false,
+      beforeResponse: async () => {
+        markStarted?.();
+        await release;
+      }
+    };
+    const { app, host } = await makeHookedApp(state);
+    await enableAnklang(host);
+    const author = await login(app, databaseDemoUserIds.author);
+    const draft = await createDraft(app, author);
+
+    const checking = app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${draft.id}/similarity-check`,
+      headers: { cookie: author, origin: localOrigin },
+      payload: {}
+    });
+    await started;
+    const updated = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${draft.id}`,
+      headers: { cookie: author, origin: localOrigin },
+      payload: { expectedRevision: draft.revision, title: "并发修改后的合成题" }
+    });
+    expect(updated.statusCode).toBe(200);
+    releaseResponse?.();
+
+    const stale = await checking;
+    expect(stale.statusCode).toBe(409);
+    expect(stale.body).not.toContain("非常相似");
+    expect(stale.body).not.toContain(statementText);
+  });
+
+  it("手动长请求结束后账号被停用就不返回或保存旧结果", async () => {
+    let markStarted: (() => void) | undefined;
+    let releaseResponse: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseResponse = resolve;
+    });
+    const state: FakeAnklang = {
+      calls: 0,
+      blockSubmission: false,
+      beforeResponse: async () => {
+        markStarted?.();
+        await release;
+      }
+    };
+    const { app, database, host } = await makeHookedApp(state);
+    const author = await login(app, databaseDemoUserIds.author);
+    const draft = await createDraft(app, author);
+    const submitted = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${draft.id}/submit`,
+      headers: { cookie: author, origin: localOrigin },
+      payload: { expectedRevision: draft.revision }
+    });
+    expect(submitted.statusCode).toBe(200);
+    await enableAnklang(host);
+
+    const checking = app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${draft.id}/similarity-check`,
+      headers: { cookie: author, origin: localOrigin },
+      payload: {}
+    });
+    await started;
+    await database.execute(sql`
+      UPDATE users
+      SET disabled_at = now()
+      WHERE id = ${BigInt(databaseDemoUserIds.author)}
+    `);
+    releaseResponse?.();
+
+    const denied = await checking;
+    expect(denied.statusCode).toBe(401);
+    expect(denied.body).not.toContain("非常相似");
+    expect(denied.body).not.toContain(statementText);
+    const saved = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM review_items item
+      JOIN review_rounds round_record ON round_record.id = item.round_id
+      WHERE round_record.problem_id = ${BigInt(draft.id)}
+    `);
+    expect(saved).toEqual([{ count: 0 }]);
   });
 
   it("插件停用时提交不运行查重；失败按设置降级不拦截", async () => {

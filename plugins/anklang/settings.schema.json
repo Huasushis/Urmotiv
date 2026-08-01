@@ -10,6 +10,13 @@
       "title": "Anklang 服务地址",
       "description": "Urmotiv 调用 Anklang 的 HTTP 或 HTTPS 地址。认证令牌不保存在这个字段中。"
     },
+    "apiVersion": {
+      "type": "string",
+      "enum": ["2", "1"],
+      "default": "2",
+      "title": "Anklang 接口版本",
+      "description": "新配置使用 v2；只有迁移或短期回滚旧服务时才明确选择 v1。"
+    },
     "timeoutMs": {
       "type": "integer",
       "minimum": 1000,
@@ -41,7 +48,8 @@
       "minimum": 1,
       "maximum": 10080,
       "default": 1440,
-      "title": "相同内容复用时间（分钟）"
+      "title": "本地最长复用时间（分钟）",
+      "description": "v2 只复用服务明确允许的完整结果，并取服务绝对到期时间与这个本地上限中较早的时间；v1 只使用这个上限。"
     }
   }
 }

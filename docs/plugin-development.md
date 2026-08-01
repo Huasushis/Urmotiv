@@ -616,7 +616,7 @@ plugins.md 第 5 节给出的原则是：插件如果要保存数据，必须用
 接口访问、不能拿到数据库超级用户连接，卸载后默认保留数据。
 
 **现状说明**：本仓库目前所有内置插件都没有自己的数据表——`review-default` 完全不读数据库；`anklang`
-的相似度结果缓存（`AnklangCache`）在 `apps/api/src/server.ts` 里是 `createProcessAnklangCache()`，一个
+的可复用完整相似度结果缓存（`AnklangCache`）在 `apps/api/src/server.ts` 里是 `createProcessAnklangCache()`，一个
 纯内存 `Map`，进程重启就清空，不落库。真正落库的只有核心统一提供的三张表
 （`installed_plugins`/`plugin_settings`/`plugin_secrets`，`apps/api/src/database-plugin-store.ts`），
 所有插件的设置和密钥都存在这几张共享表里，按 `plugin_id` 区分，不是"每个插件一套自己的表"。

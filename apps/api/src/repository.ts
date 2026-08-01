@@ -36,6 +36,12 @@ export interface ReviewSuggestionAuditEvent {
 
 export interface ProblemTransaction {
   getProblem(): StoredProblem | undefined;
+  /**
+   * Reloads one actor while locking every existing row that contributes to
+   * authentication and authorization. Permission writers must take the same
+   * user-row-first lock before changing memberships or grants.
+   */
+  lockUserForAuthorization(userId: string): Promise<StoredUser | undefined>;
   listUsers(): StoredUser[];
   listReviews(round: number): StoredReview[];
   hasTags(tagIds: readonly string[]): Promise<boolean>;
@@ -439,6 +445,10 @@ export class InMemoryDataStore implements DataStore {
 
       const transaction: ProblemTransaction = {
         getProblem: () => (problem === undefined ? undefined : copy(problem)),
+        lockUserForAuthorization: async (userId) => {
+          const lockedUser = this.users.get(userId);
+          return lockedUser === undefined ? undefined : copy(lockedUser);
+        },
         listUsers: () => users.map(copy),
         listReviews: (round) =>
           [...reviews.values()]

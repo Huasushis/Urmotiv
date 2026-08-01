@@ -212,6 +212,17 @@ function createProcessAnklangCache(): {
       const expiresAtMs = Date.parse(expiresAt);
       if (Number.isFinite(expiresAtMs)) {
         entries.set(contentHash, { value: result, expiresAtMs });
+        if (entries.size > 500) {
+          const currentMs = Date.now();
+          for (const [key, entry] of entries) {
+            if (entry.expiresAtMs <= currentMs || entries.size > 400) {
+              entries.delete(key);
+            }
+            if (entries.size <= 400) {
+              break;
+            }
+          }
+        }
       }
     }
   };

@@ -1716,6 +1716,7 @@ export class DatabaseDataStore implements DataStore {
     if (id === undefined) {
       return operation({
         getProblem: () => undefined,
+        lockUserForAuthorization: async () => undefined,
         listUsers: () => [],
         listReviews: () => [],
         hasTags: async (tagIds) => tagIds.length === 0,
@@ -1762,6 +1763,47 @@ export class DatabaseDataStore implements DataStore {
       const transaction: ProblemTransaction = {
         executor,
         getProblem: () => (problem === undefined ? undefined : copy(problem)),
+        lockUserForAuthorization: async (userId) => {
+          const userDatabaseId = parseDatabaseId(userId);
+          if (userDatabaseId === undefined) {
+            return undefined;
+          }
+
+          // Keep this order aligned with every permission writer: the problem
+          // and current round are already locked, then the actor, memberships,
+          // and grants are locked in stable primary-key order. Locking existing
+          // rows does not protect writers that insert grants without first
+          // taking the actor row, hence the explicit user-row-first protocol.
+          const lockedUsers = await executor.query<{ id: string }>(sql`
+            SELECT id::text AS id
+            FROM users
+            WHERE id = ${userDatabaseId}
+            FOR UPDATE
+          `);
+          if (lockedUsers.length === 0) {
+            return undefined;
+          }
+          await executor.query<{ id: string }>(sql`
+            SELECT membership.id::text AS id
+            FROM role_memberships membership
+            WHERE membership.user_id = ${userDatabaseId}
+            ORDER BY membership.id
+            FOR UPDATE OF membership
+          `);
+          await executor.query<{ id: string }>(sql`
+            SELECT grant_record.id::text AS id
+            FROM permission_grants grant_record
+            WHERE grant_record.subject_user_id = ${userDatabaseId}
+               OR grant_record.subject_role_id IN (
+                 SELECT membership.role_id
+                 FROM role_memberships membership
+                 WHERE membership.user_id = ${userDatabaseId}
+               )
+            ORDER BY grant_record.id
+            FOR UPDATE OF grant_record
+          `);
+          return (await loadUsers(executor, [userDatabaseId]))[0];
+        },
         listUsers: () => users.map(copy),
         listReviews: (round) =>
           [...reviews.values()]

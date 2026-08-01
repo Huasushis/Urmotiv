@@ -72,7 +72,12 @@ import {
 } from "./problem-file-service";
 import { ProblemService, type SubmitCheckRunner } from "./service";
 import type { TransferService } from "./transfer-service";
-import type { AnklangCache } from "@urmotiv/plugin-anklang";
+import {
+  anklangCheckId,
+  anklangCompletionStatus,
+  type AnklangCache,
+  type AnklangCompletionStatus
+} from "@urmotiv/plugin-anklang";
 import {
   anklangPluginId,
   anklangServiceTokenSecretName,
@@ -274,43 +279,75 @@ function requestContentLengthExceeds(
 }
 
 /**
- * 依次运行所有已启用的提交前检查。任何一项要求阻止即整体阻止；
- * 各项返回的审核条目带上来源插件后汇总，供提交流程与手动检索共用。
+ * 依次运行指定的已启用提交前检查。正常提交使用管理员配置的完整顺序；
+ * 手动原题检索只运行 Anklang，避免其他插件的失败冒充检索结果。
  */
 function createSubmitCheckRunner(host: TrustedPluginHost): SubmitCheckRunner {
+  const runSelected = async (
+    input: Parameters<SubmitCheckRunner["run"]>[0],
+    checkIds: readonly string[]
+  ): ReturnType<SubmitCheckRunner["run"]> => {
+    const collected: StoredReviewItemInput[] = [];
+    let similarityStatus: AnklangCompletionStatus | undefined = checkIds.includes(anklangCheckId)
+      ? "unavailable"
+      : undefined;
+    for (const checkId of checkIds) {
+      const result = await host.runBeforeSubmit(input, [checkId]);
+      if (result.decision === "block") {
+        return {
+          blocked: { code: result.code, message: result.message },
+          reviewItems: [],
+          checksRun: checkIds.length,
+          ...(checkId === anklangCheckId
+            ? {
+                similarityStatus:
+                  result.code === "anklang_partial_same_problem"
+                    ? ("partial" as const)
+                    : result.code === "anklang_similar_problem"
+                      ? ("complete" as const)
+                      : ("unavailable" as const)
+              }
+            : similarityStatus === undefined
+              ? {}
+              : { similarityStatus })
+        };
+      }
+      const pluginId = host.pluginIdForCheckId(checkId);
+      for (const item of result.reviewItems ?? []) {
+        if (pluginId === anklangPluginId) {
+          similarityStatus = anklangCompletionStatus(item.data) ?? "unavailable";
+        }
+        collected.push({
+          type: item.type,
+          source: pluginId === anklangPluginId ? "anklang" : "plugin",
+          sourcePluginId: pluginId,
+          visibility: item.visibility === "admin" ? "administrator" : item.visibility,
+          summary: item.summary.slice(0, 500),
+          data: item.data,
+          contentHash: item.contentHash,
+          ...(item.expiresAt === undefined ? {} : { expiresAt: item.expiresAt })
+        });
+      }
+    }
+    return {
+      reviewItems: collected,
+      checksRun: checkIds.length,
+      ...(similarityStatus === undefined ? {} : { similarityStatus })
+    };
+  };
+
   return {
     async run(input) {
-      const checkIds = await host.listEnabledBeforeSubmitCheckIds();
-      const collected: StoredReviewItemInput[] = [];
-      for (const checkId of checkIds) {
-        const result = await host.runBeforeSubmit(input, [checkId]);
-        if (result.decision === "block") {
-          return {
-            blocked: { code: result.code, message: result.message },
-            reviewItems: [],
-            checksRun: checkIds.length
-          };
-        }
-        const pluginId = host.pluginIdForCheckId(checkId);
-        for (const item of result.reviewItems ?? []) {
-          collected.push({
-            type: item.type,
-            source: pluginId === anklangPluginId ? "anklang" : "plugin",
-            sourcePluginId: pluginId,
-            visibility: item.visibility === "admin" ? "administrator" : item.visibility,
-            summary: item.summary.slice(0, 500),
-            data: item.data,
-            contentHash: item.contentHash,
-            ...(item.expiresAt === undefined ? {} : { expiresAt: item.expiresAt })
-          });
-        }
-      }
-      return { reviewItems: collected, checksRun: checkIds.length };
+      return runSelected(input, await host.listEnabledBeforeSubmitCheckIds());
+    },
+    async runSimilarity(input) {
+      const enabled = await host.listEnabledBeforeSubmitCheckIds();
+      return runSelected(input, enabled.includes(anklangCheckId) ? [anklangCheckId] : []);
     }
   };
 }
 
-/** 进程内的查重结果缓存；键是题目内容摘要，过期后自动失效。 */
+/** 进程内查重缓存；复合键绑定接口、服务地址、本地保留上限和内容摘要。 */
 function createInMemoryAnklangCache(now: () => Date): AnklangCache {
   const entries = new Map<string, { value: unknown; expiresAtMs: number }>();
   return {
@@ -334,7 +371,7 @@ function createInMemoryAnklangCache(now: () => Date): AnklangCache {
       if (entries.size > 500) {
         const currentMs = now().getTime();
         for (const [key, entry] of entries) {
-          if (entry.expiresAtMs <= currentMs || entries.size > 500) {
+          if (entry.expiresAtMs <= currentMs || entries.size > 400) {
             entries.delete(key);
           }
           if (entries.size <= 400) {

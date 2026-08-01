@@ -30,7 +30,7 @@ import type {
   ReviewRoundSnapshot
 } from "@urmotiv/plugin-sdk";
 import { computeProblemContentHash } from "./database-store";
-import { ApiError, conflict, forbidden, notFound, type FieldErrors } from "./errors";
+import { ApiError, conflict, forbidden, notFound, unauthorized, type FieldErrors } from "./errors";
 import type {
   ProblemListFilters,
   StoredProblem,
@@ -66,10 +66,13 @@ export interface SubmitCheckOutcome {
   readonly reviewItems: readonly StoredReviewItemInput[];
   /** 实际运行的检查数量；为 0 表示当前没有任何启用的提交前检查。 */
   readonly checksRun: number;
+  /** 原题检索的完成状态；未启用 Anklang 时不提供。 */
+  readonly similarityStatus?: "complete" | "partial" | "unavailable";
 }
 
 export interface SubmitCheckRunner {
   run(input: BeforeSubmitInput): Promise<SubmitCheckOutcome>;
+  runSimilarity(input: BeforeSubmitInput): Promise<SubmitCheckOutcome>;
 }
 
 export interface ProblemServiceOptions {
@@ -653,23 +656,72 @@ export class ProblemService {
       ...current,
       reviewRound: Math.max(1, current.reviewRound)
     };
-    const outcome = await this.submitChecks.run(submitCheckInputFor(probe));
-    if (outcome.checksRun === 0) {
-      return { status: "unavailable", blockedAdvice: null, items: [] };
-    }
-    if (
-      current.reviewRound >= 1 &&
-      this.reviewItems !== undefined &&
-      outcome.reviewItems.length > 0
-    ) {
-      await this.reviewItems.append(current.id, current.reviewRound, outcome.reviewItems);
-    }
-    const now = asIso(this.now());
-    return {
-      status: "completed",
-      blockedAdvice: outcome.blocked ?? null,
-      items: outcome.reviewItems.map((item) => inputItemToView(item, now))
-    };
+    const initialInput = submitCheckInputFor(probe);
+    const outcome = await this.submitChecks.runSimilarity(initialInput);
+
+    return this.store.runProblemTransaction(problemId, async (transaction) => {
+      const refreshedUser = await transaction.lockUserForAuthorization(user.id);
+      const checkedAt = this.now();
+      if (
+        refreshedUser === undefined ||
+        refreshedUser.disabled ||
+        !hasPermission(refreshedUser, "auth.login", {}, checkedAt)
+      ) {
+        throw unauthorized();
+      }
+      const refreshed = transaction.getProblem();
+      if (
+        refreshed === undefined ||
+        !canViewProblem(createProblemVisibility(refreshedUser, checkedAt), refreshed)
+      ) {
+        throw notFound();
+      }
+      const refreshedTarget = { ownerId: refreshed.ownerId, objectId: refreshed.id };
+      const mayStillReview =
+        hasPermission(refreshedUser, "problem.review", refreshedTarget, checkedAt) ||
+        hasPermission(refreshedUser, "problem.status.change", refreshedTarget, checkedAt);
+      if (!canEditProblem(refreshedUser, refreshed, checkedAt) && !mayStillReview) {
+        throw forbidden();
+      }
+      const refreshedProbe: StoredProblem = {
+        ...refreshed,
+        reviewRound: Math.max(1, refreshed.reviewRound)
+      };
+      if (
+        refreshed.revision !== current.revision ||
+        refreshed.reviewRound !== current.reviewRound ||
+        refreshed.status !== current.status ||
+        submitCheckInputFor(refreshedProbe).contentHash !== initialInput.contentHash
+      ) {
+        throw conflict("题目已在检索期间发生变化，请重新检查。");
+      }
+      if (outcome.checksRun === 0 || outcome.similarityStatus === undefined) {
+        return { status: "unavailable", blockedAdvice: null, items: [] };
+      }
+      if (
+        refreshed.status === "pending_review" &&
+        refreshed.reviewRound >= 1 &&
+        this.reviewItems !== undefined &&
+        outcome.reviewItems.length > 0
+      ) {
+        await this.reviewItems.replacePluginItems(
+          refreshed.id,
+          refreshed.reviewRound,
+          outcome.reviewItems,
+          transaction.executor
+        );
+      }
+      const blockedAdvice =
+        outcome.blocked?.code === "anklang_similar_problem" ||
+        outcome.blocked?.code === "anklang_partial_same_problem"
+          ? outcome.blocked
+          : null;
+      return {
+        status: outcome.similarityStatus === "complete" ? "completed" : outcome.similarityStatus,
+        blockedAdvice,
+        items: outcome.reviewItems.map((item) => inputItemToView(item, asIso(checkedAt)))
+      };
+    });
   }
 
   private visibleItemLevels(user: StoredUser, problem: StoredProblem): ReviewItemVisibility[] {

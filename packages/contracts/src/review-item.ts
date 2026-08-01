@@ -42,7 +42,7 @@ export type ReviewItemListResponse = z.infer<typeof reviewItemListResponseSchema
  */
 export const similarityCheckResponseSchema = z
   .object({
-    status: z.enum(["completed", "unavailable"]),
+    status: z.enum(["completed", "partial", "unavailable"]),
     blockedAdvice: z
       .object({
         code: z.string().min(1).max(160),
