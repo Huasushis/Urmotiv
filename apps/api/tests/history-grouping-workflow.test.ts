@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { writeZipArchive } from "@urmotiv/problem-package";
@@ -202,7 +202,7 @@ describe("历史题目人工分组文件工作流", () => {
     ).rejects.toMatchObject({ code: "GROUPING_CHANGED" });
   });
 
-  it("符号链接和伪装成 ZIP 的损坏文件都只返回固定安全错误", async () => {
+  it("符号链接返回固定错误，未通过安全检查的 ZIP 只进入人工队列", async () => {
     const privateRoot = await createPrivateRoot();
     const linkedSourceDirectory = join(privateRoot, "linked-sources");
     await mkdir(linkedSourceDirectory, { mode: 0o700 });
@@ -228,18 +228,89 @@ describe("历史题目人工分组文件工作流", () => {
     await mkdir(brokenSourceDirectory, { mode: 0o700 });
     const brokenName = "synthetic-private-broken.zip";
     await writeFile(join(brokenSourceDirectory, brokenName), "SYNTHETIC NOT A ZIP", "utf8");
-    let brokenError: unknown;
+    const brokenResult = await inventoryHistorySources({
+      privateRootDirectory: privateRoot,
+      sourceDirectory: brokenSourceDirectory,
+      outputDirectory: join(privateRoot, "broken-catalog"),
+    });
+    expect(brokenResult).toMatchObject({
+      sourceCount: 1,
+      archiveSourceCount: 0,
+      manualSourceCount: 1,
+    });
+    const manualReview = JSON.parse(
+      await readFile(join(privateRoot, "broken-catalog", "manual-review.json"), "utf8"),
+    ) as {
+      manualSourceCount: number;
+      sources: Array<{
+        sourceId: string;
+        reasons: string[];
+      }>;
+    };
+    expect(manualReview).toEqual({
+      version: 1,
+      phase: "inventory",
+      sourceCount: 1,
+      manualSourceCount: 1,
+      sources: [
+        {
+          sourceId: "source-000001",
+          reasons: ["not_a_zip_archive"],
+        },
+      ],
+    });
+    expect(JSON.stringify(manualReview)).not.toContain(brokenName);
+    await expectPrivateMode(join(privateRoot, "broken-catalog", "manual-review.json"), 0o600);
+  });
+
+  it("源文件超过清单上限时只在私有失败清单中记录原路径", async () => {
+    const privateRoot = await createPrivateRoot();
+    const sourceDirectory = join(privateRoot, "oversized-sources");
+    await mkdir(sourceDirectory, { mode: 0o700 });
+    const privateSourceName = "synthetic-private-oversized.bin";
+    const handle = await open(join(sourceDirectory, privateSourceName), "w", 0o600);
+    await handle.truncate(128 * 1024 * 1024 + 1);
+    await handle.close();
+    const outputDirectory = join(privateRoot, "oversized-catalog");
+
+    let failure: unknown;
     try {
       await inventoryHistorySources({
         privateRootDirectory: privateRoot,
-        sourceDirectory: brokenSourceDirectory,
-        outputDirectory: join(privateRoot, "broken-catalog"),
+        sourceDirectory,
+        outputDirectory,
       });
     } catch (error) {
-      brokenError = error;
+      failure = error;
     }
-    expect(brokenError).toMatchObject({ code: "SOURCE_FILE_INVALID" });
-    expect(String(brokenError)).not.toContain(brokenName);
+    expect(failure).toMatchObject({ code: "SOURCE_FILE_INVALID" });
+    expect(String(failure)).not.toContain(privateSourceName);
+    const report = JSON.parse(
+      await readFile(join(outputDirectory, "inventory-failures.private.json"), "utf8"),
+    ) as {
+      failureCount: number;
+      failures: Array<{
+        sourceId: string;
+        sourcePath: string;
+        code: string;
+        reasons: string[];
+      }>;
+    };
+    expect(report).toMatchObject({
+      failureCount: 1,
+      failures: [
+        {
+          sourceId: "source-000001",
+          sourcePath: privateSourceName,
+          code: "SOURCE_TOO_LARGE",
+          reasons: ["source_too_large"],
+        },
+      ],
+    });
+    await expect(lstat(join(outputDirectory, "inventory.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expectPrivateMode(join(outputDirectory, "inventory-failures.private.json"), 0o600);
   });
 
   it("二进制完整文件不能冒充文本片段，失败时不写分组文件", async () => {

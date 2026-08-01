@@ -6,6 +6,8 @@ import {
   isSafeArchivePath,
   looksLikeZipArchive,
   readZipArchive,
+  UnsafeArchiveError,
+  type ArchiveIssue,
 } from "@urmotiv/problem-package";
 import { z } from "zod";
 import { sha256Hex } from "./digests";
@@ -44,6 +46,30 @@ import {
 const maximumCatalogFiles = 10_000;
 const maximumCatalogTotalBytes = 512 * 1024 * 1024;
 const maximumCatalogSourceBytes = defaultArchiveSafetyLimits.maxArchiveBytes;
+
+type HistorySourceInspectionReason =
+  | ArchiveIssue["code"]
+  | "archive_invalid"
+  | "manual_binary"
+  | "source_too_large"
+  | "source_unreadable"
+  | "text_empty"
+  | "text_not_utf8"
+  | "text_too_large";
+
+class HistorySourceInspectionFailure extends HistoryMigrationError {
+  public readonly reasons: readonly HistorySourceInspectionReason[];
+
+  public constructor(
+    code: "SOURCE_FILE_INVALID" | "SOURCE_TOO_LARGE",
+    reasons: readonly HistorySourceInspectionReason[],
+    message: string,
+  ) {
+    super(code, message);
+    this.name = "HistorySourceInspectionFailure";
+    this.reasons = reasons;
+  }
+}
 
 const privateRelativePathSchema = z
   .string()
@@ -205,8 +231,9 @@ interface MaterializedFragment {
 }
 
 /**
- * 对私有源目录建立两份清单：inventory.json 只有安全编号和摘要；
- * source-locations.private.json 才保存原相对路径。两份文件都只写进新的私有目录。
+ * 对私有源目录建立清单：inventory.json 只有安全编号和摘要；
+ * source-locations.private.json 才保存原相对路径；manual-review.json 只列
+ * 待人工处理的安全编号与原因码。所有文件都只写进新的私有目录。
  */
 export async function inventoryHistorySources(
   options: InventoryHistorySourcesOptions,
@@ -224,22 +251,53 @@ export async function inventoryHistorySources(
 
   const sources: HistorySourceInventory["sources"] = [];
   const locations: CatalogSourceLocation[] = [];
+  const failures: Array<{
+    readonly sourceId: string;
+    readonly sourcePath: string;
+    readonly code: "SOURCE_FILE_INVALID" | "SOURCE_TOO_LARGE";
+    readonly reasons: readonly HistorySourceInspectionReason[];
+  }> = [];
+  const manualReviews: Array<{
+    readonly sourceId: string;
+    readonly reasons: readonly HistorySourceInspectionReason[];
+  }> = [];
   let totalSourceBytes = 0;
   let archiveEntryCount = 0;
 
   for (const [index, sourcePath] of sourcePaths.entries()) {
     const sourceId = makeSafeId("source", index + 1);
-    const inspected = await inspectSourceForInventory(
-      options.sourceDirectory,
-      sourcePath,
-      sourceId,
-    );
+    let inspected: Awaited<ReturnType<typeof inspectSourceForInventory>>;
+    try {
+      inspected = await inspectSourceForInventory(options.sourceDirectory, sourcePath, sourceId);
+    } catch (error) {
+      if (
+        error instanceof HistoryMigrationError &&
+        (error.code === "SOURCE_FILE_INVALID" || error.code === "SOURCE_TOO_LARGE")
+      ) {
+        failures.push({
+          sourceId,
+          sourcePath,
+          code: error.code,
+          reasons:
+            error instanceof HistorySourceInspectionFailure
+              ? error.reasons
+              : error.code === "SOURCE_TOO_LARGE"
+                ? ["source_too_large"]
+                : ["source_unreadable"],
+        });
+        continue;
+      }
+      throw error;
+    }
     totalSourceBytes += inspected.inventory.byteLength;
     if (totalSourceBytes > maximumCatalogTotalBytes) {
       throw new HistoryMigrationError("SOURCE_TOO_LARGE", "本批私有源文件的总大小超过明确上限。");
     }
     if (inspected.inventory.kind === "zip") {
       archiveEntryCount += inspected.inventory.entries.length;
+    }
+    if (inspected.manualReasons !== undefined) {
+      manualReviews.push({ sourceId, reasons: inspected.manualReasons });
     }
     sources.push(inspected.inventory);
     locations.push(inspected.location);
@@ -248,6 +306,13 @@ export async function inventoryHistorySources(
     throw new HistoryMigrationError(
       "GROUPING_CHANGED",
       "私有源目录在建立清单过程中发生变化，必须重新开始。",
+    );
+  }
+  if (failures.length > 0) {
+    await writeInventoryFailureOutput(options.outputDirectory, sourcePaths.length, failures);
+    throw new HistoryMigrationError(
+      "SOURCE_FILE_INVALID",
+      "部分私有源文件未通过安全登记；具体路径只写入私有失败清单。",
     );
   }
 
@@ -274,17 +339,26 @@ export async function inventoryHistorySources(
       join(stagingDirectory, "source-locations.private.json"),
       sourceLocations,
     );
+    await writeNewPrivateJson(join(stagingDirectory, "manual-review.json"), {
+      version: 1,
+      phase: "inventory",
+      sourceCount: inventory.sources.length,
+      manualSourceCount: manualReviews.length,
+      sources: manualReviews,
+    });
     await writeNewPrivateJson(join(stagingDirectory, "INVENTORY_COMPLETE"), {
       version: 1,
       phase: "inventory",
       inventorySha256,
       sourceCount: inventory.sources.length,
       archiveEntryCount,
+      manualSourceCount: manualReviews.length,
       totalSourceBytes,
     });
     await publishStagedEntries(options.outputDirectory, stagingDirectory, [
       "inventory.json",
       "source-locations.private.json",
+      "manual-review.json",
       "INVENTORY_COMPLETE",
     ]);
   } catch (error) {
@@ -558,6 +632,7 @@ async function inspectSourceForInventory(
 ): Promise<{
   readonly inventory: HistorySourceInventory["sources"][number];
   readonly location: CatalogSourceLocation;
+  readonly manualReasons?: readonly HistorySourceInspectionReason[];
 }> {
   const absolutePath = await resolvePrivateSourceFile(sourceDirectory, sourcePath);
   const bytes = await readPrivateRegularBytes(absolutePath, maximumCatalogSourceBytes);
@@ -565,11 +640,37 @@ async function inspectSourceForInventory(
   const lowerExtension = extname(sourcePath).toLocaleLowerCase("en-US");
 
   if (lowerExtension === ".zip" || looksLikeZipArchive(bytes)) {
-    const entries = [...readSafeHistoryZip(bytes)].sort((first, second) =>
-      compareCodeUnits(first.path, second.path),
-    );
+    let entries: ReturnType<typeof readSafeHistoryZip>;
+    try {
+      entries = [...readSafeHistoryZip(bytes)].sort((first, second) =>
+        compareCodeUnits(first.path, second.path),
+      );
+    } catch (error) {
+      if (error instanceof HistorySourceInspectionFailure) {
+        return {
+          inventory: {
+            sourceId,
+            kind: "file",
+            contentSha256,
+            byteLength: bytes.byteLength,
+          },
+          location: { sourceId, sourcePath, entries: [] },
+          manualReasons: error.reasons,
+        };
+      }
+      throw error;
+    }
     if (entries.length === 0) {
-      throw new HistoryMigrationError("SOURCE_FILE_INVALID", "私有压缩包中没有可登记的普通文件。");
+      return {
+        inventory: {
+          sourceId,
+          kind: "file",
+          contentSha256,
+          byteLength: bytes.byteLength,
+        },
+        location: { sourceId, sourcePath, entries: [] },
+        manualReasons: ["empty_file"],
+      };
     }
     return {
       inventory: {
@@ -595,7 +696,24 @@ async function inspectSourceForInventory(
   }
 
   if (lowerExtension === ".md" || lowerExtension === ".txt") {
-    const text = decodeMaterializableText(bytes);
+    let text: string;
+    try {
+      text = decodeMaterializableText(bytes);
+    } catch (error) {
+      if (error instanceof HistorySourceInspectionFailure) {
+        return {
+          inventory: {
+            sourceId,
+            kind: "file",
+            contentSha256,
+            byteLength: bytes.byteLength,
+          },
+          location: { sourceId, sourcePath, entries: [] },
+          manualReasons: error.reasons,
+        };
+      }
+      throw error;
+    }
     return {
       inventory: {
         sourceId,
@@ -616,6 +734,7 @@ async function inspectSourceForInventory(
       byteLength: bytes.byteLength,
     },
     location: { sourceId, sourcePath, entries: [] },
+    manualReasons: ["manual_binary"],
   };
 }
 
@@ -957,9 +1076,14 @@ function readSafeHistoryZip(
       maxCompressionRatio: 200,
       allowNestedArchives: false,
     }).list();
-  } catch {
-    throw new HistoryMigrationError(
+  } catch (error) {
+    const reasons: readonly HistorySourceInspectionReason[] =
+      error instanceof UnsafeArchiveError
+        ? [...new Set(error.issues.map((issue) => issue.code))].sort()
+        : ["archive_invalid"];
+    throw new HistorySourceInspectionFailure(
       "SOURCE_FILE_INVALID",
+      reasons,
       "私有压缩包未通过路径、类型、大小或完整性安全检查。",
     );
   }
@@ -967,19 +1091,28 @@ function readSafeHistoryZip(
 
 function decodeMaterializableText(bytes: Uint8Array): string {
   if (bytes.byteLength > maximumHistorySourceBytes) {
-    throw new HistoryMigrationError("SOURCE_TOO_LARGE", "待分组文本超过明确的存储字节上限。");
+    throw new HistorySourceInspectionFailure(
+      "SOURCE_TOO_LARGE",
+      ["text_too_large"],
+      "待分组文本超过明确的存储字节上限。",
+    );
   }
   let text: string;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
-    throw new HistoryMigrationError(
+    throw new HistorySourceInspectionFailure(
       "SOURCE_FILE_INVALID",
+      ["text_not_utf8"],
       "选中的历史资料片段不是有效的 UTF-8 文本。",
     );
   }
   if (text.length > maximumHistorySourceTextUnits) {
-    throw new HistoryMigrationError("SOURCE_TOO_LARGE", "待分组文本超过明确的字符长度上限。");
+    throw new HistorySourceInspectionFailure(
+      "SOURCE_TOO_LARGE",
+      ["text_too_large"],
+      "待分组文本超过明确的字符长度上限。",
+    );
   }
   assertNonemptyMaterializedText(text);
   return text;
@@ -987,7 +1120,11 @@ function decodeMaterializableText(bytes: Uint8Array): string {
 
 function assertNonemptyMaterializedText(text: string): void {
   if (text.trim().length === 0) {
-    throw new HistoryMigrationError("SOURCE_FILE_INVALID", "选中的历史资料片段是空白文本。");
+    throw new HistorySourceInspectionFailure(
+      "SOURCE_FILE_INVALID",
+      ["text_empty"],
+      "选中的历史资料片段是空白文本。",
+    );
   }
 }
 
@@ -1027,6 +1164,45 @@ async function publishStagedEntries(
     await rename(join(stagingDirectory, entry), join(outputDirectory, entry));
   }
   await rmdir(stagingDirectory);
+}
+
+async function writeInventoryFailureOutput(
+  outputDirectory: string,
+  sourceCount: number,
+  failures: readonly {
+    readonly sourceId: string;
+    readonly sourcePath: string;
+    readonly code: "SOURCE_FILE_INVALID" | "SOURCE_TOO_LARGE";
+    readonly reasons: readonly HistorySourceInspectionReason[];
+  }[],
+): Promise<void> {
+  await createNewPrivateDirectory(outputDirectory);
+  const stagingDirectory = join(outputDirectory, ".inventory-failed-incomplete");
+  try {
+    await mkdir(stagingDirectory, { recursive: false, mode: 0o700 });
+    await writeNewPrivateJson(join(stagingDirectory, "inventory-failures.private.json"), {
+      version: 1,
+      phase: "inventory",
+      status: "failed",
+      sourceCount,
+      failureCount: failures.length,
+      failures,
+    });
+    await writeNewPrivateJson(join(stagingDirectory, "INVENTORY_FAILED"), {
+      version: 1,
+      phase: "inventory",
+      status: "failed",
+      sourceCount,
+      failureCount: failures.length,
+    });
+    await publishStagedEntries(outputDirectory, stagingDirectory, [
+      "inventory-failures.private.json",
+      "INVENTORY_FAILED",
+    ]);
+  } catch (error) {
+    await rm(outputDirectory, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 function assertOutputOutsideSource(sourceDirectory: string, outputPath: string): void {

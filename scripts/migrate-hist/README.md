@@ -54,10 +54,18 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts inventory \
 
 - `inventory.json`：安全编号、类型、字节数、字符数或 ZIP 条目安全编号及摘要，不含原路径；
 - `source-locations.private.json`：安全编号到原相对路径的私有对照，只供人工查看和后续复核；
+- `manual-review.json`：只含仍需人工处理的安全编号和固定原因码，不含原路径或正文；
 - `INVENTORY_COMPLETE`：完整写完标记及安全计数。
 
 `.md`、`.txt` 会作为 UTF-8 文本登记；通过完整安全检查的 ZIP 会按条目登记；PDF、图片和其他二进制文件
-只登记为待人工处理的完整文件，不会自动提取或猜题目。
+只登记为待人工处理的完整文件，不会自动提取或猜题目。扩展名虽然是 ZIP、但未通过严格安全检查的旧文件
+也只作为不透明完整文件进入人工队列，不会放宽检查或尝试解压。
+
+如果个别文件无法作为普通文件安全读取或超过源文件上限，命令返回失败，且不会写出 `inventory.json` 或
+完成标记。新输出目录中只保留
+`inventory-failures.private.json` 和 `INVENTORY_FAILED`：终端仍不显示原路径，失败文件的安全编号、
+原路径、固定错误码和不含正文的失败原因码只写在权限收紧的私有失败清单中，供人工定位后换一个新输出
+目录重试。
 
 ## 2. 人工编写分组计划
 
