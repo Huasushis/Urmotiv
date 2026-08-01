@@ -92,6 +92,28 @@ export async function readPrivateJsonWithDigest(
   }
 }
 
+/**
+ * 读取已经由调用方限制在私有目录内的普通文件。这里仍使用 O_NOFOLLOW，
+ * 并在读取前后检查文件类型和大小；错误信息不会带出实际路径。
+ */
+export async function readPrivateRegularBytes(
+  path: string,
+  maximumBytes: number
+): Promise<Uint8Array> {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0) {
+    throw new HistoryMigrationError(
+      "INVALID_ARGUMENTS",
+      "私有文件读取上限不正确。"
+    );
+  }
+  return readRegularFile(
+    path,
+    maximumBytes,
+    "SOURCE_FILE_INVALID",
+    "私有源文件无法安全读取。"
+  );
+}
+
 export async function readConfirmedSource(
   sourceDirectory: string,
   sourcePath: string,
