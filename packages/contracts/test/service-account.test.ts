@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  createServiceAccountTokenInputSchema,
   createdServiceAccountTokenSchema,
+  createServiceAccountTokenInputSchema,
   robotHardDeniedPermissions,
   serviceAccountTokenSchema
 } from "../src";
@@ -46,7 +46,7 @@ describe("机器人令牌管理契约", () => {
       ...validInput,
       sourceCidrs: ["::ffff:192.0.2.128/128"]
     });
-    expect(embedded.sourceCidrs).toEqual(["::ffff:c000:280/128"]);
+    expect(embedded.sourceCidrs).toEqual(["192.0.2.128/32"]);
 
     expect(createServiceAccountTokenInputSchema.safeParse({
       ...validInput,
@@ -58,6 +58,10 @@ describe("机器人令牌管理契约", () => {
     expect(createServiceAccountTokenInputSchema.safeParse({
       ...validInput,
       sourceCidrs: ["192.0.2.1/24", "192.0.2.200/24"]
+    }).success).toBe(false);
+    expect(createServiceAccountTokenInputSchema.safeParse({
+      ...validInput,
+      sourceCidrs: ["192.0.2.1/24", "::ffff:192.0.2.200/120"]
     }).success).toBe(false);
   });
 

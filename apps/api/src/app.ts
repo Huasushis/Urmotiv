@@ -133,6 +133,7 @@ export interface ApiAppOptions {
   transfer?: TransferService;
   reviewItems?: ReviewItemStore;
   robots?: DatabaseRobotStore;
+  trustedProxyCidrs?: readonly string[];
   now?: () => Date;
 }
 
@@ -157,6 +158,7 @@ interface AppDependencies {
   transfer?: TransferService;
   reviewItemStore: ReviewItemStore;
   robots?: DatabaseRobotStore;
+  trustedProxyCidrs: readonly string[];
 }
 
 function formatZodErrors(error: ZodError): Record<string, string[]> {
@@ -410,6 +412,7 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     ...(options.transfer === undefined ? {} : { transfer: options.transfer }),
     reviewItemStore: reviewItems,
     ...(options.robots === undefined ? {} : { robots: options.robots }),
+    trustedProxyCidrs: options.trustedProxyCidrs ?? [],
     allowedOrigins: options.allowedOrigins ?? [
       "http://localhost:5173",
       "http://127.0.0.1:5173"
@@ -437,7 +440,8 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   await dependencies.pluginHost.initialize();
   const app = Fastify({
     logger: false,
-    genReqId: () => randomUUID()
+    genReqId: () => randomUUID(),
+    trustProxy: false
   });
 
   await app.register(cors, {

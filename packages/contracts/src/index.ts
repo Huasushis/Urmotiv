@@ -1,6 +1,7 @@
 export * from "./api";
 export * from "./auth";
 export * from "./contest";
+export * from "./ip-address";
 export * from "./permissions";
 export * from "./problem-file";
 export * from "./problem";

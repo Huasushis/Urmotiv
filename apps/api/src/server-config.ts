@@ -1,5 +1,6 @@
 import type { ApiAppOptions } from "./app";
 import { casConfigurationSchema, type CasConfiguration } from "@urmotiv/auth";
+import { normalizeIpCidr } from "@urmotiv/contracts";
 import {
   validateLocalStorageRoot,
   validateS3StorageConnection,
@@ -8,6 +9,9 @@ import {
 
 const defaultStorageMaxFileBytes = 128 * 1024 * 1024;
 const maximumStorageMaxFileBytes = 512 * 1024 * 1024;
+const maximumTrustedProxyCidrs = 32;
+const trustedProxyConfigurationError =
+  "URMOTIV_TRUSTED_PROXY_CIDRS 必须是最多 32 项、逗号分隔且不含全网范围的 IPv4 或 IPv6 CIDR。";
 
 export interface ServerEnvironment {
   readonly [name: string]: string | undefined;
@@ -30,6 +34,7 @@ export interface ServerEnvironment {
   URMOTIV_CAS_STUDENT_ID_ATTRIBUTES?: string;
   URMOTIV_CAS_STATE_SECRET?: string;
   URMOTIV_PGLITE_PATH?: string;
+  URMOTIV_TRUSTED_PROXY_CIDRS?: string;
   URMOTIV_WEB_ORIGIN?: string;
   STORAGE_LOCAL_ROOT?: string;
   STORAGE_MAX_FILE_BYTES?: string;
@@ -85,14 +90,41 @@ export function readServerOptions(environment: ServerEnvironment): ApiAppOptions
   if (production && allowedOrigins.length === 0) {
     throw new Error("生产环境必须配置 URMOTIV_WEB_ORIGIN。");
   }
+  const trustedProxyCidrs = readTrustedProxyCidrs(environment.URMOTIV_TRUSTED_PROXY_CIDRS);
 
   return {
     secureCookies: production,
     demoAuthEnabled,
     emailLoginEnabled: environment.URMOTIV_EMAIL_LOGIN_ENABLED !== "false",
     emailRegistrationEnabled: environment.URMOTIV_EMAIL_REGISTRATION_ENABLED === "true",
-    ...(allowedOrigins.length === 0 ? {} : { allowedOrigins })
+    ...(allowedOrigins.length === 0 ? {} : { allowedOrigins }),
+    ...(trustedProxyCidrs.length === 0 ? {} : { trustedProxyCidrs })
   };
+}
+
+export function readTrustedProxyCidrs(value: string | undefined): string[] {
+  if (value === undefined || value.trim().length === 0) return [];
+  const entries = value.split(",");
+  if (entries.length > maximumTrustedProxyCidrs) {
+    throw new Error(trustedProxyConfigurationError);
+  }
+
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    const cidr = normalizeIpCidr(entry.trim());
+    if (
+      cidr === undefined ||
+      cidr === "0.0.0.0/0" ||
+      cidr === "::/0" ||
+      seen.has(cidr)
+    ) {
+      throw new Error(trustedProxyConfigurationError);
+    }
+    seen.add(cidr);
+    normalized.push(cidr);
+  }
+  return normalized;
 }
 
 export function readServerAuthenticationOptions(
