@@ -6,6 +6,7 @@ import {
 import type { DatabaseHandle } from "@urmotiv/database";
 import {
   ExportResultSaveError,
+  ExportSourceIntegrityError,
   ImportResultSaveError,
   ProblemPackageTemporaryError,
   type AtomicImportedProblemWriter,
@@ -823,7 +824,8 @@ export class DatabaseFixedRevisionExportReader implements FixedRevisionExportRea
       files: fileRecords.map((record) => ({
         path: record.logicalPath,
         category: toCanonicalCategory(record.category),
-        byteSize: record.byteSize
+        byteSize: record.byteSize,
+        sha256: record.sha256
       }))
     };
   }
@@ -836,11 +838,15 @@ export class DatabaseFixedRevisionExportReader implements FixedRevisionExportRea
     try {
       return await this.#readFile(input);
     } catch (error) {
-      if (error instanceof TaskAborted || error instanceof ProblemPackageTemporaryError) {
+      if (
+        error instanceof TaskAborted ||
+        error instanceof ProblemPackageTemporaryError ||
+        error instanceof ExportSourceIntegrityError
+      ) {
         throw error;
       }
       if (error instanceof StoredContentMismatch) {
-        return undefined;
+        throw new ExportSourceIntegrityError();
       }
       if (error instanceof StorageError && error.code === "OBJECT_NOT_FOUND") {
         return undefined;
@@ -868,10 +874,16 @@ export class DatabaseFixedRevisionExportReader implements FixedRevisionExportRea
     if (record === undefined) {
       return undefined;
     }
+    if (record.sha256 !== input.file.sha256) {
+      throw new ExportSourceIntegrityError();
+    }
     const stream = await storage.open({ id: record.id, storageKey: record.storageKey });
     const content = await collectBytes(stream, record.byteSize, input.signal);
-    if (content.byteLength !== record.byteSize) {
-      return undefined;
+    if (
+      content.byteLength !== record.byteSize ||
+      sha256Hex(content) !== input.file.sha256
+    ) {
+      throw new ExportSourceIntegrityError();
     }
     return { path: input.file.path, category: input.file.category, content };
   }

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   ChecksumValidationError,
   ProblemPackageError,
@@ -86,6 +86,20 @@ export interface ExportProblemFileDescriptor {
   readonly category: ProblemPackageFileCategory;
   /** 已保存文件的字节数；用于在读取文件内容前检查一次导出的总量。 */
   readonly byteSize: number;
+  /** 固定修订登记的内容摘要；读取字节后必须再次核对。 */
+  readonly sha256: string;
+}
+
+/**
+ * The selected revision still exists, but one of its registered file bytes no
+ * longer matches the immutable metadata snapshot. The message is deliberately
+ * fixed so storage paths and file names cannot escape through worker errors.
+ */
+export class ExportSourceIntegrityError extends Error {
+  public constructor() {
+    super("固定版本中的文件内容与登记信息不一致。");
+    this.name = "ExportSourceIntegrityError";
+  }
 }
 
 export interface ExportProblemRevision {
@@ -456,6 +470,9 @@ export function createProblemPackageExportHandler(
           ) {
             throw new PackageTaskError("export_file_missing");
           }
+          if (sha256Hex(file.content) !== descriptor.sha256) {
+            throw new ExportSourceIntegrityError();
+          }
           files.push(file);
         }
 
@@ -664,6 +681,9 @@ async function precheckSelectedExportFiles(
         invalidSize = true;
         continue;
       }
+      if (!isSha256(descriptor.sha256)) {
+        throw new ExportSourceIntegrityError();
+      }
       if (exceedsLimit || descriptor.byteSize > maximumBytes - selectedBytes) {
         exceedsLimit = true;
         continue;
@@ -758,7 +778,8 @@ export class InMemoryFixedRevisionExportReader implements FixedRevisionExportRea
         files: parsed.files.map((file) => ({
           path: file.path,
           category: file.category,
-          byteSize: file.content.byteLength
+          byteSize: file.content.byteLength,
+          sha256: sha256Hex(file.content)
         }))
       },
       files: new Map(parsed.files.map((file) => [file.path, copyFile(file)]))
@@ -782,7 +803,15 @@ export class InMemoryFixedRevisionExportReader implements FixedRevisionExportRea
     assertActive(input.signal);
     const stored = this.#revisions.get(revisionKey(input.selection));
     const file = stored?.files.get(input.file.path);
-    return file === undefined ? undefined : copyFile(file);
+    if (file === undefined) return undefined;
+    if (
+      file.category !== input.file.category ||
+      file.content.byteLength !== input.file.byteSize ||
+      sha256Hex(file.content) !== input.file.sha256
+    ) {
+      throw new ExportSourceIntegrityError();
+    }
+    return copyFile(file);
   }
 }
 
@@ -1146,6 +1175,7 @@ function classifyImportFailure(error: unknown, signal: AbortSignal): ProblemPack
 function classifyExportFailure(error: unknown, signal: AbortSignal): ProblemPackageFailureCode {
   if (signal.aborted) return "cancelled";
   if (error instanceof PackageTaskError) return error.code;
+  if (error instanceof ExportSourceIntegrityError) return "export_source_integrity";
   if (error instanceof UnsafeArchiveError) {
     return error.issues.some(
       (issue) => issue.code === "archive_too_large" || issue.code === "file_too_large"
@@ -1167,8 +1197,16 @@ function requireUuid(value: string): string {
 }
 
 function requireSha256(value: string): string {
-  if (!/^[a-f0-9]{64}$/.test(value)) throw new PackageTaskError("source_digest_mismatch");
+  if (!isSha256(value)) throw new PackageTaskError("source_digest_mismatch");
   return value;
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function sha256Hex(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 function requireDatabaseId(value: string): string {

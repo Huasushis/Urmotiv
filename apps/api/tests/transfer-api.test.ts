@@ -1652,6 +1652,102 @@ describe("题目包导出", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("固定修订文件发生同长度变化时以固定完整性错误失败", async () => {
+    const { app, database, jobs, metadata, storage, storageRoot, worker } =
+      await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const problemId = await importFixtureProblem(app, worker, leader);
+    const revisions = await database.query<{ id: string }>(sql`
+      SELECT id::text AS id
+      FROM problem_revisions
+      WHERE problem_id = ${BigInt(problemId)}
+      ORDER BY revision DESC
+      LIMIT 1
+    `);
+    const revisionId = revisions[0]?.id;
+    if (revisionId === undefined) {
+      throw new Error("测试题目没有固定版本。");
+    }
+    const record = (await metadata.listRevisionFiles(revisionId)).find(
+      (candidate) => candidate.category === "testdata"
+    );
+    if (record === undefined) {
+      throw new Error("测试题目没有数据文件。");
+    }
+    const selection = {
+      problemId,
+      revisionId,
+      includedFileCategories: ["testdata" as const]
+    };
+    const reader = new DatabaseFixedRevisionExportReader({ database, metadata, storage });
+    const revision = await reader.readRevision({
+      selection,
+      signal: new AbortController().signal
+    });
+    const descriptor = revision?.files.find((file) => file.path === record.logicalPath);
+    if (descriptor === undefined) {
+      throw new Error("固定版本没有返回数据文件描述。");
+    }
+
+    const changed = new Uint8Array(record.byteSize);
+    changed.fill(0x5a);
+    const changedDigest = createHash("sha256").update(changed).digest("hex");
+    expect(changedDigest).not.toBe(record.sha256);
+    await writeFile(join(storageRoot, "objects", record.id), changed);
+
+    // 即使对象和元数据被一起改动，先前读取的固定修订快照也不能跟随新摘要。
+    await database.execute(sql`
+      UPDATE stored_files SET sha256 = ${changedDigest} WHERE id = ${record.id}::uuid
+    `);
+    let metadataMismatch: unknown;
+    try {
+      await reader.readFile({
+        selection,
+        file: descriptor,
+        signal: new AbortController().signal
+      });
+    } catch (error) {
+      metadataMismatch = error;
+    }
+    expect(metadataMismatch).toMatchObject({
+      name: "ExportSourceIntegrityError",
+      message: "固定版本中的文件内容与登记信息不一致。"
+    });
+    expect(JSON.stringify(metadataMismatch)).not.toContain(record.originalName);
+    expect(JSON.stringify(metadataMismatch)).not.toContain(record.storageKey);
+
+    // 元数据仍声明原摘要而对象发生等长变化时，后台任务也必须固定失败且不写产物。
+    await database.execute(sql`
+      UPDATE stored_files SET sha256 = ${record.sha256} WHERE id = ${record.id}::uuid
+    `);
+    const exportJobId = await createExportJob(
+      app,
+      leader,
+      problemId,
+      "export-source-integrity"
+    );
+    expect(await worker.runOnce()).toBe(true);
+    const failed = await jobs.getExportJob(exportJobId);
+    expect(failed).toEqual(
+      expect.objectContaining({
+        state: "failed",
+        resultFileId: null,
+        failure: {
+          code: "export_source_integrity",
+          message: "固定版本中的文件内容与登记信息不一致。"
+        }
+      })
+    );
+    expect(JSON.stringify(failed)).not.toContain(record.originalName);
+    expect(JSON.stringify(failed)).not.toContain(record.storageKey);
+    const outputs = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'export_output' AND deleted_at IS NULL
+    `);
+    expect(outputs).toEqual([{ count: 0 }]);
+  });
+
   it("原始单文件的扩展名或内容不符时不会写出产物", async () => {
     const { artifacts, storage } = await makeTransferApp();
     const stage = vi.spyOn(storage, "stage");

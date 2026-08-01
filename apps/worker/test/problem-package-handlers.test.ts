@@ -788,6 +788,45 @@ describe("题目包导出任务处理器", () => {
     expect(artifact?.archives).toHaveLength(1);
   });
 
+  it("读取器返回同长度但摘要不同的字节时由处理器再次拒绝", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedExport();
+    const selection = job.problems[0];
+    if (selection === undefined) {
+      throw new Error("测试导出任务没有题目选择。");
+    }
+    const source = new InMemoryFixedRevisionExportReader();
+    source.put(selection, fixtureProblem());
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source: {
+        readRevision: (input) => source.readRevision(input),
+        readFile: async (input) => {
+          const file = await source.readFile(input);
+          if (file === undefined) return undefined;
+          const changed = new Uint8Array(file.content.byteLength);
+          changed.fill(0x5a);
+          return { ...file, content: changed };
+        }
+      },
+      authorization: allowAll(),
+      artifacts: new InMemoryExportArtifactWriter()
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).rejects.toMatchObject({
+      name: "PermanentJobError",
+      code: "export_source_integrity",
+      message: "固定版本中的文件内容与登记信息不一致。"
+    });
+    expect(store.exports.get(job.id)).toEqual(
+      expect.objectContaining({
+        state: "failed",
+        resultFileId: null,
+        failure: safeProblemPackageFailure("export_source_integrity")
+      })
+    );
+  });
+
   it("原子写入已完成后队列进度保存失败不会删除有效导出结果", async () => {
     const store = new FakeProblemPackageJobStore();
     const job = store.seedExport();
