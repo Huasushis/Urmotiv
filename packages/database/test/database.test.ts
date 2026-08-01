@@ -1,5 +1,13 @@
 import { sql } from "drizzle-orm";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -28,6 +36,29 @@ function createEmptyDatabase(): LocalDatabaseHandle {
   const handle = createLocalDatabase();
   openDatabases.push(handle);
   return handle;
+}
+
+function migrationFolderThrough(lastIndex: number): string {
+  const source = new URL("../migrations/", import.meta.url);
+  const temporaryDirectory = mkdtempSync(join(tmpdir(), "urmotiv-migrations-"));
+  temporaryDirectories.push(temporaryDirectory);
+  mkdirSync(join(temporaryDirectory, "meta"), { recursive: true });
+  const journal = JSON.parse(
+    readFileSync(new URL("meta/_journal.json", source), "utf8")
+  ) as { entries: Array<{ idx: number; tag: string }> };
+  const entries = journal.entries.filter((entry) => entry.idx <= lastIndex);
+  for (const entry of entries) {
+    cpSync(
+      new URL(`${entry.tag}.sql`, source),
+      join(temporaryDirectory, `${entry.tag}.sql`)
+    );
+  }
+  writeFileSync(
+    join(temporaryDirectory, "meta", "_journal.json"),
+    JSON.stringify({ ...journal, entries }),
+    { encoding: "utf8", mode: 0o600 }
+  );
+  return temporaryDirectory;
 }
 
 afterEach(async () => {
@@ -544,5 +575,146 @@ describe("problem revisions and audit history", () => {
       WHERE request_id = '30000000-0000-4000-8000-000000000001'
     `);
     expect(storedEvents.rows).toEqual([{ result: "success" }]);
+  });
+});
+
+describe("robot review lease migration", () => {
+  it("blocks live leases, then archives expired and legacy rows without changing human opinions", async () => {
+    const handle = createEmptyDatabase();
+    await migrateDatabase(handle, { migrationsFolder: migrationFolderThrough(8) });
+    await seedCoreDatabase(handle);
+    await handle.transaction(async (transaction) => {
+      await transaction.execute(sql`
+        INSERT INTO users (id, nickname, account_type)
+        VALUES (7001, '合成机器人', 'robot'), (7002, '合成人工审题人', 'human')
+      `);
+      await transaction.execute(sql`
+        INSERT INTO problems (id, owner_id, status, current_revision, current_review_round)
+        VALUES (7001, 0, 'pending_review', 1, 1)
+      `);
+      await transaction.execute(sql`
+        INSERT INTO problem_revisions (
+          id, problem_id, revision, status, title, type, basic_statement, basic_solution,
+          content_hash, change_reason, created_by_user_id
+        ) VALUES (
+          '70000000-0000-4000-8000-000000000001', 7001, 1, 'pending_review',
+          '公开构造迁移题', 'traditional', '公开构造题面', '公开构造题解',
+          '0000000000000000000000000000000000000000000000000000000000000000',
+          '迁移测试', 0
+        )
+      `);
+      await transaction.execute(sql`
+        INSERT INTO review_rounds (
+          id, problem_id, round, submitted_revision_id, status, rule_id, rule_version,
+          submitted_by_user_id
+        ) VALUES (
+          '70000000-0000-4000-8000-000000000002', 7001, 1,
+          '70000000-0000-4000-8000-000000000001', 'open', 'fixture', '1', 0
+        )
+      `);
+      await transaction.execute(sql`
+        INSERT INTO review_opinions (
+          id, round_id, reviewer_user_id, source, verdict, codeforces_difficulty,
+          quality_level, originality_level, thinking_level, coding_level, improvements
+        ) VALUES (
+          '70000000-0000-4000-8000-000000000003',
+          '70000000-0000-4000-8000-000000000002', 7002, 'human', 'approve', 1600,
+          4, 4, 3, 2, '公开构造的人工意见'
+        )
+      `);
+      await transaction.execute(sql`
+        INSERT INTO review_assignments (
+          id, round_id, reviewer_user_id, assigned_by_user_id, reason, expires_at
+        ) VALUES (
+          '70000000-0000-4000-8000-000000000004',
+          '70000000-0000-4000-8000-000000000002', 7001, 7001, '迁移门禁测试',
+          now() + interval '1 hour'
+        )
+      `);
+    });
+
+    await expect(migrateDatabase(handle)).rejects.toThrow(
+      /robot review lease migration requires all live robot leases to finish/
+    );
+    const absentColumns = await handle.query<{ count: number | string }>(sql`
+      SELECT count(*)::integer AS count
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'review_assignments'
+        AND column_name = 'closure_reason'
+    `);
+    expect(Number(absentColumns[0]?.count ?? -1)).toBe(0);
+
+    await handle.execute(sql`
+      UPDATE review_assignments
+      SET created_at = now() - interval '2 hours',
+          expires_at = now() - interval '1 hour'
+      WHERE id = '70000000-0000-4000-8000-000000000004'
+    `);
+    await handle.execute(sql`
+      INSERT INTO review_assignments (
+        id, round_id, reviewer_user_id, assigned_by_user_id, reason,
+        revoked_at, revoked_by_user_id, created_at
+      ) VALUES (
+        '70000000-0000-4000-8000-000000000005',
+        '70000000-0000-4000-8000-000000000002', 7001, 7001, '旧撤销记录',
+        now(), 7001, now() - interval '1 hour'
+      )
+    `);
+    await migrateDatabase(handle);
+
+    const assignments = await handle.query<{
+      id: string;
+      closure_reason: string;
+      assignment_kind: string;
+      expires_at: Date | string | null;
+    }>(sql`
+      SELECT id::text AS id, closure_reason::text AS closure_reason,
+             assignment_kind::text AS assignment_kind, expires_at
+      FROM review_assignments
+      ORDER BY id
+    `);
+    expect(assignments).toEqual([
+      {
+        id: "70000000-0000-4000-8000-000000000004",
+        closure_reason: "expired",
+        assignment_kind: "robot",
+        expires_at: expect.anything()
+      },
+      {
+        id: "70000000-0000-4000-8000-000000000005",
+        closure_reason: "legacy_closed",
+        assignment_kind: "robot",
+        expires_at: expect.anything()
+      }
+    ]);
+    const opinions = await handle.query<{
+      id: string;
+      is_active: boolean;
+      improvements: string;
+    }>(sql`
+      SELECT id::text AS id, is_active, improvements FROM review_opinions
+    `);
+    expect(opinions).toEqual([{
+      id: "70000000-0000-4000-8000-000000000003",
+      is_active: true,
+      improvements: "公开构造的人工意见"
+    }]);
+
+    await expect(handle.execute(sql`
+      UPDATE review_assignments
+      SET closure_reason = NULL
+      WHERE id = '70000000-0000-4000-8000-000000000004'
+    `)).rejects.toBeDefined();
+    await expect(handle.execute(sql`
+      INSERT INTO review_assignments (
+        id, round_id, reviewer_user_id, assigned_by_user_id, assignment_kind,
+        claimed_problem_revision, claimed_submitted_revision_id, expires_at
+      ) VALUES (
+        '70000000-0000-4000-8000-000000000006',
+        '70000000-0000-4000-8000-000000000002', 7001, 7001, 'robot',
+        NULL, '70000000-0000-4000-8000-000000000001', now() + interval '1 hour'
+      )
+    `)).rejects.toBeDefined();
   });
 });

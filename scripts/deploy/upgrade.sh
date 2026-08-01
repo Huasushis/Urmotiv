@@ -10,10 +10,10 @@ env_file="$1"
 backup_directory="$2"
 root_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-"$root_directory/scripts/deploy/validate-env.sh" "$env_file"
-"$root_directory/scripts/deploy/backup.sh" "$env_file" "$backup_directory"
-
+bash "$root_directory/scripts/deploy/validate-env.sh" "$env_file"
 docker compose --project-directory "$root_directory" --env-file "$env_file" build
+docker compose --project-directory "$root_directory" --env-file "$env_file" stop api worker web
+bash "$root_directory/scripts/deploy/backup.sh" "$env_file" "$backup_directory"
 docker compose --project-directory "$root_directory" --env-file "$env_file" run --rm migrate
 docker compose --project-directory "$root_directory" --env-file "$env_file" up -d --remove-orphans
 

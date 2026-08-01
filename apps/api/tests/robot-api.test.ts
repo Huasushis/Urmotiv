@@ -208,6 +208,7 @@ function completionPayload(task: {
   readonly problem: { readonly revision: number; readonly reviewRound: number };
 }): Record<string, unknown> {
   return {
+    requestId: randomUUID(),
     expectedLeaseExpiresAt: task.leaseExpiresAt,
     expectedProblemRevision: task.problem.revision,
     experimentVersion: "negative-matrix-v1",
@@ -240,7 +241,7 @@ async function claimOne(app: FastifyInstance): Promise<ClaimedTask> {
 }
 
 describe("机器人审题接口", () => {
-  it("认证事务在读取账号或权限前固定为一致快照", async () => {
+  it("认证事务先使用读已提交，再按账号、令牌和权限顺序显式锁定", async () => {
     const { database } = await makeRobotApp();
     let firstOperation: "execute" | "query" | undefined;
     let firstStatementIsolation: string | undefined;
@@ -276,7 +277,7 @@ describe("机器人审题接口", () => {
     );
     expect(identity?.user.id).toBe(databaseDemoUserIds.robot);
     expect(firstOperation).toBe("execute");
-    expect(firstStatementIsolation).toBe("repeatable read");
+    expect(firstStatementIsolation).toBe("read committed");
   });
 
   it("序列化冲突只重试一次，其他数据库故障不会伪装成令牌不存在", async () => {
@@ -635,6 +636,70 @@ describe("机器人审题接口", () => {
     ]);
   });
 
+  it("支持题型在候选 LIMIT 前过滤，不会被前五十道不支持题型饿死", async () => {
+    const { app, database } = await makeRobotApp();
+    const supportedProblem = await createPendingProblem(app);
+    await database.execute(sql`
+      UPDATE review_rounds
+      SET created_at = '2100-01-01T00:00:00.000Z'::timestamptz
+      WHERE problem_id = ${BigInt(supportedProblem.id)}
+    `);
+    await database.transaction(async (transaction) => {
+      for (let index = 0; index < 50; index += 1) {
+        const createdAt = new Date(Date.UTC(2001, 0, 1, 0, 0, index)).toISOString();
+        const revisionId = randomUUID();
+        const roundId = randomUUID();
+        const inserted = await transaction.query<{ id: string }>(sql`
+          INSERT INTO problems (
+            owner_id, status, current_revision, current_review_round, created_at, updated_at
+          ) VALUES (
+            ${BigInt(databaseDemoUserIds.author)}, 'pending_review', 1, 1,
+            ${createdAt}::timestamptz, ${createdAt}::timestamptz
+          )
+          RETURNING id::text AS id
+        `);
+        const problemId = inserted[0]?.id;
+        if (problemId === undefined) throw new Error("未建立公开构造的不支持题型候选。");
+        await transaction.execute(sql`
+          INSERT INTO problem_revisions (
+            id, problem_id, revision, status, title, type, basic_statement, basic_solution,
+            content_hash, change_reason, created_by_user_id, created_at
+          ) VALUES (
+            ${revisionId}::uuid, ${BigInt(problemId)}, 1, 'pending_review',
+            ${`公开构造的交互题 ${index}`}, 'interactive', '公开构造题面', '公开构造题解',
+            '0000000000000000000000000000000000000000000000000000000000000000',
+            '题型过滤测试', ${BigInt(databaseDemoUserIds.author)}, ${createdAt}::timestamptz
+          )
+        `);
+        await transaction.execute(sql`
+          INSERT INTO review_rounds (
+            id, problem_id, round, submitted_revision_id, status, rule_id, rule_version,
+            rule_settings, submitted_by_user_id, created_at
+          ) VALUES (
+            ${roundId}::uuid, ${BigInt(problemId)}, 1, ${revisionId}::uuid, 'open',
+            'robot-type-filter-test', '1', '{}'::jsonb,
+            ${BigInt(databaseDemoUserIds.author)}, ${createdAt}::timestamptz
+          )
+        `);
+      }
+    });
+
+    const claimed = await app.inject({
+      method: "POST",
+      url: "/api/v1/robot/review-tasks/claim",
+      headers: robotHeaders(),
+      payload: {
+        maximumTasks: 1,
+        leaseSeconds: 300,
+        supportedProblemTypes: ["traditional"]
+      }
+    });
+    expect(claimed.statusCode).toBe(200);
+    expect((claimed.json() as { items: ClaimedTask[] }).items).toEqual([
+      expect.objectContaining({ problem: expect.objectContaining({ id: supportedProblem.id }) })
+    ]);
+  });
+
   it("领取待审任务、提交结构化意见并完成整个闭环", async () => {
     const { app } = await makeRobotApp();
     const problem = await createPendingProblem(app);
@@ -663,7 +728,11 @@ describe("机器人审题接口", () => {
       method: "POST",
       url: `/api/v1/robot/review-tasks/${task.assignmentId}/renew`,
       headers: robotHeaders(),
-      payload: { expectedLeaseExpiresAt: task.leaseExpiresAt, leaseSeconds: 300 }
+      payload: {
+        requestId: randomUUID(),
+        expectedLeaseExpiresAt: task.leaseExpiresAt,
+        leaseSeconds: 300
+      }
     });
     expect(renewed.statusCode).toBe(200);
     const newLease = (renewed.json() as { leaseExpiresAt: string }).leaseExpiresAt;
@@ -673,7 +742,11 @@ describe("机器人审题接口", () => {
       method: "POST",
       url: `/api/v1/robot/review-tasks/${task.assignmentId}/renew`,
       headers: robotHeaders(),
-      payload: { expectedLeaseExpiresAt: task.leaseExpiresAt, leaseSeconds: 300 }
+      payload: {
+        requestId: randomUUID(),
+        expectedLeaseExpiresAt: task.leaseExpiresAt,
+        leaseSeconds: 300
+      }
     });
     expect(staleRenew.statusCode).toBe(404);
 
@@ -682,6 +755,7 @@ describe("机器人审题接口", () => {
       url: `/api/v1/robot/review-tasks/${task.assignmentId}/complete`,
       headers: robotHeaders(),
       payload: {
+        requestId: randomUUID(),
         expectedLeaseExpiresAt: newLease,
         expectedProblemRevision: task.problem.revision + 5,
         experimentVersion: "exp-2026-07",
@@ -704,6 +778,7 @@ describe("机器人审题接口", () => {
       url: `/api/v1/robot/review-tasks/${task.assignmentId}/complete`,
       headers: robotHeaders(),
       payload: {
+        requestId: randomUUID(),
         expectedLeaseExpiresAt: newLease,
         expectedProblemRevision: task.problem.revision,
         experimentVersion: "exp-2026-07",
@@ -747,6 +822,232 @@ describe("机器人审题接口", () => {
     expect((reclaimed.json() as { items: unknown[] }).items).toHaveLength(0);
   });
 
+  it("续租和完成在响应丢失后按请求标识重放固定结果，且拒绝不同载荷", async () => {
+    const { app, database } = await makeRobotApp();
+    await createPendingProblem(app);
+    const task = await claimOne(app);
+
+    const renewalRequestId = randomUUID();
+    const renewalPayload = {
+      requestId: renewalRequestId,
+      expectedLeaseExpiresAt: task.leaseExpiresAt,
+      leaseSeconds: 300
+    };
+    const firstRenewal = await app.inject({
+      method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/renew`,
+      headers: robotHeaders(),
+      payload: renewalPayload
+    });
+    const replayedRenewal = await app.inject({
+      method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/renew`,
+      headers: robotHeaders(),
+      payload: renewalPayload
+    });
+    expect(firstRenewal.statusCode).toBe(200);
+    expect(replayedRenewal.statusCode).toBe(200);
+    expect(replayedRenewal.json()).toEqual(firstRenewal.json());
+
+    const conflictingRenewal = await app.inject({
+      method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/renew`,
+      headers: robotHeaders(),
+      payload: { ...renewalPayload, leaseSeconds: 301 }
+    });
+    expect(conflictingRenewal.statusCode).toBe(409);
+    const renewedLease = (firstRenewal.json() as { leaseExpiresAt: string }).leaseExpiresAt;
+
+    const completionRequestId = randomUUID();
+    const baseCompletion = completionPayload({
+        ...task,
+        leaseExpiresAt: renewedLease
+      });
+    const completionReview = baseCompletion.review as Record<string, unknown>;
+    const completion = {
+      ...baseCompletion,
+      requestId: completionRequestId
+    };
+    const firstCompletion = await app.inject({
+      method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/complete`,
+      headers: robotHeaders(),
+      payload: completion
+    });
+    const replayedCompletion = await app.inject({
+      method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/complete`,
+      headers: robotHeaders(),
+      payload: completion
+    });
+    expect(firstCompletion.statusCode).toBe(200);
+    expect(replayedCompletion.statusCode).toBe(200);
+    expect(replayedCompletion.json()).toEqual(firstCompletion.json());
+
+    const conflictingCompletion = await app.inject({
+      method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/complete`,
+      headers: robotHeaders(),
+      payload: {
+        ...completion,
+        review: { ...completionReview, codeforcesDifficulty: 1700 }
+      }
+    });
+    expect(conflictingCompletion.statusCode).toBe(409);
+
+    const effects = await database.query<{
+      opinion_count: number | string;
+      renew_operation_count: number | string;
+      complete_operation_count: number | string;
+      renew_audit_count: number | string;
+      complete_audit_count: number | string;
+      closure_reason: string | null;
+      completion_request_id: string | null;
+    }>(sql`
+      SELECT
+        (SELECT count(*) FROM review_opinions)::integer AS opinion_count,
+        (
+          SELECT count(*) FROM review_assignment_operations
+          WHERE operation = 'renew'
+        )::integer AS renew_operation_count,
+        (
+          SELECT count(*) FROM review_assignment_operations
+          WHERE operation = 'complete'
+        )::integer AS complete_operation_count,
+        (
+          SELECT count(*) FROM audit_events WHERE action = 'robot.review.renew'
+        )::integer AS renew_audit_count,
+        (
+          SELECT count(*) FROM audit_events WHERE action = 'robot.review.complete'
+        )::integer AS complete_audit_count,
+        assignment.closure_reason,
+        assignment.completion_request_id::text AS completion_request_id
+      FROM review_assignments assignment
+      WHERE assignment.id = ${task.assignmentId}::uuid
+    `);
+    expect(effects[0]).toEqual({
+      opinion_count: 1,
+      renew_operation_count: 1,
+      complete_operation_count: 1,
+      renew_audit_count: 1,
+      complete_audit_count: 1,
+      closure_reason: "completed",
+      completion_request_id: completionRequestId
+    });
+  });
+
+  it("过期完成的失败结果也按请求标识固定重放且只关闭和审计一次", async () => {
+    const { app, database } = await makeRobotApp();
+    await createPendingProblem(app);
+    const task = await claimOne(app);
+    await database.execute(sql`
+      UPDATE review_assignments
+      SET created_at = now() - interval '2 hours',
+          expires_at = now() - interval '1 hour'
+      WHERE id = ${task.assignmentId}::uuid
+    `);
+    const payload = completionPayload(task);
+    const first = await app.inject({
+      method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/complete`,
+      headers: robotHeaders(),
+      payload,
+    });
+    const replay = await app.inject({
+      method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/complete`,
+      headers: robotHeaders(),
+      payload,
+    });
+    expect(first.statusCode).toBe(409);
+    expect(replay.statusCode).toBe(409);
+    const firstError = first.json() as { error: { code: string; message: string } };
+    const replayError = replay.json() as { error: { code: string; message: string } };
+    expect(replayError.error.code).toBe(firstError.error.code);
+    expect(replayError.error.message).toBe(firstError.error.message);
+
+    const review = payload.review as Record<string, unknown>;
+    const conflicting = await app.inject({
+      method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/complete`,
+      headers: robotHeaders(),
+      payload: { ...payload, review: { ...review, codeforcesDifficulty: 1700 } },
+    });
+    expect(conflicting.statusCode).toBe(409);
+
+    const effects = await database.query<{
+      closure_reason: string;
+      operation_count: number | string;
+      close_audit_count: number | string;
+      opinion_count: number | string;
+      stored_outcome: string | null;
+    }>(sql`
+      SELECT assignment.closure_reason::text AS closure_reason,
+             (
+               SELECT count(*)::integer FROM review_assignment_operations operation
+               WHERE operation.assignment_id = assignment.id AND operation.operation = 'complete'
+             ) AS operation_count,
+             (
+               SELECT count(*)::integer FROM audit_events audit
+               WHERE audit.action = 'robot.review.assignment.close'
+                 AND audit.request_id = ${(payload.requestId as string)}::uuid
+             ) AS close_audit_count,
+             (SELECT count(*)::integer FROM review_opinions) AS opinion_count,
+             (
+               SELECT operation.result ->> 'outcome'
+               FROM review_assignment_operations operation
+               WHERE operation.assignment_id = assignment.id AND operation.operation = 'complete'
+             ) AS stored_outcome
+      FROM review_assignments assignment
+      WHERE assignment.id = ${task.assignmentId}::uuid
+    `);
+    expect(effects).toEqual([{
+      closure_reason: "expired",
+      operation_count: 1,
+      close_audit_count: 1,
+      opinion_count: 0,
+      stored_outcome: "conflict",
+    }]);
+  });
+
+  it("滚动升级期间兼容未带请求标识的旧 Fermata，且仍不重复写意见", async () => {
+    const { app, database } = await makeRobotApp();
+    await createPendingProblem(app);
+    const task = await claimOne(app);
+    const renewed = await app.inject({
+      method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/renew`,
+      headers: robotHeaders(),
+      payload: {
+        expectedLeaseExpiresAt: task.leaseExpiresAt,
+        leaseSeconds: 300,
+      },
+    });
+    expect(renewed.statusCode).toBe(200);
+    const renewedLease = (renewed.json() as { leaseExpiresAt: string }).leaseExpiresAt;
+    const legacyCompletion = completionPayload({ ...task, leaseExpiresAt: renewedLease });
+    Reflect.deleteProperty(legacyCompletion, "requestId");
+    const completed = await app.inject({
+      method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/complete`,
+      headers: robotHeaders(),
+      payload: legacyCompletion,
+    });
+    expect(completed.statusCode).toBe(200);
+    const effects = await database.query<{
+      operations: number | string;
+      opinions: number | string;
+      generated_ids: number | string;
+    }>(sql`
+      SELECT count(*)::integer AS operations,
+             (SELECT count(*)::integer FROM review_opinions) AS opinions,
+             count(request_id)::integer AS generated_ids
+      FROM review_assignment_operations
+      WHERE assignment_id = ${task.assignmentId}::uuid
+    `);
+    expect(effects).toEqual([{ operations: 2, opinions: 1, generated_ids: 2 }]);
+  });
+
   it("领取后失去具体题目的审题或查看权限时，续租和完成都按不存在处理", async () => {
     const { app, database } = await makeRobotApp();
     await createPendingProblem(app);
@@ -770,7 +1071,11 @@ describe("机器人审题接口", () => {
         url: `/api/v1/robot/review-tasks/${task.assignmentId}/${path}`,
         headers: robotHeaders(),
         payload: path === "renew"
-          ? { expectedLeaseExpiresAt: task.leaseExpiresAt, leaseSeconds: 300 }
+          ? {
+              requestId: randomUUID(),
+              expectedLeaseExpiresAt: task.leaseExpiresAt,
+              leaseSeconds: 300
+            }
           : completionPayload(task),
       });
       expect(response.statusCode).toBe(404);
@@ -788,7 +1093,11 @@ describe("机器人审题接口", () => {
         url: `/api/v1/robot/review-tasks/${task.assignmentId}/${path}`,
         headers: robotHeaders(),
         payload: path === "renew"
-          ? { expectedLeaseExpiresAt: task.leaseExpiresAt, leaseSeconds: 300 }
+          ? {
+              requestId: randomUUID(),
+              expectedLeaseExpiresAt: task.leaseExpiresAt,
+              leaseSeconds: 300
+            }
           : completionPayload(task),
       });
       expect(response.statusCode).toBe(404);
@@ -796,19 +1105,24 @@ describe("机器人审题接口", () => {
 
     const sideEffects = await database.query<{
       revoked_at: Date | string | null;
+      closure_reason: string | null;
       opinion_count: number | string;
       audit_count: number | string;
     }>(sql`
-      SELECT assignment.revoked_at,
+      SELECT assignment.revoked_at, assignment.closure_reason,
              (SELECT count(*) FROM review_opinions)::integer AS opinion_count,
-             (SELECT count(*) FROM audit_events WHERE action = 'robot.review.complete')::integer AS audit_count
+             (
+               SELECT count(*) FROM audit_events
+               WHERE action = 'robot.review.assignment.close'
+             )::integer AS audit_count
       FROM review_assignments assignment
       WHERE assignment.id = ${task.assignmentId}::uuid
     `);
     expect(sideEffects[0]).toEqual(expect.objectContaining({
-      revoked_at: null,
+      revoked_at: expect.anything(),
+      closure_reason: "permission_revoked",
       opinion_count: 0,
-      audit_count: 0,
+      audit_count: 1,
     }));
   });
 
@@ -822,7 +1136,11 @@ describe("机器人审题接口", () => {
       method: "POST",
       url: `/api/v1/robot/review-tasks/${task.assignmentId}/renew`,
       headers: robotHeaders(),
-      payload: { expectedLeaseExpiresAt: task.leaseExpiresAt, leaseSeconds: 300 },
+      payload: {
+        requestId: randomUUID(),
+        expectedLeaseExpiresAt: task.leaseExpiresAt,
+        leaseSeconds: 300
+      },
     });
     expect(renewed.statusCode).toBe(404);
 
@@ -877,7 +1195,11 @@ describe("机器人审题接口", () => {
       method: "POST",
       url: `/api/v1/robot/review-tasks/${task.assignmentId}/renew`,
       headers: robotHeaders(),
-      payload: { expectedLeaseExpiresAt: task.leaseExpiresAt, leaseSeconds: 300 },
+      payload: {
+        requestId: randomUUID(),
+        expectedLeaseExpiresAt: task.leaseExpiresAt,
+        leaseSeconds: 300
+      },
     });
     expect(renewed.statusCode).toBe(404);
     const completed = await app.inject({

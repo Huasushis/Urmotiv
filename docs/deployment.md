@@ -20,7 +20,7 @@
 
    ```bash
    cd /home/ubuntu/urmotiv-codex/repo
-   scripts/deploy/validate-env.sh /home/ubuntu/urmotiv-codex/private/urmotiv.env
+   bash scripts/deploy/validate-env.sh /home/ubuntu/urmotiv-codex/private/urmotiv.env
    ```
 
 3. 构建镜像并先启动基础服务，再单独运行迁移。全新数据库迁移完成后会进入一次性的
@@ -66,14 +66,27 @@
 
 升级前先把经过审查的代码同步到专用目录并检查当前提交；升级脚本不会自行执行 `git pull`，以免在未知代码上自动修改运行中的服务。
 
+包含 `0009_robot_review_leases` 的升级必须安排维护窗口。先停止 Fermata 的新轮询，但保持旧版 Urmotiv API
+可用，让已经发出的付费模型请求继续流式读取到服务端真正结束并提交完成结果；不能主动取消，也不能恢复 120 秒
+总时限。待它们全部提交完成或租约自然过期，并确认数据库中没有尚未到期或没有到期时间的机器人租约后，再完整
+停止旧版 Urmotiv API，等待它属于本项目的数据库事务全部结束，然后运行迁移。
+
+迁移发现活租约会固定失败，不会猜测其是否已经完成；发现涉及的表仍被旧请求或其他事务占用也会立即安全失败，
+不会一边持锁一边等待而与旧版领取形成死锁。取得全部独占锁后，迁移会阻止旧版写入直到提交；已经自然过期的
+旧租约归档为 `expired`，迁移前已经撤销的旧记录归档为 `legacy_closed`，人工审核意见保持不变。锁忙时应确认占用
+事务属于本项目并等待它自然结束，再重试原迁移；不要批量结束数据库进程，也不要手工跳过门禁或删除领取记录。
+
 ```bash
 cd /home/ubuntu/urmotiv-codex/repo
-scripts/deploy/upgrade.sh \
+bash scripts/deploy/upgrade.sh \
   /home/ubuntu/urmotiv-codex/private/urmotiv.env \
   /home/ubuntu/urmotiv-codex/backups
 ```
 
-脚本按顺序验证私有配置、创建 PostgreSQL 备份、构建镜像、单独运行迁移、启动服务并检查健康状态。若迁移或健康检查失败，脚本会停止并保留容器，便于检查。不要通过删除数据库表来“回滚”迁移；应先停止服务、恢复升级前的备份，再切换回已经验证过的代码版本。
+脚本先验证私有配置并构建镜像；构建成功后明确停止旧 `api`、`worker`、`web` 容器并排空其数据库事务，再创建
+与停机切换点一致的 PostgreSQL 备份，然后单独运行迁移、启动服务并检查健康状态。若迁移失败，应用容器保持停止而数据库等基础服务保留，
+不能绕过失败强行启动；若健康检查失败，新容器保持原状以便检查。不要通过删除数据库表来“回滚”迁移；应先停止
+服务、恢复升级前的备份，再切换回已经验证过的代码版本。
 
 示例恢复命令需要在确认目标备份与停机窗口后手工执行：
 
@@ -93,7 +106,7 @@ docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env exec -T
 ```bash
 docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env ps
 docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env logs --tail=100 api
-scripts/deploy/backup.sh \
+bash scripts/deploy/backup.sh \
   /home/ubuntu/urmotiv-codex/private/urmotiv.env \
   /home/ubuntu/urmotiv-codex/backups
 ```
@@ -182,7 +195,7 @@ Fermata 的难度评定与等级标定实验（结果与当前校准状态）见
 
 ```bash
 # 在旧实例导出（backup.sh 也会做同样的事，产物在备份目录）
-scripts/deploy/backup.sh /home/ubuntu/urmotiv-codex/private/urmotiv.env /home/ubuntu/urmotiv-codex/backups
+bash scripts/deploy/backup.sh /home/ubuntu/urmotiv-codex/private/urmotiv.env /home/ubuntu/urmotiv-codex/backups
 
 # 在新实例恢复（见上面“升级与恢复”里的 pg_restore 示例），再切到对应代码版本 up -d
 ```

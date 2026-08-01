@@ -46,6 +46,8 @@ export interface ProblemTransaction {
     changedByUserId?: string
   ): boolean;
   writeReviewSuggestionAudit(event: ReviewSuggestionAuditEvent): Promise<void>;
+  /** Database-only hook: runs after opinion rows are durable in this transaction and before problem state writes. */
+  afterReviewWrites?(action: (executor: DatabaseExecutor) => Promise<void>): void;
   /** Database transactions expose their executor only so related core stores can share it. */
   readonly executor?: DatabaseExecutor;
 }

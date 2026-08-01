@@ -93,7 +93,12 @@ import {
 } from "./plugin-host";
 import { computeProblemContentHash } from "./database-store";
 import { resolveClientAddress } from "./client-address";
-import type { DatabaseRobotStore } from "./robot-store";
+import {
+  DatabaseRobotStore,
+  digestRobotOperationPayload,
+  type RobotCompletionResult,
+  type RobotTokenIdentity,
+} from "./robot-store";
 import { PluginReviewDecisionRunner } from "./review-decision";
 import { ReviewPolicyService } from "./review-policy-service";
 
@@ -991,7 +996,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   const robots = dependencies.robots;
   if (robots !== undefined) {
-    const requireRobot = async (request: FastifyRequest): Promise<StoredUser> => {
+    const requireRobot = async (request: FastifyRequest): Promise<RobotTokenIdentity> => {
       const header = request.headers.authorization;
       const token = typeof header === "string" && header.startsWith("Bearer ")
         ? header.slice("Bearer ".length).trim()
@@ -1006,61 +1011,12 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       if (identity === undefined) {
         throw unauthorized();
       }
-      return identity.user;
-    };
-
-    const robotTaskFor = async (
-      robotUser: StoredUser,
-      assignment: { problemId: string; round: number; id: string; expiresAt: string }
-    ) => {
-      const problem = await dependencies.store.findVisibleProblem(
-        assignment.problemId,
-        createProblemVisibility(robotUser, dependencies.now())
-      );
-      if (
-        problem === undefined ||
-        problem.status !== "pending_review" ||
-        problem.reviewRound !== assignment.round ||
-        !hasPermission(
-          robotUser,
-          "problem.review",
-          { ownerId: problem.ownerId, objectId: problem.id },
-          dependencies.now(),
-        )
-      ) {
-        return undefined;
-      }
-      const items = await dependencies.reviewItemStore.list(problem.id, problem.reviewRound, [
-        "author",
-        "reviewer"
-      ]);
-      return robotReviewTaskSchema.parse({
-        assignmentId: assignment.id,
-        leaseExpiresAt: assignment.expiresAt,
-        problem: {
-          id: problem.id,
-          revision: problem.revision,
-          reviewRound: problem.reviewRound,
-          contentHash: computeProblemContentHash(problem),
-          title: problem.title,
-          type: problem.type,
-          tagIds: problem.tagIds,
-          basicStatement: problem.content.basicStatement,
-          basicSolution: problem.content.basicSolution
-        },
-        reviewItems: items.map((item) => ({
-          id: item.id,
-          type: item.type,
-          summary: item.summary,
-          data: item.data,
-          contentHash: item.contentHash,
-          createdAt: item.createdAt
-        }))
-      });
+      return identity;
     };
 
     app.post("/api/v1/robot/review-tasks/claim", async (request) => {
-      const robotUser = await requireRobot(request);
+      const identity = await requireRobot(request);
+      const robotUser = identity.user;
       const permissionEvaluatedAt = dependencies.now();
       const reviewPermission = createProblemPermissionFilter(
         robotUser,
@@ -1071,171 +1027,187 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
         throw forbidden();
       }
       const input = claimRobotReviewTasksInputSchema.parse(request.body ?? {});
-      const supported = input.supportedProblemTypes === undefined
-        ? undefined
-        : new Set(input.supportedProblemTypes);
       const visibility = createProblemVisibility(robotUser, permissionEvaluatedAt);
       const candidates = await robots.listOpenRoundCandidates(
         robotUser.id,
         50,
         visibility,
         reviewPermission,
+        input.supportedProblemTypes,
       );
       const tasks = [];
       for (const candidate of candidates) {
         if (tasks.length >= input.maximumTasks) {
           break;
         }
-        if (!hasPermission(
-          robotUser,
-          "problem.review",
-          { ownerId: candidate.ownerId, objectId: candidate.problemId },
-          dependencies.now(),
-        )) {
-          continue;
-        }
-        const problem = await dependencies.store.findVisibleProblem(
+        const task = await dependencies.store.runProblemTransaction(
           candidate.problemId,
-          visibility,
+          async (transaction) => {
+            const problem = transaction.getProblem();
+            const executor = transaction.executor;
+            if (
+              problem === undefined
+              || executor === undefined
+              || problem.status !== "pending_review"
+              || problem.reviewRound !== candidate.round
+              || (
+                input.supportedProblemTypes !== undefined
+                && !input.supportedProblemTypes.includes(problem.type)
+              )
+            ) {
+              return undefined;
+            }
+            const claimed = await robots.claimAssignmentInTransaction(
+              executor,
+              identity,
+              problem,
+              candidate.roundId,
+              input.leaseSeconds,
+              request.id,
+            );
+            if (claimed === undefined) return undefined;
+            const items = await dependencies.reviewItemStore.list(
+              problem.id,
+              problem.reviewRound,
+              ["author", "reviewer"],
+              executor,
+            );
+            return robotReviewTaskSchema.parse({
+              assignmentId: claimed.assignment.id,
+              leaseExpiresAt: claimed.assignment.expiresAt,
+              problem: {
+                id: problem.id,
+                revision: problem.revision,
+                reviewRound: problem.reviewRound,
+                contentHash: computeProblemContentHash(problem),
+                title: problem.title,
+                type: problem.type,
+                tagIds: problem.tagIds,
+                basicStatement: problem.content.basicStatement,
+                basicSolution: problem.content.basicSolution,
+              },
+              reviewItems: items.map((item) => ({
+                id: item.id,
+                type: item.type,
+                summary: item.summary,
+                data: item.data,
+                contentHash: item.contentHash,
+                createdAt: item.createdAt,
+              })),
+            });
+          },
         );
-        if (
-          problem === undefined ||
-          problem.status !== "pending_review" ||
-          problem.reviewRound !== candidate.round ||
-          !hasPermission(
-            robotUser,
-            "problem.review",
-            { ownerId: problem.ownerId, objectId: problem.id },
-            dependencies.now(),
-          ) ||
-          (supported !== undefined && !supported.has(problem.type))
-        ) {
-          continue;
-        }
-        const assignment = await robots.createAssignment(
-          candidate.roundId,
-          robotUser.id,
-          input.leaseSeconds
-        );
-        if (assignment === undefined) {
-          continue;
-        }
-        const task = await robotTaskFor(robotUser, assignment);
-        if (task === undefined) {
-          await robots.closeAssignment(assignment.id, robotUser.id);
-          continue;
-        }
+        if (task === undefined) continue;
         tasks.push(task);
       }
       return claimRobotReviewTasksResponseSchema.parse({ items: tasks });
     });
 
     app.post("/api/v1/robot/review-tasks/:assignmentId/renew", async (request) => {
-      const robotUser = await requireRobot(request);
+      const identity = await requireRobot(request);
       const assignmentId = parseAssignmentId(request);
       const input = renewRobotReviewTaskInputSchema.parse(request.body ?? {});
-      const assignment = await robots.findAssignment(assignmentId, robotUser.id);
-      if (assignment === undefined) {
-        throw notFound();
-      }
-      const problem = await dependencies.store.findVisibleProblem(
-        assignment.problemId,
-        createProblemVisibility(robotUser, dependencies.now()),
-      );
-      if (
-        problem === undefined ||
-        problem.status !== "pending_review" ||
-        problem.reviewRound !== assignment.round ||
-        !hasPermission(
-          robotUser,
-          "problem.review",
-          { ownerId: problem.ownerId, objectId: problem.id },
-          dependencies.now(),
-        )
-      ) {
-        throw notFound();
-      }
-      const renewed = await robots.renewAssignment(
-        assignmentId,
-        robotUser.id,
-        input.expectedLeaseExpiresAt,
-        input.leaseSeconds
-      );
-      if (renewed === undefined) {
-        throw notFound();
-      }
-      return renewRobotReviewTaskResponseSchema.parse({
-        assignmentId,
-        leaseExpiresAt: renewed
+      const operationInput = { ...input, requestId: input.requestId ?? randomUUID() };
+      const target = await robots.findAssignmentTarget(assignmentId, identity.userId);
+      if (target === undefined) throw notFound();
+      const payloadDigest = digestRobotOperationPayload({
+        expectedLeaseExpiresAt: input.expectedLeaseExpiresAt,
+        leaseSeconds: input.leaseSeconds,
       });
+      const outcome = await dependencies.store.runProblemTransaction(
+        target.problemId,
+        async (transaction) => {
+          const problem = transaction.getProblem();
+          const executor = transaction.executor;
+          if (problem === undefined || executor === undefined) return { kind: "not_found" } as const;
+          return robots.renewAssignmentInTransaction(
+            executor,
+            identity,
+            problem,
+            assignmentId,
+            operationInput,
+            payloadDigest,
+          );
+        },
+      );
+      if (outcome.kind === "not_found") throw notFound();
+      if (outcome.kind === "conflict") {
+        throw conflict("请求标识已用于不同内容，或任务快照已变化。");
+      }
+      return renewRobotReviewTaskResponseSchema.parse(outcome.result);
     });
 
     app.post("/api/v1/robot/review-tasks/:assignmentId/complete", async (request) => {
-      const robotUser = await requireRobot(request);
+      const identity = await requireRobot(request);
       const assignmentId = parseAssignmentId(request);
       const input = completeRobotReviewTaskInputSchema.parse(request.body);
-      const assignment = await robots.findAssignment(assignmentId, robotUser.id);
-      if (assignment === undefined) {
-        throw notFound();
-      }
-      const problem = await dependencies.store.findVisibleProblem(
-        assignment.problemId,
-        createProblemVisibility(robotUser, dependencies.now())
+      const operationInput = { ...input, requestId: input.requestId ?? randomUUID() };
+      const target = await robots.findAssignmentTarget(assignmentId, identity.userId);
+      if (target === undefined) throw notFound();
+      const payloadDigest = digestRobotOperationPayload({
+        expectedLeaseExpiresAt: input.expectedLeaseExpiresAt,
+        expectedProblemRevision: input.expectedProblemRevision,
+        experimentVersion: input.experimentVersion,
+        modelProfileName: input.modelProfileName,
+        review: input.review,
+      });
+      const outcome = await dependencies.store.runProblemTransaction(
+        target.problemId,
+        async (transaction) => {
+          const problem = transaction.getProblem();
+          const executor = transaction.executor;
+          if (
+            problem === undefined
+            || executor === undefined
+            || transaction.afterReviewWrites === undefined
+          ) {
+            return { kind: "not_found" } as const;
+          }
+          const prepared = await robots.prepareCompletionInTransaction(
+            executor,
+            identity,
+            problem,
+            assignmentId,
+            operationInput,
+            payloadDigest,
+          );
+          if (prepared.kind !== "ready") return prepared;
+          const submitted = await dependencies.service.submitReviewInTransaction(
+            transaction,
+            prepared.prepared.user,
+            problem.id,
+            input.review,
+            operationInput.requestId,
+          );
+          const result: RobotCompletionResult = {
+            assignmentId,
+            accepted: true,
+            problemStatus: submitted.summary.status === "approved"
+              ? "approved"
+              : submitted.summary.status === "rejected"
+                ? "rejected"
+                : "pending_review",
+          };
+          transaction.afterReviewWrites(async (transactionExecutor) => {
+            await robots.finishCompletionInTransaction(
+              transactionExecutor,
+              prepared.prepared,
+              result,
+              submitted.opinionId,
+              {
+                experimentVersion: input.experimentVersion,
+                modelProfileName: input.modelProfileName,
+              },
+            );
+          });
+          return { kind: "success", result, replayed: false } as const;
+        },
       );
-      if (
-        problem === undefined ||
-        problem.status !== "pending_review" ||
-        problem.reviewRound !== assignment.round ||
-        !hasPermission(
-          robotUser,
-          "problem.review",
-          { ownerId: problem.ownerId, objectId: problem.id },
-          dependencies.now(),
-        )
-      ) {
-        throw notFound();
+      if (outcome.kind === "not_found") throw notFound();
+      if (outcome.kind === "conflict") {
+        throw conflict("请求标识已用于不同内容，或任务快照已变化。");
       }
-      if (
-        assignment.expiresAt !== input.expectedLeaseExpiresAt ||
-        Date.parse(assignment.expiresAt) <= dependencies.now().getTime()
-      ) {
-        throw conflict("任务租约已变化或过期，请重新领取。");
-      }
-      if (problem.revision !== input.expectedProblemRevision) {
-        throw conflict("题目内容已更新，本次分析结果不再适用。");
-      }
-
-      let result: "success" | "failure" = "failure";
-      try {
-        const summary = await dependencies.service.submitReview(
-          robotUser,
-          assignment.problemId,
-          input.review,
-          request.id
-        );
-        result = "success";
-        await robots.closeAssignment(assignment.id, robotUser.id);
-        return robotReviewTaskCompletionSchema.parse({
-          assignmentId: assignment.id,
-          accepted: true,
-          problemStatus: summary.status === "approved"
-            ? "approved"
-            : summary.status === "rejected"
-              ? "rejected"
-              : "pending_review"
-        });
-      } finally {
-        await robots
-          .writeCompletionAudit({
-            reviewerUserId: robotUser.id,
-            problemId: assignment.problemId,
-            assignmentId: assignment.id,
-            experimentVersion: input.experimentVersion,
-            modelProfileName: input.modelProfileName,
-            result
-          })
-          .catch(() => undefined);
-      }
+      return robotReviewTaskCompletionSchema.parse(outcome.result);
     });
   }
 

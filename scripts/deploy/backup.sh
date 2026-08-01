@@ -10,7 +10,7 @@ env_file="$1"
 backup_directory="$2"
 root_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-"$root_directory/scripts/deploy/validate-env.sh" "$env_file"
+bash "$root_directory/scripts/deploy/validate-env.sh" "$env_file"
 mkdir -p "$backup_directory"
 chmod 700 "$backup_directory"
 

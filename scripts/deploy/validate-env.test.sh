@@ -26,14 +26,14 @@ EOF
 valid_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 valid_file="$temporary_directory/valid.env"
 write_environment "$valid_file" "$valid_key"
-"$validator" "$valid_file" >"$temporary_directory/valid.out" 2>"$temporary_directory/valid.err"
+bash "$validator" "$valid_file" >"$temporary_directory/valid.out" 2>"$temporary_directory/valid.err"
 grep -Fqx "环境文件的必填项和权限已通过检查。" "$temporary_directory/valid.out"
 test ! -s "$temporary_directory/valid.err"
 
 invalid_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB"
 invalid_file="$temporary_directory/invalid-key.env"
 write_environment "$invalid_file" "$invalid_key"
-if "$validator" "$invalid_file" >"$temporary_directory/invalid.out" 2>"$temporary_directory/invalid.err"; then
+if bash "$validator" "$invalid_file" >"$temporary_directory/invalid.out" 2>"$temporary_directory/invalid.err"; then
   echo "非标准 Base64URL 密钥不应通过检查。" >&2
   exit 1
 fi
@@ -46,7 +46,7 @@ fi
 unsafe_file="$temporary_directory/unsafe-permissions.env"
 write_environment "$unsafe_file" "$valid_key"
 chmod 644 "$unsafe_file"
-if "$validator" "$unsafe_file" >"$temporary_directory/unsafe.out" 2>"$temporary_directory/unsafe.err"; then
+if bash "$validator" "$unsafe_file" >"$temporary_directory/unsafe.out" 2>"$temporary_directory/unsafe.err"; then
   echo "权限过宽的环境文件不应通过检查。" >&2
   exit 1
 fi

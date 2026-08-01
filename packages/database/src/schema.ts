@@ -105,6 +105,20 @@ export const adminBootstrapStatus = pgEnum("admin_bootstrap_status", [
   "open",
   "completed"
 ]);
+export const reviewAssignmentKind = pgEnum("review_assignment_kind", ["human", "robot"]);
+export const reviewAssignmentClosureReason = pgEnum("review_assignment_closure_reason", [
+  "completed",
+  "expired",
+  "round_closed",
+  "permission_revoked",
+  "content_changed",
+  "abandoned",
+  "legacy_closed"
+]);
+export const reviewAssignmentOperation = pgEnum("review_assignment_operation", [
+  "renew",
+  "complete"
+]);
 
 export const adminBootstrapState = pgTable(
   "admin_bootstrap_state",
@@ -814,6 +828,10 @@ export const reviewRounds = pgTable(
   },
   (table) => [
     uniqueIndex("review_rounds_problem_round_uq").on(table.problemId, table.round),
+    uniqueIndex("review_rounds_id_submitted_revision_uq").on(
+      table.id,
+      table.submittedRevisionId
+    ),
     uniqueIndex("review_rounds_one_open_uq")
       .on(table.problemId)
       .where(sql`${table.status} = 'open'`),
@@ -926,18 +944,47 @@ export const reviewAssignments = pgTable(
       .notNull()
       .references(() => users.id, { onDelete: "restrict" }),
     reason: varchar("reason", { length: 500 }).notNull().default(""),
+    assignmentKind: reviewAssignmentKind("assignment_kind").notNull(),
+    claimedProblemRevision: integer("claimed_problem_revision"),
+    claimedSubmittedRevisionId: uuid("claimed_submitted_revision_id"),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     revokedByUserId: bigint("revoked_by_user_id", { mode: "bigint" }).references(
       () => users.id,
       { onDelete: "restrict" }
     ),
+    closedAt: timestamp("closed_at", { withTimezone: true }),
+    closureReason: reviewAssignmentClosureReason("closure_reason"),
+    closedByUserId: bigint("closed_by_user_id", { mode: "bigint" }).references(
+      () => users.id,
+      { onDelete: "restrict" }
+    ),
+    lastRenewalRequestId: uuid("last_renewal_request_id"),
+    lastRenewalPayloadDigest: char("last_renewal_payload_digest", { length: 64 }),
+    lastRenewalResult: jsonb("last_renewal_result").$type<JsonObject>(),
+    lastRenewalAuditId: bigint("last_renewal_audit_id", { mode: "bigint" }).references(
+      () => auditEvents.id,
+      { onDelete: "restrict" }
+    ),
+    completionRequestId: uuid("completion_request_id"),
+    completionPayloadDigest: char("completion_payload_digest", { length: 64 }),
+    completionResult: jsonb("completion_result").$type<JsonObject>(),
+    completionAuditId: bigint("completion_audit_id", { mode: "bigint" }).references(
+      () => auditEvents.id,
+      { onDelete: "restrict" }
+    ),
+    completionOpinionId: uuid("completion_opinion_id").references(() => reviewOpinions.id, {
+      onDelete: "restrict"
+    }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
   },
   (table) => [
     uniqueIndex("review_assignments_active_reviewer_uq")
       .on(table.roundId, table.reviewerUserId)
       .where(sql`${table.revokedAt} IS NULL`),
+    uniqueIndex("review_assignments_completion_request_uq")
+      .on(table.id, table.completionRequestId)
+      .where(sql`${table.completionRequestId} IS NOT NULL`),
     index("review_assignments_reviewer_idx").on(table.reviewerUserId, table.expiresAt),
     check(
       "review_assignments_revoke_ck",
@@ -946,6 +993,120 @@ export const reviewAssignments = pgTable(
     check(
       "review_assignments_expiry_ck",
       sql`${table.expiresAt} IS NULL OR ${table.expiresAt} > ${table.createdAt}`
+    ),
+    check(
+      "review_assignments_claimed_revision_ck",
+      sql`(
+        ${table.assignmentKind} = 'human'
+        AND ${table.claimedProblemRevision} IS NULL
+        AND ${table.claimedSubmittedRevisionId} IS NULL
+      ) OR (
+        ${table.assignmentKind} = 'robot'
+        AND ${table.claimedProblemRevision} IS NOT NULL
+        AND ${table.claimedProblemRevision} > 0
+        AND ${table.claimedSubmittedRevisionId} IS NOT NULL
+        AND ${table.expiresAt} IS NOT NULL
+      )`
+    ),
+    check(
+      "review_assignments_lifecycle_ck",
+      sql`(
+        ${table.closureReason} IS NULL
+        AND ${table.closedAt} IS NULL
+        AND ${table.closedByUserId} IS NULL
+        AND ${table.revokedAt} IS NULL
+        AND ${table.revokedByUserId} IS NULL
+      ) OR (
+        ${table.closureReason} IS NOT NULL
+        AND ${table.closedAt} IS NOT NULL
+        AND ${table.closedByUserId} IS NOT NULL
+        AND ${table.revokedAt} = ${table.closedAt}
+        AND ${table.revokedByUserId} = ${table.closedByUserId}
+      )`
+    ),
+    check(
+      "review_assignments_last_renewal_ck",
+      sql`num_nonnulls(
+        ${table.lastRenewalRequestId},
+        ${table.lastRenewalPayloadDigest},
+        ${table.lastRenewalResult},
+        ${table.lastRenewalAuditId}
+      ) IN (0, 4)
+      AND (
+        ${table.lastRenewalPayloadDigest} IS NULL
+        OR ${table.lastRenewalPayloadDigest} ~ '^[0-9a-f]{64}$'
+      )
+      AND (
+        ${table.lastRenewalResult} IS NULL
+        OR jsonb_typeof(${table.lastRenewalResult}) = 'object'
+      )`
+    ),
+    check(
+      "review_assignments_completion_ck",
+      sql`(
+        ${table.closureReason} = 'completed'
+        AND num_nonnulls(
+          ${table.completionRequestId},
+          ${table.completionPayloadDigest},
+          ${table.completionResult},
+          ${table.completionAuditId},
+          ${table.completionOpinionId}
+        ) = 5
+      ) OR (
+        ${table.closureReason} IS DISTINCT FROM 'completed'
+        AND num_nonnulls(
+          ${table.completionRequestId},
+          ${table.completionPayloadDigest},
+          ${table.completionResult},
+          ${table.completionAuditId},
+          ${table.completionOpinionId}
+        ) = 0
+      )`
+    ),
+    check(
+      "review_assignments_completion_digest_ck",
+      sql`${table.completionPayloadDigest} IS NULL OR ${table.completionPayloadDigest} ~ '^[0-9a-f]{64}$'`
+    ),
+    check(
+      "review_assignments_completion_result_ck",
+      sql`${table.completionResult} IS NULL OR jsonb_typeof(${table.completionResult}) = 'object'`
+    ),
+    foreignKey({
+      columns: [table.roundId, table.claimedSubmittedRevisionId],
+      foreignColumns: [reviewRounds.id, reviewRounds.submittedRevisionId],
+      name: "review_assignments_claimed_round_fk"
+    }).onDelete("restrict")
+  ]
+);
+
+export const reviewAssignmentOperations = pgTable(
+  "review_assignment_operations",
+  {
+    assignmentId: uuid("assignment_id")
+      .notNull()
+      .references(() => reviewAssignments.id, { onDelete: "restrict" }),
+    requestId: uuid("request_id").notNull(),
+    operation: reviewAssignmentOperation("operation").notNull(),
+    payloadDigest: char("payload_digest", { length: 64 }).notNull(),
+    result: jsonb("result").$type<JsonObject>().notNull(),
+    auditEventId: bigint("audit_event_id", { mode: "bigint" })
+      .notNull()
+      .references(() => auditEvents.id, { onDelete: "restrict" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    primaryKey({
+      columns: [table.assignmentId, table.requestId],
+      name: "review_assignment_operations_pk"
+    }),
+    index("review_assignment_operations_audit_idx").on(table.auditEventId),
+    check(
+      "review_assignment_operations_digest_ck",
+      sql`${table.payloadDigest} ~ '^[0-9a-f]{64}$'`
+    ),
+    check(
+      "review_assignment_operations_result_ck",
+      sql`jsonb_typeof(${table.result}) = 'object'`
     )
   ]
 );

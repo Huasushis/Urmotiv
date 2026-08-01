@@ -47,7 +47,7 @@ import {
   effectivePermissionNames,
   hasPermission
 } from "./permissions";
-import type { DataStore, ProblemRevisionAction } from "./repository";
+import type { DataStore, ProblemRevisionAction, ProblemTransaction } from "./repository";
 import type {
   ReviewItemStore,
   ReviewItemVisibility,
@@ -915,12 +915,31 @@ export class ProblemService {
     requestId?: string
   ): Promise<ReviewRoundSummary> {
     await this.findVisibleProblem(user, problemId);
-    return this.store.runProblemTransaction(problemId, async (transaction) => {
+    const result = await this.store.runProblemTransaction(problemId, (transaction) =>
+      this.submitReviewInTransaction(transaction, user, problemId, input, requestId)
+    );
+    return result.summary;
+  }
+
+  /**
+   * Shares the caller's already locked problem transaction. Robot completion
+   * uses this entry point so its opinion, lease closure, round decision and
+   * audit record either all commit or all roll back.
+   */
+  public async submitReviewInTransaction(
+    transaction: ProblemTransaction,
+    user: StoredUser,
+    problemId: string,
+    input: ReviewInput,
+    requestId?: string,
+  ): Promise<{ readonly summary: ReviewRoundSummary; readonly opinionId: string }> {
       const problem = transaction.getProblem();
       const users = transaction.listUsers();
-      const actor = users.find((candidate) => candidate.id === user.id);
+      const storedActor = users.find((candidate) => candidate.id === user.id);
+      const actor = user.accountType === "robot" ? user : storedActor;
       if (
         problem === undefined ||
+        problem.id !== problemId ||
         actor === undefined ||
         !canViewProblem(createProblemVisibility(actor, this.now()), problem)
       ) {
@@ -977,6 +996,9 @@ export class ProblemService {
       transaction.upsertReview(review);
 
       const reviews = transaction.listReviews(problem.reviewRound);
+      const effectiveUsers = users.map((candidate) =>
+        candidate.id === actor.id ? actor : candidate
+      );
       const roundState = this.requireOpenRoundState(problem);
       const reviewItems = this.reviewItems === undefined
         ? []
@@ -990,7 +1012,7 @@ export class ProblemService {
       try {
         decision = await this.reviewDecisions.evaluate(
           roundState,
-          this.createReviewRoundSnapshot(problem, reviews, users, reviewItems, evaluatedAt),
+          this.createReviewRoundSnapshot(problem, reviews, effectiveUsers, reviewItems, evaluatedAt),
           evaluatedAt,
           transaction.executor
         );
@@ -1001,14 +1023,17 @@ export class ProblemService {
         throw error;
       }
       if (decision.decision === "pending") {
-        return this.buildReviewRoundSummary(
-          problem,
-          reviews,
-          users,
-          actor,
-          decision,
-          true
-        );
+        return {
+          opinionId: review.id,
+          summary: this.buildReviewRoundSummary(
+            problem,
+            reviews,
+            effectiveUsers,
+            actor,
+            decision,
+            true
+          )
+        };
       }
 
       const finalStatus = decision.decision === "approve" ? "approved" : "rejected";
@@ -1033,8 +1058,17 @@ export class ProblemService {
       if (!transaction.replaceProblem(next, problem.revision, actor.id)) {
         throw conflict("题目已被其他操作修改，请刷新后重试。");
       }
-      return this.buildReviewRoundSummary(next, reviews, users, actor, decision, true);
-    });
+      return {
+        opinionId: review.id,
+        summary: this.buildReviewRoundSummary(
+          next,
+          reviews,
+          effectiveUsers,
+          actor,
+          decision,
+          true
+        )
+      };
   }
 
   public async finalizeReview(

@@ -824,6 +824,16 @@ async function replaceProblemInTransaction(
     return false;
   }
 
+  if (Number(current.current_review_round) > 0) {
+    await executor.query<{ id: string }>(sql`
+      SELECT id::text AS id
+      FROM review_rounds
+      WHERE problem_id = ${problemId}
+        AND round = ${Number(current.current_review_round)}
+      FOR UPDATE
+    `);
+  }
+
   if (
     problem.reviewRound === Number(current.current_review_round) + 1 &&
     problem.status !== "pending_review"
@@ -903,6 +913,22 @@ async function replaceProblemInTransaction(
       WHERE problem_id = ${problemId}
         AND round = ${Number(current.current_review_round)}
         AND status = 'open'
+    `);
+    await executor.execute(sql`
+      UPDATE review_assignments
+      SET closed_at = ${roundState.decidedAt}::timestamptz,
+          closure_reason = 'round_closed',
+          closed_by_user_id = ${actorId},
+          revoked_at = ${roundState.decidedAt}::timestamptz,
+          revoked_by_user_id = ${actorId}
+      WHERE round_id = (
+        SELECT id
+        FROM review_rounds
+        WHERE problem_id = ${problemId}
+          AND round = ${Number(current.current_review_round)}
+      )
+        AND assignment_kind = 'robot'
+        AND closure_reason IS NULL
     `);
     if (roundState.decisionRequestId !== undefined) {
       await executor.execute(sql`
@@ -1708,6 +1734,15 @@ export class DatabaseDataStore implements DataStore {
         WHERE id = ${id} AND deleted_at IS NULL
         FOR UPDATE
       `);
+      await executor.query<{ id: string }>(sql`
+        SELECT review_round.id::text AS id
+        FROM review_rounds review_round
+        JOIN problems problem
+          ON problem.id = review_round.problem_id
+         AND problem.current_review_round = review_round.round
+        WHERE problem.id = ${id}
+        FOR UPDATE OF review_round
+      `);
       let problem = (
         await hydrateProblems(executor, await loadProblemRows(executor, sql`problem.id = ${id}`))
       )[0];
@@ -1719,6 +1754,7 @@ export class DatabaseDataStore implements DataStore {
         ]),
       );
       const changedReviews = new Set<string>();
+      const afterReviewWrites: Array<(executor: DatabaseExecutor) => Promise<void>> = [];
       let pendingReplacement:
         | { problem: StoredProblem; expectedRevision: number; changedByUserId?: string }
         | undefined;
@@ -1782,6 +1818,9 @@ export class DatabaseDataStore implements DataStore {
             )
           `);
         },
+        afterReviewWrites: (action) => {
+          afterReviewWrites.push(action);
+        },
       };
 
       const result = await operation(transaction);
@@ -1790,6 +1829,9 @@ export class DatabaseDataStore implements DataStore {
         if (review !== undefined) {
           await writeReview(executor, id, review);
         }
+      }
+      for (const action of afterReviewWrites) {
+        await action(executor);
       }
       if (pendingReplacement !== undefined) {
         const replaced = await replaceProblemInTransaction(
