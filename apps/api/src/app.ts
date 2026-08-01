@@ -457,6 +457,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   });
 
   app.setErrorHandler((error, request, reply) => {
+    if (reply.raw.headersSent) {
+      reply.raw.destroy();
+      return;
+    }
     if (error instanceof ApiError) {
       sendError(reply, request.id, error);
       return;
@@ -1197,6 +1201,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       reply.header("content-length", String(download.item.byteSize));
       reply.header("content-disposition", contentDispositionFor(download.item.originalName));
       reply.header("cache-control", "private, no-store");
+      reply.header("x-content-type-options", "nosniff");
       return reply.send(Readable.from(download.stream));
     });
 
@@ -1288,6 +1293,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       reply.header("content-length", String(download.byteSize));
       reply.header("content-disposition", contentDispositionFor(download.fileName));
       reply.header("cache-control", "private, no-store");
+      reply.header("x-content-type-options", "nosniff");
       return reply.send(Readable.from(download.stream));
     });
   }

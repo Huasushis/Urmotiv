@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -529,6 +529,7 @@ describe("题目包导入", () => {
     });
     expect(downloaded.statusCode).toBe(200);
     expect(downloaded.headers["content-type"]).toBe("application/zip");
+    expect(downloaded.headers["x-content-type-options"]).toBe("nosniff");
 
     const roundTripped = await urmotivNativeAdapter.import(
       readZipArchive(new Uint8Array(downloaded.rawPayload)),
@@ -653,6 +654,127 @@ describe("题目包导入", () => {
     expect(serializedAudit).not.toContain(solutionText);
     expect(serializedAudit).not.toContain("导入的演示题目");
     expect(serializedAudit).not.toContain("problem.zip");
+  });
+
+  it("题目包中的题面图片也按扩展名和实际文件头校验", async () => {
+    const { app, database, worker } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const base = fixtureProblem();
+    const disguisedImage = new TextEncoder().encode("not-an-image");
+    const disguisedImageDigest = createHash("sha256").update(disguisedImage).digest("hex");
+    const packageWithDisguisedImage = canonicalProblemSchema.parse({
+      ...base,
+      files: [
+        ...base.files,
+        {
+          path: `assets/${disguisedImageDigest}.png`,
+          category: "asset",
+          content: disguisedImage
+        }
+      ]
+    });
+    const uploaded = await uploadPackage(
+      app,
+      leader,
+      await nativeZipOf(packageWithDisguisedImage)
+    );
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: upload.fileId,
+        sha256: upload.sha256,
+        formatId: "urmotiv",
+        idempotencyKey: "import-invalid-statement-image-1"
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const jobId = (created.json() as { id: string }).id;
+    expect(await worker.runOnce()).toBe(true);
+
+    const finished = await app.inject({
+      method: "GET",
+      url: `/api/v1/transfer/imports/${jobId}`,
+      headers: { cookie: leader }
+    });
+    expect(finished.statusCode).toBe(200);
+    expect(finished.json()).toEqual(
+      expect.objectContaining({
+        state: "failed",
+        failure: expect.objectContaining({ code: "import_invalid" })
+      })
+    );
+    const storedProblemFiles = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'problem'
+    `);
+    expect(storedProblemFiles).toEqual([{ count: 0 }]);
+    expect(finished.body).not.toContain("not-an-image");
+    expect(finished.body).not.toContain(disguisedImageDigest);
+  });
+
+  it("带合法题面图片的原生包导出后可以重新导入", async () => {
+    const { app, worker } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const base = fixtureProblem();
+    const image = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01]);
+    const digest = createHash("sha256").update(image).digest("hex");
+    const problemWithImage = canonicalProblemSchema.parse({
+      ...base,
+      files: [
+        ...base.files,
+        { path: `assets/${digest}.PNG`, category: "asset", content: image }
+      ]
+    });
+    const uploaded = await uploadPackage(app, leader, await nativeZipOf(problemWithImage));
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: upload.fileId,
+        sha256: upload.sha256,
+        formatId: "urmotiv",
+        idempotencyKey: "import-valid-statement-image-1"
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const jobId = (created.json() as { id: string }).id;
+    expect(await worker.runOnce()).toBe(true);
+
+    const finished = await app.inject({
+      method: "GET",
+      url: `/api/v1/transfer/imports/${jobId}`,
+      headers: { cookie: leader }
+    });
+    expect(finished.statusCode).toBe(200);
+    const finishedBody = finished.json() as {
+      state: string;
+      items: Array<{ importedProblemId: string | null }>;
+    };
+    expect(finishedBody.state).toBe("succeeded");
+    const importedProblemId = finishedBody.items[0]?.importedProblemId;
+    expect(importedProblemId).toMatch(/^\d+$/);
+
+    const files = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${importedProblemId}/files`,
+      headers: { cookie: leader }
+    });
+    expect(files.statusCode).toBe(200);
+    expect(files.json()).toEqual({
+      items: expect.arrayContaining([
+        expect.objectContaining({ category: "statement_image", mediaType: "image/png" })
+      ])
+    });
   });
 
   it("没有导入权限的用户不能上传，任务对其他用户不可见", async () => {

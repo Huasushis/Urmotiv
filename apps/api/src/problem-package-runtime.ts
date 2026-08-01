@@ -20,6 +20,7 @@ import {
 } from "@urmotiv/jobs";
 import {
   UnsafeArchiveError,
+  ProblemPackageError,
   canonicalProblemSchema,
   defaultArchiveSafetyLimits,
   readProblemPackageInput,
@@ -40,7 +41,7 @@ import { z } from "zod";
 import type { StoredProblem, StoredUser } from "./domain";
 import type { DatabaseDataStore } from "./database-store";
 import { ApiError } from "./errors";
-import { ProblemFileStore } from "./problem-file-store";
+import type { ProblemFileStore } from "./problem-file-store";
 import {
   ProblemPackageJobStoreError,
   completeDatabaseExportJob
@@ -50,6 +51,7 @@ import {
   type ProblemPackageAuditWriter
 } from "./problem-package-audit";
 import type { ProblemService } from "./service";
+import { assertStatementImageBytes, InvalidStatementImageError } from "./statement-image";
 
 /**
  * 本文件是后台题目包任务的“真实依赖”：读取上传的压缩包、把转换后的题目原子地写入
@@ -381,6 +383,20 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
       createdAt: now,
       updatedAt: now
     };
+
+    for (const file of problem.files) {
+      if (file.category !== "asset") {
+        continue;
+      }
+      try {
+        assertStatementImageBytes(mediaTypeForPath(file.path), file.path, file.content);
+      } catch (error) {
+        if (error instanceof InvalidStatementImageError) {
+          throw new ProblemPackageError("题目包中包含无效的题面图片。");
+        }
+        throw error;
+      }
+    }
 
     const published: StoredFile[] = [];
     let transactionWritesFinished = false;

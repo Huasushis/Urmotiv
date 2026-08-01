@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import {
   createLocalDatabase,
   type LocalDatabaseHandle,
@@ -10,7 +11,7 @@ import {
 } from "@urmotiv/database";
 import { LocalFileStorage } from "@urmotiv/storage";
 import type { FastifyInstance } from "fastify";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import { DatabaseContestStore } from "../src/database-contest-store";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo";
@@ -46,6 +47,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(openApps.splice(0).map((app) => app.close()));
   await Promise.all(openDatabases.splice(0).map((database) => database.close()));
   await rm(temporaryDirectory, { recursive: true, force: true });
@@ -118,7 +120,7 @@ interface UploadOptions {
   readonly originalName: string;
   readonly mediaType?: string;
   readonly replaceExisting?: boolean;
-  readonly content?: string | Buffer;
+  readonly content?: string | Buffer | Readable;
 }
 
 async function uploadFile(
@@ -204,6 +206,7 @@ describe("题目文件接口", () => {
     expect(downloaded.headers["content-type"]).toBe("text/plain");
     expect(downloaded.headers["content-disposition"]).toContain("filename*=UTF-8''");
     expect(downloaded.headers["cache-control"]).toBe("private, no-store");
+    expect(downloaded.headers["x-content-type-options"]).toBe("nosniff");
   });
 
   it("没有测试数据权限的作者不能上传内部文件，命题组成员可以", async () => {
@@ -289,7 +292,7 @@ describe("题目文件接口", () => {
       logicalPath: "assets/figure.png",
       originalName: "figure.png",
       mediaType: "image/png",
-      content: "png-bytes"
+      content: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01])
     });
     expect(uploadedPublic.statusCode).toBe(200);
 
@@ -488,5 +491,304 @@ describe("题目文件接口", () => {
       originalName: "robot.txt"
     });
     expect(robotUpload.statusCode).toBe(403);
+  });
+
+  it("题面图片会绕过客户端声明按文件头校验，失败时不发布文件或创建版本", async () => {
+    const { app, objectsDirectory, stagingDirectory } = await makeFileApp();
+    const author = await login(app, databaseDemoUserIds.author);
+    const draft = await createDraft(app, author);
+
+    const invalidUploads = [
+      {
+        logicalPath: "assets/invalid.svg",
+        originalName: "invalid.svg",
+        mediaType: "image/svg+xml",
+        content: Buffer.from("<svg>private-image-detail</svg>")
+      },
+      {
+        logicalPath: "assets/mismatched.png",
+        originalName: "mismatched.png",
+        mediaType: "image/png",
+        content: Buffer.from([0xff, 0xd8, 0xff, 0x00])
+      },
+      {
+        logicalPath: "assets/empty.gif",
+        originalName: "empty.gif",
+        mediaType: "image/gif",
+        content: Buffer.alloc(0)
+      },
+      {
+        logicalPath: "assets/truncated.webp",
+        originalName: "truncated.webp",
+        mediaType: "image/webp",
+        content: Buffer.from("RIFF")
+      },
+      {
+        logicalPath: "assets/disguised.svg",
+        originalName: "disguised.png",
+        mediaType: "image/png",
+        content: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+      },
+      {
+        logicalPath: "assets/disguised.png",
+        originalName: "disguised.bin",
+        mediaType: "image/png",
+        content: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+      }
+    ];
+
+    for (const invalid of invalidUploads) {
+      const response = await uploadFile(app, author, draft.id, {
+        expectedRevision: draft.revision,
+        category: "statement_image",
+        logicalPath: invalid.logicalPath,
+        originalName: invalid.originalName,
+        mediaType: invalid.mediaType,
+        content: invalid.content
+      });
+      expect(response.statusCode).toBe(422);
+      expect(response.json()).toEqual({
+        error: expect.objectContaining({ code: "INVALID_STATEMENT_IMAGE" })
+      });
+      expect(response.body).not.toContain("private-image-detail");
+    }
+
+    expect(await countFiles(objectsDirectory)).toBe(0);
+    expect(await countFiles(stagingDirectory)).toBe(0);
+
+    const validAfterFailures = await uploadFile(app, author, draft.id, {
+      expectedRevision: draft.revision,
+      category: "statement_image",
+      logicalPath: "assets/valid.png",
+      originalName: "valid.png",
+      mediaType: "image/png",
+      content: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+    });
+    expect(validAfterFailures.statusCode).toBe(200);
+    expect((validAfterFailures.json() as { revision: number }).revision).toBe(draft.revision + 1);
+  });
+
+  it("跨数据块读取最短 WebP 文件头，并完整保留后续字节", async () => {
+    const { app } = await makeFileApp();
+    const author = await login(app, databaseDemoUserIds.author);
+    const draft = await createDraft(app, author);
+    const chunks = [
+      Buffer.from("R"),
+      Buffer.from("IF"),
+      Buffer.from([0x46, 0x04, 0x00, 0x00, 0x00, 0x57]),
+      Buffer.from("EBPpayload")
+    ];
+
+    const uploaded = await uploadFile(app, author, draft.id, {
+      expectedRevision: draft.revision,
+      category: "statement_image",
+      logicalPath: "assets/figure.webp",
+      originalName: "figure.webp",
+      mediaType: "image/webp",
+      content: Readable.from(chunks)
+    });
+    expect(uploaded.statusCode).toBe(200);
+    const uploadBody = uploaded.json() as { item: { id: string; byteSize: number } };
+    expect(uploadBody.item.byteSize).toBe(Buffer.concat(chunks).byteLength);
+
+    const downloaded = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${draft.id}/files/${uploadBody.item.id}`,
+      headers: { cookie: author }
+    });
+    expect(downloaded.statusCode).toBe(200);
+    expect(downloaded.rawPayload).toEqual(Buffer.concat(chunks));
+    expect(downloaded.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  it("题面图片允许四种声明类型且各自必须使用对应文件头", async () => {
+    const { app } = await makeFileApp();
+    const author = await login(app, databaseDemoUserIds.author);
+    const draft = await createDraft(app, author);
+    const images = [
+      {
+        logicalExtension: "PNG",
+        originalExtension: "png",
+        mediaType: "image/png",
+        content: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01])
+      },
+      {
+        logicalExtension: "jpeg",
+        originalExtension: "JPG",
+        mediaType: "image/jpeg",
+        content: Buffer.from([0xff, 0xd8, 0xff, 0xe0])
+      },
+      {
+        logicalExtension: "GiF",
+        originalExtension: "gif",
+        mediaType: "image/gif",
+        content: Buffer.from("GIF89a+")
+      },
+      {
+        logicalExtension: "webp",
+        originalExtension: "WEBP",
+        mediaType: "image/webp",
+        content: Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("WEBP+")])
+      }
+    ];
+    let expectedRevision = draft.revision;
+
+    for (const image of images) {
+      const uploaded = await uploadFile(app, author, draft.id, {
+        expectedRevision,
+        category: "statement_image",
+        logicalPath: `assets/allowed.${image.logicalExtension}`,
+        originalName: `allowed.${image.originalExtension}`,
+        mediaType: image.mediaType,
+        content: image.content
+      });
+      expect(uploaded.statusCode).toBe(200);
+      const body = uploaded.json() as { item: { mediaType: string }; revision: number };
+      expect(body.item.mediaType).toBe(image.mediaType);
+      expectedRevision = body.revision;
+    }
+  });
+
+  it("文件存储和读取失败使用固定响应且不泄漏底层错误", async () => {
+    const { app } = await makeFileApp();
+    const author = await login(app, databaseDemoUserIds.author);
+    const draft = await createDraft(app, author);
+    const privateFailure = "private-storage-detail";
+
+    vi.spyOn(LocalFileStorage.prototype, "stage").mockRejectedValueOnce(new Error(privateFailure));
+    const failedUpload = await uploadFile(app, author, draft.id, {
+      expectedRevision: draft.revision,
+      category: "public_attachment",
+      logicalPath: "attachments/failure.txt",
+      originalName: "failure.txt"
+    });
+    expect(failedUpload.statusCode).toBe(500);
+    expect(failedUpload.json()).toEqual({
+      error: expect.objectContaining({ code: "STORAGE_FAILED" })
+    });
+    expect(failedUpload.body).not.toContain(privateFailure);
+
+    const uploaded = await uploadFile(app, author, draft.id, {
+      expectedRevision: draft.revision,
+      category: "public_attachment",
+      logicalPath: "attachments/available.txt",
+      originalName: "available.txt"
+    });
+    expect(uploaded.statusCode).toBe(200);
+    const fileId = (uploaded.json() as { item: { id: string } }).item.id;
+
+    const openFile = vi
+      .spyOn(LocalFileStorage.prototype, "open")
+      .mockRejectedValueOnce(new Error(privateFailure));
+    const failedDownload = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${draft.id}/files/${fileId}`,
+      headers: { cookie: author }
+    });
+    expect(failedDownload.statusCode).toBe(500);
+    expect(failedDownload.json()).toEqual({
+      error: expect.objectContaining({ code: "STORAGE_FAILED" })
+    });
+    expect(failedDownload.body).not.toContain(privateFailure);
+
+    const failingReadStream: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => ({
+        next: () => Promise.reject(new Error(privateFailure))
+      })
+    };
+    openFile.mockResolvedValueOnce(failingReadStream);
+    const failedStreamDownload = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${draft.id}/files/${fileId}`,
+      headers: { cookie: author }
+    });
+    expect(failedStreamDownload.statusCode).toBe(500);
+    expect(failedStreamDownload.json()).toEqual({
+      error: expect.objectContaining({ code: "STORAGE_FAILED" })
+    });
+    expect(failedStreamDownload.body).not.toContain(privateFailure);
+
+    const closeEmptyRead = vi.fn(async (): Promise<IteratorResult<Uint8Array>> => ({
+      done: true,
+      value: undefined
+    }));
+    const emptyChunkStream: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => ({ done: false, value: new Uint8Array(0) }),
+        return: closeEmptyRead
+      })
+    };
+    openFile.mockResolvedValueOnce(emptyChunkStream);
+    const failedEmptyChunks = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${draft.id}/files/${fileId}`,
+      headers: { cookie: author }
+    });
+    expect(failedEmptyChunks.statusCode).toBe(500);
+    expect(failedEmptyChunks.json()).toEqual({
+      error: expect.objectContaining({ code: "STORAGE_FAILED" })
+    });
+    expect(closeEmptyRead).toHaveBeenCalledOnce();
+
+    const closeShortRead = vi.fn(async (): Promise<IteratorResult<Uint8Array>> => ({
+      done: true,
+      value: undefined
+    }));
+    const shortStream: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => ({ done: true, value: undefined }),
+        return: closeShortRead
+      })
+    };
+    openFile.mockResolvedValueOnce(shortStream);
+    const failedLength = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${draft.id}/files/${fileId}`,
+      headers: { cookie: author }
+    });
+    expect(failedLength.statusCode).toBe(500);
+    expect(failedLength.json()).toEqual({
+      error: expect.objectContaining({ code: "STORAGE_FAILED" })
+    });
+    expect(closeShortRead).toHaveBeenCalledOnce();
+
+    let partialReadCount = 0;
+    const closePartialRead = vi.fn(async (): Promise<IteratorResult<Uint8Array>> => ({
+      done: true,
+      value: undefined
+    }));
+    const partialFailureStream: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => {
+          partialReadCount += 1;
+          if (partialReadCount === 1) {
+            return { done: false as const, value: new Uint8Array(Buffer.from("file-")) };
+          }
+          throw new Error(privateFailure);
+        },
+        return: closePartialRead
+      })
+    };
+    openFile.mockResolvedValueOnce(partialFailureStream);
+    let partialResponse: Awaited<ReturnType<typeof app.inject>> | undefined;
+    let partialError: unknown;
+    try {
+      partialResponse = await app.inject({
+        method: "GET",
+        url: `/api/v1/problems/${draft.id}/files/${fileId}`,
+        headers: { cookie: author }
+      });
+    } catch (error) {
+      partialError = error;
+    }
+    expect(partialResponse !== undefined || partialError !== undefined).toBe(true);
+    const visibleFailure =
+      partialResponse?.body ??
+      (partialError instanceof Error ? `${partialError.name}:${partialError.message}` : "");
+    expect(visibleFailure).not.toContain(privateFailure);
+    if (partialResponse !== undefined) {
+      expect(partialResponse.rawPayload.byteLength).toBeLessThan(Buffer.byteLength("file-content"));
+    }
+    expect(closePartialRead).toHaveBeenCalledOnce();
   });
 });

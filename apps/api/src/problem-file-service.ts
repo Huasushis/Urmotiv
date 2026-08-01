@@ -9,8 +9,14 @@ import {
 import { StorageError, type FileStorage, type StagedFile, type StoredFile } from "@urmotiv/storage";
 import { ApiError, conflict, forbidden, notFound } from "./errors";
 import type { StoredProblem, StoredUser } from "./domain";
-import { ProblemFileStore, ProblemFileStoreError } from "./problem-file-store";
+import { type ProblemFileStore, ProblemFileStoreError } from "./problem-file-store";
 import type { ProblemService } from "./service";
+import {
+  InvalidStatementImageError,
+  prepareStatementImage,
+  StatementImageReadError,
+  type PreparedStatementImage
+} from "./statement-image";
 
 /** 这两类文件跟随题面公开；能看题面就能看到并下载它们。 */
 export const publicProblemFileCategories = [
@@ -101,16 +107,45 @@ export class ProblemFileService {
       throw forbidden("上传测试数据或内部资料需要测试数据管理权限。");
     }
 
+    let preparedImage: PreparedStatementImage | undefined;
+    if (input.category === "statement_image") {
+      try {
+        preparedImage = await prepareStatementImage(
+          input.mediaType,
+          [input.logicalPath, input.originalName],
+          content
+        );
+      } catch (error) {
+        if (error instanceof InvalidStatementImageError) {
+          throw invalidStatementImage();
+        }
+        if (error instanceof StatementImageReadError) {
+          throw storageFailed();
+        }
+        throw storageFailed();
+      }
+    }
+    const checkedContent = preparedImage?.content ?? content;
+
     let staged: StagedFile;
     try {
       staged = await this.#storage.stage({
         originalName: input.originalName,
         mediaType: input.mediaType,
-        content
+        content: checkedContent
       });
     } catch (error) {
+      await preparedImage?.close();
+      if (
+        input.category === "statement_image" &&
+        error instanceof StorageError &&
+        error.code === "INVALID_STREAM"
+      ) {
+        throw invalidStatementImage();
+      }
       throw translateStorageError(error);
     }
+    await preparedImage?.close();
     let stored: StoredFile;
     try {
       stored = await this.#storage.publish(staged);
@@ -179,16 +214,22 @@ export class ProblemFileService {
   ): Promise<ProblemFileDownload> {
     const access = await this.#service.getProblemForFileAccess(user, problemId);
     const record = await this.#findVisibleFile(access, fileId, "read");
-    let stream: AsyncIterable<Uint8Array>;
+    const item = toSummary(record);
     try {
-      stream = await this.#storage.open({ id: record.id, storageKey: record.storageKey });
+      const stream = await this.#storage.open({ id: record.id, storageKey: record.storageKey });
+      return {
+        item,
+        stream: await prepareDownloadStream(stream, record.byteSize)
+      };
     } catch (error) {
       if (error instanceof StorageError && error.code === "OBJECT_NOT_FOUND") {
         throw notFound();
       }
+      if (error instanceof ApiError) {
+        throw error;
+      }
       throw translateStorageError(error);
     }
-    return { item: toSummary(record), stream };
   }
 
   /**
@@ -254,6 +295,8 @@ interface ProblemFileAccessCapabilities {
   readonly canWriteTestdata: boolean;
 }
 
+const maximumConsecutiveEmptyDownloadChunks = 1024;
+
 function requireRevisionId(problem: StoredProblem): string {
   if (problem.revisionId === undefined) {
     throw new Error("题目文件功能需要数据库存储提供版本编号。");
@@ -275,6 +318,147 @@ function toSummary(record: ProblemRevisionFileRecord): ProblemFileSummary {
   });
 }
 
+function invalidStatementImage(): ApiError {
+  return new ApiError(
+    422,
+    "INVALID_STATEMENT_IMAGE",
+    "题面图片必须是内容与声明类型一致的 PNG、JPEG、GIF 或 WebP 文件。"
+  );
+}
+
+function storageFailed(): ApiError {
+  return new ApiError(500, "STORAGE_FAILED", "文件存储暂时不可用，请稍后重试。");
+}
+
+async function closeDownloadIterator(iterator: AsyncIterator<Uint8Array>): Promise<void> {
+  try {
+    await iterator.return?.();
+  } catch {
+    // 关闭失败不能覆盖固定的存储错误。
+  }
+}
+
+function closeDownloadIteratorOnce(iterator: AsyncIterator<Uint8Array>): () => Promise<void> {
+  let closing: Promise<void> | undefined;
+  return () => {
+    closing ??= closeDownloadIterator(iterator);
+    return closing;
+  };
+}
+
+async function prepareDownloadStream(
+  source: AsyncIterable<Uint8Array>,
+  expectedByteSize: number
+): Promise<AsyncIterable<Uint8Array>> {
+  let iterator: AsyncIterator<Uint8Array>;
+  try {
+    iterator = source[Symbol.asyncIterator]();
+  } catch {
+    throw new StorageError("STORAGE_READ_FAILED", "文件读取失败。");
+  }
+  const close = closeDownloadIteratorOnce(iterator);
+
+  let emptyChunks = 0;
+  while (true) {
+    let step: IteratorResult<Uint8Array>;
+    try {
+      step = await iterator.next();
+    } catch {
+      await close();
+      throw new StorageError("STORAGE_READ_FAILED", "文件读取失败。");
+    }
+    if (typeof step !== "object" || step === null) {
+      await close();
+      throw new StorageError("STORAGE_READ_FAILED", "文件读取失败。");
+    }
+    if (step.done === true) {
+      await close();
+      if (expectedByteSize !== 0) {
+        throw new StorageError("STORAGE_READ_FAILED", "文件读取失败。");
+      }
+      return emptyDownloadStream();
+    }
+    if (!(step.value instanceof Uint8Array)) {
+      await close();
+      throw new StorageError("STORAGE_READ_FAILED", "文件读取失败。");
+    }
+    if (step.value.byteLength === 0) {
+      emptyChunks += 1;
+      if (emptyChunks > maximumConsecutiveEmptyDownloadChunks) {
+        await close();
+        throw new StorageError("STORAGE_READ_FAILED", "文件读取失败。");
+      }
+      continue;
+    }
+    if (step.value.byteLength > expectedByteSize) {
+      await close();
+      throw new StorageError("STORAGE_READ_FAILED", "文件读取失败。");
+    }
+    return replayDownloadStream(step.value, iterator, expectedByteSize, close);
+  }
+}
+
+function emptyDownloadStream(): AsyncIterable<Uint8Array> {
+  return {
+    [Symbol.asyncIterator]: () => ({
+      next: async () => ({ done: true, value: undefined })
+    })
+  };
+}
+
+async function* replayDownloadStream(
+  firstChunk: Uint8Array,
+  iterator: AsyncIterator<Uint8Array>,
+  expectedByteSize: number,
+  close: () => Promise<void>
+): AsyncGenerator<Uint8Array> {
+  let completed = false;
+  let emittedBytes = firstChunk.byteLength;
+  let emptyChunks = 0;
+  try {
+    yield firstChunk;
+    while (true) {
+      let step: IteratorResult<Uint8Array>;
+      try {
+        step = await iterator.next();
+      } catch {
+        throw storageFailed();
+      }
+      if (typeof step !== "object" || step === null) {
+        throw storageFailed();
+      }
+      if (step.done === true) {
+        if (emittedBytes !== expectedByteSize) {
+          throw storageFailed();
+        }
+        completed = true;
+        await close();
+        return;
+      }
+      if (!(step.value instanceof Uint8Array)) {
+        throw storageFailed();
+      }
+      if (step.value.byteLength === 0) {
+        emptyChunks += 1;
+        if (emptyChunks > maximumConsecutiveEmptyDownloadChunks) {
+          throw storageFailed();
+        }
+        continue;
+      }
+      emptyChunks = 0;
+      if (emittedBytes + step.value.byteLength > expectedByteSize) {
+        throw storageFailed();
+      }
+      emittedBytes += step.value.byteLength;
+      yield step.value;
+    }
+  } finally {
+    if (!completed) {
+      await close();
+    }
+  }
+}
+
 function translateMetadataError(error: unknown): unknown {
   if (error instanceof ProblemFileStoreError && error.code === "FILE_LINK_CONFLICT") {
     return conflict("该题目版本中已有相同路径的文件。可以选择替换，或换一个文件路径。");
@@ -287,7 +471,7 @@ function translateMetadataError(error: unknown): unknown {
 
 function translateStorageError(error: unknown): unknown {
   if (!(error instanceof StorageError)) {
-    return error;
+    return new ApiError(500, "STORAGE_FAILED", "文件存储暂时不可用，请稍后重试。");
   }
   if (error.code === "FILE_TOO_LARGE") {
     return new ApiError(413, "FILE_TOO_LARGE", "文件超出允许的大小限制。");
