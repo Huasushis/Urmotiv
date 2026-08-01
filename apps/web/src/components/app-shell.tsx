@@ -34,8 +34,11 @@ export function AppShell({ session, demoEnabled, children }: AppShellProps) {
   const signOut = useMutation({
     mutationFn: logout,
     onSuccess: () => {
-      client.setQueryData(["session"], undefined);
-      void client.invalidateQueries({ queryKey: ["session"] });
+      client.removeQueries({
+        predicate: (query) => query.queryKey[0] !== "session"
+      });
+      client.getMutationCache().clear();
+      void client.resetQueries({ queryKey: ["session"], exact: true });
     }
   });
   return (

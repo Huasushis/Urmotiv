@@ -61,6 +61,65 @@ test("手机视口中的 Markdown 编辑器在编辑和预览间切换", async (
   await page.screenshot({ path: testInfo.outputPath("mobile-markdown-preview.png"), fullPage: true });
 });
 
+test("评价公开字段、本人修改和状态联动在桌面与手机上保持一致", async ({ page }, testInfo) => {
+  await loginAsAuthor(page);
+  const problem = await postJson(page, "/api/v1/problems", {
+    title: `审核页面联调题-${testInfo.project.name}-${Date.now()}`,
+    type: "traditional",
+    tagIds: ["algorithm.implementation"],
+    content: {
+      basicStatement: "给定一个整数，原样输出。",
+      basicSolution: "直接输出输入值。",
+      background: "",
+      statement: "",
+      inputFormat: "",
+      outputFormat: "",
+      constraints: "",
+      solution: "",
+      hints: ""
+    },
+    samples: []
+  });
+  const problemId = problem.id as string;
+  const submitted = await postJson(page, `/api/v1/problems/${problemId}/submit`, {
+    expectedRevision: problem.revision
+  });
+
+  await loginAs(page, /审题人/);
+  await page.goto(`/problems/${problemId}?tab=reviews`);
+  await expect(page.getByRole("heading", { name: "提交我的评价" })).toBeVisible();
+  await page.getByLabel("结论").selectOption("request_changes");
+  await page.getByLabel("主要改进点").fill("请补充负数输入的说明。");
+  await page.getByLabel("仅审题人可见备注（可选）").fill("内部复核备注，不向作者公开。");
+  await page.getByRole("button", { name: "提交审核意见" }).click();
+  await expect(page.getByText("我的评价 · 人工审核")).toBeVisible();
+  await expect(page.locator(".review-item").getByText("请补充负数输入的说明。")).toBeVisible();
+
+  await loginAs(page, /投稿人/);
+  await page.goto(`/problems/${problemId}?tab=reviews`);
+  await expect(page.getByText("请补充负数输入的说明。")).toBeVisible();
+  await expect(page.getByText("内部复核备注，不向作者公开。")).toHaveCount(0);
+  await expect(page.locator(".review-form")).toHaveCount(0);
+
+  await loginAs(page, /审题人/);
+  await page.goto(`/problems/${problemId}?tab=reviews`);
+  await expect(page.getByRole("heading", { name: "修改我的评价" })).toBeVisible();
+  await expect(page.getByLabel("主要改进点")).toHaveValue("请补充负数输入的说明。");
+  await page.getByLabel("结论").selectOption("reject");
+  await page.getByLabel("主要改进点").fill("题面缺少必要约束，暂不通过。");
+  await page.getByRole("button", { name: "保存修改" }).click();
+
+  await expect(page.locator(".review-summary").getByText("审核不通过")).toBeVisible();
+  await expect(page.getByText("本轮审核已经结束，所有意见均为只读。")).toBeVisible();
+  await expect(page.locator(".review-form")).toHaveCount(0);
+  expect(submitted.reviewRound).toBe(1);
+  const pageFitsViewport = await page.evaluate(
+    () => document.documentElement.scrollWidth <= document.documentElement.clientWidth
+  );
+  expect(pageFitsViewport).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("review-workflow.png"), fullPage: true });
+});
+
 test("组长把审核通过的固定题目版本加入组题方案", async ({ page }, testInfo) => {
   const authorSession = await loginAs(page, /投稿人/);
   const problem = await postJson(page, "/api/v1/problems", {

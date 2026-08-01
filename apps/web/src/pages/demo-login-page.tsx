@@ -31,8 +31,8 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
   const [verificationPending, setVerificationPending] = useState(false);
   const auth = existingSession?.auth;
   const complete = (session: SessionResponse) => {
+    client.clear();
     client.setQueryData(["session"], session);
-    client.invalidateQueries({ queryKey: ["problems"] });
     navigate("/problems");
   };
   const login = useMutation({ mutationFn: demoLogin, onSuccess: complete });

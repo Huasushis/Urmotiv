@@ -752,45 +752,162 @@ describe("可配置审核决定流程", () => {
     }
   });
 
-  it("同一审题人更新意见时替换旧票而不是重复计票", async () => {
-    const { app } = await makeApp();
+  it("同一审题人修改自己的意见时重新判定题目，轮次结束后不能再改", async () => {
+    for (const expected of [
+      {
+        verdict: "approve",
+        status: "approved",
+        approvals: 1,
+        blockingReviews: 0
+      },
+      {
+        verdict: "reject",
+        status: "rejected",
+        approvals: 0,
+        blockingReviews: 1
+      }
+    ] as const) {
+      const { app } = await makeApp();
+      const authorCookie = await login(app, "author");
+      const reviewerCookie = await login(app, "reviewer");
+      const leaderCookie = await login(app, "leader");
+      await updatePolicy(app, leaderCookie, 1, {
+        requiredApprovals: 1,
+        maximumRejections: 0,
+        countRobotReviews: false
+      });
+      const problem = await submitProblem(
+        app,
+        authorCookie,
+        await createDraft(app, authorCookie)
+      );
+
+      const first = await submitReview(
+        app,
+        reviewerCookie,
+        problem.id,
+        problem.reviewRound,
+        "request_changes"
+      );
+      expect(first.statusCode).toBe(200);
+      const firstSummary = first.json() as ReviewSummaryResult;
+      expect(firstSummary).toEqual(expect.objectContaining({
+        approvals: 0,
+        blockingReviews: 0,
+        status: "waiting"
+      }));
+      expect(firstSummary.reviews).toHaveLength(1);
+
+      const forgedTarget = await app.inject({
+        method: "POST",
+        url: `/api/v1/problems/${problem.id}/reviews`,
+        headers: { cookie: reviewerCookie, origin },
+        payload: {
+          ...reviewInput(problem.reviewRound, expected.verdict),
+          id: "another-review",
+          reviewerId: "member"
+        }
+      });
+      expect(forgedTarget.statusCode).toBe(422);
+
+      const changed = await submitReview(
+        app,
+        reviewerCookie,
+        problem.id,
+        problem.reviewRound,
+        expected.verdict
+      );
+      expect(changed.statusCode).toBe(200);
+      const changedSummary = changed.json() as ReviewSummaryResult;
+      expect(changedSummary).toEqual(expect.objectContaining({
+        status: expected.status,
+        approvals: expected.approvals,
+        blockingReviews: expected.blockingReviews,
+        decisionSource: "rule"
+      }));
+      expect(changedSummary.reviews).toHaveLength(1);
+      expect(changedSummary.reviews[0]?.id).toBe(firstSummary.reviews[0]?.id);
+      expect(changedSummary.reviews[0]?.verdict).toBe(expected.verdict);
+
+      const afterClose = await submitReview(
+        app,
+        reviewerCookie,
+        problem.id,
+        problem.reviewRound,
+        "request_changes"
+      );
+      expect(afterClose.statusCode).toBe(409);
+    }
+  });
+
+  it("有题目查看权的用户可以查看公开评价，但看不到私密备注也不能提交意见", async () => {
+    const reviewer = demoUser("reviewer");
+    const readOnlyUser: StoredUser = {
+      ...reviewer,
+      id: "review-reader",
+      nickname: "只读评价查看者",
+      roles: ["只读成员"],
+      grants: [...reviewer.grants, deny("problem.review")]
+    };
+    const { app } = await makeApp({
+      users: [...createDemoUsers(), readOnlyUser]
+    });
     const authorCookie = await login(app, "author");
     const reviewerCookie = await login(app, "reviewer");
-    const leaderCookie = await login(app, "leader");
-    await updatePolicy(app, leaderCookie, 1, {
-      requiredApprovals: 2,
-      maximumRejections: 1,
-      countRobotReviews: false
-    });
-    const problem = await submitProblem(app, authorCookie, await createDraft(app, authorCookie));
-
-    const first = await submitReview(app, reviewerCookie, problem.id, problem.reviewRound);
-    expect(first.statusCode).toBe(200);
-    const firstSummary = first.json() as ReviewSummaryResult;
-    expect(firstSummary).toEqual(expect.objectContaining({
-      approvals: 1,
-      blockingReviews: 0,
-      status: "waiting"
-    }));
-    expect(firstSummary.reviews).toHaveLength(1);
-
-    const changed = await submitReview(
+    const readOnlyCookie = await login(app, readOnlyUser.id);
+    const noAccessCookie = await login(app, "denied");
+    const problem = await submitProblem(
       app,
-      reviewerCookie,
-      problem.id,
-      problem.reviewRound,
-      "reject"
+      authorCookie,
+      await createDraft(app, authorCookie)
     );
-    expect(changed.statusCode).toBe(200);
-    const changedSummary = changed.json() as ReviewSummaryResult;
-    expect(changedSummary).toEqual(expect.objectContaining({
-      approvals: 0,
-      blockingReviews: 1,
-      status: "waiting"
+    const privateNote = "只允许审题人查看的测试备注。";
+
+    const review = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${problem.id}/reviews`,
+      headers: { cookie: reviewerCookie, origin },
+      payload: {
+        ...reviewInput(problem.reviewRound, "request_changes"),
+        privateNote
+      }
+    });
+    expect(review.statusCode).toBe(200);
+
+    const visible = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${problem.id}/reviews`,
+      headers: { cookie: readOnlyCookie }
+    });
+    expect(visible.statusCode).toBe(200);
+    expect(visible.json()).toEqual(expect.objectContaining({
+      status: "waiting",
+      reviews: [
+        expect.objectContaining({
+          verdict: "request_changes",
+          improvements: "请补充边界情况说明。",
+          privateNote: ""
+        })
+      ]
     }));
-    expect(changedSummary.reviews).toHaveLength(1);
-    expect(changedSummary.reviews[0]?.id).toBe(firstSummary.reviews[0]?.id);
-    expect(changedSummary.reviews[0]?.verdict).toBe("reject");
+    expect(visible.body).not.toContain(privateNote);
+
+    const cannotSubmit = await submitReview(
+      app,
+      readOnlyCookie,
+      problem.id,
+      problem.reviewRound
+    );
+    expect(cannotSubmit.statusCode).toBe(403);
+
+    const hidden = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${problem.id}/reviews`,
+      headers: { cookie: noAccessCookie }
+    });
+    expect(hidden.statusCode).toBe(404);
+    expect(hidden.body).not.toContain("审核规则测试题");
+    expect(hidden.body).not.toContain(privateNote);
   });
 
   it("规则插件停用时审核意见与题目状态一起回滚", async () => {

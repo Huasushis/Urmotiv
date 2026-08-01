@@ -50,7 +50,11 @@ const tabs = [
 type TabId = (typeof tabs)[number]["id"];
 type SaveState = "saved" | "dirty" | "saving" | "failed";
 
-function localDraftKey(problemId: string): string {
+export function localDraftKey(currentUserId: string, problemId: string): string {
+  return `urmotiv.web.unsaved.${encodeURIComponent(currentUserId)}.${encodeURIComponent(problemId)}`;
+}
+
+function legacyLocalDraftKey(problemId: string): string {
   return `urmotiv.web.unsaved.${problemId}`;
 }
 
@@ -69,14 +73,14 @@ function updateInput(problem: Problem): UpdateProblemInput {
   };
 }
 
-export function ProblemWorkspacePage() {
+export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string }) {
   const { problemId = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab");
   const activeTab = tabs.some((tab) => tab.id === requestedTab) ? (requestedTab as TabId) : "overview";
   const client = useQueryClient();
   const problemQuery = useQuery({
-    queryKey: ["problem", problemId],
+    queryKey: ["problem", problemId, currentUserId],
     queryFn: () => getProblem(problemId),
     enabled: Boolean(problemId)
   });
@@ -120,7 +124,10 @@ export function ProblemWorkspacePage() {
 
   useEffect(() => {
     if (problemQuery.data && !dirty) {
-      const rawDraft = window.sessionStorage.getItem(localDraftKey(problemQuery.data.id));
+      window.sessionStorage.removeItem(legacyLocalDraftKey(problemQuery.data.id));
+      const rawDraft = window.sessionStorage.getItem(
+        localDraftKey(currentUserId, problemQuery.data.id)
+      );
       if (rawDraft) {
         try {
           const localDraft = JSON.parse(rawDraft) as Problem;
@@ -131,21 +138,21 @@ export function ProblemWorkspacePage() {
             return;
           }
         } catch {
-          window.sessionStorage.removeItem(localDraftKey(problemQuery.data.id));
+          window.sessionStorage.removeItem(localDraftKey(currentUserId, problemQuery.data.id));
         }
       }
       setWorking(problemQuery.data);
       setSaveState("saved");
     }
-  }, [problemQuery.data, dirty]);
+  }, [currentUserId, problemQuery.data, dirty]);
 
   const save = useMutation({
     mutationFn: ({ problem }: { problem: Problem; edit: number }) =>
       updateProblem(problem.id, updateInput(problem)),
     onMutate: () => setSaveState("saving"),
     onSuccess: (saved, variables) => {
-      client.setQueryData(["problem", saved.id], saved);
-      window.sessionStorage.removeItem(localDraftKey(saved.id));
+      client.setQueryData(["problem", saved.id, currentUserId], saved);
+      window.sessionStorage.removeItem(localDraftKey(currentUserId, saved.id));
       if (variables.edit === editNumber.current) {
         setWorking(saved);
         setDirty(false);
@@ -156,7 +163,10 @@ export function ProblemWorkspacePage() {
       }
     },
     onError: (_error, variables) => {
-      window.sessionStorage.setItem(localDraftKey(variables.problem.id), JSON.stringify(variables.problem));
+      window.sessionStorage.setItem(
+        localDraftKey(currentUserId, variables.problem.id),
+        JSON.stringify(variables.problem)
+      );
       setSaveState("failed");
     }
   });
@@ -193,8 +203,8 @@ export function ProblemWorkspacePage() {
         : withdrawProblem(working.id, working.revision);
     },
     onSuccess: (saved) => {
-      client.setQueryData(["problem", saved.id], saved);
-      window.sessionStorage.removeItem(localDraftKey(saved.id));
+      client.setQueryData(["problem", saved.id, currentUserId], saved);
+      window.sessionStorage.removeItem(localDraftKey(currentUserId, saved.id));
       client.invalidateQueries({ queryKey: ["problems"] });
       client.invalidateQueries({ queryKey: ["reviews", saved.id] });
       setWorking(saved);
@@ -339,7 +349,16 @@ export function ProblemWorkspacePage() {
         {activeTab === "samples" ? <SamplesTab problem={working} update={update} /> : null}
         {activeTab === "judge" ? <DataAndJudgeTab problem={working} update={update} /> : null}
         {activeTab === "solution" ? <SolutionTab problem={working} update={update} /> : null}
-        {activeTab === "reviews" ? <ReviewTab problem={working} /> : null}
+        {activeTab === "reviews" ? (
+          <ReviewTab
+            problem={working}
+            currentUserId={currentUserId}
+            submissionBlocked={dirty || save.isPending || saveState === "failed"}
+            onStatusChange={(status) => {
+              setWorking((current) => current === null ? current : { ...current, status });
+            }}
+          />
+        ) : null}
       </div>
     </section>
   );

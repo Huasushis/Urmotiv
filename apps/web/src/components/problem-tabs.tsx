@@ -13,7 +13,7 @@ import {
   Trash2
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { z } from "zod";
 import type {
   Problem,
@@ -838,16 +838,32 @@ export function ReviewItemCard({
   );
 }
 
-export function ReviewTab({ problem }: { problem: Problem }) {
+export function ReviewTab({
+  problem,
+  currentUserId,
+  submissionBlocked = false,
+  onStatusChange
+}: {
+  problem: Problem;
+  currentUserId: string;
+  submissionBlocked?: boolean;
+  onStatusChange?: (status: Problem["status"]) => void;
+}) {
   const client = useQueryClient();
   const reviews = useQuery({
-    queryKey: ["reviews", problem.id],
+    queryKey: ["reviews", problem.id, problem.reviewRound, currentUserId],
     queryFn: () => listReviews(problem.id),
     enabled: problem.reviewRound > 0
   });
   const reviewItems = useQuery({
-    queryKey: ["review-items", problem.id],
+    queryKey: ["review-items", problem.id, problem.reviewRound, currentUserId],
     queryFn: () => listReviewItems(problem.id),
+    enabled: problem.reviewRound > 0
+  });
+  const tags = useQuery({
+    queryKey: ["tags"],
+    queryFn: listTags,
+    staleTime: 5 * 60_000,
     enabled: problem.reviewRound > 0
   });
   const [verdict, setVerdict] = useState<ReviewInput["verdict"]>("request_changes");
@@ -855,16 +871,57 @@ export function ReviewTab({ problem }: { problem: Problem }) {
   const [quality, setQuality] = useState(3);
   const [thinking, setThinking] = useState(3);
   const [coding, setCoding] = useState(3);
+  const [tagIds, setTagIds] = useState<string[]>([]);
   const [improvements, setImprovements] = useState("");
   const [privateNote, setPrivateNote] = useState("");
+  const [loadedReviewVersion, setLoadedReviewVersion] = useState<string | null>(null);
+  const summary = reviews.data;
+  const ownReview = summary?.reviews.find((review) => review.reviewer.id === currentUserId);
+  const reviewVersion = summary === undefined
+    ? null
+    : JSON.stringify([
+        problem.id,
+        currentUserId,
+        summary.round,
+        ownReview?.id ?? "new",
+        ownReview?.updatedAt ?? "",
+        ownReview?.verdict ?? "",
+        ownReview?.codeforcesDifficulty ?? null,
+        ownReview?.qualityLevel ?? null,
+        ownReview?.thinkingLevel ?? null,
+        ownReview?.codingLevel ?? null,
+        ownReview?.tagIds ?? [],
+        ownReview?.improvements ?? "",
+        ownReview?.privateNote ?? ""
+      ]);
+
+  useEffect(() => {
+    if (reviewVersion === null || reviewVersion === loadedReviewVersion) {
+      return;
+    }
+    setVerdict(ownReview?.verdict ?? "request_changes");
+    setDifficulty(ownReview?.codeforcesDifficulty ?? problem.codeforcesDifficulty ?? 1600);
+    setQuality(ownReview?.qualityLevel ?? 3);
+    setThinking(ownReview?.thinkingLevel ?? 3);
+    setCoding(ownReview?.codingLevel ?? 3);
+    setTagIds(ownReview?.tagIds ?? []);
+    setImprovements(ownReview?.improvements ?? "");
+    setPrivateNote(ownReview?.privateNote ?? "");
+    setLoadedReviewVersion(reviewVersion);
+  }, [loadedReviewVersion, ownReview, problem.codeforcesDifficulty, reviewVersion]);
+
   const submit = useMutation({
     mutationFn: (input: ReviewInput) => createReview(problem.id, input),
     onSuccess: (summary) => {
-      client.setQueryData(["reviews", problem.id], summary);
+      client.setQueryData(
+        ["reviews", problem.id, problem.reviewRound, currentUserId],
+        summary
+      );
+      if (summary.status === "approved" || summary.status === "rejected") {
+        onStatusChange?.(summary.status);
+      }
       client.invalidateQueries({ queryKey: ["problem", problem.id] });
       client.invalidateQueries({ queryKey: ["problems"] });
-      setImprovements("");
-      setPrivateNote("");
     }
   });
 
@@ -878,14 +935,24 @@ export function ReviewTab({ problem }: { problem: Problem }) {
     );
   }
 
-  const summary = reviews.data;
+  const tagNameById = new Map((tags.data?.items ?? []).map((tag) => [tag.id, tag.name]));
+  const canEditOwnReview =
+    problem.capabilities.canReview &&
+    problem.status === "pending_review" &&
+    summary?.status === "waiting" &&
+    summary.decisionAvailable;
+  const displayedStatus =
+    summary?.status === "approved" || summary?.status === "rejected"
+      ? summary.status
+      : problem.status;
+
   return (
     <div className="workspace-section review-tab">
       <div className="review-summary">
         <div><span>当前轮次</span><strong>第 {summary?.round ?? problem.reviewRound} 轮</strong></div>
         <div><span>通过意见</span><strong>{summary?.approvals ?? 0}{summary?.requiredApprovals === null ? "" : ` / ${summary?.requiredApprovals ?? 2}`}</strong></div>
         <div><span>阻止通过</span><strong>{summary?.blockingReviews ?? 0}</strong></div>
-        <div><span>题目状态</span><strong>{statusText[problem.status]}</strong></div>
+        <div><span>题目状态</span><strong>{statusText[displayedStatus]}</strong></div>
       </div>
 
       {summary?.decisionAvailable === false ? (
@@ -922,28 +989,53 @@ export function ReviewTab({ problem }: { problem: Problem }) {
           <div className="section-title"><div><p className="eyebrow">记录</p><h2>本轮审核意见</h2></div></div>
           {reviews.isLoading ? <p className="empty-state">正在加载审核记录…</p> : null}
           {!reviews.isLoading && !summary?.reviews.length ? <p className="empty-state">本轮还没有审核意见。</p> : null}
-          {summary?.reviews.map((review) => (
-            <article className="review-item" key={review.id}>
-              <header>
-                <div><strong>{review.reviewer.nickname}</strong><span>{sourceName[review.source]}</span></div>
-                <span className={`review-verdict ${review.verdict}`}>{reviewVerdictText(review.verdict)}</span>
-              </header>
-              <dl>
-                <div><dt>CF 难度</dt><dd>{review.codeforcesDifficulty}</dd></div>
-                <div><dt>题目质量</dt><dd>{review.qualityLevel}</dd></div>
-                <div><dt>思维难度</dt><dd>{review.thinkingLevel}</dd></div>
-                <div><dt>代码难度</dt><dd>{review.codingLevel}</dd></div>
-              </dl>
-              <p>{review.improvements}</p>
-              {review.privateNote ? <p className="private-note"><LockKeyhole size={14} />{review.privateNote}</p> : null}
-              <footer>{dateTime(review.updatedAt)}</footer>
-            </article>
-          ))}
+          {summary?.reviews.map((review) => {
+            const isOwnReview = review.reviewer.id === currentUserId;
+            return (
+              <article className="review-item" key={review.id}>
+                <header>
+                  <div>
+                    <strong>{review.reviewer.nickname}</strong>
+                    <span>{isOwnReview ? "我的评价 · " : ""}{sourceName[review.source]}</span>
+                  </div>
+                  <span className={`review-verdict ${review.verdict}`}>{reviewVerdictText(review.verdict)}</span>
+                </header>
+                <dl>
+                  <div><dt>CF 难度</dt><dd>{review.codeforcesDifficulty}</dd></div>
+                  <div><dt>题目质量</dt><dd>{review.qualityLevel}</dd></div>
+                  <div><dt>思维难度</dt><dd>{review.thinkingLevel}</dd></div>
+                  <div><dt>代码难度</dt><dd>{review.codingLevel}</dd></div>
+                </dl>
+                {review.tagIds.length > 0 ? (
+                  <div className="compact-tags" aria-label="建议知识点">
+                    {review.tagIds.map((tagId) => (
+                      <span key={tagId}>{tagNameById.get(tagId) ?? tagId}</span>
+                    ))}
+                  </div>
+                ) : null}
+                <p>{review.improvements}</p>
+                {review.privateNote ? <p className="private-note"><LockKeyhole size={14} />{review.privateNote}</p> : null}
+                <footer>{dateTime(review.updatedAt)}</footer>
+              </article>
+            );
+          })}
+          {summary !== undefined && summary.status !== "waiting" ? (
+            <p className="field-help">
+              <LockKeyhole size={14} />
+              本轮审核已经结束，所有意见均为只读。
+            </p>
+          ) : null}
         </section>
 
-        {problem.capabilities.canReview && problem.status === "pending_review" ? (
+        {canEditOwnReview ? (
           <section className="review-form plain-panel">
-            <div className="section-title"><div><p className="eyebrow">你的意见</p><h2>提交结构化审核</h2></div><ShieldCheck size={21} /></div>
+            <div className="section-title">
+              <div>
+                <p className="eyebrow">你的意见</p>
+                <h2>{ownReview ? "修改我的评价" : "提交我的评价"}</h2>
+              </div>
+              <ShieldCheck size={21} />
+            </div>
             <label className="field"><span>结论</span><select value={verdict} onChange={(e) => setVerdict(e.target.value as ReviewInput["verdict"])}><option value="approve">通过</option><option value="request_changes">需要修改</option><option value="reject">不通过</option></select></label>
             <label className="field"><span>CF 难度</span><input type="number" min={800} max={3500} step={100} value={difficulty} onChange={(e) => setDifficulty(Number(e.target.value))} /></label>
             <div className="three-field-grid">
@@ -951,11 +1043,46 @@ export function ReviewTab({ problem }: { problem: Problem }) {
               <LevelSelect label="思维难度" value={thinking} onChange={setThinking} />
               <LevelSelect label="代码难度" value={coding} onChange={setCoding} />
             </div>
+            <div className="field">
+              <span>建议知识点（可选）</span>
+              <TagPicker
+                tags={tags.data?.items ?? []}
+                value={tagIds}
+                onChange={setTagIds}
+                disabled={tags.isLoading || tags.isError}
+              />
+              {tags.isError ? <small>知识点暂时无法读取，原有选择会继续保留。</small> : null}
+            </div>
             <label className="field"><span>主要改进点</span><textarea rows={6} value={improvements} onChange={(e) => setImprovements(e.target.value)} placeholder="说明需要修改的内容；如果通过，说明判断依据。" /></label>
             <label className="field"><span>仅审题人可见备注（可选）</span><textarea rows={3} value={privateNote} onChange={(e) => setPrivateNote(e.target.value)} /></label>
             {submit.error ? <p className="form-error">{submit.error.message}</p> : null}
-            <button className="primary-button" type="button" disabled={!improvements.trim() || submit.isPending} onClick={() => submit.mutate({ verdict, codeforcesDifficulty: difficulty, qualityLevel: quality, thinkingLevel: thinking, codingLevel: coding, tagIds: [], improvements, privateNote, expectedRound: problem.reviewRound })}>{submit.isPending ? "正在提交…" : "提交审核意见"}</button>
-            <p className="field-help"><AlertTriangle size={14} />提交意见不等于直接改变状态，最终结果由服务端审核规则判断。</p>
+            <button
+              className="primary-button"
+              type="button"
+              disabled={!improvements.trim() || submit.isPending || submissionBlocked}
+              onClick={() => submit.mutate({
+                verdict,
+                codeforcesDifficulty: difficulty,
+                qualityLevel: quality,
+                thinkingLevel: thinking,
+                codingLevel: coding,
+                tagIds,
+                improvements,
+                privateNote,
+                expectedRound: problem.reviewRound
+              })}
+            >
+              {submit.isPending ? "正在保存…" : ownReview ? "保存修改" : "提交审核意见"}
+            </button>
+            <p className="field-help" role="note">
+              <AlertTriangle size={14} />
+              保存后会立即重新执行审核规则，题目可能因此直接通过或不通过；轮次结束后不能再修改。
+            </p>
+            {submissionBlocked ? (
+              <p className="field-help" role="note">
+                请先保存题目工作区中的修改，再保存审核意见。
+              </p>
+            ) : null}
           </section>
         ) : null}
       </div>

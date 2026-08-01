@@ -598,15 +598,6 @@ export class ProblemService {
 
   public async getReviewSummary(user: StoredUser, problemId: string): Promise<ReviewRoundSummary> {
     const problem = await this.findVisibleProblem(user, problemId);
-    const target = { ownerId: problem.ownerId, objectId: problem.id };
-    if (
-      problem.ownerId !== user.id &&
-      !hasPermission(user, "problem.review", target, this.now()) &&
-      !hasPermission(user, "problem.status.change", target, this.now())
-    ) {
-      throw forbidden();
-    }
-
     if (problem.reviewRound === 0) {
       throw conflict("题目尚未提交审核，因此还没有审核轮次。");
     }

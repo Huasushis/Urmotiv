@@ -65,7 +65,15 @@ function App() {
         <Route path="/" element={<Navigate to="/problems" replace />} />
         <Route path="/problems" element={<ProblemListPage />} />
         <Route path="/problems/new" element={<CreateProblemPage />} />
-        <Route path="/problems/:problemId" element={<ProblemWorkspacePage />} />
+        <Route
+          path="/problems/:problemId"
+          element={
+            <ProblemWorkspacePage
+              key={sessionData.user.id}
+              currentUserId={sessionData.user.id}
+            />
+          }
+        />
         <Route path="/submissions" element={<ProblemListPage ownOnly />} />
         <Route path="/reviews" element={<ProblemListPage fixedStatus="pending_review" />} />
         <Route path="/contests" element={<ContestPage />} />
