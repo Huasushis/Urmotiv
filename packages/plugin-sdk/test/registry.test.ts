@@ -4,7 +4,8 @@ import {
   combineBeforeSubmitResults,
   PluginRegistry,
   PluginRegistryError,
-  type BeforeSubmitInput
+  type BeforeSubmitInput,
+  type ReviewOpinion
 } from "../src";
 
 const input: BeforeSubmitInput = {
@@ -27,6 +28,30 @@ const pluginManifest = {
   version: "1.0.0",
   apiVersion: "1" as const
 };
+
+function opinion(
+  id: string,
+  reviewerId: string,
+  overrides: Partial<ReviewOpinion> = {}
+): ReviewOpinion {
+  return {
+    id,
+    reviewRound: 2,
+    reviewerId,
+    reviewerAccountType: "human",
+    verdict: "approve",
+    codeforcesDifficulty: 1600,
+    qualityLevel: 3,
+    thinkingLevel: 3,
+    codingLevel: 2,
+    tagIds: ["graph.shortest-path"],
+    improvements: "请补充边界情况说明。",
+    source: "human",
+    reviewerCanReview: true,
+    updatedAt: "2026-07-25T00:00:00.000Z",
+    ...overrides
+  };
+}
 
 describe("PluginRegistry", () => {
   it("keeps a block decision even after an earlier check continued", async () => {
@@ -185,46 +210,15 @@ describe("PluginRegistry", () => {
           round: 2,
           contentHash: "a".repeat(64),
           opinions: [
-            {
-              id: "old",
-              reviewRound: 1,
-              reviewerId: "reviewer-1",
-              reviewerAccountType: "human",
-              verdict: "approve",
-              source: "human",
-              reviewerCanReview: true,
-              updatedAt: "2026-07-25T00:00:00.000Z"
-            },
-            {
-              id: "valid",
-              reviewRound: 2,
-              reviewerId: "reviewer-2",
-              reviewerAccountType: "human",
-              verdict: "approve",
-              source: "human",
-              reviewerCanReview: true,
+            opinion("old", "reviewer-1", { reviewRound: 1 }),
+            opinion("valid", "reviewer-2", {
               updatedAt: "2026-07-25T01:00:00.000Z"
-            },
-            {
-              id: "replaced",
-              reviewRound: 2,
-              reviewerId: "reviewer-3",
-              reviewerAccountType: "human",
-              verdict: "approve",
-              source: "human",
-              reviewerCanReview: true,
-              updatedAt: "2026-07-25T00:00:00.000Z"
-            },
-            {
-              id: "ineligible",
-              reviewRound: 2,
-              reviewerId: "reviewer-3",
-              reviewerAccountType: "human",
-              verdict: "approve",
-              source: "human",
+            }),
+            opinion("replaced", "reviewer-3"),
+            opinion("ineligible", "reviewer-3", {
               reviewerCanReview: false,
               updatedAt: "2026-07-25T01:00:00.000Z"
-            }
+            })
           ],
           reviewItems: []
         },
@@ -232,6 +226,121 @@ describe("PluginRegistry", () => {
       )
     ).resolves.toMatchObject({ usedOpinionIds: ["valid"] });
     expect(visibleOpinionIds).toEqual(["valid"]);
+  });
+
+  it("passes every public structured field in an immutable opinion snapshot", async () => {
+    const registry = new PluginRegistry();
+    let visibleOpinion: ReviewOpinion | undefined;
+    let opinionWasFrozen = false;
+    let tagsWereFrozen = false;
+    let mutationWasBlocked = false;
+    registry.registerReviewDecisionRule({
+      id: "org.example.structured-rule",
+      displayName: "结构化字段示例规则",
+      supportedReviewItemTypes: [],
+      settingsSchema: z.object({}).strict(),
+      evaluate: (snapshot) => {
+        const current = snapshot.opinions[0];
+        if (current === undefined) {
+          throw new Error("测试快照缺少意见。");
+        }
+        visibleOpinion = current;
+        opinionWasFrozen = Object.isFrozen(current);
+        tagsWereFrozen = Object.isFrozen(current.tagIds);
+        try {
+          current.tagIds.push("unexpected");
+        } catch {
+          mutationWasBlocked = true;
+        }
+        return {
+          decision: "pending",
+          usedOpinionIds: [current.id],
+          usedReviewItemIds: [],
+          reason: "测试"
+        };
+      }
+    });
+    registry.lock();
+
+    await registry.evaluateReviewDecision(
+      "org.example.structured-rule",
+      {
+        problemId: "problem-1",
+        round: 2,
+        contentHash: "a".repeat(64),
+        opinions: [opinion("current", "reviewer-1", {
+          verdict: "request_changes",
+          codeforcesDifficulty: 2300,
+          qualityLevel: 4,
+          thinkingLevel: 5,
+          codingLevel: 3,
+          tagIds: ["graph.flow", "data-structures"],
+          improvements: "请补充复杂度证明。"
+        })],
+        reviewItems: []
+      },
+      {}
+    );
+
+    expect(visibleOpinion).toEqual(expect.objectContaining({
+      verdict: "request_changes",
+      codeforcesDifficulty: 2300,
+      qualityLevel: 4,
+      thinkingLevel: 5,
+      codingLevel: 3,
+      tagIds: ["graph.flow", "data-structures"],
+      improvements: "请补充复杂度证明。"
+    }));
+    expect(Object.keys(visibleOpinion ?? {})).not.toContain("privateNote");
+    expect(opinionWasFrozen).toBe(true);
+    expect(tagsWereFrozen).toBe(true);
+    expect(mutationWasBlocked).toBe(true);
+  });
+
+  it("rejects private notes or problem content before a rule can inspect them", async () => {
+    const registry = new PluginRegistry();
+    let evaluationCount = 0;
+    registry.registerReviewDecisionRule({
+      id: "org.example.strict-rule",
+      displayName: "严格输入示例规则",
+      supportedReviewItemTypes: [],
+      settingsSchema: z.object({}).strict(),
+      evaluate: () => {
+        evaluationCount += 1;
+        return {
+          decision: "pending",
+          usedOpinionIds: [],
+          usedReviewItemIds: [],
+          reason: "测试"
+        };
+      }
+    });
+    registry.lock();
+    const snapshot = {
+      problemId: "problem-1",
+      round: 2,
+      contentHash: "a".repeat(64),
+      opinions: [opinion("current", "reviewer-1")],
+      reviewItems: []
+    };
+
+    await expect(registry.evaluateReviewDecision(
+      "org.example.strict-rule",
+      {
+        ...snapshot,
+        opinions: [{ ...snapshot.opinions[0], privateNote: "不可进入规则" }]
+      } as never,
+      {}
+    )).rejects.toThrow();
+    await expect(registry.evaluateReviewDecision(
+      "org.example.strict-rule",
+      {
+        ...snapshot,
+        problem: { basicStatement: "不可进入规则" }
+      } as never,
+      {}
+    )).rejects.toThrow();
+    expect(evaluationCount).toBe(0);
   });
 
   it("rejects a rule result that names a hidden opinion", async () => {
@@ -257,18 +366,7 @@ describe("PluginRegistry", () => {
           problemId: "problem-1",
           round: 2,
           contentHash: "a".repeat(64),
-          opinions: [
-            {
-              id: "old",
-              reviewRound: 1,
-              reviewerId: "reviewer-1",
-              reviewerAccountType: "human",
-              verdict: "approve",
-              source: "human",
-              reviewerCanReview: true,
-              updatedAt: "2026-07-25T00:00:00.000Z"
-            }
-          ],
+          opinions: [opinion("old", "reviewer-1", { reviewRound: 1 })],
           reviewItems: []
         },
         {}

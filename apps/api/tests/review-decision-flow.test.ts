@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { PermissionGrant } from "@urmotiv/contracts";
 import { defaultReviewRuleId } from "@urmotiv/plugin-review-default";
+import type { ReviewRoundSnapshot } from "@urmotiv/plugin-sdk";
 import type { FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
@@ -21,6 +22,8 @@ const failingPluginId = "org.example.failing-review";
 const failingRuleId = `${failingPluginId}.rule`;
 const changingPluginId = "org.example.read-changing-review";
 const changingRuleId = `${changingPluginId}.rule`;
+const structuredPluginId = "org.example.structured-review";
+const structuredRuleId = `${structuredPluginId}.rule`;
 
 const fullContent = {
   basicStatement: "给定一个整数，输出它本身。",
@@ -342,6 +345,61 @@ function readChangingReviewPlugin(): TrustedPluginDefinition {
   };
 }
 
+function structuredReviewPlugin(
+  observe: (snapshot: ReviewRoundSnapshot) => void
+): TrustedPluginDefinition {
+  const settingsSchema = z.object({
+    minimumQualityLevel: z.number().int().min(1).max(5)
+  }).strict();
+  return {
+    source: "builtin:test-structured-review",
+    initialState: "enabled",
+    requiresRestart: false,
+    manifest: {
+      id: structuredPluginId,
+      name: "结构化评价字段测试插件",
+      version: "1.0.0",
+      apiVersion: "1",
+      permissions: []
+    },
+    reviewRuleSettingsSchemas: {
+      [structuredRuleId]: {
+        type: "object",
+        additionalProperties: false,
+        required: ["minimumQualityLevel"],
+        properties: {
+          minimumQualityLevel: {
+            type: "integer",
+            minimum: 1,
+            maximum: 5,
+            default: 4
+          }
+        }
+      }
+    },
+    registerHooks: (registry) => {
+      registry.registerReviewDecisionRule({
+        id: structuredRuleId,
+        displayName: "按质量等级判断的测试规则",
+        supportedReviewItemTypes: [],
+        settingsSchema,
+        evaluate: (input, settings) => {
+          observe(input);
+          const qualifyingOpinions = input.opinions.filter(
+            (opinion) => opinion.qualityLevel >= settings.minimumQualityLevel
+          );
+          return {
+            decision: qualifyingOpinions.length > 0 ? "approve" : "pending",
+            usedOpinionIds: qualifyingOpinions.map((opinion) => opinion.id),
+            usedReviewItemIds: [],
+            reason: qualifyingOpinions.length > 0 ? "质量等级达到测试门槛。" : "继续等待。"
+          };
+        }
+      });
+    }
+  };
+}
+
 async function expectUnavailableReviewWasRolledBack(
   app: FastifyInstance,
   problem: ProblemResult,
@@ -651,6 +709,91 @@ describe("可配置审核决定流程", () => {
       blockingReviews: 1,
       decisionSource: "rule"
     }));
+  });
+
+  it("可配置规则收到完整公开评价字段，但收不到私密备注或题目内容", async () => {
+    const observedSnapshots: ReviewRoundSnapshot[] = [];
+    const { app } = await makeApp({
+      definitions: [
+        ...createBuiltinPluginDefinitions(),
+        structuredReviewPlugin((snapshot) => observedSnapshots.push(snapshot))
+      ]
+    });
+    const authorCookie = await login(app, "author");
+    const reviewerCookie = await login(app, "reviewer");
+    const leaderCookie = await login(app, "leader");
+    await updatePolicy(
+      app,
+      leaderCookie,
+      1,
+      { minimumQualityLevel: 4 },
+      structuredRuleId
+    );
+    const problem = await submitProblem(app, authorCookie, await createDraft(app, authorCookie));
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${problem.id}/reviews`,
+      headers: { cookie: reviewerCookie, origin },
+      payload: {
+        verdict: "approve",
+        codeforcesDifficulty: 2300,
+        qualityLevel: 4,
+        thinkingLevel: 5,
+        codingLevel: 3,
+        tagIds: ["algorithm.implementation"],
+        improvements: "请补充复杂度证明。",
+        privateNote: "这段测试备注不能进入插件快照。",
+        expectedRound: problem.reviewRound
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(expect.objectContaining({
+      status: "approved",
+      decisionSource: "rule"
+    }));
+    const snapshot = observedSnapshots.at(-1);
+    expect(snapshot).toBeDefined();
+    if (snapshot === undefined) {
+      throw new Error("测试规则没有收到审核快照。");
+    }
+    expect(Object.keys(snapshot).sort()).toEqual([
+      "contentHash",
+      "opinions",
+      "problemId",
+      "reviewItems",
+      "round"
+    ]);
+    expect(snapshot.opinions).toHaveLength(1);
+    const visibleOpinion = snapshot.opinions[0];
+    expect(visibleOpinion).toEqual(expect.objectContaining({
+      verdict: "approve",
+      codeforcesDifficulty: 2300,
+      qualityLevel: 4,
+      thinkingLevel: 5,
+      codingLevel: 3,
+      tagIds: ["algorithm.implementation"],
+      improvements: "请补充复杂度证明。"
+    }));
+    expect(Object.keys(visibleOpinion ?? {}).sort()).toEqual([
+      "codeforcesDifficulty",
+      "codingLevel",
+      "id",
+      "improvements",
+      "qualityLevel",
+      "reviewRound",
+      "reviewerAccountType",
+      "reviewerCanReview",
+      "reviewerId",
+      "source",
+      "tagIds",
+      "thinkingLevel",
+      "updatedAt",
+      "verdict"
+    ]);
+    expect(Reflect.get(visibleOpinion ?? {}, "privateNote")).toBeUndefined();
+    expect(Reflect.get(snapshot, "problem")).toBeUndefined();
   });
 
   it("机器人是否计票由当前轮次快照决定", async () => {

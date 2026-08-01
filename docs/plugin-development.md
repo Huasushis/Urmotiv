@@ -165,6 +165,11 @@ export interface ReviewDecisionRule<TSettings> {
 直接 `import` 后调用——那就应该像 `review-default` 的 `latestUsableOpinions` 那样自己重新过滤一遍，
 不依赖调用方帮你把关。）
 
+每条 `opinion` 还固定包含 `codeforcesDifficulty`、`qualityLevel`、`thinkingLevel`、`codingLevel`、
+`tagIds` 和 `improvements`。插件可以把质量、难度或知识点门槛写进自己的 `settingsSchema`，由管理员选择
+这条规则并保存设置，再在 `evaluate` 中读取这些公开结构化字段。`privateNote`、题目名称、题面、题解和附件不在
+快照中；输入经过 `.strict()` 校验并在调用前冻结，插件也不能在判断过程中改写它。
+
 `plugins/example-review-rule/src/index.ts`：
 
 ```ts
@@ -302,22 +307,11 @@ import { registerExampleReviewRule } from "@urmotiv/plugin-example-review-rule";
   `signal`）。检查自己必须在 `run` 内部去读当前设置和密钥，这就要求 `registerHooks` 在注册时提前拿到
   一个能读设置/密钥/缓存的"运行时"对象，闭包捕获它——这正是第 7 节要讲的 `AnklangHookRuntime` 模式。
 
-**现状说明——这一步做完之后，规则是否真的会决定审核结果？** 接上 `registerHooks` 之后，这个规则就"存在"
-于 registry 里了：能用 `registry.listReviewRules()` 列出来，也能直接调用
-`registry.evaluateReviewDecision(ruleId, snapshot, settings)`（或
-`TrustedPluginHost.evaluateReviewDecision(...)`）拿到正确结果，`packages/plugin-sdk/test/registry.test.ts`
-就是这么测的。但截至目前，仓库里没有任何 HTTP 路由或后台流程会在一次真实审核后调用这个方法。审核轮次
-的通过/不通过判断，现在由 `apps/api/src/service.ts` 里 `summarizeReviewRound` 方法用一段独立硬编码逻辑
-完成（`defaultReviewSettings = { requiredApprovals: 2, maximumBlockingReviews: 0 }` 常量，且它会直接
-排除所有机器人和 Fermata 来源的意见），跟 `review-default` 插件包是两份相似但独立的实现——字段名都不
-一样（`maximumBlockingReviews` vs 插件包里的 `maximumRejections`）。`org.ustc.urmotiv.review-default` 这
-个内置插件目前在 `createBuiltinPluginDefinitions()` 里也确实只登记了清单和设置结构，没有传
-`registerHooks`，所以它导出的 `defaultReviewDecisionRule` 从未被注册进真正跑起来的 registry。
-
-也就是说：写一个 `ReviewDecisionRule` 插件在机制上是完整、可测试的，但要让它真正影响一次审核的通过与
-否，还需要 `apps/api` 那边把 `service.ts` 的审核流程接到 `evaluateReviewDecision` 上——这不是插件包自己
-能做到的事，需要连同核心审核服务一起改。动手写这类插件前，建议先搜一下 `apps/api/src/service.ts` 里还
-在不在 `defaultReviewSettings` 这段硬编码，确认这条链路是否已经补上。
+**这一步做完之后，规则会不会真的决定审核结果？** 会。内置插件和管理员启用的受信任插件通过
+`registerHooks` 把规则登记到运行中的 registry；提交或修改意见后，API 会调用
+`TrustedPluginHost.evaluateReviewDecision(...)`，并在同一事务内保存意见和可能发生的状态变化。每个审核
+轮次在提交题目时固定规则编号、插件版本和设置，之后修改全局策略不会偷偷改变正在进行的轮次。插件停用、超时、
+抛错或返回畸形结果时，本次意见和状态变化一起回滚，并向调用者返回固定的“审核规则不可用”错误。
 
 ## 6. 其余几类钩子的最小示例
 

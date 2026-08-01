@@ -989,6 +989,12 @@ export class ProblemService {
         reviewerId: review.reviewerId,
         reviewerAccountType: reviewer?.accountType ?? "human",
         verdict: review.verdict,
+        codeforcesDifficulty: review.codeforcesDifficulty,
+        qualityLevel: review.qualityLevel,
+        thinkingLevel: review.thinkingLevel,
+        codingLevel: review.codingLevel,
+        tagIds: [...review.tagIds],
+        improvements: review.improvements,
         source: review.source,
         reviewerCanReview,
         updatedAt: review.updatedAt

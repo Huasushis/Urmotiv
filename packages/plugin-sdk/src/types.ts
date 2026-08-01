@@ -1,4 +1,9 @@
-import { problemTypeSchema } from "@urmotiv/contracts";
+import {
+  codeforcesDifficultySchema,
+  difficultyLevelSchema,
+  problemTypeSchema,
+  reviewVerdictSchema
+} from "@urmotiv/contracts";
 import { z } from "zod";
 
 export type JsonValue =
@@ -134,7 +139,13 @@ export const reviewOpinionSchema = z
     reviewRound: z.number().int().positive(),
     reviewerId: z.string().min(1).max(200),
     reviewerAccountType: z.enum(["human", "robot"]),
-    verdict: z.enum(["approve", "request_changes", "reject"]),
+    verdict: reviewVerdictSchema,
+    codeforcesDifficulty: codeforcesDifficultySchema,
+    qualityLevel: difficultyLevelSchema,
+    thinkingLevel: difficultyLevelSchema,
+    codingLevel: difficultyLevelSchema,
+    tagIds: z.array(z.string().min(1).max(120)).max(30),
+    improvements: z.string().trim().min(1).max(20_000),
     source: z.enum(["human", "anklang", "fermata", "plugin"]),
     reviewerCanReview: z.boolean(),
     updatedAt: z.string().datetime()

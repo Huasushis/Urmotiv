@@ -18,6 +18,12 @@ function opinion(
     reviewerId,
     reviewerAccountType: "human",
     verdict,
+    codeforcesDifficulty: 1600,
+    qualityLevel: 3,
+    thinkingLevel: 3,
+    codingLevel: 2,
+    tagIds: ["graph.shortest-path"],
+    improvements: "请补充边界情况说明。",
     source: "human",
     reviewerCanReview: true,
     updatedAt: "2026-07-25T00:00:00.000Z",
@@ -105,6 +111,32 @@ describe("default review rule", () => {
     expect(decision.decision).toBe("approve");
     expect(decision.usedOpinionIds).toContain("new");
     expect(decision.usedOpinionIds).not.toContain("old");
+  });
+
+  it("keeps request-changes neutral regardless of its other structured scores", async () => {
+    const decision = await defaultReviewDecisionRule.evaluate(
+      {
+        problemId: "problem-1",
+        round: 1,
+        contentHash: "a".repeat(64),
+        opinions: [
+          opinion("approval", "reviewer-1", "approve"),
+          opinion("changes", "reviewer-2", "request_changes", {
+            codeforcesDifficulty: 3500,
+            qualityLevel: 5,
+            thinkingLevel: 5,
+            codingLevel: 5,
+            tagIds: ["dynamic-programming"],
+            improvements: "请重新核对样例与数据范围。"
+          })
+        ],
+        reviewItems: []
+      },
+      defaultReviewRuleSettingsSchema.parse({})
+    );
+
+    expect(decision.decision).toBe("pending");
+    expect(decision.usedOpinionIds).toEqual(["approval", "changes"]);
   });
 });
 
