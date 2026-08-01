@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { corePermissions, type CorePermission } from "@urmotiv/contracts";
 import { sql } from "drizzle-orm";
-import type { DatabaseHandle } from "./client";
+import type { DatabaseExecutor, DatabaseHandle } from "./client";
 
 interface PermissionText {
   readonly displayName: string;
@@ -321,6 +321,189 @@ export async function seedCoreDatabase(
   };
 }
 
+/**
+ * Checks only the rows owned by seedCoreDatabase. Callers that use this as a
+ * fresh-install guard must also prove that every other application table is empty.
+ */
+export async function hasExactDefaultCoreSeed(
+  executor: DatabaseExecutor
+): Promise<boolean> {
+  const rootRows = await executor.query<{
+    id: string;
+    nickname: string;
+    account_type: string;
+    password_hash: string | null;
+    auth_revision: number;
+    password_changed_at_is_null: boolean;
+    disabled_at_is_null: boolean;
+    disabled_reason_is_null: boolean;
+  }>(sql`
+    SELECT
+      id::text AS id,
+      nickname,
+      account_type::text AS account_type,
+      password_hash,
+      auth_revision::integer AS auth_revision,
+      password_changed_at IS NULL AS password_changed_at_is_null,
+      disabled_at IS NULL AS disabled_at_is_null,
+      disabled_reason IS NULL AS disabled_reason_is_null
+    FROM users
+    ORDER BY id
+  `);
+  if (!sameRows(rootRows, [{
+    id: "0",
+    nickname: "root",
+    account_type: "human",
+    password_hash: null,
+    auth_revision: 1,
+    password_changed_at_is_null: true,
+    disabled_at_is_null: true,
+    disabled_reason_is_null: true
+  }])) {
+    return false;
+  }
+
+  const permissionRows = await executor.query<{
+    name: string;
+    display_name: string;
+    description: string;
+    source: string;
+  }>(sql`
+    SELECT name, display_name, description, source
+    FROM permission_definitions
+    ORDER BY name
+  `);
+  const expectedPermissions = corePermissions
+    .map((name) => ({
+      name,
+      display_name: permissionText[name].displayName,
+      description: permissionText[name].description,
+      source: "core"
+    }))
+    .sort(compareNamedRows);
+  if (!sameRows(permissionRows, expectedPermissions)) {
+    return false;
+  }
+
+  const roleRows = await executor.query<{
+    id: string;
+    key: string;
+    display_name: string;
+    description: string;
+    is_built_in: boolean;
+    created_by_user_id: string | null;
+  }>(sql`
+    SELECT
+      id::text AS id,
+      key,
+      display_name,
+      description,
+      is_built_in,
+      created_by_user_id::text AS created_by_user_id
+    FROM roles
+    ORDER BY key
+  `);
+  const expectedRoles = roleDefinitions
+    .map((role) => ({
+      id: stableUuid(`role:${role.key}`),
+      key: role.key,
+      display_name: role.displayName,
+      description: role.description,
+      is_built_in: true,
+      created_by_user_id: "0"
+    }))
+    .sort((left, right) => compareText(left.key, right.key));
+  if (!sameRows(roleRows, expectedRoles)) {
+    return false;
+  }
+
+  const grantRows = await executor.query<{
+    id: string;
+    subject_user_id: string | null;
+    subject_role_id: string | null;
+    permission_name: string;
+    effect: string;
+    scope: string;
+    object_type: string | null;
+    object_id: string | null;
+    expires_at_is_null: boolean;
+    granted_by_user_id: string;
+    reason: string;
+    revoked_at_is_null: boolean;
+    revoked_by_user_id_is_null: boolean;
+  }>(sql`
+    SELECT
+      id::text AS id,
+      subject_user_id::text AS subject_user_id,
+      subject_role_id::text AS subject_role_id,
+      permission_name,
+      effect::text AS effect,
+      scope::text AS scope,
+      object_type,
+      object_id,
+      expires_at IS NULL AS expires_at_is_null,
+      granted_by_user_id::text AS granted_by_user_id,
+      reason,
+      revoked_at IS NULL AS revoked_at_is_null,
+      revoked_by_user_id IS NULL AS revoked_by_user_id_is_null
+    FROM permission_grants
+    ORDER BY id
+  `);
+  const expectedGrants = roleDefinitions
+    .flatMap((role) => role.permissions.map((permission) => ({
+      id: stableUuid(`role-grant:${role.key}:${permission}`),
+      subject_user_id: null,
+      subject_role_id: stableUuid(`role:${role.key}`),
+      permission_name: permission,
+      effect: "allow",
+      scope: permission.endsWith(".own") ? "own" : "global",
+      object_type: null,
+      object_id: null,
+      expires_at_is_null: true,
+      granted_by_user_id: "0",
+      reason: "内置角色的初始权限",
+      revoked_at_is_null: true,
+      revoked_by_user_id_is_null: true
+    })))
+    .sort((left, right) => compareText(left.id, right.id));
+  if (!sameRows(grantRows, expectedGrants)) {
+    return false;
+  }
+
+  const membershipRows = await executor.query<{
+    id: string;
+    user_id: string;
+    role_id: string;
+    granted_by_user_id: string;
+    reason: string;
+    expires_at_is_null: boolean;
+    revoked_at_is_null: boolean;
+    revoked_by_user_id_is_null: boolean;
+  }>(sql`
+    SELECT
+      id::text AS id,
+      user_id::text AS user_id,
+      role_id::text AS role_id,
+      granted_by_user_id::text AS granted_by_user_id,
+      reason,
+      expires_at IS NULL AS expires_at_is_null,
+      revoked_at IS NULL AS revoked_at_is_null,
+      revoked_by_user_id IS NULL AS revoked_by_user_id_is_null
+    FROM role_memberships
+    ORDER BY id
+  `);
+  return sameRows(membershipRows, [{
+    id: stableUuid("role-membership:root:0"),
+    user_id: "0",
+    role_id: stableUuid("role:root"),
+    granted_by_user_id: "0",
+    reason: "首次初始化 root 账号",
+    expires_at_is_null: true,
+    revoked_at_is_null: true,
+    revoked_by_user_id_is_null: true
+  }]);
+}
+
 function stableUuid(value: string): string {
   const digest = createHash("sha256").update(`urmotiv:${value}`, "utf8").digest("hex");
   return [
@@ -330,4 +513,19 @@ function stableUuid(value: string): string {
     `a${digest.slice(17, 20)}`,
     digest.slice(20, 32)
   ].join("-");
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function compareNamedRows(
+  left: { readonly name: string },
+  right: { readonly name: string }
+): number {
+  return compareText(left.name, right.name);
+}
+
+function sameRows(actual: unknown, expected: unknown): boolean {
+  return JSON.stringify(actual) === JSON.stringify(expected);
 }

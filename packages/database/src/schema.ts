@@ -100,6 +100,29 @@ export const taskState = pgEnum("task_state", [
   "cancelled"
 ]);
 export const auditResult = pgEnum("audit_result", ["success", "denied", "failure"]);
+export const adminBootstrapStatus = pgEnum("admin_bootstrap_status", [
+  "blocked",
+  "open",
+  "completed"
+]);
+
+export const adminBootstrapState = pgTable(
+  "admin_bootstrap_state",
+  {
+    singleton: boolean("singleton").primaryKey().default(true),
+    status: adminBootstrapStatus("status").notNull().default("blocked"),
+    openedAt: timestamp("opened_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    check("admin_bootstrap_state_singleton_ck", sql`${table.singleton} = true`),
+    check(
+      "admin_bootstrap_state_timestamps_ck",
+      sql`(${table.status} = 'blocked' AND ${table.openedAt} IS NULL AND ${table.completedAt} IS NULL) OR (${table.status} = 'open' AND ${table.openedAt} IS NOT NULL AND ${table.completedAt} IS NULL) OR (${table.status} = 'completed' AND ${table.openedAt} IS NOT NULL AND ${table.completedAt} IS NOT NULL AND ${table.completedAt} >= ${table.openedAt})`
+    )
+  ]
+);
 
 export const users = pgTable(
   "users",
