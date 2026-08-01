@@ -6,7 +6,6 @@ import {
   FileCode2,
   FileUp,
   LockKeyhole,
-  Paperclip,
   Plus,
   Search,
   ShieldCheck,
@@ -25,11 +24,21 @@ import type {
 import { createReview, listReviewItems, listReviews, listTags } from "../lib/api";
 import { dateTime, isFrozen, reviewVerdictText, statusText, typeText } from "../lib/presentation";
 import { MarkdownEditor } from "./markdown-editor";
+import {
+  ProblemFilesPanel,
+  useStatementImageUploader
+} from "./problem-files";
 import { TagPicker } from "./tag-picker";
 
 export type ProblemUpdater = (updater: (problem: Problem) => Problem) => void;
 
-type ProblemTabProps = { problem: Problem; update: ProblemUpdater };
+type ProblemTabProps = {
+  problem: Problem;
+  update: ProblemUpdater;
+  fileUploadsDisabled?: boolean;
+  onFileRevisionChange?: ((revision: number) => void) | undefined;
+  onFileUploadPendingChange?: ((pending: boolean) => void) | undefined;
+};
 
 function setContent(problem: Problem, key: keyof Problem["content"], value: string): Problem {
   return { ...problem, content: { ...problem.content, [key]: value } };
@@ -140,15 +149,28 @@ export function OverviewTab({ problem, update }: ProblemTabProps) {
   );
 }
 
-export function StatementTab({ problem, update }: ProblemTabProps) {
+export function StatementTab({
+  problem,
+  update,
+  fileUploadsDisabled = false,
+  onFileRevisionChange,
+  onFileUploadPendingChange
+}: ProblemTabProps) {
   const canEdit = problem.capabilities.canEdit;
   const basicFrozen = isFrozen(problem.status, "content.basicStatement") && !problem.capabilities.canEditFrozen;
+  const uploadStatementImage = useStatementImageUploader(problem, {
+    onRevisionChange: onFileRevisionChange,
+    onPendingChange: onFileUploadPendingChange
+  });
 
   const editor = (label: string, key: keyof Problem["content"], helper: string, frozen = false) => (
     <MarkdownEditor
       label={label}
       value={problem.content[key]}
       onChange={(value) => update((current) => setContent(current, key, value))}
+      problemId={problem.id}
+      onUploadImage={uploadStatementImage}
+      uploadDisabled={fileUploadsDisabled}
       readOnly={!canEdit || frozen}
       frozen={frozen}
       helper={helper}
@@ -688,15 +710,28 @@ function LegacyDataAndJudgeTab({ problem }: { problem: Problem }) {
   );
 }
 
-export function SolutionTab({ problem, update }: ProblemTabProps) {
+export function SolutionTab({
+  problem,
+  update,
+  fileUploadsDisabled = false,
+  onFileRevisionChange,
+  onFileUploadPendingChange
+}: ProblemTabProps) {
   const canEdit = problem.capabilities.canEdit;
   const basicFrozen = isFrozen(problem.status, "content.basicSolution") && !problem.capabilities.canEditFrozen;
+  const uploadStatementImage = useStatementImageUploader(problem, {
+    onRevisionChange: onFileRevisionChange,
+    onPendingChange: onFileUploadPendingChange
+  });
   return (
     <div className="workspace-section stacked-editors">
       <MarkdownEditor
         label="基础题解"
         value={problem.content.basicSolution}
         onChange={(value) => update((current) => setContent(current, "basicSolution", value))}
+        problemId={problem.id}
+        onUploadImage={uploadStatementImage}
+        uploadDisabled={fileUploadsDisabled}
         readOnly={!canEdit || basicFrozen}
         frozen={basicFrozen}
         helper="审核时使用的核心思路，进入待审核后保持不变。"
@@ -705,6 +740,9 @@ export function SolutionTab({ problem, update }: ProblemTabProps) {
         label="正式题解"
         value={problem.content.solution}
         onChange={(value) => update((current) => setContent(current, "solution", value))}
+        problemId={problem.id}
+        onUploadImage={uploadStatementImage}
+        uploadDisabled={fileUploadsDisabled}
         readOnly={!canEdit}
         helper="补充正确性证明、复杂度分析和实现细节。"
       />
@@ -712,22 +750,20 @@ export function SolutionTab({ problem, update }: ProblemTabProps) {
         label="提示"
         value={problem.content.hints}
         onChange={(value) => update((current) => setContent(current, "hints", value))}
+        problemId={problem.id}
+        onUploadImage={uploadStatementImage}
+        uploadDisabled={fileUploadsDisabled}
         readOnly={!canEdit}
         helper="可选。按比赛需要拆分为逐步提示。"
         minRows={7}
       />
 
-      <section className="materials-section">
-        <div className="section-title">
-          <div><p className="eyebrow">文件</p><h2>程序与附件</h2></div>
-          <Paperclip size={21} aria-hidden="true" />
-        </div>
-        <div className="materials-grid">
-          <div><strong>公开附件</strong><span>可随公开题面一起导出</span><button className="secondary-button" type="button" disabled={!canEdit}>选择文件</button></div>
-          <div><strong>内部附件</strong><span>仅有内部资料权限的人可下载</span><button className="secondary-button" type="button" disabled={!problem.capabilities.canWriteTestdata}>选择文件</button></div>
-          <div><strong>标准程序</strong><span>用于核对答案，不会出现在公开题面</span><button className="secondary-button" type="button" disabled={!problem.capabilities.canWriteTestdata}>选择文件</button></div>
-        </div>
-      </section>
+      <ProblemFilesPanel
+        problem={problem}
+        uploadsDisabled={fileUploadsDisabled}
+        onRevisionChange={onFileRevisionChange}
+        onPendingChange={onFileUploadPendingChange}
+      />
     </div>
   );
 }

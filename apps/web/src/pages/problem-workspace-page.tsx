@@ -87,6 +87,8 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
   const [working, setWorking] = useState<Problem | null>(null);
   const [dirty, setDirty] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("saved");
+  const [fileUploadsInFlight, setFileUploadsInFlight] = useState(0);
+  const fileUploadPending = fileUploadsInFlight > 0;
   const editNumber = useRef(0);
 
   useEffect(() => {
@@ -172,19 +174,25 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
   });
 
   const saveNow = useCallback(() => {
-    if (!working || !dirty || save.isPending || !working.capabilities.canEdit) {
+    if (!working || !dirty || save.isPending || fileUploadPending || !working.capabilities.canEdit) {
       return;
     }
     save.mutate({ problem: working, edit: editNumber.current });
-  }, [working, dirty, save]);
+  }, [working, dirty, save, fileUploadPending]);
 
   useEffect(() => {
-    if (!dirty || save.isPending || saveState === "failed" || !working?.capabilities.canEdit) {
+    if (
+      !dirty ||
+      save.isPending ||
+      fileUploadPending ||
+      saveState === "failed" ||
+      !working?.capabilities.canEdit
+    ) {
       return;
     }
     const timer = window.setTimeout(saveNow, 1200);
     return () => window.clearTimeout(timer);
-  }, [dirty, save.isPending, saveNow, saveState, working?.capabilities.canEdit]);
+  }, [dirty, fileUploadPending, save.isPending, saveNow, saveState, working?.capabilities.canEdit]);
 
   const update: ProblemUpdater = (updater) => {
     setWorking((current) => (current ? updater(current) : current));
@@ -192,6 +200,19 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
     setDirty(true);
     setSaveState("dirty");
   };
+
+  const synchronizeFileRevision = useCallback((revision: number) => {
+    setWorking((current) => current === null ? current : { ...current, revision });
+    client.setQueryData<Problem>(
+      ["problem", problemId, currentUserId],
+      (current) => current === undefined ? current : { ...current, revision }
+    );
+    void client.invalidateQueries({ queryKey: ["problem", problemId, currentUserId] });
+  }, [client, currentUserId, problemId]);
+
+  const updateFileUploadPending = useCallback((pending: boolean) => {
+    setFileUploadsInFlight((current) => pending ? current + 1 : Math.max(0, current - 1));
+  }, []);
 
   const statusAction = useMutation({
     mutationFn: async (action: "submit" | "withdraw") => {
@@ -293,8 +314,8 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
             <button
               className="primary-button"
               type="button"
-              disabled={dirty || save.isPending || statusAction.isPending}
-              title={dirty ? "请等待当前修改保存完成" : undefined}
+              disabled={dirty || save.isPending || fileUploadPending || statusAction.isPending}
+              title={dirty || fileUploadPending ? "请等待当前修改和文件上传完成" : undefined}
               onClick={() => statusAction.mutate("submit")}
             >
               <Send size={16} aria-hidden="true" />
@@ -305,7 +326,7 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
             <button
               className="secondary-button"
               type="button"
-              disabled={dirty || statusAction.isPending}
+              disabled={dirty || fileUploadPending || statusAction.isPending}
               onClick={() => statusAction.mutate("withdraw")}
             >
               <RotateCcw size={16} aria-hidden="true" />
@@ -345,10 +366,26 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
 
       <div className="workspace-body">
         {activeTab === "overview" ? <OverviewTab problem={working} update={update} /> : null}
-        {activeTab === "statement" ? <StatementTab problem={working} update={update} /> : null}
+        {activeTab === "statement" ? (
+          <StatementTab
+            problem={working}
+            update={update}
+            fileUploadsDisabled={dirty || save.isPending || fileUploadPending}
+            onFileRevisionChange={synchronizeFileRevision}
+            onFileUploadPendingChange={updateFileUploadPending}
+          />
+        ) : null}
         {activeTab === "samples" ? <SamplesTab problem={working} update={update} /> : null}
         {activeTab === "judge" ? <DataAndJudgeTab problem={working} update={update} /> : null}
-        {activeTab === "solution" ? <SolutionTab problem={working} update={update} /> : null}
+        {activeTab === "solution" ? (
+          <SolutionTab
+            problem={working}
+            update={update}
+            fileUploadsDisabled={dirty || save.isPending || fileUploadPending}
+            onFileRevisionChange={synchronizeFileRevision}
+            onFileUploadPendingChange={updateFileUploadPending}
+          />
+        ) : null}
         {activeTab === "reviews" ? (
           <ReviewTab
             problem={working}

@@ -61,6 +61,89 @@ test("手机视口中的 Markdown 编辑器在编辑和预览间切换", async (
   await page.screenshot({ path: testInfo.outputPath("mobile-markdown-preview.png"), fullPage: true });
 });
 
+test("题面图片与公开附件可以上传、预览和下载", async ({ page }, testInfo) => {
+  await loginAsAuthor(page);
+  const problem = await postJson(page, "/api/v1/problems", {
+    title: `文件联调题-${testInfo.project.name}-${Date.now()}`,
+    type: "traditional",
+    tagIds: ["algorithm.implementation"],
+    content: {
+      basicStatement: "给定一个整数，原样输出。",
+      basicSolution: "直接输出输入值。",
+      background: "",
+      statement: "",
+      inputFormat: "",
+      outputFormat: "",
+      constraints: "",
+      solution: "",
+      hints: ""
+    },
+    samples: []
+  });
+  const problemId = problem.id as string;
+  await page.goto(`/problems/${problemId}?tab=statement`);
+
+  const editor = page.locator('section[aria-label="题目描述"]');
+  const imageButton = editor.getByRole("button", { name: "上传并插入图片" });
+  await expect(imageButton).toBeEnabled();
+
+  const wrongFileChooser = page.waitForEvent("filechooser");
+  await imageButton.click();
+  await (await wrongFileChooser).setFiles({
+    name: "not-an-image.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("synthetic text", "utf8")
+  });
+  await expect(editor.getByRole("alert")).toContainText("仅支持 PNG、JPEG、GIF 或 WebP 图片");
+  await expect(editor.locator("textarea")).not.toHaveValue(/\/api\/v1\/problems\//);
+
+  const imageFileChooser = page.waitForEvent("filechooser");
+  await imageButton.click();
+  await (await imageFileChooser).setFiles({
+    name: "synthetic.png",
+    mimeType: "image/png",
+    buffer: Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64"
+    )
+  });
+
+  await expect(editor.locator("textarea")).toHaveValue(
+    new RegExp(`!\\[题面图片\\]\\(/api/v1/problems/${problemId}/files/[0-9a-f-]+\\)`)
+  );
+  await expect(imageButton).toBeEnabled();
+  if (testInfo.project.name === "mobile-chromium") {
+    await editor.getByRole("button", { name: "预览" }).click();
+  }
+  const previewImage = editor.locator(".markdown-body img");
+  await expect(previewImage).toBeVisible();
+  await expect.poll(() => previewImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+
+  await page.getByRole("button", { name: "题解与资料" }).click();
+  const attachmentButton = page.getByRole("button", { name: "选择公开附件" });
+  await expect(attachmentButton).toBeEnabled();
+  const attachmentChooser = page.waitForEvent("filechooser");
+  await attachmentButton.click();
+  await (await attachmentChooser).setFiles({
+    name: "synthetic-note.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("synthetic attachment", "utf8")
+  });
+
+  const attachmentRow = page.locator(".problem-file-row", { hasText: "synthetic-note.txt" });
+  await expect(attachmentRow).toBeVisible();
+  const downloadStarted = page.waitForEvent("download");
+  await attachmentRow.getByRole("link", { name: "下载" }).click();
+  const download = await downloadStarted;
+  expect(download.suggestedFilename()).toBe("synthetic-note.txt");
+
+  const pageFitsViewport = await page.evaluate(
+    () => document.documentElement.scrollWidth <= document.documentElement.clientWidth
+  );
+  expect(pageFitsViewport).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("problem-files.png"), fullPage: true });
+});
+
 test("评价公开字段、本人修改和状态联动在桌面与手机上保持一致", async ({ page }, testInfo) => {
   await loginAsAuthor(page);
   const problem = await postJson(page, "/api/v1/problems", {

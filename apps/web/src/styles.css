@@ -894,6 +894,27 @@ textarea:read-only {
   border-radius: 0;
 }
 
+.problem-file-input {
+  display: none;
+}
+
+.editor-file-status,
+.editor-file-error {
+  margin: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.editor-file-status {
+  color: var(--teal-dark);
+  background: var(--teal-soft);
+}
+
+.editor-file-error {
+  border-radius: 0;
+}
+
 .editor-columns {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -1303,6 +1324,98 @@ textarea:read-only {
 .materials-grid .secondary-button {
   align-self: end;
   justify-self: start;
+}
+
+.material-card-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text);
+}
+
+.material-card-title svg {
+  flex: none;
+  color: var(--teal);
+}
+
+.file-help {
+  margin: 10px 0 0;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.file-error {
+  margin: 10px 0 0;
+}
+
+.problem-file-list {
+  margin-top: 18px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.problem-file-list-heading,
+.problem-file-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 2fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.problem-file-list-heading {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-soft);
+  background: var(--surface-subtle);
+  font-size: 12px;
+}
+
+.problem-file-list-heading strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.problem-file-list > :last-child {
+  border-bottom: 0;
+}
+
+.problem-file-list .empty-state {
+  min-height: 0;
+  margin: 12px;
+  padding: 18px;
+}
+
+.problem-file-kind {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.problem-file-kind svg {
+  flex: none;
+  color: var(--teal);
+}
+
+.problem-file-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.problem-file-size {
+  color: var(--text-faint);
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .review-summary {
@@ -2781,6 +2894,32 @@ textarea:read-only {
   .sample-io-grid,
   .materials-grid {
     grid-template-columns: 1fr;
+  }
+
+  .problem-file-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 7px 12px;
+  }
+
+  .problem-file-name {
+    grid-column: 1 / -1;
+    grid-row: 1;
+    padding-right: 8px;
+  }
+
+  .problem-file-kind {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .problem-file-size {
+    grid-column: 1;
+    grid-row: 3;
+  }
+
+  .problem-file-row .secondary-button {
+    grid-column: 2;
+    grid-row: 2 / span 2;
   }
 
   .editor-columns {

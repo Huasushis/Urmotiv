@@ -9,6 +9,8 @@ import {
   importJobViewSchema,
   importPreviewResponseSchema,
   packageUploadResponseSchema,
+  problemFileListResponseSchema,
+  problemFileSummarySchema,
   problemListResponseSchema,
   problemAccessListResponseSchema,
   problemSchema,
@@ -35,6 +37,9 @@ import {
   type ImportPreviewResponse,
   type PackageUploadResponse,
   type Problem,
+  type ProblemFileCategory,
+  type ProblemFileListResponse,
+  type ProblemFileSummary,
   type ProblemListQuery,
   type ProblemListResponse,
   type ReviewInput,
@@ -69,6 +74,26 @@ export class ApiError extends Error {
 }
 
 const tagsResponseSchema = z.object({ items: z.array(tagSchema) });
+const problemFileUploadResponseSchema = z
+  .object({
+    item: problemFileSummarySchema,
+    revision: z.number().int().positive()
+  })
+  .strict();
+
+export type ProblemFileUploadResponse = {
+  item: ProblemFileSummary;
+  revision: number;
+};
+
+export type ProblemFileUploadRequest = {
+  file: File;
+  expectedRevision: number;
+  category: ProblemFileCategory;
+  logicalPath: string;
+  position?: number;
+  replaceExisting?: boolean;
+};
 
 function apiBaseUrl(): string {
   const configured = import.meta.env.VITE_API_BASE_URL?.trim();
@@ -256,6 +281,47 @@ export function updateProblem(id: string, input: UpdateProblemInput): Promise<Pr
       ),
     async () => (await import("./demo-store")).updateDemoProblem(id, input)
   );
+}
+
+export function listProblemFiles(problemId: string): Promise<ProblemFileListResponse> {
+  return request(
+    `/problems/${encodeURIComponent(problemId)}/files`,
+    { method: "GET" },
+    problemFileListResponseSchema
+  );
+}
+
+export function uploadProblemFile(
+  problemId: string,
+  input: ProblemFileUploadRequest
+): Promise<ProblemFileUploadResponse> {
+  const parameters = new URLSearchParams({
+    expectedRevision: String(input.expectedRevision),
+    category: input.category,
+    logicalPath: input.logicalPath,
+    position: String(input.position ?? 0),
+    originalName: input.file.name,
+    mediaType: input.file.type.trim().toLowerCase() || "application/octet-stream",
+    replaceExisting: String(input.replaceExisting ?? false)
+  });
+  return request(
+    `/problems/${encodeURIComponent(problemId)}/files?${parameters.toString()}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: input.file
+    },
+    problemFileUploadResponseSchema
+  );
+}
+
+/** Markdown 中只保存这个受权限检查的站内地址，不保存对象存储位置。 */
+export function problemFileReferenceUrl(problemId: string, fileId: string): string {
+  return `/api/v1/problems/${encodeURIComponent(problemId)}/files/${encodeURIComponent(fileId)}`;
+}
+
+export function problemFileDownloadUrl(problemId: string, fileId: string): string {
+  return `${apiBaseUrl()}/problems/${encodeURIComponent(problemId)}/files/${encodeURIComponent(fileId)}`;
 }
 
 export function submitProblem(id: string, expectedRevision: number): Promise<Problem> {
