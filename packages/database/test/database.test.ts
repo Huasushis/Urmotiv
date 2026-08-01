@@ -77,17 +77,32 @@ describe("database migration and initial data", () => {
     expect(rootMemberships.rows[0]?.count).toBe(1);
   });
 
-  it("rejects plain root passwords before writing anything", async () => {
+  it("never injects a login credential into the seed-only root account", async () => {
     const handle = await createMigratedDatabase();
+    await seedCoreDatabase(handle);
+    await seedCoreDatabase(handle);
 
-    await expect(
-      seedCoreDatabase(handle, { rootPasswordHash: "this-is-not-a-password-hash" })
-    ).rejects.toThrow("Argon2id");
-
-    const root = await handle.client.query<{ count: number }>(
-      "SELECT count(*)::integer AS count FROM users WHERE id = 0"
-    );
-    expect(root.rows[0]?.count).toBe(0);
+    const root = await handle.client.query<{
+      nickname: string;
+      password_hash: string | null;
+      password_changed_at: string | null;
+    }>(`
+      SELECT nickname, password_hash, password_changed_at
+      FROM users
+      WHERE id = 0
+    `);
+    expect(root.rows).toEqual([{
+      nickname: "root",
+      password_hash: null,
+      password_changed_at: null
+    }]);
+    const identities = await handle.client.query<{ count: number }>(`
+      SELECT (
+        (SELECT count(*) FROM user_emails WHERE user_id = 0)
+        + (SELECT count(*) FROM external_identities WHERE user_id = 0)
+      )::integer AS count
+    `);
+    expect(identities.rows).toEqual([{ count: 0 }]);
   });
 
   it("keeps normalized email addresses unique across all users", async () => {

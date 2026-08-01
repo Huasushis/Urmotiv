@@ -221,34 +221,17 @@ const roleDefinitions = [
   readonly permissions: readonly CorePermission[];
 }[];
 
-export interface CoreSeedOptions {
-  readonly rootNickname?: string;
-  /** Pass an Argon2id hash made on the server. Never pass a plain password. */
-  readonly rootPasswordHash?: string | null;
-}
-
 export interface CoreSeedResult {
   readonly rootUserId: 0n;
   readonly roleKeys: readonly string[];
   readonly permissionNames: readonly CorePermission[];
 }
 
-export async function seedCoreDatabase(
-  handle: DatabaseHandle,
-  options: CoreSeedOptions = {}
-): Promise<CoreSeedResult> {
-  const rootNickname = options.rootNickname?.trim() || "root";
-  const rootPasswordHash = options.rootPasswordHash ?? null;
-  if (rootPasswordHash !== null && !rootPasswordHash.startsWith("$argon2id$")) {
-    throw new Error(
-      "rootPasswordHash 必须是服务器用 Argon2id 处理密码后得到的摘要，不能传入明文密码。"
-    );
-  }
-
+export async function seedCoreDatabase(handle: DatabaseHandle): Promise<CoreSeedResult> {
   await handle.transaction(async (transaction) => {
     await transaction.execute(sql`
       INSERT INTO users (id, nickname, account_type, password_hash)
-      VALUES (0, ${rootNickname}, 'human', ${rootPasswordHash})
+      VALUES (0, 'root', 'human', NULL)
       ON CONFLICT (id) DO NOTHING
     `);
 

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { getTableName, isTable, sql } from "drizzle-orm";
 import type { DatabaseExecutor, DatabaseHandle } from "./client";
 import * as databaseSchema from "./schema";
@@ -46,6 +47,18 @@ export type AdminBootstrapOpenResult =
   | "baseline_mismatch"
   | "lock_lost"
   | "state_not_blocked";
+
+export interface AdminBootstrapAdministratorInput {
+  /** Already-normalized address. Plain passwords must never cross this boundary. */
+  readonly normalizedEmail: string;
+  readonly passwordHash: string;
+}
+
+export type AdminBootstrapCompletionResult =
+  | "completed"
+  | "not_open"
+  | "baseline_mismatch"
+  | "role_invalid";
 
 export async function tryAcquireAdminBootstrapMigrationLease(
   handle: DatabaseHandle
@@ -238,7 +251,7 @@ export async function openAdminBootstrapForFreshSeed(
     if (state.status !== "blocked") {
       return "state_not_blocked";
     }
-    if (!await hasExactFreshSeedBaseline(transaction, state)) {
+    if (!await hasExactFreshSeedBaseline(transaction, state, "blocked")) {
       return "baseline_mismatch";
     }
 
@@ -255,6 +268,149 @@ export async function openAdminBootstrapForFreshSeed(
       throw new Error("URMOTIV_ADMIN_BOOTSTRAP_LOCK_LOST");
     }
     return "opened";
+  });
+}
+
+/**
+ * Creates the first normal administrator without turning the seed-only root
+ * account into a login identity. Callers must create the Argon2id digest before
+ * entering this transaction so password hashing never holds database locks.
+ */
+export async function completeAdminBootstrap(
+  handle: DatabaseHandle,
+  input: AdminBootstrapAdministratorInput
+): Promise<AdminBootstrapCompletionResult> {
+  validateAdministratorInput(input);
+
+  const emailId = randomUUID();
+  const membershipId = randomUUID();
+  const requestId = randomUUID();
+
+  return handle.transaction(async (transaction) => {
+    await transaction.execute(sql`
+      SELECT pg_advisory_xact_lock(
+        ${migrationLockKeyOne}::integer,
+        ${migrationLockKeyTwo}::integer
+      )
+    `);
+    await lockFreshSeedBaseline(transaction);
+
+    const state = parseStateRows(await transaction.query<StateRow>(sql`
+      SELECT status::text AS status, opened_at, completed_at
+      FROM admin_bootstrap_state
+      WHERE singleton = true
+      FOR UPDATE
+    `));
+    if (state.status !== "open") {
+      return "not_open";
+    }
+    if (!await hasExactFreshSeedBaseline(transaction, state, "open")) {
+      return "baseline_mismatch";
+    }
+
+    const administratorRoles = await transaction.query<{
+      id: string;
+      is_built_in: boolean;
+    }>(sql`
+      SELECT id::text AS id, is_built_in
+      FROM roles
+      WHERE key = 'system_administrator'
+    `);
+    const administratorRole = administratorRoles[0];
+    if (
+      administratorRoles.length !== 1
+      || administratorRole === undefined
+      || administratorRole.is_built_in !== true
+    ) {
+      return "role_invalid";
+    }
+
+    const insertedUsers = await transaction.query<{ id: string }>(sql`
+      INSERT INTO users (
+        nickname,
+        account_type,
+        password_hash,
+        password_changed_at
+      ) VALUES (
+        '系统管理员',
+        'human',
+        ${input.passwordHash},
+        transaction_timestamp()
+      )
+      RETURNING id::text AS id
+    `);
+    const administrator = insertedUsers[0];
+    if (insertedUsers.length !== 1 || administrator === undefined) {
+      throw new Error("URMOTIV_ADMIN_BOOTSTRAP_WRITE_FAILED");
+    }
+
+    await transaction.execute(sql`
+      INSERT INTO user_emails (
+        id,
+        user_id,
+        address,
+        normalized_address,
+        is_primary,
+        verified_at
+      ) VALUES (
+        ${emailId}::uuid,
+        ${BigInt(administrator.id)},
+        ${input.normalizedEmail},
+        ${input.normalizedEmail},
+        true,
+        transaction_timestamp()
+      )
+    `);
+    await transaction.execute(sql`
+      INSERT INTO role_memberships (
+        id,
+        user_id,
+        role_id,
+        granted_by_user_id,
+        reason
+      ) VALUES (
+        ${membershipId}::uuid,
+        ${BigInt(administrator.id)},
+        ${administratorRole.id}::uuid,
+        0,
+        '服务器控制台首次初始化'
+      )
+    `);
+    await transaction.execute(sql`
+      INSERT INTO audit_events (
+        actor_user_id,
+        subject_user_id,
+        request_id,
+        action,
+        object_type,
+        object_id,
+        result,
+        metadata
+      ) VALUES (
+        NULL,
+        ${BigInt(administrator.id)},
+        ${requestId}::uuid,
+        'admin.bootstrap.complete',
+        'user',
+        ${administrator.id},
+        'success',
+        '{"channel":"server_tty","roleKey":"system_administrator"}'::jsonb
+      )
+    `);
+
+    const completed = await transaction.query<{ status: string }>(sql`
+      UPDATE admin_bootstrap_state
+      SET
+        status = 'completed',
+        completed_at = transaction_timestamp(),
+        updated_at = transaction_timestamp()
+      WHERE singleton = true AND status = 'open'
+      RETURNING status::text AS status
+    `);
+    if (completed.length !== 1 || completed[0]?.status !== "completed") {
+      throw new Error("URMOTIV_ADMIN_BOOTSTRAP_WRITE_FAILED");
+    }
+    return "completed";
   });
 }
 
@@ -300,11 +456,14 @@ async function transactionOwnsMigrationLease(
 
 async function hasExactFreshSeedBaseline(
   executor: DatabaseExecutor,
-  lockedState: AdminBootstrapStateRecord
+  lockedState: AdminBootstrapStateRecord,
+  expectedStatus: "blocked" | "open"
 ): Promise<boolean> {
   if (
-    lockedState.status !== "blocked"
-    || lockedState.openedAt !== null
+    lockedState.status !== expectedStatus
+    || (expectedStatus === "blocked"
+      ? lockedState.openedAt !== null
+      : lockedState.openedAt === null)
     || lockedState.completedAt !== null
   ) {
     return false;
@@ -366,10 +525,25 @@ async function hasExactFreshSeedBaseline(
       SELECT last_value::text AS last_value, is_called
       FROM ${sql.identifier(expected.schema)}.${sql.identifier(expected.name)}
     `);
-    if (!sameRows(sequenceState, [{
-      last_value: expected.last_value,
-      is_called: expected.is_called
-    }])) {
+    if (
+      expectedStatus === "blocked"
+      || expected.schema === "drizzle"
+    ) {
+      if (!sameRows(sequenceState, [{
+        last_value: expected.last_value,
+        is_called: expected.is_called
+      }])) {
+        return false;
+      }
+      continue;
+    }
+    const value = sequenceState[0];
+    if (
+      sequenceState.length !== 1
+      || value === undefined
+      || !/^[1-9][0-9]*$/u.test(value.last_value)
+      || typeof value.is_called !== "boolean"
+    ) {
       return false;
     }
   }
@@ -441,11 +615,26 @@ function parseStateRows(rows: readonly StateRow[]): AdminBootstrapStateRecord {
   ) {
     throw new Error("URMOTIV_ADMIN_BOOTSTRAP_STATE_INVALID");
   }
-  return {
+  const parsed = {
     status: row.status,
     openedAt: normalizeTimestamp(row.opened_at),
     completedAt: normalizeTimestamp(row.completed_at)
   };
+  if (
+    (parsed.status === "blocked"
+      && (parsed.openedAt !== null || parsed.completedAt !== null))
+    || (parsed.status === "open"
+      && (parsed.openedAt === null || parsed.completedAt !== null))
+    || (parsed.status === "completed"
+      && (
+        parsed.openedAt === null
+        || parsed.completedAt === null
+        || Date.parse(parsed.completedAt) < Date.parse(parsed.openedAt)
+      ))
+  ) {
+    throw new Error("URMOTIV_ADMIN_BOOTSTRAP_STATE_INVALID");
+  }
+  return parsed;
 }
 
 function isAdminBootstrapStatus(value: string): value is AdminBootstrapStatus {
@@ -469,4 +658,19 @@ function compareText(left: string, right: string): number {
 
 function sameRows(actual: unknown, expected: unknown): boolean {
   return JSON.stringify(actual) === JSON.stringify(expected);
+}
+
+function validateAdministratorInput(input: AdminBootstrapAdministratorInput): void {
+  if (
+    input.normalizedEmail.length === 0
+    || input.normalizedEmail.length > 320
+    || input.normalizedEmail !== input.normalizedEmail.trim().toLocaleLowerCase("en-US")
+    || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(input.normalizedEmail)
+    || input.passwordHash.length > 2_048
+    || !/^\$argon2id\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/_-]+={0,2}\$[A-Za-z0-9+/_-]+={0,2}$/u.test(
+      input.passwordHash
+    )
+  ) {
+    throw new Error("URMOTIV_ADMIN_BOOTSTRAP_INPUT_INVALID");
+  }
 }

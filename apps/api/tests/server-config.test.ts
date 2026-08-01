@@ -151,6 +151,14 @@ describe("数据库启动配置", () => {
     });
   });
 
+  it("拒绝生产 API 进程内迁移，避免绕过首位管理员初始化", () => {
+    expect(() => readServerDatabaseOptions({
+      NODE_ENV: "production",
+      DATABASE_URL: "postgres://database.example/urmotiv",
+      URMOTIV_DATABASE_MIGRATE: "true"
+    })).toThrow("URMOTIV_PRODUCTION_API_MIGRATION_FORBIDDEN");
+  });
+
   it("生产环境不允许退回本地文件数据库", () => {
     expect(() => readServerDatabaseOptions({ NODE_ENV: "production" })).toThrow(
       "生产环境必须配置 DATABASE_URL"

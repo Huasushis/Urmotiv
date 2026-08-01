@@ -220,6 +220,9 @@ export function readServerDatabaseOptions(
   if (production && connectionString.length === 0) {
     throw new Error("生产环境必须配置 DATABASE_URL，不能使用本地文件数据库。");
   }
+  if (production && environment.URMOTIV_DATABASE_MIGRATE === "true") {
+    throw new Error("URMOTIV_PRODUCTION_API_MIGRATION_FORBIDDEN");
+  }
 
   if (connectionString.length > 0) {
     return {

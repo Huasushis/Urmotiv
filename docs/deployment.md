@@ -23,14 +23,38 @@
    scripts/deploy/validate-env.sh /home/ubuntu/urmotiv-codex/private/urmotiv.env
    ```
 
-3. 构建并启动。`migrate` 容器会先执行仓库中已经审核过的数据库迁移并创建初始 `root` 账号及角色；它不接受明文 root 密码。请在受控的后续流程中为 root 绑定邮箱并设置密码，或先完成 CAS 配置。
+3. 构建镜像并先启动基础服务，再单独运行迁移。全新数据库迁移完成后会进入一次性的
+   `open` 状态；此时 API 固定拒绝监听端口。`root` 只是不可登录的内部初始化授权者，永远不绑定
+   密码、邮箱或 CAS 身份。
 
    ```bash
-   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env up -d --build
+   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env build
+   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env up -d postgres redis minio minio-init
+   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env run --rm migrate
+   ```
+
+4. 在服务器的真实终端中创建独立的首位系统管理员。不要添加 `-T`，不要通过管道或重定向提供输入；
+   命令不接受邮箱或密码参数、环境变量、JSON 和密码文件。邮箱与密码各输入两次，输入均不回显。
+
+   ```bash
+   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env run --rm --no-deps api \
+     pnpm --filter @urmotiv/api bootstrap-admin
+   ```
+
+   只有固定结果 `BOOTSTRAP_ADMIN_OK` 表示已明确完成。若返回 `OUTCOME_UNKNOWN`，连接或提交结果无法确认，
+   命令不会自动重试；恢复连接后重新运行会先只读检查状态，已经完成时不会再次读取凭据或创建账号。
+
+5. 初始化明确完成后启动应用并检查状态。
+
+   ```bash
+   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env up -d api worker web
    docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env ps
    docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env exec -T web \
      wget -qO- http://127.0.0.1/api/v1/health
    ```
+
+   生产 API 不允许设置 `URMOTIV_DATABASE_MIGRATE=true`；迁移必须使用上面的独立命令，避免空数据库被
+   普通 API 启动永久标成不可初始化。
 
    网站默认只监听 `127.0.0.1:8080`，不会直接暴露 PostgreSQL、Redis、MinIO 或 API。对外访问应由服务器已有的 HTTPS 反向代理转发到这个地址；反向代理负责证书和 HTTP 到 HTTPS 的跳转。调试时可用 SSH 转发访问：`ssh -L 8080:127.0.0.1:8080 ustc`。
 

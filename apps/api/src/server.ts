@@ -48,6 +48,7 @@ import {
   readServerOptions,
   readServerStorageOptions
 } from "./server-config";
+import { assertAdminBootstrapReadyForServer } from "./bootstrap-admin";
 
 const appOptions = readServerOptions(process.env);
 const databaseOptions = readServerDatabaseOptions(process.env);
@@ -65,6 +66,7 @@ try {
   if (databaseOptions.migrate) {
     await migrateDatabase(database);
   }
+  await assertAdminBootstrapReadyForServer(database);
   await seedCoreDatabase(database);
   if (databaseOptions.seedDemoData) {
     await seedDatabaseDemoData(database);
@@ -189,7 +191,7 @@ try {
   const port = Number.parseInt(configuredPort, 10);
   await app.listen({ port: Number.isFinite(port) ? port : 3000, host: "0.0.0.0" });
 } catch (error) {
-  await database.close();
+  await database.close().catch(() => undefined);
   throw error;
 }
 function createProcessAnklangCache(): {

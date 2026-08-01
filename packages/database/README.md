@@ -18,8 +18,9 @@ API 服务按以下环境变量选择数据库：
 - 设置 `DATABASE_URL` 时连接 PostgreSQL。生产环境必须设置这个值，不会在连接失败或漏配时改用内存数据。
 - 开发环境没有设置 `DATABASE_URL` 时使用 PGlite。`URMOTIV_PGLITE_PATH` 留空会保存到
   `.data/database`，也可以把它改为服务器上的另一个私有目录。
-- PGlite 启动时会执行仓库中的迁移。PostgreSQL 只有在明确设置
-  `URMOTIV_DATABASE_MIGRATE=true` 时才随 API 启动执行迁移，正常生产升级应先单独执行迁移再启动服务。
+- PGlite 启动时会执行仓库中的迁移。开发环境 PostgreSQL 只有在明确设置 `URMOTIV_DATABASE_MIGRATE=true`
+  时才随 API 启动执行迁移。生产 API 固定拒绝进程内迁移，必须先运行独立迁移命令，避免全新数据库
+  绕过首位管理员初始化保护。
 - 只有 `URMOTIV_DEMO_AUTH=true` 与 `URMOTIV_DEMO_SEED=true` 同时设置时，才会创建人工演示账号和知识点。
   生产环境拒绝演示登录，因此也不会创建这些数据。
 
@@ -96,21 +97,8 @@ API 应返回冲突并让用户重新载入，不能覆盖新内容。一次正�
 - 投稿人、审题人、命题组成员、组长、系统管理员和 root 六个初始角色；
 - root 用户的角色关系。
 
-初始化不会覆盖已经存在的角色授权。若确实需要给 root 设置邮箱密码，只能传入服务器使用 Argon2id
-处理密码后得到的摘要；Argon2id 会故意增加猜密码所需的时间和内存：
-
-```ts
-const rootPasswordHash = process.env.ROOT_PASSWORD_HASH;
-if (rootPasswordHash === undefined) {
-  throw new Error("服务器没有设置 ROOT_PASSWORD_HASH");
-}
-
-await seedCoreDatabase(database, {
-  rootPasswordHash
-});
-```
-
-不要传明文密码。没有摘要时 root 默认没有邮箱密码，应通过服务器上的受控初始化流程完成后续设置。
+初始化不会覆盖已经存在的角色授权。`root` 是不可登录的内部初始化授权者，固定使用编号 `0` 和昵称
+`root`，不会绑定密码、邮箱、CAS 身份、会话或 API 令牌。不得把它当作真人管理员账号。
 
 独立迁移命令会为“一次性的首管理员初始化”维护一个资格标记。迁移文件本身始终把标记建成
 `blocked`（不可用）；只有独立的 `pnpm --filter @urmotiv/api migrate` 命令在迁移前确认数据库
@@ -121,6 +109,16 @@ await seedCoreDatabase(database, {
 也没有需要保留的初始化结果后，删除并重新创建整个目标数据库，再重新运行独立迁移命令。不能删除表、
 改迁移记录或手工更新资格标记来伪装成全新数据库；已有数据库应保留 `blocked`。标记一旦进入
 `completed` 就不能回到其他状态。
+
+全新 PostgreSQL 数据库的独立迁移成功后，API 会在监听端口前检查到 `open` 并拒绝启动。管理员必须在
+真实终端中运行 `pnpm --filter @urmotiv/api bootstrap-admin`。命令不接受参数、管道、重定向、JSON、
+密码文件或环境变量中的账号凭据；邮箱和密码各输入两次，四次输入均不回显。它会创建一个独立的普通人类
+账号，为其写入 Argon2id 密码、已验证主邮箱和内置 `system_administrator` 角色，然后把标记改为
+`completed`。用户、邮箱、角色关系、安全审计和标记更新同处一个事务；任何一步失败都会回滚。
+
+命令只输出固定结果码，不输出邮箱、账号编号、密码摘要或数据库错误。若返回 `OUTCOME_UNKNOWN`，说明连接
+或提交结果无法确认；命令不会自动重试。恢复连接后可以重新运行，程序会先只读检查标记，已完成时不会再次
+询问凭据或创建账号。
 
 普通邮箱账号至少保留一个邮箱、机器人固定禁止项、拒绝优先、题目字段冻结、附件读取和导出下载的再次授权检查，
 都需要 API 在事务中执行。数据库约束负责阻止明显无效或互相矛盾的数据，但它不能知道当前请求者是否有权操作。
