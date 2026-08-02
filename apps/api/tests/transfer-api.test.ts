@@ -1143,6 +1143,149 @@ describe("题目包导入", () => {
     storageFailure.mockRestore();
   });
 
+  it("写入前固定拒绝无效知识点且不会暂存文件或泄露目录错误", async () => {
+    const { app, database, jobs, storage, store, writer } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const uploaded = await uploadPackage(app, leader, await nativeZipOf(fixtureProblem()));
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: upload.fileId,
+        sha256: upload.sha256,
+        formatId: "urmotiv",
+        idempotencyKey: "invalid-import-tags-before-staging"
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const jobId = (created.json() as { id: string }).id;
+    await jobs.startImportJob(jobId);
+    await database.execute(sql`
+      UPDATE tags SET is_active = false WHERE id = 'catalog.tag.02.10'
+    `);
+    const staged = vi.spyOn(storage, "stage");
+    const beforeProblems = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count FROM problems
+    `);
+    const base = fixtureProblem();
+    const invalidProblems: CanonicalProblem[] = [
+      { ...base, tags: [] },
+      { ...base, tags: ["catalog.tag.02.09", "catalog.tag.02.09"] },
+      { ...base, tags: ["synthetic.unknown-import-tag"] },
+      { ...base, tags: ["catalog.category.02"] },
+      { ...base, tags: ["catalog.tag.02.10"] },
+      { ...base, tags: Array.from({ length: 31 }, (_, index) => `synthetic.tag.${index}`) },
+      { ...base, title: "" }
+    ];
+    for (const problem of invalidProblems) {
+      let rejected: unknown;
+      try {
+        await writer.write({
+          importJobId: jobId,
+          position: 0,
+          requestedByUserId: databaseDemoUserIds.leader,
+          choices: { conflictAction: "create" },
+          problem,
+          signal: new AbortController().signal
+        });
+      } catch (error) {
+        rejected = error;
+      }
+      expect(rejected).toMatchObject({
+        name: "ProblemPackageError",
+        message: expect.stringMatching(/^题目包(?:中的知识点无效|内容不符合导入要求)。$/)
+      });
+      expect(String(rejected)).not.toContain("synthetic.unknown-import-tag");
+    }
+    expect(staged).not.toHaveBeenCalled();
+    expect(await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count FROM problems
+    `)).toEqual(beforeProblems);
+
+    const privateFailure = `catalog unavailable ${statementText}`;
+    vi.spyOn(store, "hasTags").mockRejectedValueOnce(new Error(privateFailure));
+    let catalogFailure: unknown;
+    try {
+      await writer.write({
+        importJobId: jobId,
+        position: 0,
+        requestedByUserId: databaseDemoUserIds.leader,
+        choices: { conflictAction: "create" },
+        problem: fixtureProblem(),
+        signal: new AbortController().signal
+      });
+    } catch (error) {
+      catalogFailure = error;
+    }
+    expect(catalogFailure).toMatchObject({
+      name: "ImportResultSaveError",
+      message: "导入结果的保存状态暂时无法确认。"
+    });
+    expect(String(catalogFailure)).not.toContain(privateFailure);
+    expect(staged).not.toHaveBeenCalled();
+  });
+
+  it("知识点在预检后停用时由事务最终拒绝并清理已发布文件", async () => {
+    const { app, database, jobs, storage, store, writer } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const uploaded = await uploadPackage(app, leader, await nativeZipOf(fixtureProblem()));
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: upload.fileId,
+        sha256: upload.sha256,
+        formatId: "urmotiv",
+        idempotencyKey: "tag-deactivated-after-import-preflight"
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const jobId = (created.json() as { id: string }).id;
+    await jobs.startImportJob(jobId);
+    const beforeProblems = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count FROM problems
+    `);
+    const originalHasTags = store.hasTags.bind(store);
+    vi.spyOn(store, "hasTags").mockImplementationOnce(async (tagIds) => {
+      expect(await originalHasTags(tagIds)).toBe(true);
+      await database.execute(sql`
+        UPDATE tags SET is_active = false WHERE id = 'catalog.tag.02.09'
+      `);
+      return true;
+    });
+    const staged = vi.spyOn(storage, "stage");
+    const deleted = vi.spyOn(storage, "delete");
+
+    await expect(writer.write({
+      importJobId: jobId,
+      position: 0,
+      requestedByUserId: databaseDemoUserIds.leader,
+      choices: { conflictAction: "create" },
+      problem: fixtureProblem(),
+      signal: new AbortController().signal
+    })).rejects.toMatchObject({
+      name: "ImportResultSaveError",
+      message: "导入结果的保存状态暂时无法确认。"
+    });
+
+    expect(staged).toHaveBeenCalledTimes(fixtureProblem().files.length);
+    expect(deleted).toHaveBeenCalledTimes(fixtureProblem().files.length);
+    expect(await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count FROM problems
+    `)).toEqual(beforeProblems);
+    expect(await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'problem' AND deleted_at IS NULL
+    `)).toEqual([{ count: 0 }]);
+  });
+
   it("两个工作进程同时写同一导入项目时只保留一道题并复用题目编号", async () => {
     const { app, database, jobs, storage, store, writer } = await makeTransferApp();
     const leader = await login(app, databaseDemoUserIds.leader);
@@ -1168,20 +1311,20 @@ describe("题目包导入", () => {
       FROM problems
     `);
     const deleted = vi.spyOn(storage, "delete");
-    const originalListTags = store.listTags.bind(store);
+    const originalHasTags = store.hasTags.bind(store);
     let releaseBothTagReads: (() => void) | undefined;
     const bothTagReads = new Promise<void>((resolve) => {
       releaseBothTagReads = resolve;
     });
     let tagReadCount = 0;
-    vi.spyOn(store, "listTags").mockImplementation(async () => {
-      const tags = await originalListTags();
+    vi.spyOn(store, "hasTags").mockImplementation(async (tagIds) => {
+      const hasTags = await originalHasTags(tagIds);
       tagReadCount += 1;
       if (tagReadCount === 2) {
         releaseBothTagReads?.();
       }
       await bothTagReads;
-      return tags;
+      return hasTags;
     });
     const signal = new AbortController().signal;
     const write = () =>

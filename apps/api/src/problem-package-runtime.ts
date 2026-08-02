@@ -341,14 +341,29 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
       return { problemId: existingProblemId };
     }
 
-    const problem = canonicalProblemSchema.parse(input.problem);
-    let knownTags: Set<string>;
+    let problem: CanonicalProblem;
     try {
-      knownTags = new Set((await this.#store.listTags()).map((tag) => tag.id));
+      problem = canonicalProblemSchema.parse(input.problem);
+    } catch {
+      throw new ProblemPackageError("题目包内容不符合导入要求。");
+    }
+    const tagIds = problem.tags;
+    if (
+      tagIds.length < 1 ||
+      tagIds.length > 30 ||
+      new Set(tagIds).size !== tagIds.length
+    ) {
+      throw new ProblemPackageError("题目包中的知识点无效。");
+    }
+    let tagsAreActiveLeaves: boolean;
+    try {
+      tagsAreActiveLeaves = await this.#store.hasTags(tagIds);
     } catch {
       throw new ImportResultSaveError();
     }
-    const tagIds = problem.tags.filter((tag) => knownTags.has(tag));
+    if (!tagsAreActiveLeaves) {
+      throw new ProblemPackageError("题目包中的知识点无效。");
+    }
     const now = this.#now().toISOString();
     const stored: StoredProblem = {
       id: randomUUID(),
