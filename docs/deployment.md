@@ -129,19 +129,58 @@ bash scripts/deploy/backup.sh \
 - Docker 卷 `postgres-data`、`redis-data`、`minio-data` 是运行数据，不能随意执行 `docker compose down -v`。这会删除数据卷。
 - 日志、任务报告和故障信息不得包含题面全文、题解、测试数据、密码、令牌或密钥。
 
+## 启用 Anklang（原题检索服务）
+
+Anklang 是独立的原题检索服务，默认不随主应用启动，也不连接 Urmotiv 的 PostgreSQL、Redis 或
+MinIO。启用步骤：
+
+1. 把 Anklang 仓库与本仓库同级检出（`compose.yaml` 的 `build: ../Anklang` 依赖这个相对位置），
+   或改用已经核对过的发布镜像。
+2. 在 Anklang 仓库内准备被 Git 忽略的私有环境文件；真实服务令牌、上游地址和可选模型密钥都只放
+   在这里，不要写进 `urmotiv.env`：
+
+   ```bash
+   install -d -m 700 /home/ubuntu/urmotiv-codex/Anklang/private
+   cp /home/ubuntu/urmotiv-codex/Anklang/.env.example \
+     /home/ubuntu/urmotiv-codex/Anklang/private/anklang.env
+   chmod 600 /home/ubuntu/urmotiv-codex/Anklang/private/anklang.env
+   ```
+
+   至少填写一个长度不小于 16 的 `ANKLANG_SERVICE_TOKEN`。不要用 shell 的 `source` 或 `.` 加载
+   这个文件；Compose 会通过 `env_file` 直接注入。容器内的监听地址、正式端口、强制令牌和停止宽限
+   由 Compose 固定为安全值，私有文件不能把它们改成对外开放或无鉴权模式。
+3. 启动可选 profile：
+
+   ```bash
+   cd /home/ubuntu/urmotiv-codex/repo
+   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env \
+     --profile anklang up -d anklang
+   ```
+
+   容器以非 root 用户运行，使用只读根文件系统并移除全部额外 Linux 权限。宿主只监听
+   `127.0.0.1:8730`；健康检查访问容器内的 `/api/v1/live`，不会触发外部检索。
+4. 在管理后台启用“原题相似度检查”插件，把 `baseUrl` 设为 `http://anklang:8730`，并填写与
+   `ANKLANG_SERVICE_TOKEN` 相同的服务令牌。插件使用 v2 接口；`partial` 或 `unavailable` 不能当成
+   “没有原题”。
+
+不带 `--profile anklang` 的普通 `docker compose up` 不会创建 Anklang 容器。不要同时运行独立
+Anklang Compose 和这个 profile 占用同一个宿主端口或数据卷。
+
 ## 启用 Fermata（AI 审题服务）
 
 Fermata 是独立的 AI 审题进程，默认不随主应用启动。启用步骤：
 
 1. 把 Fermata 仓库与本仓库同级检出（`compose.yaml` 的 `build: ../Fermata` 依赖这个相对位置），
    或改用已发布镜像。
-2. 在私有目录准备它自己的环境文件（例如 `/home/ubuntu/urmotiv-codex/private/fermata.env`），
+2. 在 Fermata 仓库内被 Git 整体忽略的私有目录准备环境文件（例如
+   `/home/ubuntu/urmotiv-codex/Fermata/private/fermata.env`），
    字段见 Fermata 仓库的 `.env.example`。加载环境变量时不要用 shell 的 `source`——值里出现
    `#`、`)` 等字符会导致报错并把密钥回显到终端；Fermata 自带 `scripts/run-with-env.mjs`
    专门解决这个问题（Docker 部署下由 compose 的 `env_file` 注入，天然没有这个风险）。
 3. 在 Urmotiv 管理后台创建机器人账号并签发 API 令牌，填入 `URMOTIV_ROBOT_TOKEN`。
-4. 用 profile 启动：`docker compose --profile fermata up -d`，或在环境里设置
-   `COMPOSE_PROFILES=fermata` 后照常 `docker compose up -d`。
+4. 用 profile 启动：`docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env
+   --profile fermata up -d fermata`，或在主环境文件里设置 `COMPOSE_PROFILES=fermata` 后照常
+   `docker compose up -d`。
 5. 在管理后台启用 `Fermata 审核服务管理` 插件，把 `baseUrl` 指向
    `http://fermata:8720`（compose 内部网络）并配置管理令牌，即可在插件页看到健康状态、
    修改轮询间隔等公开设置。

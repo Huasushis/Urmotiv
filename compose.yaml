@@ -152,6 +152,53 @@ services:
       retries: 12
       start_period: 10s
 
+  # Anklang 是独立仓库的原题检索服务，不连接 Urmotiv 的数据库、Redis 或对象存储。
+  # 默认不启动；只有显式启用 anklang profile 时才加入当前 Compose 项目。
+  # build 假定 Anklang 与本仓库以同级目录检出。服务令牌和外部服务密钥只从
+  # Anklang 自己被 Git 忽略的 private/anklang.env 注入，不进入 Urmotiv 环境文件。
+  anklang:
+    build:
+      context: ../Anklang
+    restart: unless-stopped
+    profiles: ["anklang"]
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    env_file:
+      - path: ../Anklang/private/anklang.env
+        required: true
+    environment:
+      ANKLANG_BIND_HOST: "0.0.0.0"
+      ANKLANG_PORT: "8730"
+      ANKLANG_REQUIRE_SERVICE_TOKEN: "true"
+      ANKLANG_SHUTDOWN_GRACE_SECONDS: "30"
+    ports:
+      - "127.0.0.1:8730:8730"
+    volumes:
+      - anklang-problems-data:/app/problems-data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import urllib.request;
+          opener=urllib.request.build_opener(urllib.request.ProxyHandler({}));
+          response=opener.open('http://127.0.0.1:8730/api/v1/live', timeout=2);
+          raise SystemExit(0 if response.status == 200 else 1)
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 5s
+    stop_grace_period: "45s"
+
   # Fermata 是独立仓库的 AI 审核实验服务：用机器人令牌领取、续租并提交审题任务，
   # 不直接连接 Postgres、Redis 或 MinIO。它与主应用之间通过管理后台的
   # “Fermata 审核服务管理”插件设置（baseUrl、超时）对接，不经过环境变量。
@@ -167,8 +214,9 @@ services:
     profiles: ["fermata"]
     env_file:
       # 与 urmotiv.env 分开存放：Fermata 自己的模型 / 服务凭据不进入主应用的环境文件，
-      # 按同样的约定放在私有目录，例如 /home/ubuntu/urmotiv-codex/private/fermata.env。
-      - ../private/fermata.env
+      # 放在 Fermata 仓库内被 Git 整体忽略的 private/fermata.env。
+      - path: ../Fermata/private/fermata.env
+        required: true
     ports:
       - "127.0.0.1:8720:8720"
     depends_on:
@@ -186,3 +234,4 @@ volumes:
   postgres-data:
   redis-data:
   minio-data:
+  anklang-problems-data:
