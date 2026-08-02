@@ -142,7 +142,7 @@ async function createPendingProblem(app: FastifyInstance): Promise<{ id: string 
     payload: {
       title: "机器人审题演示题",
       type: "traditional",
-      tagIds: ["algorithm.implementation"],
+      tagIds: ["catalog.tag.02.09"],
       content: {
         basicStatement: "给定 n，输出 n。",
         basicSolution: "直接输出。",
@@ -587,6 +587,10 @@ describe("机器人审题接口", () => {
           )
         `);
         await transaction.execute(sql`
+          INSERT INTO problem_revision_tags (revision_id, tag_id)
+          VALUES (${revisionId}::uuid, 'catalog.tag.02.09')
+        `);
+        await transaction.execute(sql`
           INSERT INTO review_rounds (
             id, problem_id, round, submitted_revision_id, status,
             rule_id, rule_version, rule_settings, submitted_by_user_id, created_at
@@ -670,6 +674,10 @@ describe("机器人审题接口", () => {
             '0000000000000000000000000000000000000000000000000000000000000000',
             '题型过滤测试', ${BigInt(databaseDemoUserIds.author)}, ${createdAt}::timestamptz
           )
+        `);
+        await transaction.execute(sql`
+          INSERT INTO problem_revision_tags (revision_id, tag_id)
+          VALUES (${revisionId}::uuid, 'catalog.tag.02.09')
         `);
         await transaction.execute(sql`
           INSERT INTO review_rounds (

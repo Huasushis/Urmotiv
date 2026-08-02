@@ -84,7 +84,7 @@ async function createPendingProblem(app: FastifyInstance, cookie: string): Promi
     payload: {
       title: "并发撤权查重测试题",
       type: "traditional",
-      tagIds: ["algorithm.implementation"],
+      tagIds: ["catalog.tag.02.09"],
       content: {
         basicStatement: "给定一个整数，输出这个整数。",
         basicSolution: "直接输出输入值。",

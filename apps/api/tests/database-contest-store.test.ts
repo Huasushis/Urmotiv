@@ -57,7 +57,7 @@ function approvedProblem(): StoredProblem {
     id: randomUUID(),
     title: "公开构造的持久化组题测试题",
     type: "traditional",
-    tagIds: ["algorithm.implementation"],
+    tagIds: ["catalog.tag.02.09"],
     codeforcesDifficulty: 1400,
     thinkingLevel: 2,
     codingLevel: 2,

@@ -441,13 +441,14 @@ describe("one-time administrator bootstrap eligibility", () => {
     await handle.execute(sql`DELETE FROM api_tokens`);
 
     await handle.execute(sql`
-      INSERT INTO tags (id, name, group_name, created_by_user_id)
-      VALUES ('fixture', '合成标签', '合成分组', 0)
+      UPDATE tags SET description = '合成变更' WHERE id = 'catalog.tag.01.01'
     `);
     await expect(openAdminBootstrapForFreshSeed(handle, lease)).resolves.toBe(
       "baseline_mismatch"
     );
-    await handle.execute(sql`DELETE FROM tags`);
+    await handle.execute(sql`
+      UPDATE tags SET description = '' WHERE id = 'catalog.tag.01.01'
+    `);
 
     await handle.execute(sql`
       UPDATE review_policy SET revision = 2, updated_at = now() WHERE singleton = true
@@ -521,6 +522,10 @@ describe("problem revisions and audit history", () => {
           '创建草稿',
           0
         )
+      `);
+      await transaction.execute(sql`
+        INSERT INTO problem_revision_tags (revision_id, tag_id)
+        VALUES ('20000000-0000-4000-8000-000000000001', 'catalog.tag.02.09')
       `);
     });
 
@@ -607,6 +612,14 @@ describe("robot review lease migration", () => {
           '0000000000000000000000000000000000000000000000000000000000000000',
           '迁移测试', 0
         )
+      `);
+      await transaction.execute(sql`
+        INSERT INTO tags (id, name, group_name)
+        VALUES ('legacy.synthetic', '合成迁移标签', '迁移测试分组')
+      `);
+      await transaction.execute(sql`
+        INSERT INTO problem_revision_tags (revision_id, tag_id)
+        VALUES ('70000000-0000-4000-8000-000000000001', 'legacy.synthetic')
       `);
       await transaction.execute(sql`
         INSERT INTO review_rounds (
@@ -1980,8 +1993,8 @@ describePostgres("problem package outbox on real PostgreSQL", () => {
       FROM drizzle.__drizzle_migrations_id_seq
     `);
     expect(migrationState).toEqual([{
-      migration_count: 11,
-      sequence_value: "11",
+      migration_count: 12,
+      sequence_value: "12",
       sequence_called: true
     }]);
     const indexes = await database.query<{ indexname: string }>(sql`

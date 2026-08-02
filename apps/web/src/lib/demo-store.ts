@@ -6,6 +6,7 @@ import type {
   ProblemListQuery,
   ProblemListResponse,
   ProblemStatus,
+  ProblemTag,
   ReviewInput,
   ReviewRoundSummary,
   ReviewSuggestionView,
@@ -133,7 +134,7 @@ const initialProblems: Problem[] = [
   }
 ];
 
-const tags = [
+const tags: ProblemTag[] = [
   { id: "graph.shortest-path", name: "最短路", group: "图论" },
   { id: "graph.dag", name: "有向无环图", group: "图论" },
   { id: "data-structure.segment-tree", name: "线段树", group: "数据结构" },

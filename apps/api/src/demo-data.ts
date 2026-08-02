@@ -100,9 +100,44 @@ export function createDemoUsers(): StoredUser[] {
 }
 
 export const demoTags: ProblemTag[] = [
-  { id: "algorithm.implementation", name: "模拟", group: "算法" },
-  { id: "data-structure.graph", name: "图论", group: "数据结构与图" },
-  { id: "dynamic-programming", name: "动态规划", group: "算法" },
-  { id: "math.number-theory", name: "数论", group: "数学" },
-  { id: "string", name: "字符串", group: "基础" }
+  {
+    id: "algorithm.implementation",
+    name: "模拟",
+    group: "算法",
+    itemKind: "tag",
+    active: true,
+    category: { id: "demo.category.algorithm", name: "算法" }
+  },
+  {
+    id: "data-structure.graph",
+    name: "图论",
+    group: "数据结构与图",
+    itemKind: "tag",
+    active: true,
+    category: { id: "demo.category.data-structure-graph", name: "数据结构与图" }
+  },
+  {
+    id: "dynamic-programming",
+    name: "动态规划",
+    group: "算法",
+    itemKind: "tag",
+    active: true,
+    category: { id: "demo.category.algorithm", name: "算法" }
+  },
+  {
+    id: "math.number-theory",
+    name: "数论",
+    group: "数学",
+    itemKind: "tag",
+    active: true,
+    category: { id: "demo.category.math", name: "数学" }
+  },
+  {
+    id: "string",
+    name: "字符串",
+    group: "基础",
+    itemKind: "tag",
+    active: true,
+    category: { id: "demo.category.basic", name: "基础" }
+  }
 ];

@@ -86,7 +86,7 @@ function makeProblem(): StoredProblem {
     id: randomUUID(),
     title: "Package job fixture",
     type: "traditional",
-    tagIds: ["algorithm.implementation"],
+    tagIds: ["catalog.tag.02.09"],
     codeforcesDifficulty: 1200,
     thinkingLevel: 2,
     codingLevel: 2,

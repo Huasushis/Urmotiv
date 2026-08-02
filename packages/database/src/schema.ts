@@ -123,6 +123,7 @@ export const reviewAssignmentOperation = pgEnum("review_assignment_operation", [
   "renew",
   "complete"
 ]);
+export const tagItemKind = pgEnum("tag_item_kind", ["category", "tag"]);
 
 export const adminBootstrapState = pgTable(
   "admin_bootstrap_state",
@@ -696,6 +697,8 @@ export const tags = pgTable(
       { onDelete: "restrict" }
     ),
     name: varchar("name", { length: 80 }).notNull(),
+    normalizedName: varchar("normalized_name", { length: 160 }).notNull(),
+    itemKind: tagItemKind("item_kind").notNull(),
     groupName: varchar("group_name", { length: 80 }).notNull(),
     description: text("description").notNull().default(""),
     sortOrder: integer("sort_order").notNull().default(0),
@@ -708,9 +711,113 @@ export const tags = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
   },
   (table) => [
-    uniqueIndex("tags_parent_name_uq").on(table.parentId, table.name),
+    uniqueIndex("tags_parent_normalized_name_uq").on(
+      sql`COALESCE(${table.parentId}, '')`,
+      table.normalizedName
+    ),
     index("tags_group_sort_idx").on(table.groupName, table.sortOrder),
-    check("tags_not_self_parent_ck", sql`${table.parentId} IS NULL OR ${table.parentId} <> ${table.id}`)
+    index("tags_parent_sort_idx").on(table.parentId, table.sortOrder, table.id),
+    check("tags_not_self_parent_ck", sql`${table.parentId} IS NULL OR ${table.parentId} <> ${table.id}`),
+    check("tags_id_format_ck", sql`${table.id} ~ '^[a-z0-9]+(?:[._-][a-z0-9]+)*$'`),
+    check(
+      "tags_name_ck",
+      sql`length(regexp_replace(normalize(${table.name}, NFKC), '^[[:space:]]+|[[:space:]]+$', '', 'g')) > 0`
+    ),
+    check(
+      "tags_normalized_name_ck",
+      sql`length(${table.normalizedName}) > 0 AND ${table.normalizedName} = lower(regexp_replace(normalize(${table.name}, NFKC), '^[[:space:]]+|[[:space:]]+$', '', 'g'))`
+    ),
+    check(
+      "tags_structure_ck",
+      sql`(${table.itemKind} = 'category' AND ${table.parentId} IS NULL) OR (${table.itemKind} = 'tag' AND ${table.parentId} IS NOT NULL)`
+    )
+  ]
+);
+
+export const tagAliases = pgTable(
+  "tag_aliases",
+  {
+    id: uuid("id").primaryKey(),
+    tagId: varchar("tag_id", { length: 120 })
+      .notNull()
+      .references(() => tags.id, { onDelete: "restrict" }),
+    name: varchar("name", { length: 160 }).notNull(),
+    normalizedName: varchar("normalized_name", { length: 160 }).notNull(),
+    createdByUserId: bigint("created_by_user_id", { mode: "bigint" }).references(
+      () => users.id,
+      { onDelete: "set null" }
+    ),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    uniqueIndex("tag_aliases_normalized_name_uq").on(table.normalizedName),
+    index("tag_aliases_tag_idx").on(table.tagId, table.createdAt),
+    check(
+      "tag_aliases_name_ck",
+      sql`length(regexp_replace(normalize(${table.name}, NFKC), '^[[:space:]]+|[[:space:]]+$', '', 'g')) > 0`
+    ),
+    check(
+      "tag_aliases_normalized_name_ck",
+      sql`length(${table.normalizedName}) > 0 AND ${table.normalizedName} = lower(regexp_replace(normalize(${table.name}, NFKC), '^[[:space:]]+|[[:space:]]+$', '', 'g'))`
+    )
+  ]
+);
+
+export const tagCatalogState = pgTable(
+  "tag_catalog_state",
+  {
+    singleton: boolean("singleton").primaryKey().default(true),
+    version: integer("version").notNull().default(1),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    check("tag_catalog_state_singleton_ck", sql`${table.singleton} = true`),
+    check("tag_catalog_state_version_ck", sql`${table.version} > 0`)
+  ]
+);
+
+export const tagDeactivationPreviews = pgTable(
+  "tag_deactivation_previews",
+  {
+    id: uuid("id").primaryKey(),
+    actorUserId: bigint("actor_user_id", { mode: "bigint" })
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    targetTagId: varchar("target_tag_id", { length: 120 })
+      .notNull()
+      .references(() => tags.id, { onDelete: "restrict" }),
+    replacementTagId: varchar("replacement_tag_id", { length: 120 }).references(
+      () => tags.id,
+      { onDelete: "restrict" }
+    ),
+    catalogVersion: integer("catalog_version").notNull(),
+    currentProblemCount: integer("current_problem_count").notNull(),
+    soleCurrentTagCount: integer("sole_current_tag_count").notNull(),
+    historicalRevisionCount: integer("historical_revision_count").notNull(),
+    reviewOpinionCount: integer("review_opinion_count").notNull(),
+    childTagCount: integer("child_tag_count").notNull(),
+    impactDigest: char("impact_digest", { length: 64 }).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    usedAt: timestamp("used_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    index("tag_deactivation_previews_expiry_idx").on(table.expiresAt, table.usedAt),
+    check("tag_deactivation_previews_version_ck", sql`${table.catalogVersion} > 0`),
+    check(
+      "tag_deactivation_previews_counts_ck",
+      sql`${table.currentProblemCount} >= 0 AND ${table.soleCurrentTagCount} BETWEEN 0 AND ${table.currentProblemCount} AND ${table.historicalRevisionCount} >= 0 AND ${table.reviewOpinionCount} >= 0 AND ${table.childTagCount} >= 0`
+    ),
+    check("tag_deactivation_previews_digest_ck", sql`${table.impactDigest} ~ '^[0-9a-f]{64}$'`),
+    check("tag_deactivation_previews_expiry_ck", sql`${table.expiresAt} > ${table.createdAt}`),
+    check(
+      "tag_deactivation_previews_used_ck",
+      sql`${table.usedAt} IS NULL OR ${table.usedAt} BETWEEN ${table.createdAt} AND ${table.expiresAt}`
+    ),
+    check(
+      "tag_deactivation_previews_replacement_ck",
+      sql`${table.replacementTagId} IS NULL OR ${table.replacementTagId} <> ${table.targetTagId}`
+    )
   ]
 );
 

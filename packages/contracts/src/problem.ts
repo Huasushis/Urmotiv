@@ -1,4 +1,6 @@
 import { z } from "zod";
+export type { ProblemTag } from "./tag";
+export { tagSchema } from "./tag";
 
 export const problemTypes = ["traditional", "interactive", "submit_answer"] as const;
 export const problemStatuses = ["draft", "pending_review", "approved", "rejected"] as const;
@@ -231,7 +233,6 @@ export const problemDraftSchema = z.object({
 export type ProblemDraft = z.infer<typeof problemDraftSchema>;
 
 export const createProblemInputSchema = problemDraftSchema.partial({
-  tagIds: true,
   content: true,
   samples: true,
   judgeConfig: true
@@ -331,11 +332,3 @@ export const problemListQuerySchema = z.object({
 });
 
 export type ProblemListQuery = z.infer<typeof problemListQuerySchema>;
-
-export const tagSchema = z.object({
-  id: z.string().min(1).max(120),
-  name: z.string().min(1).max(80),
-  group: z.string().min(1).max(80)
-});
-
-export type ProblemTag = z.infer<typeof tagSchema>;

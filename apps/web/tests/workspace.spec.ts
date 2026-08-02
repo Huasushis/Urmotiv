@@ -63,6 +63,7 @@ test("投稿人可以创建带 Markdown 内容的草稿并看到六个工作区�
   await loginAsAuthor(page);
   await page.getByRole("link", { name: "新建题目" }).click();
   await page.getByLabel("题目名称").fill("页面联调示例题");
+  await page.locator(".tag-picker-group summary").first().click();
   await page.locator(".tag-choice").first().click();
   await page.locator('section[aria-label="基础题面"] textarea').fill("求 $1+1$ 的值。");
   await page.locator('section[aria-label="基础题解"] textarea').fill("直接计算即可。");

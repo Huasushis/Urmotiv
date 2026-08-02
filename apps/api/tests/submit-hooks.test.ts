@@ -217,7 +217,7 @@ async function createDraft(app: FastifyInstance, cookie: string): Promise<{ id: 
     payload: {
       title: "查重链路演示题",
       type: "traditional",
-      tagIds: ["algorithm.implementation"],
+      tagIds: ["catalog.tag.02.09"],
       content: {
         basicStatement: statementText,
         basicSolution: "直接输出。",

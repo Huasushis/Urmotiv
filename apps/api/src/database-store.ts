@@ -194,7 +194,7 @@ async function hasActiveTags(
   const rows = await executor.query<{ count: number | string }>(sql`
     SELECT count(*)::integer AS count
     FROM tags
-    WHERE is_active = true AND id IN (${sqlList(uniqueTagIds)})
+    WHERE is_active = true AND item_kind = 'tag' AND id IN (${sqlList(uniqueTagIds)})
   `);
   return Number(rows[0]?.count ?? 0) === uniqueTagIds.length;
 }
@@ -1446,13 +1446,34 @@ export class DatabaseDataStore implements DataStore {
   }
 
   public async listTags(): Promise<ProblemTag[]> {
-    const rows = await this.handle.query<{ id: string; name: string; group_name: string }>(sql`
-      SELECT id, name, group_name
-      FROM tags
-      WHERE is_active = true
-      ORDER BY group_name, sort_order, name, id
+    const rows = await this.handle.query<{
+      id: string;
+      name: string;
+      category_id: string;
+      category_name: string;
+      is_active: boolean;
+    }>(sql`
+      SELECT
+        leaf.id,
+        leaf.name,
+        category.id AS category_id,
+        category.name AS category_name,
+        leaf.is_active
+      FROM tags leaf
+      JOIN tags category
+        ON category.id = leaf.parent_id
+       AND category.item_kind = 'category'
+      WHERE leaf.item_kind = 'tag'
+      ORDER BY category.sort_order, category.id, leaf.sort_order, leaf.name, leaf.id
     `);
-    return rows.map((row) => ({ id: row.id, name: row.name, group: row.group_name }));
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      group: row.category_name,
+      itemKind: "tag",
+      active: row.is_active,
+      category: { id: row.category_id, name: row.category_name }
+    }));
   }
 
   public async hasTags(tagIds: string[]): Promise<boolean> {

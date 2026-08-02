@@ -118,7 +118,7 @@ async function createDraft(
     payload: {
       title: "文件接口演示题目",
       type,
-      tagIds: ["algorithm.implementation"],
+      tagIds: ["catalog.tag.02.09"],
       content: fullContent
     }
   });

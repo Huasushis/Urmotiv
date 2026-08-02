@@ -510,7 +510,7 @@ describe("题目 API", () => {
       originalityLevel: 3,
       thinkingLevel: 2,
       codingLevel: 1,
-      tagIds: [],
+      tagIds: ["algorithm.implementation"],
       improvements: "补充边界说明。",
       publicComment: "这条公开评论可供作者修改题目时参考。",
       privateNote: "仅审核相关成员可见",

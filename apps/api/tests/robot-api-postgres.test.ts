@@ -474,6 +474,18 @@ async function insertLegacyLeaseFixture(database: PostgresDatabaseHandle): Promi
       )
     `);
     await transaction.execute(sql`
+      INSERT INTO tags (id, name, group_name, description)
+      VALUES (
+        'fixture.robot-lease', '公开迁移夹具知识点', '公开迁移夹具分类',
+        '用于验证跨版本迁移的公开测试夹具'
+      )
+      ON CONFLICT (id) DO NOTHING
+    `);
+    await transaction.execute(sql`
+      INSERT INTO problem_revision_tags (revision_id, tag_id)
+      VALUES (${revisionId}::uuid, 'fixture.robot-lease')
+    `);
+    await transaction.execute(sql`
       INSERT INTO review_rounds (
         id, problem_id, round, submitted_revision_id, status, rule_id, rule_version,
         submitted_by_user_id
@@ -538,7 +550,7 @@ async function createPendingProblem(app: FastifyInstance): Promise<{ id: string 
     payload: {
       title: "公开构造的 PostgreSQL 并发题",
       type: "traditional",
-      tagIds: ["algorithm.implementation"],
+      tagIds: ["catalog.tag.02.09"],
       content: { basicStatement: "输入一个数。", basicSolution: "直接处理。" }
     }
   });

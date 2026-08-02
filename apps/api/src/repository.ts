@@ -332,11 +332,16 @@ export class InMemoryDataStore implements DataStore {
   }
 
   public async listTags(): Promise<ProblemTag[]> {
-    return [...this.tags.values()].map(copy).sort((left, right) => left.name.localeCompare(right.name));
+    return [...this.tags.values()]
+      .map(copy)
+      .sort((left, right) => left.name.localeCompare(right.name));
   }
 
   public async hasTags(tagIds: string[]): Promise<boolean> {
-    return tagIds.every((tagId) => this.tags.has(tagId));
+    return tagIds.every((tagId) => {
+      const tag = this.tags.get(tagId);
+      return tag !== undefined && tag.active !== false;
+    });
   }
 
   public async createProblem(problem: StoredProblem): Promise<StoredProblem> {
@@ -455,7 +460,11 @@ export class InMemoryDataStore implements DataStore {
             .filter((review) => review.expectedRound === round)
             .map(copy)
             .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
-        hasTags: async (tagIds) => tagIds.every((tagId) => this.tags.has(tagId)),
+        hasTags: async (tagIds) =>
+          tagIds.every((tagId) => {
+            const tag = this.tags.get(tagId);
+            return tag !== undefined && tag.active !== false;
+          }),
         upsertReview: (review) => {
           if (review.problemId !== problemId) {
             throw new Error("审核意见与当前题目不匹配。");

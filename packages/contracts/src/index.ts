@@ -9,5 +9,6 @@ export * from "./review";
 export * from "./review-item";
 export * from "./robot";
 export * from "./service-account";
+export * from "./tag";
 export * from "./transfer";
 export * from "./plugin";

@@ -1,4 +1,4 @@
-import type { ProblemTag } from "@urmotiv/contracts";
+import { normalizeTagName, type ProblemTag } from "@urmotiv/contracts";
 import { Check, Search, X } from "lucide-react";
 import { useEffect, useId, useMemo, useState } from "react";
 
@@ -21,7 +21,7 @@ function uniqueIds(ids: string[]): string[] {
 }
 
 function normalizeSearchText(value: string): string {
-  return value.normalize("NFKC").trim().toLocaleLowerCase("zh-CN");
+  return normalizeTagName(value);
 }
 
 export function TagPicker({ tags, value, onChange, disabled = false }: TagPickerProps) {
@@ -38,9 +38,14 @@ export function TagPicker({ tags, value, onChange, disabled = false }: TagPicker
     return [...byId.values()];
   }, [tags]);
 
+  const selectableTags = useMemo(
+    () => uniqueTags.filter((tag) => tag.active !== false),
+    [uniqueTags],
+  );
+
   const groups = useMemo(() => {
     const byName = new Map<string, ProblemTag[]>();
-    for (const tag of uniqueTags) {
+    for (const tag of selectableTags) {
       const groupTags = byName.get(tag.group);
       if (groupTags === undefined) {
         byName.set(tag.group, [tag]);
@@ -49,7 +54,7 @@ export function TagPicker({ tags, value, onChange, disabled = false }: TagPicker
       }
     }
     return [...byName].map(([name, groupTags]): TagGroup => ({ name, tags: groupTags }));
-  }, [uniqueTags]);
+  }, [selectableTags]);
 
   const tagById = useMemo(
     () => new Map(uniqueTags.map((tag) => [tag.id, tag] as const)),
@@ -129,7 +134,9 @@ export function TagPicker({ tags, value, onChange, disabled = false }: TagPicker
         ) : (
           <div className="tag-picker-selected-list">
             {selectedIds.map((id) => {
-              const name = tagById.get(id)?.name ?? `未知标签（${id}）`;
+              const tag = tagById.get(id);
+              const name = tag?.name ?? `未知标签（${id}）`;
+              const displayName = tag?.active === false ? `${name}（已停用）` : name;
               return (
                 <button
                   key={id}
@@ -137,10 +144,10 @@ export function TagPicker({ tags, value, onChange, disabled = false }: TagPicker
                   className="tag-selected-item"
                   onClick={() => setSelected(id, false)}
                   disabled={disabled}
-                  aria-label={`移除知识点“${name}”`}
-                  title={`移除“${name}”`}
+                  aria-label={`移除知识点“${displayName}”`}
+                  title={`移除“${displayName}”`}
                 >
-                  <span>{name}</span>
+                  <span>{displayName}</span>
                   <X size={13} aria-hidden="true" />
                 </button>
               );

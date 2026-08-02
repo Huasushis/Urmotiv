@@ -48,7 +48,7 @@ function makeProblem(overrides: Partial<StoredProblem> = {}): StoredProblem {
     id: randomUUID(),
     title: "Revision action regression fixture",
     type: "traditional",
-    tagIds: ["algorithm.implementation"],
+    tagIds: ["catalog.tag.02.09"],
     codeforcesDifficulty: 1200,
     thinkingLevel: 2,
     codingLevel: 2,

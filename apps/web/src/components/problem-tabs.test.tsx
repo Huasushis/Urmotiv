@@ -365,7 +365,18 @@ describe("题目审核标签页", () => {
       }))
     });
     api.listReviewItems.mockResolvedValue({ round: 1, items: [] });
-    api.listTags.mockResolvedValue({ items: [] });
+    api.listTags.mockResolvedValue({
+      items: [
+        {
+          id: "dynamic-programming",
+          name: "动态规划",
+          group: "基础算法",
+          itemKind: "tag",
+          active: false,
+          category: { id: "category.algorithm", name: "基础算法" }
+        }
+      ]
+    });
 
     const view = mount(
       <ReviewTab problem={problem(false)} currentUserId="read-only-user" />
@@ -376,6 +387,7 @@ describe("题目审核标签页", () => {
     expect(view.textContent).toContain("AI 审核服务");
     expect(view.textContent).toContain("公开评论。");
     expect(view.textContent).toContain("未提供");
+    expect(view.textContent).toContain("动态规划（已停用）");
     expect(view.textContent).not.toContain("仅审题人可见。");
     expect(view.querySelector(".review-form")).toBeNull();
     expect(view.textContent).not.toContain("保存修改");

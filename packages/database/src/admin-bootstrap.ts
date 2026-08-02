@@ -6,7 +6,7 @@ import { hasExactDefaultCoreSeed } from "./seed";
 
 const migrationLockKeyOne = 1_431_453_001;
 const migrationLockKeyTwo = 1_651_666_804;
-const expectedMigrationCount = 11;
+const expectedMigrationCount = 12;
 
 const seededPublicTables = new Set([
   "admin_bootstrap_state",
@@ -15,6 +15,8 @@ const seededPublicTables = new Set([
   "review_policy",
   "role_memberships",
   "roles",
+  "tag_catalog_state",
+  "tags",
   "users"
 ]);
 
@@ -23,7 +25,7 @@ const formalPublicTableNames = Object.values(databaseSchema)
   .sort(compareText);
 
 const expectedSequenceStates = [
-  { schema: "drizzle", name: "__drizzle_migrations_id_seq", last_value: "11", is_called: true },
+  { schema: "drizzle", name: "__drizzle_migrations_id_seq", last_value: "12", is_called: true },
   { schema: "public", name: "audit_events_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "contests_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "problems_id_seq", last_value: "1", is_called: false },
@@ -557,6 +559,49 @@ async function hasExactFreshSeedBaseline(
   }
 
   if (!await hasExactDefaultCoreSeed(executor)) {
+    return false;
+  }
+
+  const tagCatalogRows = await executor.query<{
+    version: number;
+    category_count: number;
+    tag_count: number;
+    invalid_count: number;
+    catalog_digest: string;
+  }>(sql`
+    SELECT
+      state.version::integer AS version,
+      count(*) FILTER (WHERE item.item_kind = 'category')::integer AS category_count,
+      count(*) FILTER (WHERE item.item_kind = 'tag')::integer AS tag_count,
+      count(*) FILTER (
+        WHERE item.is_active <> true
+          OR item.created_by_user_id IS NOT NULL
+          OR item.id NOT LIKE 'catalog.%'
+      )::integer AS invalid_count,
+      md5(string_agg(
+        item.id || chr(31)
+          || COALESCE(item.parent_id, '') || chr(31)
+          || item.name || chr(31)
+          || item.normalized_name || chr(31)
+          || item.item_kind::text || chr(31)
+          || item.group_name || chr(31)
+          || item.description || chr(31)
+          || item.sort_order::text || chr(31)
+          || item.is_active::text,
+        chr(30) ORDER BY item.id
+      )) AS catalog_digest
+    FROM tag_catalog_state state
+    CROSS JOIN tags item
+    WHERE state.singleton = true
+    GROUP BY state.version
+  `);
+  if (!sameRows(tagCatalogRows, [{
+    version: 1,
+    category_count: 22,
+    tag_count: 243,
+    invalid_count: 0,
+    catalog_digest: "715372cf332347084df82c6c63937e79"
+  }])) {
     return false;
   }
 

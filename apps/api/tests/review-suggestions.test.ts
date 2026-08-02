@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { PermissionGrant } from "@urmotiv/contracts";
+import type { PermissionGrant, ProblemTag } from "@urmotiv/contracts";
 import type { FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
@@ -73,11 +73,14 @@ function demoUser(userId: string): StoredUser {
   return user;
 }
 
-async function makeApp(users: StoredUser[] = createDemoUsers()): Promise<{
+async function makeApp(
+  users: StoredUser[] = createDemoUsers(),
+  tags: ProblemTag[] = demoTags
+): Promise<{
   app: FastifyInstance;
   store: ReviewSuggestionAuditStore;
 }> {
-  const store = new ReviewSuggestionAuditStore(users, demoTags);
+  const store = new ReviewSuggestionAuditStore(users, tags);
   const app = await createApp({
     demoAuthEnabled: true,
     store,
@@ -191,6 +194,109 @@ async function createApprovedProblem(app: FastifyInstance): Promise<{
 }
 
 describe("审核建议工作流", () => {
+  it("事务内拒绝评价新增已停用知识点", async () => {
+    const inactiveTags = demoTags.map((tag) =>
+      tag.id === "algorithm.implementation" ? { ...tag, active: false } : tag
+    );
+    const { app } = await makeApp(createDemoUsers(), inactiveTags);
+    const authorCookie = await login(app, "author");
+    const reviewerCookie = await login(app, "reviewer");
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/problems",
+      headers: { cookie: authorCookie, origin },
+      payload: {
+        title: "公开构造的停用知识点测试题",
+        type: "traditional",
+        tagIds: ["string"],
+        content: {
+          basicStatement: "给定一个整数，输出它本身。",
+          basicSolution: "直接输出输入即可。"
+        }
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const draft = created.json() as ProblemResult;
+    const submitted = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${draft.id}/submit`,
+      headers: { cookie: authorCookie, origin },
+      payload: { expectedRevision: draft.revision }
+    });
+    expect(submitted.statusCode).toBe(200);
+    const pending = submitted.json() as ProblemResult;
+
+    const rejected = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${draft.id}/reviews`,
+      headers: { cookie: reviewerCookie, origin },
+      payload: {
+        verdict: "approve",
+        codeforcesDifficulty: 1200,
+        qualityLevel: 3,
+        originalityLevel: 3,
+        thinkingLevel: 2,
+        codingLevel: 2,
+        tagIds: ["algorithm.implementation"],
+        improvements: "公开构造的改进意见。",
+        expectedRound: pending.reviewRound
+      }
+    });
+    expect(rejected.statusCode).toBe(422);
+    expect(rejected.json()).toEqual({
+      error: expect.objectContaining({ code: "INVALID_TAGS" })
+    });
+  });
+
+  it("兼容零知识点历史意见，只允许写回其它字段", async () => {
+    const { app, store } = await makeApp();
+    const { problem } = await createApprovedProblem(app);
+    const leaderCookie = await login(app, "leader");
+    await store.runProblemTransaction(problem.id, (transaction) => {
+      for (const review of transaction.listReviews(problem.reviewRound)) {
+        transaction.upsertReview({ ...review, tagIds: [] });
+      }
+    });
+
+    const readable = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${problem.id}/review-suggestions`,
+      headers: { cookie: leaderCookie }
+    });
+    expect(readable.statusCode).toBe(200);
+    expect(readable.json()).toEqual(expect.objectContaining({
+      suggested: expect.objectContaining({ tagIds: [] })
+    }));
+
+    const rejectedTags = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${problem.id}/review-suggestions/apply`,
+      headers: { cookie: leaderCookie, origin },
+      payload: {
+        expectedRound: problem.reviewRound,
+        expectedRevision: problem.revision,
+        fields: ["tagIds"]
+      }
+    });
+    expect(rejectedTags.statusCode).toBe(409);
+
+    const appliedOtherField = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${problem.id}/review-suggestions/apply`,
+      headers: { cookie: leaderCookie, origin },
+      payload: {
+        expectedRound: problem.reviewRound,
+        expectedRevision: problem.revision,
+        fields: ["codingLevel"]
+      }
+    });
+    expect(appliedOtherField.statusCode).toBe(200);
+    expect(appliedOtherField.json()).toEqual(expect.objectContaining({
+      codingLevel: 2,
+      tagIds: ["string"]
+    }));
+  });
+
   it("只按关闭轮次冻结的意见聚合，并按规定向上舍入半级和整百", async () => {
     const { app, store } = await makeApp();
     const { problem, authorCookie, countedOpinionIds } = await createApprovedProblem(app);

@@ -68,7 +68,7 @@ function problem(overrides: Partial<StoredProblem> = {}): StoredProblem {
     id: randomUUID(),
     title: "公开构造的数据库测试题",
     type: "traditional",
-    tagIds: ["algorithm.implementation"],
+    tagIds: ["catalog.tag.02.09"],
     codeforcesDifficulty: 1200,
     thinkingLevel: 2,
     codingLevel: 2,
@@ -125,6 +125,83 @@ describe("数据库用户加载", () => {
 });
 
 describe("数据库题目仓库", () => {
+  it("只把启用叶子作为可选知识点，并返回所属分类", async () => {
+    const database = await openDatabase(true);
+    const store = new DatabaseDataStore(database);
+
+    expect(await database.query(sql`
+      SELECT
+        count(*) FILTER (WHERE item_kind = 'category')::integer AS categories,
+        count(*) FILTER (WHERE item_kind = 'tag')::integer AS tags,
+        (SELECT version::integer FROM tag_catalog_state WHERE singleton = true) AS version
+      FROM tags
+    `)).toEqual([{ categories: 22, tags: 243, version: 1 }]);
+
+    expect(await store.hasTags(["catalog.category.01"])).toBe(false);
+    expect(await store.hasTags(["catalog.tag.02.09"])).toBe(true);
+    await database.execute(sql`
+      UPDATE tags SET is_active = false WHERE id = 'catalog.tag.02.09'
+    `);
+    expect(await store.hasTags(["catalog.tag.02.09"])).toBe(false);
+    const listed = await store.listTags();
+    expect(listed).toContainEqual(expect.objectContaining({
+      id: "catalog.tag.02.09",
+      active: false,
+      name: "模拟",
+    }));
+    expect(listed).toContainEqual(expect.objectContaining({
+      id: "catalog.tag.01.01",
+      active: true,
+      itemKind: "tag",
+      category: { id: "catalog.category.01", name: "基础" }
+    }));
+
+    const service = new ProblemService(store);
+    const author = requireUser(await store.getUser(databaseDemoUserIds.author));
+    const draft = {
+      title: "知识点门禁合成题",
+      type: "traditional" as const,
+      codeforcesDifficulty: null,
+      thinkingLevel: null,
+      codingLevel: null,
+      content: {
+        basicStatement: "合成题面",
+        basicSolution: "合成题解",
+        background: "",
+        statement: "",
+        inputFormat: "",
+        outputFormat: "",
+        constraints: "",
+        solution: "",
+        hints: ""
+      }
+    };
+    await expect(service.createProblem(author, {
+      ...draft,
+      tagIds: []
+    })).rejects.toMatchObject({ statusCode: 422, code: "INVALID_TAGS" });
+    await expect(service.createProblem(author, {
+      ...draft,
+      tagIds: Array.from({ length: 31 }, (_, index) => `synthetic-tag-${index}`)
+    })).rejects.toMatchObject({ statusCode: 422, code: "INVALID_TAGS" });
+    await expect(service.createProblem(author, {
+      ...draft,
+      tagIds: ["catalog.category.01"]
+    })).rejects.toMatchObject({ statusCode: 422, code: "INVALID_TAGS" });
+    await expect(service.createProblem(author, {
+      ...draft,
+      tagIds: ["catalog.tag.02.09"]
+    })).rejects.toMatchObject({ statusCode: 422, code: "INVALID_TAGS" });
+    const created = await service.createProblem(author, {
+      ...draft,
+      tagIds: ["catalog.tag.01.01"]
+    });
+    await expect(service.updateProblem(author, created.id, {
+      expectedRevision: created.revision,
+      tagIds: ["catalog.category.01"]
+    })).rejects.toMatchObject({ statusCode: 422, code: "INVALID_TAGS" });
+  });
+
   it("持久化邮箱凭据、一次性 CAS 状态和 authRevision 会话撤销", async () => {
     const database = await openDatabase(true);
     const store = new DatabaseDataStore(database);
@@ -360,7 +437,7 @@ describe("数据库题目仓库", () => {
       originalityLevel: null,
       thinkingLevel: 2,
       codingLevel: 1,
-      tagIds: ["algorithm.implementation"],
+      tagIds: ["catalog.tag.02.09"],
       improvements: "历史审核意见没有原创性字段。",
       publicComment: "历史公开评论。",
       privateNote: "",
@@ -427,7 +504,7 @@ describe("数据库题目仓库", () => {
     const draft = await service.createProblem(author, {
       title: "公开构造的数据库审核建议测试题",
       type: "traditional",
-      tagIds: ["string"],
+      tagIds: ["catalog.tag.01.09"],
       codeforcesDifficulty: 800,
       thinkingLevel: 1,
       codingLevel: 5,
@@ -450,7 +527,7 @@ describe("数据库题目仓库", () => {
       originalityLevel: 2,
       thinkingLevel: 2,
       codingLevel: 1,
-      tagIds: ["algorithm.implementation"],
+      tagIds: ["catalog.tag.02.09"],
       improvements: "补充公开构造的边界说明。",
       publicComment: "公开评论。",
       privateNote: "数据库事务测试私密备注。",
@@ -467,7 +544,7 @@ describe("数据库题目仓库", () => {
       originalityLevel: 3,
       thinkingLevel: 3,
       codingLevel: 2,
-      tagIds: ["dynamic-programming"]
+      tagIds: ["catalog.tag.04.01"]
     });
     const approved = await service.getProblem(leader, draft.id);
     expect(approved.status).toBe("approved");
@@ -485,7 +562,7 @@ describe("数据库题目仓库", () => {
     expect(applied).toEqual(expect.objectContaining({
       revision: approved.revision + 1,
       codeforcesDifficulty: 1300,
-      tagIds: ["algorithm.implementation", "dynamic-programming"]
+      tagIds: ["catalog.tag.02.09", "catalog.tag.04.01"]
     }));
 
     const auditRows = await database.query<{
@@ -511,7 +588,7 @@ describe("数据库题目仓库", () => {
       opinionCount: 2
     });
     const serializedMetadata = JSON.stringify(metadata);
-    expect(serializedMetadata).not.toContain("algorithm.implementation");
+    expect(serializedMetadata).not.toContain("catalog.tag.02.09");
     expect(serializedMetadata).not.toContain(baseReview.privateNote);
     expect(serializedMetadata).not.toContain(baseReview.publicComment);
   });

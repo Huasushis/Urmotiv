@@ -245,7 +245,7 @@ function fixtureProblem(): CanonicalProblem {
   return canonicalProblemSchema.parse({
     title: "导入的演示题目",
     type: "traditional",
-    tags: ["algorithm.implementation", "unknown.tag-not-in-tree"],
+    tags: ["catalog.tag.02.09"],
     difficulty: { codeforces: 1600, thinkingLevel: 3, codingLevel: 2 },
     content: {
       basicStatement: statementText,
@@ -468,7 +468,7 @@ describe("题目包导入", () => {
     };
     expect(problem.title).toBe("导入的演示题目");
     expect(problem.status).toBe("draft");
-    expect(problem.tagIds).toEqual(["algorithm.implementation"]);
+    expect(problem.tagIds).toEqual(["catalog.tag.02.09"]);
     expect(problem.content.basicStatement).toBe(statementText);
     expect(problem.judgeConfig?.testcases).toHaveLength(1);
 

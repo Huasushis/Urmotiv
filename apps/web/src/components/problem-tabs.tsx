@@ -1092,9 +1092,16 @@ export function ReviewTab({
     );
   }
 
-  const tagNameById = new Map((tags.data?.items ?? []).map((tag) => [tag.id, tag.name]));
+  const tagById = new Map((tags.data?.items ?? []).map((tag) => [tag.id, tag]));
+  const tagDisplayName = (id: string) => {
+    const tag = tagById.get(id);
+    if (tag === undefined) {
+      return id;
+    }
+    return tag.active === false ? `${tag.name}（已停用）` : tag.name;
+  };
   const tagListText = (ids: string[]) =>
-    ids.length === 0 ? "未设置" : ids.map((id) => tagNameById.get(id) ?? id).join("、");
+    ids.length === 0 ? "未设置" : ids.map(tagDisplayName).join("、");
   const editableSuggestionRows: Array<{
     field: ReviewSuggestionField;
     label: string;
@@ -1323,7 +1330,7 @@ export function ReviewTab({
                 {review.tagIds.length > 0 ? (
                   <div className="compact-tags" aria-label="建议知识点">
                     {review.tagIds.map((tagId) => (
-                      <span key={tagId}>{tagNameById.get(tagId) ?? tagId}</span>
+                      <span key={tagId}>{tagDisplayName(tagId)}</span>
                     ))}
                   </div>
                 ) : null}

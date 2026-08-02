@@ -155,6 +155,7 @@ test("题目工作台提供原题检索按钮，未形成可信结果时不会�
   await loginAsLeader(page);
   await page.goto("/problems/new");
   await page.getByLabel("题目名称").fill("查重按钮联调题");
+  await page.locator(".tag-picker-group summary").first().click();
   await page.locator(".tag-choice").first().click();
   await page.locator('section[aria-label="基础题面"] textarea').fill("给定 n，输出 n。");
   await page.locator('section[aria-label="基础题解"] textarea').fill("直接输出。");

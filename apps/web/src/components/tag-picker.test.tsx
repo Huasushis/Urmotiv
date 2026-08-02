@@ -175,4 +175,24 @@ describe("知识点选择器", () => {
     );
     expect(algorithmGroup?.open).toBe(true);
   });
+
+  it("不允许新选择已停用标签，但保留并允许移除受控值中的旧引用", () => {
+    const inactive: ProblemTag = {
+      id: "inactive",
+      name: "旧知识点",
+      group: "基础算法",
+      itemKind: "tag",
+      active: false,
+      category: { id: "category.algorithm", name: "基础算法" },
+    };
+    const onChange = vi.fn();
+    const view = mount(
+      <TagPicker tags={[...tags, inactive]} value={[inactive.id]} onChange={onChange} />,
+    );
+
+    expect(buttonByText(view, "旧知识点（已停用）").classList).toContain("tag-selected-item");
+    expect(view.querySelectorAll(".tag-choice")).toHaveLength(3);
+    act(() => buttonByText(view, "旧知识点（已停用）").click());
+    expect(onChange).toHaveBeenCalledWith([]);
+  });
 });

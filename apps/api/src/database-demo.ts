@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import type { DatabaseHandle } from "@urmotiv/database";
 import { sql } from "drizzle-orm";
-import { demoTags } from "./demo-data";
 
 export const databaseDemoUserIds = {
   author: "9000000000000001",
@@ -117,13 +116,5 @@ export async function seedDatabaseDemoData(handle: DatabaseHandle): Promise<void
       )
       ON CONFLICT (id) DO NOTHING
     `);
-
-    for (const [sortOrder, tag] of demoTags.entries()) {
-      await transaction.execute(sql`
-        INSERT INTO tags (id, name, group_name, sort_order, created_by_user_id)
-        VALUES (${tag.id}, ${tag.name}, ${tag.group}, ${sortOrder}, 0)
-        ON CONFLICT (id) DO NOTHING
-      `);
-    }
   });
 }

@@ -861,9 +861,6 @@ export class ProblemService {
         roundState,
         transaction.listReviews(problem.reviewRound)
       );
-      if (!(await transaction.hasTags(aggregate.tagIds))) {
-        throw reviewSuggestionUnavailable();
-      }
       const target = { ownerId: problem.ownerId, objectId: problem.id };
       const { opinionCount, ...suggested } = aggregate;
       return {
@@ -922,11 +919,13 @@ export class ProblemService {
         roundState,
         transaction.listReviews(problem.reviewRound)
       );
-      if (!(await transaction.hasTags(aggregate.tagIds))) {
+      const selectedFields = new Set(input.fields);
+      if (
+        selectedFields.has("tagIds") &&
+        (aggregate.tagIds.length === 0 || !(await transaction.hasTags(aggregate.tagIds)))
+      ) {
         throw reviewSuggestionUnavailable();
       }
-
-      const selectedFields = new Set(input.fields);
       const next: StoredProblem = {
         ...problem,
         codeforcesDifficulty: selectedFields.has("codeforcesDifficulty")
@@ -1224,7 +1223,12 @@ export class ProblemService {
   }
 
   private async assertKnownTags(tagIds: string[]): Promise<void> {
-    if (new Set(tagIds).size !== tagIds.length || !(await this.store.hasTags(tagIds))) {
+    if (
+      tagIds.length < 1 ||
+      tagIds.length > 30 ||
+      new Set(tagIds).size !== tagIds.length ||
+      !(await this.store.hasTags(tagIds))
+    ) {
       throw new ApiError(422, "INVALID_TAGS", "知识点中包含无效或重复项。", {
         tagIds: ["请选择存在且不重复的知识点。"]
       });

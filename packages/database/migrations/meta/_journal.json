@@ -78,6 +78,13 @@
       "when": 1785859200000,
       "tag": "0010_problem_package_job_outbox",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1785945600000,
+      "tag": "0011_tag_catalog",
+      "breakpoints": true
     }
   ]
 }

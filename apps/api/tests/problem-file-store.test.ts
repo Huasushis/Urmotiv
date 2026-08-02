@@ -62,6 +62,10 @@ async function createRevision(
         0
       )
     `);
+    await transaction.execute(sql`
+      INSERT INTO problem_revision_tags (revision_id, tag_id)
+      VALUES (${input.revisionId}::uuid, 'catalog.tag.02.09')
+    `);
   });
 }
 
