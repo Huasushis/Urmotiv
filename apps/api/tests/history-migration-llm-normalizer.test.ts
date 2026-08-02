@@ -3,6 +3,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createLlmHistoryNormalizer,
+  loadHistoryPreparationCodeSha256,
   type LlmHistoryNormalizerOptions,
 } from "../src/history-migration/index";
 
@@ -36,6 +37,10 @@ afterEach(async () => {
 });
 
 describe("历史题目模型整理流式请求", () => {
+  it("执行身份绑定实际受信代码文件而不是手填版本号", async () => {
+    await expect(loadHistoryPreparationCodeSha256()).resolves.toMatch(/^[0-9a-f]{64}$/);
+  });
+
   it("持续输出超过首段等待时仍继续，并在 stop 与 DONE 后等待 HTTP 正文真正结束", async () => {
     const allowHttpEnd = deferred<void>();
     const sentCompletionMarkers = deferred<void>();
@@ -338,14 +343,21 @@ describe("历史题目模型整理重试与完整性", () => {
         eventStreamResponse(`${completionEvent(normalizedContent, "stop")}data: [DONE]\n\n`),
       );
 
+    const registeredAttempts: number[] = [];
     await expect(
       createNormalizer({
         fetch,
         maximumAttempts: 3,
         retryBaseDelayMs: 1,
-      }).normalize(sourceInput),
+      }).normalize({
+        ...sourceInput,
+        beforeRequest: async (attempt) => {
+          registeredAttempts.push(attempt);
+        },
+      }),
     ).resolves.toMatchObject({ problems: [{ title: "合成候选题" }] });
     expect(fetch).toHaveBeenCalledTimes(2);
+    expect(registeredAttempts).toEqual([1, 2]);
   });
 
   it("429 退避等待可以明确取消，不会继续第二次请求", async () => {
@@ -385,6 +397,7 @@ describe("历史题目模型整理重试与完整性", () => {
     }
     expect(caught).toMatchObject({
       code: "NORMALIZATION_FAILED",
+      failureKind: status === 499 ? "http_499" : "http_status",
       message: `source-000001 的模型服务返回 HTTP ${status}。`,
     });
     expect(String(caught)).not.toContain(privateMarker);
@@ -450,6 +463,7 @@ function createNormalizer(overrides: Partial<LlmHistoryNormalizerOptions> = {}) 
     baseUrl: "https://synthetic.invalid/v1/",
     apiKey: "synthetic-key",
     model: "synthetic-model",
+    codeSha256: "f".repeat(64),
     firstOutputTimeoutMs: 200,
     outputIdleTimeoutMs: 200,
     maximumAttempts: 1,

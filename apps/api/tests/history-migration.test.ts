@@ -1,30 +1,31 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   copyFile,
+  chmod,
   mkdtemp,
   mkdir,
   readFile,
   readdir,
+  rename,
   rm,
+  stat,
   symlink,
-  writeFile
+  writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import {
-  readZipArchive,
-  urmotivNativeAdapter
-} from "@urmotiv/problem-package";
+import { readZipArchive, urmotivNativeAdapter } from "@urmotiv/problem-package";
 import {
   createLlmHistoryNormalizer,
   historyMetadataFileSchema,
   historySourceMappingSchema,
+  HistoryNormalizationError,
   packageApprovedCandidates,
   prepareHistoryCandidates,
   sha256Hex,
   type HistoryCandidateRecord,
   type HistoryNormalizer,
-  type NormalizedHistoryOutput
+  type NormalizedHistoryOutput,
 } from "../src/history-migration/index";
 
 const temporaryDirectories: string[] = [];
@@ -35,7 +36,7 @@ const syntheticMetadataTitle = "合成元数据题名";
 afterEach(async () => {
   vi.unstubAllGlobals();
   await Promise.all(
-    temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true }))
+    temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
 });
 
@@ -68,10 +69,10 @@ describe("历史题目迁移安全核心", () => {
           {
             sourcePath: syntheticSourceName,
             sourceSha256: digest,
-            metadataNumber: "1"
-          }
-        ]
-      }).success
+            metadataNumber: "1",
+          },
+        ],
+      }).success,
     ).toBe(false);
 
     expect(
@@ -83,15 +84,15 @@ describe("历史题目迁移安全核心", () => {
           {
             sourcePath: syntheticSourceName,
             sourceSha256: digest,
-            metadataNumber: "1"
+            metadataNumber: "1",
           },
           {
             sourcePath: "another.md",
             sourceSha256: "b".repeat(64),
-            metadataNumber: "1"
-          }
-        ]
-      }).success
+            metadataNumber: "1",
+          },
+        ],
+      }).success,
     ).toBe(false);
   });
 
@@ -107,11 +108,11 @@ describe("历史题目迁移安全核心", () => {
           async normalize() {
             called = true;
             return normalizedOutput();
-          }
-        }
-      })
+          },
+        },
+      }),
     ).rejects.toMatchObject({
-      code: "INVALID_ARGUMENTS"
+      code: "INVALID_ARGUMENTS",
     });
     expect(called).toBe(false);
   });
@@ -127,8 +128,8 @@ describe("历史题目迁移安全核心", () => {
         async normalize(input) {
           received = input.text;
           return normalizedOutput();
-        }
-      }
+        },
+      },
     });
 
     expect(received).toBe(sourceText);
@@ -145,8 +146,8 @@ describe("历史题目迁移安全核心", () => {
         async normalize(input) {
           receivedLength = input.text.length;
           return normalizedOutput();
-        }
-      }
+        },
+      },
     });
 
     expect(receivedLength).toBe(500_000);
@@ -156,36 +157,34 @@ describe("历史题目迁移安全核心", () => {
     const fixture = await createFixture("x".repeat(500_001));
     let called = false;
 
-    await expect(
-      prepareHistoryCandidates({
-        ...fixture.prepareOptions,
-        normalizer: {
-          async normalize() {
-            called = true;
-            return normalizedOutput();
-          }
-        }
-      })
-    ).rejects.toMatchObject({
-      code: "SOURCE_TOO_LARGE"
+    const result = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize() {
+          called = true;
+          return normalizedOutput();
+        },
+      },
+    });
+    expect(result).toMatchObject({
+      complete: false,
+      failedSourceCount: 1,
     });
     expect(called).toBe(false);
+    await expectFailureKind(fixture.prepareOutput, "source_validation");
   });
 
   it("候选文件使用安全编号，公开审核清单不含题名、学号、原文件名或正文", async () => {
     const fixture = await createFixture("只用于合成测试的源正文。");
     await prepareHistoryCandidates({
       ...fixture.prepareOptions,
-      normalizer: fixedNormalizer()
+      normalizer: fixedNormalizer(),
     });
 
     expect(await readdir(join(fixture.prepareOutput, "candidates"))).toEqual([
-      "candidate-000001.json"
+      "candidate-000001.json",
     ]);
-    const reportText = await readFile(
-      join(fixture.prepareOutput, "review.json"),
-      "utf8"
-    );
+    const reportText = await readFile(join(fixture.prepareOutput, "review.json"), "utf8");
     expect(reportText).toContain("candidate-000001");
     expect(reportText).toMatch(/[0-9a-f]{64}/);
     expect(reportText).not.toContain(syntheticMetadataTitle);
@@ -197,7 +196,7 @@ describe("历史题目迁移安全核心", () => {
     expect(candidate.problem.extensions).toEqual({});
     expect(candidate.problem.difficulty).toEqual({});
     expect(candidate.problem.provenance).toEqual({
-      sourceSystem: "ustc-history-private"
+      sourceSystem: "ustc-history-private",
     });
     expect(JSON.stringify(candidate)).not.toContain(syntheticStudentId);
     expect(JSON.stringify(candidate)).not.toContain(syntheticSourceName);
@@ -207,25 +206,282 @@ describe("历史题目迁移安全核心", () => {
     const fixture = await createFixture("只用于合成测试的源正文。");
     const first = await prepareHistoryCandidates({
       ...fixture.prepareOptions,
-      normalizer: fixedNormalizer()
+      normalizer: fixedNormalizer(),
     });
-    const reportBefore = await readFile(
-      join(fixture.prepareOutput, "review.json"),
-      "utf8"
-    );
+    const reportBefore = await readFile(join(fixture.prepareOutput, "review.json"), "utf8");
 
     await expect(
       prepareHistoryCandidates({
         ...fixture.prepareOptions,
-        normalizer: fixedNormalizer()
-      })
+        normalizer: fixedNormalizer(),
+      }),
     ).rejects.toMatchObject({
-      code: "OUTPUT_ALREADY_EXISTS"
+      code: "OUTPUT_ALREADY_EXISTS",
     });
     expect(first.candidateCount).toBe(1);
+    expect(await readFile(join(fixture.prepareOutput, "review.json"), "utf8")).toBe(reportBefore);
+  });
+
+  it("每次付费调用前先同步登记安全身份，返回后才登记完成", async () => {
+    const fixture = await createFixture("只用于检查登记顺序的合成正文。");
+    const release = deferred<NormalizedHistoryOutput>();
+    let activeSeenBeforeCall = false;
+    const running = prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize() {
+          const activePath = join(fixture.prepareOutput, "requests", "source-000001.active.json");
+          activeSeenBeforeCall = (await stat(activePath)).isFile();
+          await expect(
+            stat(join(fixture.prepareOutput, "requests", "source-000001.completed.json")),
+          ).rejects.toMatchObject({ code: "ENOENT" });
+          return release.promise;
+        },
+      },
+    });
+    await vi.waitFor(() => expect(activeSeenBeforeCall).toBe(true));
+    release.resolve(normalizedOutput());
+    await expect(running).resolves.toMatchObject({ complete: true });
+
+    const activeText = await readFile(
+      join(fixture.prepareOutput, "requests", "source-000001.active.json"),
+      "utf8",
+    );
+    expect(activeText).toMatch(/[0-9a-f]{64}/);
+    expect(activeText).not.toContain(fixture.prepareOptions.operationTag);
+    expect(activeText).not.toContain(syntheticSourceName);
+    expect((await stat(fixture.prepareOutput)).mode & 0o777).toBe(0o700);
     expect(
-      await readFile(join(fixture.prepareOutput, "review.json"), "utf8")
-    ).toBe(reportBefore);
+      (await stat(join(fixture.prepareOutput, "requests", "source-000001.active.json"))).mode &
+        0o777,
+    ).toBe(0o600);
+  });
+
+  it("完成检查点绑定 429 重试前的每一份请求登记", async () => {
+    const fixture = await createFixture("只用于检查重试登记链的合成正文。");
+    const responseBody = `data: ${JSON.stringify({
+      choices: [
+        {
+          delta: { content: JSON.stringify(normalizedOutput()) },
+          finish_reason: "stop",
+        },
+      ],
+    })}\n\ndata: [DONE]\n\n`;
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("synthetic rate limit", { status: 429 }))
+      .mockResolvedValueOnce(
+        new Response(responseBody, { headers: { "Content-Type": "text/event-stream" } }),
+      );
+    const normalizer = createLlmHistoryNormalizer({
+      baseUrl: "https://synthetic.invalid/v1/",
+      apiKey: "synthetic-key",
+      model: "synthetic-model",
+      codeSha256: "f".repeat(64),
+      maximumAttempts: 2,
+      retryBaseDelayMs: 1,
+      fetch,
+    });
+    await expect(
+      prepareHistoryCandidates({
+        ...fixture.prepareOptions,
+        executionIdentity: normalizer.preparationIdentity,
+        normalizer,
+      }),
+    ).resolves.toMatchObject({ complete: true });
+    const completion = JSON.parse(
+      await readFile(
+        join(fixture.prepareOutput, "requests", "source-000001.completed.json"),
+        "utf8",
+      ),
+    ) as { readonly requestAttemptSha256s?: unknown };
+    expect(completion.requestAttemptSha256s).toEqual([
+      expect.stringMatching(/^[0-9a-f]{64}$/),
+      expect.stringMatching(/^[0-9a-f]{64}$/),
+    ]);
+
+    await rm(join(fixture.prepareOutput, "requests", "source-000001.attempt-02.active.json"));
+    await expect(
+      prepareHistoryCandidates({
+        ...fixture.prepareOptions,
+        executionIdentity: normalizer.preparationIdentity,
+        resume: true,
+        normalizer,
+      }),
+    ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("失败后继续处理其余题，续跑只补未开始项且不重复完成或不确定请求", async () => {
+    const fixture = await createMultiFixture();
+    const firstCalls: string[] = [];
+    const first = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize(input) {
+          firstCalls.push(input.sourceId);
+          if (input.sourceId === "source-000002") {
+            throw new HistoryNormalizationError("cancelled", "合成取消。");
+          }
+          return normalizedOutput();
+        },
+      },
+    });
+    expect(firstCalls).toEqual(["source-000001", "source-000002"]);
+    expect(first).toMatchObject({
+      complete: false,
+      completedSourceCount: 1,
+      failedSourceCount: 1,
+      pendingSourceCount: 1,
+    });
+    const failedCheckpoint = await readFile(
+      join(fixture.prepareOutput, "requests", "source-000002.failed.json"),
+      "utf8",
+    );
+    expect(failedCheckpoint).toContain('"failureKind": "cancelled"');
+    expect(failedCheckpoint).not.toContain("合成取消");
+    expect(failedCheckpoint).not.toContain("第二份合成正文");
+
+    const resumedCalls: string[] = [];
+    const resumed = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      resume: true,
+      normalizer: {
+        async normalize(input) {
+          resumedCalls.push(input.sourceId);
+          return normalizedOutput();
+        },
+      },
+    });
+    expect(resumedCalls).toEqual(["source-000003"]);
+    expect(resumed).toMatchObject({
+      complete: false,
+      completedSourceCount: 2,
+      failedSourceCount: 1,
+      pendingSourceCount: 0,
+    });
+    expect(await readdir(join(fixture.prepareOutput, "candidates"))).toEqual([
+      "candidate-000001.json",
+      "candidate-000061.json",
+    ]);
+  });
+
+  it("只有 active 的不确定请求不会在续跑时再次发送", async () => {
+    const fixture = await createMultiFixture();
+    const requests = join(fixture.prepareOutput, "requests");
+    const heldRequests = join(fixture.prepareOutput, "requests-held");
+    const outsideDirectory = await mkdtemp(join(tmpdir(), "urmotiv-history-checkpoint-outside-"));
+    temporaryDirectories.push(outsideDirectory);
+    await expect(
+      prepareHistoryCandidates({
+        ...fixture.prepareOptions,
+        normalizer: {
+          async normalize() {
+            await rename(requests, heldRequests);
+            await symlink(outsideDirectory, requests, "dir");
+            throw new HistoryNormalizationError("connection", "合成连接状态未知。");
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_ARGUMENTS" });
+    await rm(requests, { force: true });
+    await rename(heldRequests, requests);
+
+    const resumedCalls: string[] = [];
+    const resumed = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      resume: true,
+      normalizer: {
+        async normalize(input) {
+          resumedCalls.push(input.sourceId);
+          return normalizedOutput();
+        },
+      },
+    });
+    expect(resumedCalls).toEqual(["source-000002", "source-000003"]);
+    expect(resumed).toMatchObject({
+      complete: false,
+      uncertainSourceCount: 1,
+      completedSourceCount: 2,
+      pendingSourceCount: 0,
+    });
+  });
+
+  it("旧版无检查点输出与身份变化都不能假装续跑", async () => {
+    const legacy = await createFixture("旧版合成输出。");
+    await mkdir(legacy.prepareOutput, { mode: 0o700 });
+    let called = false;
+    await expect(
+      prepareHistoryCandidates({
+        ...legacy.prepareOptions,
+        resume: true,
+        normalizer: {
+          async normalize() {
+            called = true;
+            return normalizedOutput();
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
+    expect(called).toBe(false);
+
+    const current = await createFixture("身份变化合成输出。");
+    await prepareHistoryCandidates({
+      ...current.prepareOptions,
+      normalizer: fixedNormalizer(),
+    });
+    let resumedCompletedCall = false;
+    await expect(
+      prepareHistoryCandidates({
+        ...current.prepareOptions,
+        resume: true,
+        normalizer: {
+          async normalize() {
+            resumedCompletedCall = true;
+            return normalizedOutput();
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ complete: true });
+    expect(resumedCompletedCall).toBe(false);
+    await expect(
+      prepareHistoryCandidates({
+        ...current.prepareOptions,
+        resume: true,
+        operationTag: "different-run-tag",
+        normalizer: fixedNormalizer(),
+      }),
+    ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
+  });
+
+  it("续跑拒绝权限被放宽的目录或检查点", async () => {
+    const fileFixture = await createFixture("权限检查合成正文一。");
+    await prepareHistoryCandidates({
+      ...fileFixture.prepareOptions,
+      normalizer: fixedNormalizer(),
+    });
+    await chmod(join(fileFixture.prepareOutput, "run.json"), 0o644);
+    await expect(
+      prepareHistoryCandidates({
+        ...fileFixture.prepareOptions,
+        resume: true,
+        normalizer: fixedNormalizer(),
+      }),
+    ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
+
+    const directoryFixture = await createFixture("权限检查合成正文二。");
+    await prepareHistoryCandidates({
+      ...directoryFixture.prepareOptions,
+      normalizer: fixedNormalizer(),
+    });
+    await chmod(join(directoryFixture.prepareOutput, "requests"), 0o755);
+    await expect(
+      prepareHistoryCandidates({
+        ...directoryFixture.prepareOptions,
+        resume: true,
+        normalizer: fixedNormalizer(),
+      }),
+    ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
   });
 
   it("源文件内容变化后使第一份人工确认失效", async () => {
@@ -233,223 +489,210 @@ describe("历史题目迁移安全核心", () => {
     await writeFile(
       join(fixture.sourceDirectory, syntheticSourceName),
       "确认后被修改的合成正文。",
-      "utf8"
+      "utf8",
     );
 
-    await expect(
-      prepareHistoryCandidates({
-        ...fixture.prepareOptions,
-        normalizer: fixedNormalizer()
-      })
-    ).rejects.toMatchObject({
-      code: "SOURCE_DIGEST_MISMATCH"
+    const result = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: fixedNormalizer(),
     });
+    expect(result).toMatchObject({
+      complete: false,
+      failedSourceCount: 1,
+    });
+    await expectFailureKind(fixture.prepareOutput, "source_validation");
   });
 
   it("作者归属等元数据变化后使第一份人工确认失效", async () => {
     const fixture = await createFixture("确认时的合成正文。");
-    const metadata = JSON.parse(
-      await readFile(fixture.prepareOptions.metadataFile, "utf8")
-    ) as { records: Array<Record<string, unknown>> };
+    const metadata = JSON.parse(await readFile(fixture.prepareOptions.metadataFile, "utf8")) as {
+      records: Array<Record<string, unknown>>;
+    };
     metadata.records[0] = {
       ...metadata.records[0],
-      authorStudentId: "SYNTHETIC-STUDENT-CHANGED"
+      authorStudentId: "SYNTHETIC-STUDENT-CHANGED",
     };
     await writeFile(
       fixture.prepareOptions.metadataFile,
       `${JSON.stringify(metadata, null, 2)}\n`,
-      "utf8"
+      "utf8",
     );
 
     await expect(
       prepareHistoryCandidates({
         ...fixture.prepareOptions,
-        normalizer: fixedNormalizer()
-      })
+        normalizer: fixedNormalizer(),
+      }),
     ).rejects.toMatchObject({
-      code: "SOURCE_MAPPING_CHANGED"
+      code: "SOURCE_MAPPING_CHANGED",
     });
   });
 
   it("候选内容变化后使第二份人工批准失效", async () => {
     const fixture = await createPreparedFixture();
     const candidate = await readCandidate(fixture.prepareOutput);
-    await writeApproval(
-      fixture.approvalFile,
-      candidate.candidateId,
-      candidate.contentSha256
-    );
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
     const changed = {
       ...candidate,
       problem: {
         ...candidate.problem,
         content: {
           ...candidate.problem.content,
-          basicStatement: "批准后被修改的合成题面。"
-        }
-      }
+          basicStatement: "批准后被修改的合成题面。",
+        },
+      },
     };
     await writeFile(
-      join(
-        fixture.prepareOutput,
-        "candidates",
-        `${candidate.candidateId}.json`
-      ),
+      join(fixture.prepareOutput, "candidates", `${candidate.candidateId}.json`),
       `${JSON.stringify(changed, null, 2)}\n`,
-      "utf8"
+      "utf8",
     );
 
-    await expect(
-      packageApprovedCandidates(fixture.packageOptions)
-    ).rejects.toMatchObject({
-      code: "CANDIDATE_CHANGED"
+    await expect(packageApprovedCandidates(fixture.packageOptions)).rejects.toMatchObject({
+      code: "CANDIDATE_CHANGED",
+    });
+  });
+
+  it("打包拒绝旧版完成标记或仍带不完整标记的 prepare 输出", async () => {
+    const incomplete = await createPreparedFixture();
+    const incompleteCandidate = await readCandidate(incomplete.prepareOutput);
+    await writeApproval(
+      incomplete.approvalFile,
+      incompleteCandidate.candidateId,
+      incompleteCandidate.contentSha256,
+    );
+    await copyFile(
+      join(incomplete.prepareOutput, "PREPARE_RUN"),
+      join(incomplete.prepareOutput, "PREPARE_INCOMPLETE"),
+    );
+    await expect(packageApprovedCandidates(incomplete.packageOptions)).rejects.toMatchObject({
+      code: "CANDIDATE_INVALID",
+    });
+
+    const legacy = await createPreparedFixture();
+    const legacyCandidate = await readCandidate(legacy.prepareOutput);
+    await writeApproval(
+      legacy.approvalFile,
+      legacyCandidate.candidateId,
+      legacyCandidate.contentSha256,
+    );
+    await writeFile(
+      join(legacy.prepareOutput, "PREPARE_COMPLETE"),
+      `${JSON.stringify({
+        version: 1,
+        phase: "prepare",
+        batchSha256: "a".repeat(64),
+        candidateCount: 1,
+      })}\n`,
+      "utf8",
+    );
+    await expect(packageApprovedCandidates(legacy.packageOptions)).rejects.toMatchObject({
+      code: "CANDIDATE_INVALID",
     });
   });
 
   it("候选审核备注变化后也使第二份人工批准失效", async () => {
     const fixture = await createPreparedFixture();
     const candidate = await readCandidate(fixture.prepareOutput);
-    await writeApproval(
-      fixture.approvalFile,
-      candidate.candidateId,
-      candidate.contentSha256
-    );
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
     await writeFile(
-      join(
-        fixture.prepareOutput,
-        "candidates",
-        `${candidate.candidateId}.json`
-      ),
+      join(fixture.prepareOutput, "candidates", `${candidate.candidateId}.json`),
       `${JSON.stringify(
         {
           ...candidate,
-          normalizationNote: "批准后被修改的合成审核备注。"
+          normalizationNote: "批准后被修改的合成审核备注。",
         },
         null,
-        2
+        2,
       )}\n`,
-      "utf8"
+      "utf8",
     );
 
-    await expect(
-      packageApprovedCandidates(fixture.packageOptions)
-    ).rejects.toMatchObject({
-      code: "CANDIDATE_CHANGED"
+    await expect(packageApprovedCandidates(fixture.packageOptions)).rejects.toMatchObject({
+      code: "CANDIDATE_CHANGED",
     });
   });
 
   it("模型置信度变化后也使第二份人工批准失效", async () => {
     const fixture = await createPreparedFixture();
     const candidate = await readCandidate(fixture.prepareOutput);
-    await writeApproval(
-      fixture.approvalFile,
-      candidate.candidateId,
-      candidate.contentSha256
-    );
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
     await writeFile(
-      join(
-        fixture.prepareOutput,
-        "candidates",
-        `${candidate.candidateId}.json`
-      ),
+      join(fixture.prepareOutput, "candidates", `${candidate.candidateId}.json`),
       `${JSON.stringify(
         {
           ...candidate,
-          modelConfidence: 0.1
+          modelConfidence: 0.1,
         },
         null,
-        2
+        2,
       )}\n`,
-      "utf8"
+      "utf8",
     );
 
-    await expect(
-      packageApprovedCandidates(fixture.packageOptions)
-    ).rejects.toMatchObject({
-      code: "CANDIDATE_CHANGED"
+    await expect(packageApprovedCandidates(fixture.packageOptions)).rejects.toMatchObject({
+      code: "CANDIDATE_CHANGED",
     });
   });
 
   it("准备后原始文本变化时打包阶段重新核对并停止", async () => {
     const fixture = await createPreparedFixture();
     const candidate = await readCandidate(fixture.prepareOutput);
-    await writeApproval(
-      fixture.approvalFile,
-      candidate.candidateId,
-      candidate.contentSha256
-    );
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
     await writeFile(
       join(fixture.sourceDirectory, syntheticSourceName),
       "准备阶段之后被修改的合成正文。",
-      "utf8"
+      "utf8",
     );
 
-    await expect(
-      packageApprovedCandidates(fixture.packageOptions)
-    ).rejects.toMatchObject({
-      code: "SOURCE_DIGEST_MISMATCH"
+    await expect(packageApprovedCandidates(fixture.packageOptions)).rejects.toMatchObject({
+      code: "SOURCE_DIGEST_MISMATCH",
     });
   });
 
   it("拒绝从指向私有根目录外的候选子目录读取文件", async () => {
     const fixture = await createPreparedFixture();
     const candidate = await readCandidate(fixture.prepareOutput);
-    await writeApproval(
-      fixture.approvalFile,
-      candidate.candidateId,
-      candidate.contentSha256
-    );
-    const outsideDirectory = await mkdtemp(
-      join(tmpdir(), "urmotiv-history-outside-")
-    );
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+    const outsideDirectory = await mkdtemp(join(tmpdir(), "urmotiv-history-outside-"));
     temporaryDirectories.push(outsideDirectory);
     await copyFile(
-      join(
-        fixture.prepareOutput,
-        "candidates",
-        `${candidate.candidateId}.json`
-      ),
-      join(outsideDirectory, `${candidate.candidateId}.json`)
+      join(fixture.prepareOutput, "candidates", `${candidate.candidateId}.json`),
+      join(outsideDirectory, `${candidate.candidateId}.json`),
     );
     await rm(join(fixture.prepareOutput, "candidates"), {
       recursive: true,
-      force: true
+      force: true,
     });
-    await symlink(
-      outsideDirectory,
-      join(fixture.prepareOutput, "candidates"),
-      "dir"
-    );
+    await symlink(outsideDirectory, join(fixture.prepareOutput, "candidates"), "dir");
 
-    await expect(
-      packageApprovedCandidates(fixture.packageOptions)
-    ).rejects.toMatchObject({
-      code: "INVALID_ARGUMENTS"
+    await expect(packageApprovedCandidates(fixture.packageOptions)).rejects.toMatchObject({
+      code: "INVALID_ARGUMENTS",
     });
   });
 
   it("已知学号出现在模型结果时拒绝生成候选", async () => {
     const modelLeakFixture = await createFixture("只用于合成测试的源正文。");
-    await expect(
-      prepareHistoryCandidates({
-        ...modelLeakFixture.prepareOptions,
-        normalizer: {
-          async normalize() {
-            return {
-              problems: [
-                {
-                  ...normalizedProblem("合成候选题"),
-                  basicStatement: `不应进入候选的标识：${syntheticStudentId}`
-                }
-              ]
-            };
-          }
-        }
-      })
-    ).rejects.toMatchObject({
-      code: "CANDIDATE_INVALID"
+    const result = await prepareHistoryCandidates({
+      ...modelLeakFixture.prepareOptions,
+      normalizer: {
+        async normalize() {
+          return {
+            problems: [
+              {
+                ...normalizedProblem("合成候选题"),
+                basicStatement: `不应进入候选的标识：${syntheticStudentId}`,
+              },
+            ],
+          };
+        },
+      },
     });
-
+    expect(result).toMatchObject({
+      complete: false,
+      failedSourceCount: 1,
+    });
+    await expectFailureKind(modelLeakFixture.prepareOutput, "candidate_validation");
   });
 
   it("元数据题名和难度都不进入整理器、候选难度或扩展字段", async () => {
@@ -461,8 +704,8 @@ describe("历史题目迁移安全核心", () => {
         async normalize(input) {
           normalizerInput = input;
           return normalizedOutput();
-        }
-      }
+        },
+      },
     });
 
     expect(normalizerInput).not.toHaveProperty("difficultyGuess");
@@ -477,46 +720,43 @@ describe("历史题目迁移安全核心", () => {
   it("拒绝写出超过后续读取上限的候选，不留下完成标记", async () => {
     const fixture = await createFixture("只用于合成测试的源正文。");
     const oversized = "甲".repeat(500_000);
-    await expect(
-      prepareHistoryCandidates({
-        ...fixture.prepareOptions,
-        normalizer: {
-          async normalize() {
-            return {
-              problems: [
-                {
-                  ...normalizedProblem("合成候选题"),
-                  basicStatement: oversized,
-                  basicSolution: oversized,
-                  background: oversized,
-                  statement: oversized,
-                  inputFormat: oversized,
-                  outputFormat: oversized,
-                  constraints: oversized,
-                  solution: oversized,
-                  hints: oversized
-                }
-              ]
-            };
-          }
-        }
-      })
-    ).rejects.toMatchObject({
-      code: "CANDIDATE_INVALID"
+    const result = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize() {
+          return {
+            problems: [
+              {
+                ...normalizedProblem("合成候选题"),
+                basicStatement: oversized,
+                basicSolution: oversized,
+                background: oversized,
+                statement: oversized,
+                inputFormat: oversized,
+                outputFormat: oversized,
+                constraints: oversized,
+                solution: oversized,
+                hints: oversized,
+              },
+            ],
+          };
+        },
+      },
     });
+    expect(result).toMatchObject({
+      complete: false,
+      failedSourceCount: 1,
+    });
+    await expectFailureKind(fixture.prepareOutput, "candidate_validation");
     await expect(
-      readFile(join(fixture.prepareOutput, "PREPARE_COMPLETE"), "utf8")
+      readFile(join(fixture.prepareOutput, "PREPARE_COMPLETE"), "utf8"),
     ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("即使人工编辑候选，也拒绝把作者学号塞进扩展字段", async () => {
     const fixture = await createPreparedFixture();
     const candidate = await readCandidate(fixture.prepareOutput);
-    await writeApproval(
-      fixture.approvalFile,
-      candidate.candidateId,
-      candidate.contentSha256
-    );
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
     const unsafe = {
       ...candidate,
       problem: {
@@ -524,25 +764,19 @@ describe("历史题目迁移安全核心", () => {
         extensions: {
           migration: {
             difficultyText: "",
-            authorStudentId: syntheticStudentId
-          }
-        }
-      }
+            authorStudentId: syntheticStudentId,
+          },
+        },
+      },
     };
     await writeFile(
-      join(
-        fixture.prepareOutput,
-        "candidates",
-        `${candidate.candidateId}.json`
-      ),
+      join(fixture.prepareOutput, "candidates", `${candidate.candidateId}.json`),
       `${JSON.stringify(unsafe, null, 2)}\n`,
-      "utf8"
+      "utf8",
     );
 
-    await expect(
-      packageApprovedCandidates(fixture.packageOptions)
-    ).rejects.toMatchObject({
-      code: "CANDIDATE_INVALID"
+    await expect(packageApprovedCandidates(fixture.packageOptions)).rejects.toMatchObject({
+      code: "CANDIDATE_INVALID",
     });
   });
 
@@ -582,13 +816,10 @@ describe("历史题目迁移安全核心", () => {
       normalizer: {
         async normalize() {
           return {
-            problems: [
-              normalizedProblem("第一道合成题"),
-              normalizedProblem("第二道合成题")
-            ]
+            problems: [normalizedProblem("第一道合成题"), normalizedProblem("第二道合成题")],
           };
-        }
-      }
+        },
+      },
     });
     const first = await readCandidate(fixture.prepareOutput, "candidate-000001");
     const second = await readCandidate(fixture.prepareOutput, "candidate-000002");
@@ -602,52 +833,42 @@ describe("历史题目迁移安全核心", () => {
             {
               candidateId: first.candidateId,
               contentSha256: first.contentSha256,
-              decision: "approved"
+              decision: "approved",
             },
             {
               candidateId: second.candidateId,
               contentSha256: second.contentSha256,
-              decision: "approved"
-            }
-          ]
+              decision: "approved",
+            },
+          ],
         },
         null,
-        2
+        2,
       )}\n`,
-      "utf8"
+      "utf8",
     );
 
-    await expect(
-      packageApprovedCandidates(fixture.packageOptions)
-    ).rejects.toMatchObject({
-      code: "DUPLICATE_ASSIGNMENT"
+    await expect(packageApprovedCandidates(fixture.packageOptions)).rejects.toMatchObject({
+      code: "DUPLICATE_ASSIGNMENT",
     });
   });
 
   it("批准后才生成题目包，作者学号只进入单独私有映射文件", async () => {
     const fixture = await createPreparedFixture();
     const candidate = await readCandidate(fixture.prepareOutput);
-    await writeApproval(
-      fixture.approvalFile,
-      candidate.candidateId,
-      candidate.contentSha256
-    );
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
 
     const result = await packageApprovedCandidates(fixture.packageOptions);
     expect(result).toEqual({ packageCount: 1, authorMappingCount: 1 });
 
-    const packagePath = join(
-      fixture.packageOutput,
-      "packages",
-      "candidate-000001.zip"
-    );
+    const packagePath = join(fixture.packageOutput, "packages", "candidate-000001.zip");
     const archive = readZipArchive(new Uint8Array(await readFile(packagePath)));
     const imported = await urmotivNativeAdapter.import(archive, {
-      conflictAction: "create"
+      conflictAction: "create",
     });
     expect(imported.extensions).toEqual({});
     expect(imported.provenance).toEqual({
-      sourceSystem: "ustc-history-private"
+      sourceSystem: "ustc-history-private",
     });
     expect(imported.provenance?.sourceProblemId).toBeUndefined();
 
@@ -671,10 +892,7 @@ describe("历史题目迁移安全核心", () => {
       expect(text).not.toContain(syntheticSourceName);
     }
 
-    const reportText = await readFile(
-      join(fixture.packageOutput, "report.json"),
-      "utf8"
-    );
+    const reportText = await readFile(join(fixture.packageOutput, "report.json"), "utf8");
     expect(reportText).not.toContain(syntheticStudentId);
     expect(reportText).not.toContain(syntheticSourceName);
     expect(reportText).not.toContain(syntheticMetadataTitle);
@@ -698,30 +916,22 @@ describe("历史题目迁移安全核心", () => {
       }>;
     };
     expect(authorMap.batchSha256).toBe(report.batchSha256);
-    expect(authorMap.records[0]?.contentSha256).toBe(
-      report.packages[0]?.contentSha256
-    );
-    expect(authorMap.records[0]?.packageSha256).toBe(
-      report.packages[0]?.packageSha256
-    );
+    expect(authorMap.records[0]?.contentSha256).toBe(report.packages[0]?.contentSha256);
+    expect(authorMap.records[0]?.packageSha256).toBe(report.packages[0]?.packageSha256);
   });
 
   it("作者映射不能写进题目包输出目录", async () => {
     const fixture = await createPreparedFixture();
     const candidate = await readCandidate(fixture.prepareOutput);
-    await writeApproval(
-      fixture.approvalFile,
-      candidate.candidateId,
-      candidate.contentSha256
-    );
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
 
     await expect(
       packageApprovedCandidates({
         ...fixture.packageOptions,
-        authorMappingOutput: join(fixture.packageOutput, "author-map.json")
-      })
+        authorMappingOutput: join(fixture.packageOutput, "author-map.json"),
+      }),
     ).rejects.toMatchObject({
-      code: "INVALID_ARGUMENTS"
+      code: "INVALID_ARGUMENTS",
     });
   });
 });
@@ -733,30 +943,31 @@ describe("历史题目模型整理响应限制", () => {
         new ReadableStream<Uint8Array>({
           start() {
             // 故意只返回响应头，让正文保持未完成。
-          }
+          },
         }),
-        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
       );
     });
     const normalizer = createLlmHistoryNormalizer({
       baseUrl: "https://synthetic.invalid/v1/",
       apiKey: "synthetic-key",
       model: "synthetic-model",
+      codeSha256: "f".repeat(64),
       firstOutputTimeoutMs: 20,
       outputIdleTimeoutMs: 20,
       maximumAttempts: 1,
       maximumResponseBytes: 1_000,
-      fetch
+      fetch,
     });
 
     await expect(
       normalizer.normalize({
         sourceId: "source-000001",
-        text: "合成正文"
-      })
+        text: "合成正文",
+      }),
     ).rejects.toMatchObject({
       code: "NORMALIZATION_FAILED",
-      message: "source-000001 的模型请求在首段有效输出前超时。"
+      message: "source-000001 的模型请求在首段有效输出前超时。",
     });
   });
 
@@ -769,25 +980,26 @@ describe("历史题目模型整理响应限制", () => {
       baseUrl: "https://synthetic.invalid/v1/",
       apiKey: "synthetic-key",
       model: "synthetic-model",
+      codeSha256: "f".repeat(64),
       firstOutputTimeoutMs: 1_000,
       outputIdleTimeoutMs: 1_000,
       maximumAttempts: 1,
       maximumResponseBytes: 32,
-      fetch
+      fetch,
     });
 
     let caught: unknown;
     try {
       await normalizer.normalize({
         sourceId: "source-000001",
-        text: "合成正文"
+        text: "合成正文",
       });
     } catch (error) {
       caught = error;
     }
     expect(caught).toMatchObject({
       code: "NORMALIZATION_FAILED",
-      message: "模型响应超过明确大小上限。"
+      message: "模型响应超过明确大小上限。",
     });
     expect(String(caught)).not.toContain(privateMarker);
   });
@@ -806,6 +1018,14 @@ async function createFixture(sourceText: string): Promise<{
     readonly metadataFile: string;
     readonly sourceConfirmationFile: string;
     readonly outputDirectory: string;
+    readonly operationTag: string;
+    readonly executionIdentity: {
+      readonly version: 1;
+      readonly codeSha256: string;
+      readonly promptSha256: string;
+      readonly modelSha256: string;
+      readonly configSha256: string;
+    };
   };
   readonly packageOptions: {
     readonly privateRootDirectory: string;
@@ -832,14 +1052,14 @@ async function createFixture(sourceText: string): Promise<{
     authorStudentId: syntheticStudentId,
     status: "",
     contest: "",
-    note: ""
+    note: "",
   };
   const metadataText = `${JSON.stringify(
     {
-      records: [metadataRecord]
+      records: [metadataRecord],
     },
     null,
-    2
+    2,
   )}\n`;
   await writeFile(metadataFile, metadataText, "utf8");
   const sourceConfirmationFile = join(root, "source-confirmation.private.json");
@@ -854,14 +1074,14 @@ async function createFixture(sourceText: string): Promise<{
           {
             sourcePath: syntheticSourceName,
             sourceSha256: sha256Hex(sourceText),
-            metadataNumber: "synthetic-1"
-          }
-        ]
+            metadataNumber: "synthetic-1",
+          },
+        ],
       },
       null,
-      2
+      2,
     )}\n`,
-    "utf8"
+    "utf8",
   );
   const prepareOutput = join(root, "prepared");
   const approvalFile = join(root, "candidate-approval.private.json");
@@ -880,7 +1100,15 @@ async function createFixture(sourceText: string): Promise<{
       sourceDirectory,
       metadataFile,
       sourceConfirmationFile,
-      outputDirectory: prepareOutput
+      outputDirectory: prepareOutput,
+      operationTag: "synthetic-run-001",
+      executionIdentity: {
+        version: 1,
+        codeSha256: "1".repeat(64),
+        promptSha256: "2".repeat(64),
+        modelSha256: "3".repeat(64),
+        configSha256: "4".repeat(64),
+      },
     },
     packageOptions: {
       privateRootDirectory: root,
@@ -891,19 +1119,63 @@ async function createFixture(sourceText: string): Promise<{
       approvalFile,
       outputDirectory: packageOutput,
       authorMappingOutput,
-      exportedAt: "2026-07-30T00:00:00.000Z"
-    }
+      exportedAt: "2026-07-30T00:00:00.000Z",
+    },
   };
 }
 
-async function createPreparedFixture(): Promise<
-  Awaited<ReturnType<typeof createFixture>>
-> {
+async function createPreparedFixture(): Promise<Awaited<ReturnType<typeof createFixture>>> {
   const fixture = await createFixture("只用于合成测试的源正文。");
   await prepareHistoryCandidates({
     ...fixture.prepareOptions,
-    normalizer: fixedNormalizer()
+    normalizer: fixedNormalizer(),
   });
+  return fixture;
+}
+
+async function createMultiFixture(): Promise<Awaited<ReturnType<typeof createFixture>>> {
+  const fixture = await createFixture("第一份合成正文。");
+  const sources = [
+    { path: syntheticSourceName, text: "第一份合成正文。", number: "synthetic-1" },
+    { path: "synthetic-extra-two.md", text: "第二份合成正文。", number: "synthetic-2" },
+    { path: "synthetic-extra-three.md", text: "第三份合成正文。", number: "synthetic-3" },
+  ] as const;
+  for (const source of sources.slice(1)) {
+    await writeFile(join(fixture.sourceDirectory, source.path), source.text, "utf8");
+  }
+  const metadataText = `${JSON.stringify(
+    {
+      records: sources.map((source) => ({
+        number: source.number,
+        name: `合成元数据-${source.number}`,
+        authorStudentId: "",
+        status: "",
+        contest: "",
+        note: "",
+      })),
+    },
+    null,
+    2,
+  )}\n`;
+  await writeFile(fixture.prepareOptions.metadataFile, metadataText, "utf8");
+  await writeFile(
+    fixture.prepareOptions.sourceConfirmationFile,
+    `${JSON.stringify(
+      {
+        version: 1,
+        confirmed: true,
+        metadataFileSha256: sha256Hex(metadataText),
+        mappings: sources.map((source) => ({
+          sourcePath: source.path,
+          sourceSha256: sha256Hex(source.text),
+          metadataNumber: source.number,
+        })),
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
   return fixture;
 }
 
@@ -911,13 +1183,13 @@ function fixedNormalizer(): HistoryNormalizer {
   return {
     async normalize() {
       return normalizedOutput();
-    }
+    },
   };
 }
 
 function normalizedOutput(): NormalizedHistoryOutput {
   return {
-    problems: [normalizedProblem("合成候选题")]
+    problems: [normalizedProblem("合成候选题")],
   };
 }
 
@@ -937,26 +1209,23 @@ function normalizedProblem(title: string): NormalizedHistoryOutput["problems"][n
     samples: [],
     tags: ["synthetic"],
     confidence: 0.9,
-    migrationNote: "合成测试备注。"
+    migrationNote: "合成测试备注。",
   };
 }
 
 async function readCandidate(
   preparedDirectory: string,
-  candidateId = "candidate-000001"
+  candidateId = "candidate-000001",
 ): Promise<HistoryCandidateRecord> {
   return JSON.parse(
-    await readFile(
-      join(preparedDirectory, "candidates", `${candidateId}.json`),
-      "utf8"
-    )
+    await readFile(join(preparedDirectory, "candidates", `${candidateId}.json`), "utf8"),
   ) as HistoryCandidateRecord;
 }
 
 async function writeApproval(
   approvalFile: string,
   candidateId: string,
-  contentSha256: string
+  contentSha256: string,
 ): Promise<void> {
   await writeFile(
     approvalFile,
@@ -968,13 +1237,34 @@ async function writeApproval(
           {
             candidateId,
             contentSha256,
-            decision: "approved"
-          }
-        ]
+            decision: "approved",
+          },
+        ],
       },
       null,
-      2
+      2,
     )}\n`,
-    "utf8"
+    "utf8",
   );
+}
+
+async function expectFailureKind(preparedDirectory: string, failureKind: string): Promise<void> {
+  const failure = JSON.parse(
+    await readFile(join(preparedDirectory, "requests", "source-000001.failed.json"), "utf8"),
+  ) as { readonly failureKind?: unknown };
+  expect(failure.failureKind).toBe(failureKind);
+  await expect(readFile(join(preparedDirectory, "PREPARE_COMPLETE"), "utf8")).rejects.toMatchObject(
+    { code: "ENOENT" },
+  );
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T | PromiseLike<T>) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }

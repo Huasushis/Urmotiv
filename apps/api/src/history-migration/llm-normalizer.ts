@@ -1,6 +1,18 @@
 import { EnvHttpProxyAgent, fetch as undiciFetch } from "undici";
-import type { HistoryNormalizer, HistoryNormalizerInput } from "./core";
-import { HistoryMigrationError } from "./errors";
+import { readFile } from "node:fs/promises";
+import { dirname, extname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type {
+  HistoryNormalizer,
+  HistoryNormalizerInput,
+  HistoryPreparationExecutionIdentity,
+} from "./core";
+import { sha256Hex } from "./digests";
+import {
+  HistoryMigrationError,
+  HistoryNormalizationError,
+  type HistoryNormalizationFailureKind,
+} from "./errors";
 import { type NormalizedHistoryOutput, normalizedHistoryOutputSchema } from "./schema";
 
 type HistoryNormalizerFetch = (input: URL, init: RequestInit) => Promise<Response>;
@@ -9,6 +21,8 @@ export interface LlmHistoryNormalizerOptions {
   readonly baseUrl: string;
   readonly apiKey: string;
   readonly model: string;
+  /** 由 loadHistoryPreparationCodeSha256 读取实际受信代码字节得到。 */
+  readonly codeSha256: string;
   /** 等待第一段非空模型输出的时间。 */
   readonly firstOutputTimeoutMs?: number;
   /** 已经开始输出后，连续没有非空模型输出的等待时间。 */
@@ -26,6 +40,9 @@ export interface LlmHistoryNormalizerOptions {
 export const maximumNormalizationResponseBytes = 10_000_000;
 export const defaultNormalizationFirstOutputTimeoutMs = 30 * 60 * 1_000;
 export const defaultNormalizationOutputIdleTimeoutMs = 10 * 60 * 1_000;
+export interface IdentifiedHistoryNormalizer extends HistoryNormalizer {
+  readonly preparationIdentity: HistoryPreparationExecutionIdentity;
+}
 
 interface NormalizationRuntime {
   readonly firstOutputTimeoutMs: number;
@@ -39,13 +56,16 @@ interface NormalizationRuntime {
 
 export function createLlmHistoryNormalizer(
   options: LlmHistoryNormalizerOptions,
-): HistoryNormalizer {
+): IdentifiedHistoryNormalizer {
   const endpoint = new URL("chat/completions", ensureTrailingSlash(options.baseUrl));
   if (options.apiKey.length === 0 || options.model.trim().length === 0) {
     throw new HistoryMigrationError(
       "INVALID_ARGUMENTS",
       "模型地址、密钥和模型名称必须通过私有环境配置提供。",
     );
+  }
+  if (!/^[0-9a-f]{64}$/.test(options.codeSha256)) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "历史 prepare 代码身份不正确。");
   }
   const runtime: NormalizationRuntime = {
     firstOutputTimeoutMs: positiveDuration(
@@ -65,6 +85,24 @@ export function createLlmHistoryNormalizer(
   };
 
   return {
+    preparationIdentity: {
+      version: 1,
+      codeSha256: options.codeSha256,
+      promptSha256: sha256Hex(normalizationInstructions),
+      modelSha256: sha256Hex(options.model.trim()),
+      configSha256: sha256Hex(
+        JSON.stringify({
+          endpointSha256: sha256Hex(endpoint.toString()),
+          firstOutputTimeoutMs: runtime.firstOutputTimeoutMs,
+          outputIdleTimeoutMs: runtime.outputIdleTimeoutMs,
+          maximumAttempts: runtime.maximumAttempts,
+          retryBaseDelayMs: runtime.retryBaseDelayMs,
+          maximumResponseBytes: runtime.maximumResponseBytes,
+          streaming: true,
+          retryPolicy: "http-429-only",
+        }),
+      ),
+    },
     async normalize(input: HistoryNormalizerInput): Promise<NormalizedHistoryOutput> {
       const response = await requestNormalization(
         endpoint,
@@ -75,14 +113,25 @@ export function createLlmHistoryNormalizer(
       );
       const parsed = normalizedHistoryOutputSchema.safeParse(response);
       if (!parsed.success) {
-        throw new HistoryMigrationError(
-          "NORMALIZATION_FAILED",
-          `${input.sourceId} 的模型结果不符合候选内容格式。`,
-        );
+        throw normalizationFailure("schema", `${input.sourceId} 的模型结果不符合候选内容格式。`);
       }
       return parsed.data;
     },
   };
+}
+
+export async function loadHistoryPreparationCodeSha256(): Promise<string> {
+  const currentPath = fileURLToPath(import.meta.url);
+  const extension = extname(currentPath);
+  const directory = dirname(currentPath);
+  const names = ["core", "digests", "errors", "llm-normalizer", "private-files", "schema"] as const;
+  const files = await Promise.all(
+    names.map(async (name) => ({
+      name,
+      sha256: sha256Hex(await readFile(join(directory, `${name}${extension}`))),
+    })),
+  );
+  return sha256Hex(JSON.stringify({ version: 1, files }));
 }
 
 async function requestNormalization(
@@ -99,23 +148,21 @@ async function requestNormalization(
       model,
       input.sourceId,
       input,
+      attempt,
       runtime,
     );
     if (attemptResult.kind === "content") {
       try {
         return JSON.parse(extractJsonObject(attemptResult.content)) as unknown;
       } catch {
-        throw new HistoryMigrationError(
-          "NORMALIZATION_FAILED",
+        throw normalizationFailure(
+          "invalid_json",
           `${input.sourceId} 的模型响应不包含有效候选 JSON。`,
         );
       }
     }
     if (attempt === runtime.maximumAttempts) {
-      throw new HistoryMigrationError(
-        "NORMALIZATION_FAILED",
-        `${input.sourceId} 的模型服务持续返回 HTTP 429。`,
-      );
+      throw normalizationFailure("http_429", `${input.sourceId} 的模型服务持续返回 HTTP 429。`);
     }
     await waitBeforeRateLimitRetry(
       runtime.retryBaseDelayMs * attempt,
@@ -123,7 +170,7 @@ async function requestNormalization(
       input.sourceId,
     );
   }
-  throw new HistoryMigrationError("NORMALIZATION_FAILED", `${input.sourceId} 的模型请求失败。`);
+  throw normalizationFailure("internal", `${input.sourceId} 的模型请求失败。`);
 }
 
 type NormalizationAttemptResult =
@@ -136,11 +183,13 @@ async function requestNormalizationOnce(
   model: string,
   sourceId: string,
   input: HistoryNormalizerInput,
+  attempt: number,
   runtime: NormalizationRuntime,
 ): Promise<NormalizationAttemptResult> {
   if (isSignalAborted(runtime.signal)) {
     throw cancelledRequest(sourceId);
   }
+  await input.beforeRequest?.(attempt);
 
   const controller = new AbortController();
   const watchdog = new NormalizationOutputWatchdog(
@@ -172,10 +221,7 @@ async function requestNormalizationOnce(
             { role: "system", content: normalizationInstructions },
             {
               role: "user",
-              content: [
-                "原始文本：",
-                input.text,
-              ].join("\n"),
+              content: ["原始文本：", input.text].join("\n"),
             },
           ],
         }),
@@ -189,8 +235,8 @@ async function requestNormalizationOnce(
       if (response.status === 429) {
         return { kind: "rate_limited" };
       }
-      throw new HistoryMigrationError(
-        "NORMALIZATION_FAILED",
+      throw normalizationFailure(
+        response.status === 499 ? "http_499" : "http_status",
         `${sourceId} 的模型服务返回 HTTP ${response.status}。`,
       );
     }
@@ -205,16 +251,13 @@ async function requestNormalizationOnce(
   } catch (error) {
     const timeoutKind = watchdog.timeoutKind();
     if (timeoutKind === "first_output") {
-      throw new HistoryMigrationError(
-        "NORMALIZATION_FAILED",
+      throw normalizationFailure(
+        "first_output_timeout",
         `${sourceId} 的模型请求在首段有效输出前超时。`,
       );
     }
     if (timeoutKind === "output_idle") {
-      throw new HistoryMigrationError(
-        "NORMALIZATION_FAILED",
-        `${sourceId} 的模型输出长时间没有继续。`,
-      );
+      throw normalizationFailure("output_idle_timeout", `${sourceId} 的模型输出长时间没有继续。`);
     }
     if (isSignalAborted(runtime.signal)) {
       throw cancelledRequest(sourceId);
@@ -222,8 +265,8 @@ async function requestNormalizationOnce(
     if (error instanceof HistoryMigrationError) {
       throw error;
     }
-    throw new HistoryMigrationError(
-      "NORMALIZATION_FAILED",
+    throw normalizationFailure(
+      responseReceived ? "eof_incomplete" : "connection",
       responseReceived
         ? `${sourceId} 的模型响应在完整结束前中断。`
         : `${sourceId} 的模型连接失败。`,
@@ -312,7 +355,7 @@ async function readSuccessfulResponse(
   try {
     payload = JSON.parse(responseText) as unknown;
   } catch {
-    throw new HistoryMigrationError("NORMALIZATION_FAILED", "模型响应不是完整的 JSON。");
+    throw normalizationFailure("protocol", "模型响应不是完整的 JSON。");
   }
   return readCompletedResponseContent(payload);
 }
@@ -385,7 +428,7 @@ async function readBoundedJsonResponseText(
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
-    throw new HistoryMigrationError("NORMALIZATION_FAILED", "模型响应不是有效的 UTF-8 文本。");
+    throw normalizationFailure("invalid_utf8", "模型响应不是有效的 UTF-8 文本。");
   }
 }
 
@@ -573,7 +616,7 @@ function decodeEventStreamText(decoder: TextDecoder, bytes?: Uint8Array): string
   try {
     return bytes === undefined ? decoder.decode() : decoder.decode(bytes, { stream: true });
   } catch {
-    throw new HistoryMigrationError("NORMALIZATION_FAILED", "模型响应不是有效的 UTF-8 文本。");
+    throw normalizationFailure("invalid_utf8", "模型响应不是有效的 UTF-8 文本。");
   }
 }
 
@@ -751,19 +794,26 @@ const normalizationInstructions = [
 ].join("\n");
 
 function cancelledRequest(sourceId: string): HistoryMigrationError {
-  return new HistoryMigrationError("NORMALIZATION_FAILED", `${sourceId} 的模型请求已明确取消。`);
+  return normalizationFailure("cancelled", `${sourceId} 的模型请求已明确取消。`);
 }
 
 function responseTooLarge(): HistoryMigrationError {
-  return new HistoryMigrationError("NORMALIZATION_FAILED", "模型响应超过明确大小上限。");
+  return normalizationFailure("response_too_large", "模型响应超过明确大小上限。");
 }
 
 function invalidResponseFormat(): HistoryMigrationError {
-  return new HistoryMigrationError("NORMALIZATION_FAILED", "模型响应缺少完整候选内容。");
+  return normalizationFailure("protocol", "模型响应缺少完整候选内容。");
 }
 
 function interruptedResponse(): HistoryMigrationError {
-  return new HistoryMigrationError("NORMALIZATION_FAILED", "模型响应在完成标记前结束。");
+  return normalizationFailure("eof_incomplete", "模型响应在完成标记前结束。");
+}
+
+function normalizationFailure(
+  kind: HistoryNormalizationFailureKind,
+  message: string,
+): HistoryNormalizationError {
+  return new HistoryNormalizationError(kind, message);
 }
 
 function positiveDuration(value: number): number {

@@ -11,6 +11,7 @@ import {
   HistoryMigrationError,
   initializeHistoryGroupingWorksheet,
   inventoryHistorySources,
+  loadHistoryPreparationCodeSha256,
   materializeHistoryGrouping,
   packageApprovedCandidates,
   prepareHistoryCandidates,
@@ -70,6 +71,8 @@ type Command =
       readonly materializedDirectory: string;
       readonly metadataFile: string;
       readonly outputDirectory: string;
+      readonly operationTag: string;
+      readonly resume: boolean;
     }
   | {
       readonly phase: "package";
@@ -128,6 +131,13 @@ async function main(): Promise<void> {
     if (baseUrl === undefined || apiKey === undefined) {
       throw new HistoryMigrationError("INVALID_ARGUMENTS", "准备候选内容需要私有模型地址与密钥。");
     }
+    const codeSha256 = await loadHistoryPreparationCodeSha256();
+    const normalizer = createLlmHistoryNormalizer({
+      baseUrl,
+      apiKey,
+      model: process.env.MIGRATE_MODEL ?? "deepseek-v4-flash",
+      codeSha256,
+    });
     const result = await prepareHistoryCandidates({
       privateRootDirectory: command.privateRootDirectory,
       sourceDirectory: join(command.materializedDirectory, "sources"),
@@ -137,12 +147,17 @@ async function main(): Promise<void> {
         "source-confirmation.private.json",
       ),
       outputDirectory: command.outputDirectory,
-      normalizer: createLlmHistoryNormalizer({
-        baseUrl,
-        apiKey,
-        model: process.env.MIGRATE_MODEL ?? "deepseek-v4-flash",
-      }),
+      operationTag: command.operationTag,
+      resume: command.resume,
+      executionIdentity: normalizer.preparationIdentity,
+      normalizer,
     });
+    if (!result.complete) {
+      throw new HistoryMigrationError(
+        "PREPARE_INCOMPLETE",
+        "本次 prepare 含失败、未确认结束或尚未处理的样本；安全报告已保留。",
+      );
+    }
     process.stdout.write(
       `已读取 ${result.sourceCount} 个确认源文件，生成 ${result.candidateCount} 个待人工批准的候选。\n`,
     );
@@ -229,6 +244,8 @@ function parseCommand(argv: readonly string[]): Command {
       materializedDirectory: requiredOption(argv, "--materialized"),
       metadataFile: requiredOption(argv, "--metadata"),
       outputDirectory: requiredOption(argv, "--out"),
+      operationTag: requiredOption(argv, "--run-tag"),
+      resume: argv.includes("--resume"),
     };
   }
   if (phase === "package") {

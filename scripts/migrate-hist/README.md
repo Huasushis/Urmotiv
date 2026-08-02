@@ -275,7 +275,8 @@ node ../Fermata/scripts/run-with-env.mjs <private-model-env> \
     --private-root <private-root> \
     --materialized <private-root>/history/materialized-001 \
     --metadata <private-root>/history/metadata.json \
-    --out <private-root>/history/prepared-001
+    --out <private-root>/history/prepared-001 \
+    --run-tag history-prepare-20260802-a
 ```
 
 在创建模型客户端和发出任何请求前，CLI 会重新读取全部物化文本，并验证 `MATERIALIZE_COMPLETE` 与
@@ -287,6 +288,36 @@ node ../Fermata/scripts/run-with-env.mjs <private-model-env> \
 10 分钟没有新有效内容才判为停顿。只要仍在持续输出就没有总时限，并一直读取到服务端 HTTP 响应真正
 结束。只有明确的 429 限流响应会重试；499、主动取消、输出中断或缺少完整结束都直接判失败且不重试，
 不能拿不完整候选继续。响应和单个候选 JSON 超过 10,000,000 字节会拒绝，不截断。
+
+`--run-tag` 是本次付费操作的唯一标签。私有检查点只保存它的摘要，不保存标签原文。工具会在每次 HTTP
+请求前同步写入不可覆盖的 `active` 登记，绑定源内容、代码、提示词、模型、配置和本次操作身份的安全摘要；
+代码身份由运行时实际读取的 prepare、传输、结构校验、摘要和私有文件安全实现字节共同计算，不依赖人工
+记得修改版本字符串。
+只有读到服务端真正的 HTTP 正文结束、协议与候选结构都通过后，才写入 `completed`。HTTP 状态（499 单列）、
+取消、连接、首段超时、输出停顿、协议、结构、非完整 EOF、JSON、UTF-8 和超限等失败只以固定原因码写入，
+不保存响应正文或底层异常。
+
+任何失败或无法确认结束的请求都会永久使该输出目录保持不完整；工具会保留 `PREPARE_INCOMPLETE`、逐题
+请求登记和每次运行的安全计数报告，不再删除未完成输出。进程中断后，可以用完全相同的输入、运行标签、
+代码、提示词、模型和配置，加 `--resume` 续跑：
+
+```bash
+node ../Fermata/scripts/run-with-env.mjs <private-model-env> \
+  apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts prepare \
+    --private-root <private-root> \
+    --materialized <private-root>/history/materialized-001 \
+    --metadata <private-root>/history/metadata.json \
+    --out <private-root>/history/prepared-001 \
+    --run-tag history-prepare-20260802-a \
+    --resume
+```
+
+续跑只处理从未登记开始的题；已经完成、已经失败或只有 `active` 而无法确认是否到达服务端的请求都不会
+再次发送。后两类会让整份报告继续保持不完整，需要使用新的输出目录和新的唯一运行标签开启另一轮，不能
+在原目录中抹掉证据。旧版没有 `run.json` 和逐题检查点的 prepare 输出不能续跑；尤其迁移前那次调用不能
+推断为未发送或已完成，必须保留原目录，并用新输出目录、新标签明确开始新运行。
+`package` 同样只接受带新版运行身份、逐题完成链和一致审核清单的 `PREPARE_COMPLETE`；旧版完成标记或与
+`PREPARE_INCOMPLETE` 并存的目录会固定拒绝，不能绕过续跑门直接打包。
 
 ## 8. 人工批准候选内容
 
