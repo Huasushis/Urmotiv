@@ -6,6 +6,7 @@ export {
   InMemoryExportArtifactWriter,
   InMemoryFixedRevisionExportReader,
   InMemoryVerifiedImportArchiveReader,
+  ImportAccessRevokedError,
   coreProblemFormatAdapterCatalog,
   coreProblemPackageAdapters,
   createProblemPackageExportHandler,
@@ -17,6 +18,7 @@ export {
   type ExportProblemRevision,
   type ExportReadAuthorization,
   type FixedRevisionExportReader,
+  type ImportExecutionAuthorization,
   type ProblemPackageExportHandlerDependencies,
   type ProblemPackageImportHandlerDependencies,
   type VerifiedImportArchiveReader

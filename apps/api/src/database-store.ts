@@ -371,6 +371,47 @@ export async function loadUsers(
   }));
 }
 
+/**
+ * 按共享的“用户行优先”顺序锁定并重读一个账号的实时权限。users 行是并发串行点：
+ * 只锁已有成员关系或授权行，不能阻止另一事务插入新的授权。所有修改账号状态、角色成员
+ * 关系、用户授权或角色授权的运行时写入，都必须先锁受影响账号的 users 行，再插入或更新
+ * 权限行。UPDATE users 本身会取得该行锁；未来的权限管理服务必须显式遵守这个顺序。
+ */
+export async function lockUserPolicyForAuthorization(
+  executor: DatabaseExecutor,
+  databaseUserId: bigint,
+): Promise<StoredUser | undefined> {
+  const lockedUsers = await executor.query<{ id: string }>(sql`
+    SELECT id::text AS id
+    FROM users
+    WHERE id = ${databaseUserId}
+    FOR UPDATE
+  `);
+  if (lockedUsers.length !== 1) {
+    return undefined;
+  }
+  await executor.query<{ id: string }>(sql`
+    SELECT membership.id::text AS id
+    FROM role_memberships membership
+    WHERE membership.user_id = ${databaseUserId}
+    ORDER BY membership.id
+    FOR UPDATE OF membership
+  `);
+  await executor.query<{ id: string }>(sql`
+    SELECT grant_record.id::text AS id
+    FROM permission_grants grant_record
+    WHERE grant_record.subject_user_id = ${databaseUserId}
+       OR grant_record.subject_role_id IN (
+         SELECT membership.role_id
+         FROM role_memberships membership
+         WHERE membership.user_id = ${databaseUserId}
+       )
+    ORDER BY grant_record.id
+    FOR UPDATE OF grant_record
+  `);
+  return (await loadUsers(executor, [databaseUserId]))[0];
+}
+
 async function loadProblemRows(
   executor: DatabaseExecutor,
   where: SQL,
@@ -1903,41 +1944,7 @@ export class DatabaseDataStore implements DataStore {
           if (userDatabaseId === undefined) {
             return undefined;
           }
-
-          // Keep this order aligned with every permission writer: the problem
-          // and current round are already locked, then the actor, memberships,
-          // and grants are locked in stable primary-key order. Locking existing
-          // rows does not protect writers that insert grants without first
-          // taking the actor row, hence the explicit user-row-first protocol.
-          const lockedUsers = await executor.query<{ id: string }>(sql`
-            SELECT id::text AS id
-            FROM users
-            WHERE id = ${userDatabaseId}
-            FOR UPDATE
-          `);
-          if (lockedUsers.length === 0) {
-            return undefined;
-          }
-          await executor.query<{ id: string }>(sql`
-            SELECT membership.id::text AS id
-            FROM role_memberships membership
-            WHERE membership.user_id = ${userDatabaseId}
-            ORDER BY membership.id
-            FOR UPDATE OF membership
-          `);
-          await executor.query<{ id: string }>(sql`
-            SELECT grant_record.id::text AS id
-            FROM permission_grants grant_record
-            WHERE grant_record.subject_user_id = ${userDatabaseId}
-               OR grant_record.subject_role_id IN (
-                 SELECT membership.role_id
-                 FROM role_memberships membership
-                 WHERE membership.user_id = ${userDatabaseId}
-               )
-            ORDER BY grant_record.id
-            FOR UPDATE OF grant_record
-          `);
-          return (await loadUsers(executor, [userDatabaseId]))[0];
+          return lockUserPolicyForAuthorization(executor, userDatabaseId);
         },
         listUsers: () => users.map(copy),
         listReviews: (round) =>

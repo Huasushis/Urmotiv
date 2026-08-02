@@ -55,6 +55,7 @@ import {
 import {
   DatabaseFixedRevisionExportReader,
   DatabaseImportedProblemWriter,
+  ServiceImportExecutionAuthorization,
   ServiceExportReadAuthorization,
   StorageExportArtifactWriter,
   StorageVerifiedImportArchiveReader
@@ -193,6 +194,9 @@ async function makeTransferApp(
   registerProblemPackageHandlers(worker, {
     import: {
       jobs: jobStore,
+      authorization: new ServiceImportExecutionAuthorization({
+        getUser: (userId) => store.getUser(userId)
+      }),
       archives: new StorageVerifiedImportArchiveReader(metadata, storage),
       writer,
       ...(adapterCatalog === undefined ? {} : { adapterCatalog })
@@ -1197,6 +1201,117 @@ describe("题目包导入", () => {
     expect(foreignJob.statusCode).toBe(404);
   });
 
+  it("任务排队后账号被禁用或导入权限被明确拒绝时后台不读取也不写入", async () => {
+    for (const revokeKind of ["disabled", "denied"] as const) {
+      const {
+        app,
+        database,
+        jobs,
+        metadata,
+        queue,
+        storage,
+        writer,
+        worker
+      } = await makeTransferApp();
+      const leader = await login(app, databaseDemoUserIds.leader);
+      const jobId = await createQueuedImportJob(
+        app,
+        leader,
+        `import-requester-${revokeKind}`
+      );
+      const beforeProblems = await database.query<{ count: number }>(sql`
+        SELECT count(*)::integer AS count FROM problems
+      `);
+      const beforeProblemFiles = await database.query<{ count: number }>(sql`
+        SELECT count(*)::integer AS count
+        FROM stored_files
+        WHERE purpose = 'problem' AND deleted_at IS NULL
+      `);
+
+      if (revokeKind === "disabled") {
+        await database.execute(sql`
+          UPDATE users
+          SET disabled_at = now(), disabled_reason = '测试：导入排队后停用账号'
+          WHERE id = ${BigInt(databaseDemoUserIds.leader)}
+        `);
+      } else {
+        await database.execute(sql`
+          INSERT INTO permission_grants (
+            id, subject_user_id, permission_name, effect, scope,
+            granted_by_user_id, reason
+          ) VALUES (
+            ${randomUUID()}::uuid, ${BigInt(databaseDemoUserIds.leader)},
+            'problem.import', 'deny', 'global', 0, '测试：导入排队后明确拒绝'
+          )
+        `);
+      }
+
+      const metadataRead = vi.spyOn(metadata, "findStoredFile");
+      const storageRead = vi.spyOn(storage, "open");
+      const databaseWrite = vi.spyOn(writer, "write");
+      expect(await worker.runOnce()).toBe(true);
+      expect(metadataRead).not.toHaveBeenCalled();
+      expect(storageRead).not.toHaveBeenCalled();
+      expect(databaseWrite).not.toHaveBeenCalled();
+
+      expect(await jobs.getImportJob(jobId)).toEqual(
+        expect.objectContaining({
+          state: "failed",
+          failure: {
+            code: "import_access_revoked",
+            message: "当前已没有导入题目包的权限。"
+          }
+        })
+      );
+      expect(await jobs.getImportItems(jobId)).toEqual([
+        expect.objectContaining({
+          state: "failed",
+          importedProblemId: null,
+          failure: {
+            code: "import_access_revoked",
+            message: "当前已没有导入题目包的权限。"
+          }
+        })
+      ]);
+      expect(await queue.get(jobId)).toEqual(
+        expect.objectContaining({
+          state: "failed",
+          failure: {
+            code: "import_access_revoked",
+            message: "当前已没有导入题目包的权限。"
+          }
+        })
+      );
+      expect(await database.query<{ count: number }>(sql`
+        SELECT count(*)::integer AS count FROM problems
+      `)).toEqual(beforeProblems);
+      expect(await database.query<{ count: number }>(sql`
+        SELECT count(*)::integer AS count
+        FROM stored_files
+        WHERE purpose = 'problem' AND deleted_at IS NULL
+      `)).toEqual(beforeProblemFiles);
+
+      if (revokeKind === "denied") {
+        const status = await app.inject({
+          method: "GET",
+          url: `/api/v1/transfer/imports/${jobId}`,
+          headers: { cookie: leader }
+        });
+        expect(status.statusCode).toBe(200);
+        expect(status.body).not.toContain(statementText);
+        expect(status.body).not.toContain(solutionText);
+        expect(status.body).not.toContain("测试：导入排队后明确拒绝");
+      }
+      const serialized = JSON.stringify({
+        job: await jobs.getImportJob(jobId),
+        items: await jobs.getImportItems(jobId),
+        queued: await queue.get(jobId)
+      });
+      expect(serialized).not.toContain(statementText);
+      expect(serialized).not.toContain(solutionText);
+    }
+  });
+
   it("上传接口明确接受原始 XML，并让 ZIP 适配器拒绝错误的文件种类", async () => {
     const { app, metadata } = await makeTransferApp();
     const leader = await login(app, databaseDemoUserIds.leader);
@@ -1513,6 +1628,67 @@ describe("题目包导入", () => {
     });
     expect(JSON.stringify(secondFailure)).not.toContain(privateFailure);
     storageFailure.mockRestore();
+  });
+
+  it("导入权限在解析后撤销时最终原子事务再次拒绝并清理对象", async () => {
+    const { app, database, jobs, storage, writer } = await makeTransferApp();
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const jobId = await createQueuedImportJob(
+      app,
+      leader,
+      "import-permission-revoked-before-atomic-write"
+    );
+    await jobs.startImportJob(jobId);
+    await database.execute(sql`
+      INSERT INTO permission_grants (
+        id, subject_user_id, permission_name, effect, scope,
+        granted_by_user_id, reason
+      ) VALUES (
+        ${randomUUID()}::uuid, ${BigInt(databaseDemoUserIds.leader)},
+        'problem.import', 'deny', 'global', 0, '测试：原子写入前撤销导入权限'
+      )
+    `);
+    const beforeProblems = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count FROM problems
+    `);
+    const staged = vi.spyOn(storage, "stage");
+    const deleted = vi.spyOn(storage, "delete");
+
+    let failure: unknown;
+    try {
+      await writer.write({
+        importJobId: jobId,
+        position: 0,
+        requestedByUserId: databaseDemoUserIds.leader,
+        choices: { conflictAction: "create" },
+        problem: fixtureProblem(),
+        signal: new AbortController().signal
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      name: "ImportAccessRevokedError",
+      message: "当前已没有导入题目包的权限。"
+    });
+    expect(JSON.stringify(failure)).not.toContain(statementText);
+    expect(JSON.stringify(failure)).not.toContain(solutionText);
+    expect(staged).toHaveBeenCalledTimes(fixtureProblem().files.length);
+    expect(deleted).toHaveBeenCalledTimes(fixtureProblem().files.length);
+    expect(await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count FROM problems
+    `)).toEqual(beforeProblems);
+    expect(await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'problem' AND deleted_at IS NULL
+    `)).toEqual([{ count: 0 }]);
+    expect(await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM audit_events
+      WHERE action = 'problem.package.import.item.complete'
+        AND request_id = ${jobId}::uuid
+    `)).toEqual([{ count: 0 }]);
   });
 
   it("写入前固定拒绝无效知识点且不会暂存文件或泄露目录错误", async () => {
@@ -2703,7 +2879,7 @@ describe("题目包导出权限", () => {
   });
 
   it("导出任务创建后权限被撤销：后台任务失败，已完成任务不能下载", async () => {
-    const { app, database, queue, worker } = await makeTransferApp();
+    const { app, database, jobs, queue, worker } = await makeTransferApp();
     const leader = await login(app, databaseDemoUserIds.leader);
     const importedProblemId = await importFixtureProblem(app, worker, leader);
 
@@ -2727,6 +2903,29 @@ describe("题目包导出权限", () => {
         'problem.testdata.read', 'deny', 'global', 0, '测试：内部文件读取权限被撤销'
       )
     `);
+    for (const hiddenJobId of [firstJob, secondJob]) {
+      const hiddenStatus = await app.inject({
+        method: "GET",
+        url: `/api/v1/transfer/exports/${hiddenJobId}`,
+        headers: { cookie: leader }
+      });
+      expect(hiddenStatus.statusCode).toBe(404);
+      expect(hiddenStatus.json()).toEqual({
+        error: expect.objectContaining({
+          code: "NOT_FOUND",
+          message: "未找到请求的资源。"
+        })
+      });
+      const hiddenBody = hiddenStatus.json() as { error: Record<string, unknown> };
+      expect(Object.keys(hiddenBody)).toEqual(["error"]);
+      expect(Object.keys(hiddenBody.error).sort()).toEqual([
+        "code",
+        "message",
+        "requestId"
+      ]);
+      expect(hiddenStatus.body).not.toContain("导入的演示题目");
+      expect(hiddenStatus.body).not.toContain(statementText);
+    }
     const internalAccessRevokedReplay = await app.inject({
       method: "POST",
       url: "/api/v1/transfer/exports",
@@ -2786,7 +2985,20 @@ describe("题目包导出权限", () => {
       url: `/api/v1/transfer/exports/${secondJob}`,
       headers: { cookie: leader }
     });
-    expect(secondStatus.json()).toEqual(
+    expect(secondStatus.statusCode).toBe(404);
+    expect(secondStatus.json()).toEqual({
+      error: expect.objectContaining({ code: "NOT_FOUND", message: "未找到请求的资源。" })
+    });
+    const failedHiddenBody = secondStatus.json() as { error: Record<string, unknown> };
+    expect(Object.keys(failedHiddenBody)).toEqual(["error"]);
+    expect(Object.keys(failedHiddenBody.error).sort()).toEqual([
+      "code",
+      "message",
+      "requestId"
+    ]);
+    expect(secondStatus.body).not.toContain("export_access_revoked");
+    expect(secondStatus.body).not.toContain(statementText);
+    expect(await jobs.getExportJob(secondJob)).toEqual(
       expect.objectContaining({
         state: "failed",
         failure: expect.objectContaining({ code: "export_access_revoked" })
@@ -3288,6 +3500,29 @@ async function importFixtureProblem(
     throw new Error("导入任务没有成功完成。");
   }
   return problemId;
+}
+
+async function createQueuedImportJob(
+  app: FastifyInstance,
+  cookie: string,
+  idempotencyKey: string
+): Promise<string> {
+  const uploaded = await uploadPackage(app, cookie, await nativeZipOf(fixtureProblem()));
+  expect(uploaded.statusCode).toBe(200);
+  const upload = uploaded.json() as { fileId: string; sha256: string };
+  const created = await app.inject({
+    method: "POST",
+    url: "/api/v1/transfer/imports",
+    headers: { cookie, origin: localOrigin },
+    payload: {
+      fileId: upload.fileId,
+      sha256: upload.sha256,
+      formatId: "urmotiv",
+      idempotencyKey
+    }
+  });
+  expect(created.statusCode).toBe(200);
+  return (created.json() as { id: string }).id;
 }
 
 async function createExportJob(

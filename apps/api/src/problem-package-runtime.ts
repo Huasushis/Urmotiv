@@ -3,10 +3,11 @@ import {
   problemJudgeConfigSchema,
   type ProblemFileCategory
 } from "@urmotiv/contracts";
-import type { DatabaseHandle } from "@urmotiv/database";
+import type { DatabaseExecutor, DatabaseHandle } from "@urmotiv/database";
 import {
   ExportResultSaveError,
   ExportSourceIntegrityError,
+  ImportAccessRevokedError,
   ImportResultSaveError,
   ProblemPackageTemporaryError,
   type AtomicImportedProblemWriter,
@@ -15,6 +16,7 @@ import {
   type ExportProblemRevision,
   type ExportReadAuthorization,
   type FixedRevisionExportReader,
+  type ImportExecutionAuthorization,
   type ProblemPackageExportSelection,
   type ProblemPackageImportChoices,
   type VerifiedImportArchiveReader
@@ -40,8 +42,12 @@ import { StorageError, type FileStorage, type StagedFile, type StoredFile } from
 import { sql } from "drizzle-orm";
 import { z } from "zod";
 import type { StoredProblem, StoredUser } from "./domain";
-import type { DatabaseDataStore } from "./database-store";
+import {
+  lockUserPolicyForAuthorization,
+  type DatabaseDataStore
+} from "./database-store";
 import { ApiError } from "./errors";
+import { hasPermission } from "./permissions";
 import type { ProblemFileStore } from "./problem-file-store";
 import {
   ProblemPackageJobStoreError,
@@ -283,6 +289,42 @@ export class StorageVerifiedImportArchiveReader implements VerifiedImportArchive
   }
 }
 
+export interface ServiceImportExecutionAuthorizationDependencies {
+  readonly getUser: (userId: string) => Promise<StoredUser | undefined>;
+  readonly now?: () => Date;
+}
+
+/**
+ * 在后台读取上传包前重新读取账号状态和 problem.import 权限。明确拒绝返回 false；
+ * 数据库或权限服务故障使用固定的临时错误，让队列稍后重试。
+ */
+export class ServiceImportExecutionAuthorization implements ImportExecutionAuthorization {
+  readonly #now: () => Date;
+
+  public constructor(
+    private readonly dependencies: ServiceImportExecutionAuthorizationDependencies
+  ) {
+    this.#now = dependencies.now ?? (() => new Date());
+  }
+
+  public async canImport(input: {
+    readonly requestedByUserId: string;
+    readonly signal: AbortSignal;
+  }): Promise<boolean> {
+    assertActive(input.signal);
+    let user: StoredUser | undefined;
+    try {
+      user = await this.dependencies.getUser(input.requestedByUserId);
+    } catch {
+      throw new ProblemPackageTemporaryError(
+        "导入权限检查暂时失败，请稍后重试。"
+      );
+    }
+    assertActive(input.signal);
+    return user !== undefined && hasPermission(user, "problem.import", {}, this.#now());
+  }
+}
+
 export interface DatabaseImportedProblemWriterDependencies {
   readonly database: DatabaseHandle;
   readonly store: DatabaseDataStore;
@@ -425,6 +467,10 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
       const created = await this.#store.createProblemWithRevisionAction(
         stored,
         async (revisionId, executor) => {
+          await this.#requireImportPermissionInTransaction(
+            executor,
+            input.requestedByUserId
+          );
           const lockedJob = await executor.query<{ id: string }>(sql`
             SELECT id::text AS id
             FROM import_jobs
@@ -530,7 +576,11 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
         }
       );
       return { problemId: created.id };
-    } catch {
+    } catch (error) {
+      if (error instanceof ImportAccessRevokedError) {
+        await this.#deletePublishedFiles(published);
+        throw error;
+      }
       let committedProblemId: string | undefined;
       try {
         committedProblemId = await this.#findImportedProblemId(
@@ -574,6 +624,20 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
       WHERE job_id = ${importJobId}::uuid AND position = ${position}
     `);
     return rows[0]?.imported_problem_id ?? undefined;
+  }
+
+  async #requireImportPermissionInTransaction(
+    executor: DatabaseExecutor,
+    requestedByUserId: string
+  ): Promise<void> {
+    if (!/^(0|[1-9]\d*)$/.test(requestedByUserId)) {
+      throw new ImportAccessRevokedError();
+    }
+    const databaseUserId = BigInt(requestedByUserId);
+    const user = await lockUserPolicyForAuthorization(executor, databaseUserId);
+    if (user === undefined || !hasPermission(user, "problem.import", {}, this.#now())) {
+      throw new ImportAccessRevokedError();
+    }
   }
 
   async #publishedFilesBelongToProblem(

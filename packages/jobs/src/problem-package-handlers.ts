@@ -77,8 +77,30 @@ export interface AtomicImportedProblemWriter {
   }): Promise<{ readonly problemId: string }>;
 }
 
+/**
+ * Rechecks the requester's live account and problem.import permission. A false
+ * result is an explicit denial; dependency failures must throw so the worker
+ * can retry without turning a temporary authorization outage into a fixed
+ * task failure.
+ */
+export interface ImportExecutionAuthorization {
+  canImport(input: {
+    readonly requestedByUserId: string;
+    readonly signal: AbortSignal;
+  }): Promise<boolean>;
+}
+
+/** The final atomic writer uses this fixed error for a live explicit denial. */
+export class ImportAccessRevokedError extends Error {
+  public constructor() {
+    super("当前已没有导入题目包的权限。");
+    this.name = "ImportAccessRevokedError";
+  }
+}
+
 export interface ProblemPackageImportHandlerDependencies {
   readonly jobs: ProblemPackageJobStore;
+  readonly authorization: ImportExecutionAuthorization;
   readonly archives: VerifiedImportArchiveReader;
   readonly writer: AtomicImportedProblemWriter;
   readonly adapterCatalog?: ProblemFormatAdapterCatalog;
@@ -242,6 +264,11 @@ export function createProblemPackageImportHandler(
         return { result: { importedProblemCount: 1, failedProblemCount: 0 } };
       }
 
+      await requireImportExecutionAccess(
+        dependencies.authorization,
+        job.requestedByUserId,
+        context.signal
+      );
       assertActive(context.signal);
       await putRunningItemOrRetry(context, "0");
       const packageInput = await dependencies.archives.read({
@@ -283,6 +310,11 @@ export function createProblemPackageImportHandler(
         importJobId,
         60,
         report("writing", 0, 0)
+      );
+      await requireImportExecutionAccess(
+        dependencies.authorization,
+        job.requestedByUserId,
+        context.signal
       );
       const committed = await dependencies.writer.write({
         importJobId,
@@ -908,6 +940,34 @@ async function requireBoundAdapter(
   return adapter;
 }
 
+async function requireImportExecutionAccess(
+  authorization: ImportExecutionAuthorization,
+  requestedByUserId: string,
+  signal: AbortSignal
+): Promise<void> {
+  assertActive(signal);
+  let allowed: boolean;
+  try {
+    allowed = await authorization.canImport({ requestedByUserId, signal });
+  } catch (error) {
+    if (error instanceof ImportAccessRevokedError) {
+      throw error;
+    }
+    if (signal.aborted) {
+      throw new PackageTaskError("cancelled");
+    }
+    if (error instanceof ProblemPackageTemporaryError) {
+      throw error;
+    }
+    throw new ProblemPackageTemporaryError(
+      "导入权限检查暂时失败，请稍后重试。"
+    );
+  }
+  if (!allowed) {
+    throw new PackageTaskError("import_access_revoked");
+  }
+}
+
 function report(
   phase: ProblemPackageJobReport["phase"],
   completedItems: number,
@@ -1192,6 +1252,7 @@ async function putFailureReport(
 
 function classifyImportFailure(error: unknown, signal: AbortSignal): ProblemPackageFailureCode {
   if (signal.aborted) return "cancelled";
+  if (error instanceof ImportAccessRevokedError) return "import_access_revoked";
   if (error instanceof PackageTaskError) return error.code;
   if (error instanceof UnsafeArchiveError) return "archive_rejected";
   if (error instanceof ChecksumValidationError || error instanceof ProblemPackageError) return "import_invalid";

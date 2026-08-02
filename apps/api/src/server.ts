@@ -26,6 +26,7 @@ import { DatabaseProblemPackageAuditWriter } from "./problem-package-audit";
 import {
   DatabaseFixedRevisionExportReader,
   DatabaseImportedProblemWriter,
+  ServiceImportExecutionAuthorization,
   ServiceExportReadAuthorization,
   StorageExportArtifactWriter,
   StorageVerifiedImportArchiveReader
@@ -115,6 +116,9 @@ try {
     import: {
       jobs: packageJobStore,
       adapterCatalog: problemFormatAdapters,
+      authorization: new ServiceImportExecutionAuthorization({
+        getUser: (userId) => store.getUser(userId)
+      }),
       archives: new StorageVerifiedImportArchiveReader(problemFileStore, fileStorage),
       writer: new DatabaseImportedProblemWriter({
         database,

@@ -471,6 +471,7 @@ export class TransferService {
     if (job === undefined || job.requestedByUserId !== user.id) {
       throw notFound();
     }
+    await this.#requireReplayExportAccess(user, job);
     return this.#toExportJobView(job);
   }
 

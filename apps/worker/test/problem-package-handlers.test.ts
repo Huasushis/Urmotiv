@@ -26,18 +26,20 @@ import {
   type ProblemPackageFailureCode,
   type ProblemPackageImportItem,
   type ProblemPackageImportJob,
+  type ProblemPackageImportHandlerDependencies,
   type ProblemPackageJobReport,
-  type ProblemPackageJobStore
+  type ProblemPackageJobStore,
+  type JobItemReport
 } from "@urmotiv/jobs";
-import type { JobItemReport } from "@urmotiv/jobs";
 import { describe, expect, it } from "vitest";
 import {
   InMemoryExportArtifactWriter,
   InMemoryFixedRevisionExportReader,
   InMemoryVerifiedImportArchiveReader,
   createProblemPackageExportHandler,
-  createProblemPackageImportHandler,
+  createProblemPackageImportHandler as createProblemPackageImportHandlerWithAuthorization,
   type ExportReadAuthorization,
+  type ImportExecutionAuthorization,
   type JobHandlerContext
 } from "../src";
 
@@ -365,6 +367,21 @@ function allowAll(): ExportReadAuthorization {
   };
 }
 
+function allowImport(): ImportExecutionAuthorization {
+  return { canImport: async () => true };
+}
+
+function createProblemPackageImportHandler(
+  dependencies: Omit<ProblemPackageImportHandlerDependencies, "authorization"> & {
+    readonly authorization?: ImportExecutionAuthorization;
+  }
+) {
+  return createProblemPackageImportHandlerWithAuthorization({
+    authorization: allowImport(),
+    ...dependencies
+  });
+}
+
 describe("题目包导入任务处理器", () => {
   it("成功导入原生包并保存题目编号", async () => {
     const store = new FakeProblemPackageJobStore();
@@ -397,6 +414,128 @@ describe("题目包导入任务处理器", () => {
     expect(store.importItems.get(job.id)?.[0]).toEqual(
       expect.objectContaining({ state: "succeeded", importedProblemId: "42" })
     );
+  });
+
+  it("读取上传包前发现导入权限已撤销时固定失败且不读取或写入", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedImport();
+    let archiveReads = 0;
+    let writes = 0;
+    const handler = createProblemPackageImportHandler({
+      jobs: store,
+      authorization: { canImport: async () => false },
+      archives: {
+        read: async () => {
+          archiveReads += 1;
+          throw new Error(`撤权后不应读取 ${statementText}`);
+        }
+      },
+      writer: {
+        write: async () => {
+          writes += 1;
+          throw new Error(`撤权后不应写入 ${solutionText}`);
+        }
+      }
+    });
+
+    await expect(handler({ importJobId: job.id }, makeContext())).rejects.toMatchObject({
+      name: "PermanentJobError",
+      code: "import_access_revoked",
+      safeMessage: "当前已没有导入题目包的权限。"
+    });
+    expect(archiveReads).toBe(0);
+    expect(writes).toBe(0);
+    expect(store.imports.get(job.id)).toEqual(
+      expect.objectContaining({
+        state: "failed",
+        failure: safeProblemPackageFailure("import_access_revoked")
+      })
+    );
+    const serialized = JSON.stringify({
+      job: store.imports.get(job.id),
+      items: store.importItems.get(job.id)
+    });
+    expect(serialized).not.toContain(statementText);
+    expect(serialized).not.toContain(solutionText);
+  });
+
+  it("解析期间撤销导入权限时写入前的第二次检查会阻止 writer", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedImport();
+    const reader = new InMemoryVerifiedImportArchiveReader();
+    reader.put(job.sourceFileId, job.inputDigest, await nativeArchiveOf(fixtureProblem()));
+    let authorizationChecks = 0;
+    let writes = 0;
+    const handler = createProblemPackageImportHandler({
+      jobs: store,
+      authorization: {
+        canImport: async () => {
+          authorizationChecks += 1;
+          return authorizationChecks === 1;
+        }
+      },
+      archives: reader,
+      writer: {
+        write: async () => {
+          writes += 1;
+          return { problemId: "42" };
+        }
+      }
+    });
+
+    await expect(handler({ importJobId: job.id }, makeContext())).rejects.toMatchObject({
+      name: "PermanentJobError",
+      code: "import_access_revoked"
+    });
+    expect(authorizationChecks).toBe(2);
+    expect(writes).toBe(0);
+    expect(store.imports.get(job.id)?.failure).toEqual(
+      safeProblemPackageFailure("import_access_revoked")
+    );
+  });
+
+  it("导入权限服务暂时失败时保留运行状态交给队列重试", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedImport();
+    const privateFailure = `permission database unavailable ${statementText}`;
+    let archiveReads = 0;
+    const handler = createProblemPackageImportHandler({
+      jobs: store,
+      authorization: {
+        canImport: async () => {
+          throw new Error(privateFailure);
+        }
+      },
+      archives: {
+        read: async () => {
+          archiveReads += 1;
+          return undefined;
+        }
+      },
+      writer: {
+        write: async () => {
+          throw new Error("权限检查失败时不应写入题目。");
+        }
+      }
+    });
+
+    let failure: unknown;
+    try {
+      await handler(
+        { importJobId: job.id },
+        makeContext({ attempt: 1, maxAttempts: 3 })
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      name: "ProblemPackageTemporaryError",
+      message: "导入权限检查暂时失败，请稍后重试。"
+    });
+    expect(JSON.stringify(failure)).not.toContain(privateFailure);
+    expect(archiveReads).toBe(0);
+    expect(store.imports.get(job.id)?.state).toBe("running");
+    expect(store.imports.get(job.id)?.failure).toBeNull();
   });
 
   it("输入文件摘要不符时用固定错误结束任务", async () => {
