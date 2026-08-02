@@ -1,8 +1,35 @@
 import { z } from "zod";
 import { problemContentSchema, problemTypeSchema } from "./problem";
 import { reviewInputSchema } from "./review";
+import { reviewItemSourceSchema, reviewItemVisibilitySchema } from "./review-item";
 
 const contentHashSchema = z.string().regex(/^[a-f0-9]{64}$/);
+export const robotAnklangPluginId = "org.ustc.urmotiv.anklang" as const;
+
+const robotReviewItemSchema = z
+  .object({
+    id: z.string().min(1).max(200),
+    type: z.string().min(1).max(160),
+    source: reviewItemSourceSchema,
+    sourcePluginId: z.string().min(1).max(160).nullable(),
+    visibility: reviewItemVisibilitySchema,
+    summary: z.string().max(1_000),
+    data: z.unknown(),
+    contentHash: contentHashSchema,
+    expiresAt: z.string().datetime({ offset: true }).nullable(),
+    createdAt: z.string().datetime()
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.source === "anklang" && value.sourcePluginId !== robotAnklangPluginId) {
+      context.addIssue({
+        code: "custom",
+        path: ["sourcePluginId"],
+        message: "Anklang 审核条目必须来自内置 Anklang 插件。"
+      });
+    }
+  });
+
 const robotSampleSchema = z
   .object({
     safeId: z.string().regex(/^sample-[0-9]{3}$/),
@@ -61,21 +88,7 @@ export const robotReviewTaskSchema = z
       })
       .strict(),
     tagCatalog: robotTagCatalogSchema,
-    reviewItems: z
-      .array(
-        z
-          .object({
-            id: z.string().min(1).max(200),
-            type: z.string().min(1).max(160),
-            summary: z.string().max(1_000),
-            data: z.unknown(),
-            contentHash: contentHashSchema,
-            createdAt: z.string().datetime()
-          })
-          .strict()
-      )
-      .max(1_000)
-      .default([])
+    reviewItems: z.array(robotReviewItemSchema).max(1_000).default([])
   })
   .strict();
 

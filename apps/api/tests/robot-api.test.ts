@@ -97,6 +97,7 @@ async function makeRobotApp(
   app: FastifyInstance;
   database: LocalDatabaseHandle;
   store: DatabaseDataStore;
+  reviewItems: DatabaseReviewItemStore;
   tokenId: string;
 }> {
   const database = createLocalDatabase({
@@ -109,13 +110,14 @@ async function makeRobotApp(
   const tokenId = await insertToken(database);
 
   const store = new DatabaseDataStore(database);
+  const reviewItems = new DatabaseReviewItemStore(database);
   const app = await createApp({
     demoAuthEnabled: true,
     store,
     contestStore: new DatabaseContestStore(database),
     demoUserIds: Object.values(databaseDemoUserIds),
     demoLoginUserIds: databaseDemoUserIds,
-    reviewItems: new DatabaseReviewItemStore(database),
+    reviewItems,
     robots: new DatabaseRobotStore(database),
     tagCatalog: new DatabaseTagCatalogService(database),
     ...(options.trustedProxyCidrs === undefined
@@ -123,7 +125,7 @@ async function makeRobotApp(
       : { trustedProxyCidrs: options.trustedProxyCidrs }),
   });
   openApps.push(app);
-  return { app, database, store, tokenId };
+  return { app, database, store, reviewItems, tokenId };
 }
 
 async function login(app: FastifyInstance, userId: string): Promise<string> {
@@ -250,6 +252,69 @@ async function claimOne(app: FastifyInstance): Promise<ClaimedTask> {
 }
 
 describe("机器人审题接口", () => {
+  it("领取任务完整保留审核条目的认证来源、可见范围和有效期", async () => {
+    const { app, database, reviewItems } = await makeRobotApp();
+    const problem = await createPendingProblem(app);
+    await database.execute(sql`
+      INSERT INTO installed_plugins (
+        id, display_name, version, api_version, source, manifest_digest,
+        state, installed_by_user_id
+      ) VALUES (
+        'org.ustc.urmotiv.anklang', '原题相似度检查', '0.2.0', '1',
+        'builtin', ${"a".repeat(64)}, 'enabled', 0
+      )
+    `);
+    const expiresAt = new Date(Date.now() + 3_600_000).toISOString();
+    await reviewItems.append(problem.id, 1, [
+      {
+        type: "org.ustc.urmotiv.anklang.similarity",
+        source: "anklang",
+        sourcePluginId: "org.ustc.urmotiv.anklang",
+        visibility: "reviewer",
+        summary: "公开构造的相似度检查结果。",
+        data: { status: "completed", candidates: [] },
+        contentHash: "a".repeat(64),
+        expiresAt
+      },
+      {
+        type: "org.example.human-note",
+        source: "human",
+        sourceUserId: databaseDemoUserIds.author,
+        visibility: "author",
+        summary: "公开构造的人工审核条目。",
+        data: null,
+        contentHash: "a".repeat(64)
+      }
+    ]);
+
+    const claimed = await app.inject({
+      method: "POST",
+      url: "/api/v1/robot/review-tasks/claim",
+      headers: robotHeaders(),
+      payload: { maximumTasks: 1, leaseSeconds: 300 }
+    });
+    expect(claimed.statusCode).toBe(200);
+    const task = (claimed.json() as {
+      items: Array<{ reviewItems: Array<Record<string, unknown>> }>;
+    }).items[0];
+    expect(task?.reviewItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "org.ustc.urmotiv.anklang.similarity",
+        source: "anklang",
+        sourcePluginId: "org.ustc.urmotiv.anklang",
+        visibility: "reviewer",
+        expiresAt
+      }),
+      expect.objectContaining({
+        type: "org.example.human-note",
+        source: "human",
+        sourcePluginId: null,
+        visibility: "author",
+        expiresAt: null
+      })
+    ]));
+  });
+
   it("认证事务先使用读已提交，再按账号、令牌和权限顺序显式锁定", async () => {
     const { database } = await makeRobotApp();
     let firstOperation: "execute" | "query" | undefined;

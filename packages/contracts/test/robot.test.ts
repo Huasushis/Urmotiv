@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   completeRobotReviewTaskInputSchema,
+  robotAnklangPluginId,
   robotReviewTaskSchema,
   renewRobotReviewTaskInputSchema
 } from "../src";
@@ -92,5 +93,83 @@ describe("机器人操作请求契约", () => {
         testcases: [{ input: "private/input.txt" }]
       }
     }).success).toBe(false);
+  });
+
+  it("审核条目保留认证来源、可见范围与有效期，并严格绑定内置 Anklang", () => {
+    const reviewItem = {
+      id: "review-item-1",
+      type: "org.ustc.urmotiv.anklang.similarity",
+      source: "anklang" as const,
+      sourcePluginId: robotAnklangPluginId,
+      visibility: "reviewer" as const,
+      summary: "公开构造的相似度检查结果。",
+      data: { status: "completed", candidates: [] },
+      contentHash: "b".repeat(64),
+      expiresAt: "2026-08-08T00:00:00.000Z",
+      createdAt: "2026-08-01T00:00:00.000Z"
+    };
+    const task = {
+      assignmentId: requestId,
+      leaseExpiresAt: expectedLeaseExpiresAt,
+      problem: {
+        id: "problem-1",
+        revision: 2,
+        reviewRound: 1,
+        contentHash: "a".repeat(64),
+        title: "合成题",
+        type: "traditional" as const,
+        tagIds: ["basic.simulation"],
+        content: {
+          basicStatement: "合成题面",
+          basicSolution: "合成题解",
+          background: "",
+          statement: "",
+          inputFormat: "",
+          outputFormat: "",
+          constraints: "",
+          solution: "",
+          hints: ""
+        },
+        samples: [],
+        limits: null
+      },
+      tagCatalog: {
+        version: 7,
+        tags: [{
+          id: "basic.simulation",
+          name: "模拟",
+          categoryId: "basic",
+          categoryName: "基础算法",
+          description: "按题意实现",
+          aliases: [],
+          active: true as const
+        }]
+      },
+      reviewItems: [reviewItem]
+    };
+
+    expect(robotReviewTaskSchema.parse(task)).toEqual(task);
+    expect(robotReviewTaskSchema.safeParse({
+      ...task,
+      reviewItems: [{ ...reviewItem, sourcePluginId: null }]
+    }).success).toBe(false);
+    expect(robotReviewTaskSchema.safeParse({
+      ...task,
+      reviewItems: [{ ...reviewItem, sourcePluginId: "org.example.forged" }]
+    }).success).toBe(false);
+    expect(robotReviewTaskSchema.safeParse({
+      ...task,
+      reviewItems: [{ ...reviewItem, unknownField: true }]
+    }).success).toBe(false);
+
+    expect(robotReviewTaskSchema.safeParse({
+      ...task,
+      reviewItems: [{
+        ...reviewItem,
+        source: "human",
+        sourcePluginId: null,
+        expiresAt: null
+      }]
+    }).success).toBe(true);
   });
 });

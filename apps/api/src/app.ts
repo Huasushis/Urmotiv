@@ -1358,9 +1358,13 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
               reviewItems: items.map((item) => ({
                 id: item.id,
                 type: item.type,
+                source: item.source,
+                sourcePluginId: item.sourcePluginId,
+                visibility: item.visibility,
                 summary: item.summary,
                 data: item.data,
                 contentHash: item.contentHash,
+                expiresAt: item.expiresAt,
                 createdAt: item.createdAt,
               })),
             });
