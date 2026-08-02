@@ -375,6 +375,7 @@ async function loadProblemRows(
   executor: DatabaseExecutor,
   where: SQL,
   suffix: SQL = sql``,
+  includeDeleted = false,
 ): Promise<ProblemRow[]> {
   return executor.query<ProblemRow>(sql`
     SELECT
@@ -421,7 +422,7 @@ async function loadProblemRows(
       AND current_round.round = problem.current_review_round
     LEFT JOIN problem_revisions submitted_revision
       ON submitted_revision.id = current_round.submitted_revision_id
-    WHERE problem.deleted_at IS NULL AND (${where})
+    WHERE ${includeDeleted ? sql`true` : sql`problem.deleted_at IS NULL`} AND (${where})
     ${suffix}
   `);
 }
@@ -737,6 +738,112 @@ async function insertProblemRevision(
   return revisionId;
 }
 
+/**
+ * Tag-reference writers take the catalogue state lock before any problem row.
+ * Catalogue mutations take the same row exclusively before touching tags or
+ * problems, so neither side can form a problem -> tag / tag -> problem cycle.
+ */
+async function lockTagCatalogReferenceWindow(executor: DatabaseExecutor): Promise<void> {
+  const rows = await executor.query<{ version: number }>(sql`
+    SELECT version
+    FROM tag_catalog_state
+    WHERE singleton = true
+    FOR SHARE
+  `);
+  const version = Number(rows[0]?.version);
+  if (!Number.isSafeInteger(version) || version < 1) {
+    throw new Error("知识点目录版本缺失。");
+  }
+}
+
+export interface TagCatalogProblemRevisionInput {
+  readonly problemId: string;
+  readonly expectedRevision: number;
+  readonly expectedRevisionId: string;
+  readonly targetTagId: string;
+  readonly replacementTagId?: string;
+  readonly actorUserId: string;
+  readonly updatedAt: string;
+}
+
+/**
+ * Creates the immutable management revision used by catalog deactivation.
+ * The caller must already hold the problem/current-revision locks. This helper
+ * deliberately returns only success/failure and never exposes problem content
+ * to the catalog API response or audit metadata.
+ */
+export async function createTagCatalogProblemRevision(
+  executor: DatabaseExecutor,
+  input: TagCatalogProblemRevisionInput,
+): Promise<boolean> {
+  const problemId = parseDatabaseId(input.problemId);
+  const actorUserId = parseDatabaseId(input.actorUserId);
+  if (problemId === undefined || actorUserId === undefined) {
+    return false;
+  }
+
+  const problem = (
+    await hydrateProblems(
+      executor,
+      await loadProblemRows(executor, sql`problem.id = ${problemId}`, sql``, true),
+    )
+  )[0];
+  if (
+    problem === undefined
+    || problem.revision !== input.expectedRevision
+    || problem.revisionId !== input.expectedRevisionId
+    || !problem.tagIds.includes(input.targetTagId)
+  ) {
+    return false;
+  }
+
+  const nextTags = new Set(problem.tagIds.filter((tagId) => tagId !== input.targetTagId));
+  // A replacement is only a safety net for a sole-tag problem. Multi-tag
+  // problems retain their other tags and must not gain unrelated metadata.
+  if (nextTags.size === 0 && input.replacementTagId !== undefined) {
+    nextTags.add(input.replacementTagId);
+  }
+  const tagIds = [...nextTags].sort();
+  if (tagIds.length < 1 || tagIds.length > 30) {
+    return false;
+  }
+
+  const nextProblem: StoredProblem = {
+    ...copy(problem),
+    tagIds,
+    revision: problem.revision + 1,
+    updatedAt: input.updatedAt,
+  };
+  const revisionId = await insertProblemRevision(
+    executor,
+    nextProblem,
+    problemId,
+    actorUserId,
+    "知识点目录停用管理修订",
+    problem.revisionId,
+  );
+  // Package format extensions belong to the immutable revision as well. They
+  // are not part of StoredProblem, so copy them explicitly instead of silently
+  // resetting them on this administrative metadata-only revision.
+  await executor.execute(sql`
+    UPDATE problem_revisions next_revision
+    SET format_extensions = previous_revision.format_extensions,
+        changed_fields = '["tagIds"]'::jsonb
+    FROM problem_revisions previous_revision
+    WHERE next_revision.id = ${revisionId}::uuid
+      AND previous_revision.id = ${problem.revisionId}::uuid
+  `);
+  const updated = await executor.query<{ id: string }>(sql`
+    UPDATE problems
+    SET current_revision = ${nextProblem.revision},
+        updated_at = ${input.updatedAt}::timestamptz
+    WHERE id = ${problemId}
+      AND current_revision = ${input.expectedRevision}
+    RETURNING id::text AS id
+  `);
+  return updated.length === 1;
+}
+
 async function insertReviewRound(
   executor: DatabaseExecutor,
   problem: StoredProblem,
@@ -802,6 +909,8 @@ async function replaceProblemInTransaction(
   if (problemId === undefined) {
     return false;
   }
+
+  await lockTagCatalogReferenceWindow(executor);
 
   const lockedRows = await executor.query<{
     current_revision: number;
@@ -1501,6 +1610,7 @@ export class DatabaseDataStore implements DataStore {
   ): Promise<StoredProblem> {
     const ownerId = requireDatabaseId(problem.ownerId, "题目作者编号");
     return this.handle.transaction(async (transaction) => {
+      await lockTagCatalogReferenceWindow(transaction);
       const inserted = await transaction.query<{ id: string }>(sql`
         INSERT INTO problems (
           owner_id,
@@ -1750,6 +1860,7 @@ export class DatabaseDataStore implements DataStore {
     }
 
     return this.handle.transaction(async (executor) => {
+      await lockTagCatalogReferenceWindow(executor);
       await executor.query<{ id: string }>(sql`
         SELECT id::text AS id
         FROM problems

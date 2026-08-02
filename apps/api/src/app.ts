@@ -6,6 +6,7 @@ import {
   applyReviewSuggestionsInputSchema,
   casCallbackQuerySchema,
   casStartQuerySchema,
+  confirmTagDeactivationInputSchema,
   claimRobotReviewTasksInputSchema,
   claimRobotReviewTasksResponseSchema,
   completeRobotReviewTaskInputSchema,
@@ -14,8 +15,11 @@ import {
   robotReviewTaskCompletionSchema,
   robotReviewTaskSchema,
   createContestInputSchema,
+  createTagAliasInputSchema,
+  createTagCatalogItemInputSchema,
   createProblemInputSchema,
   demoLoginInputSchema,
+  deleteTagAliasInputSchema,
   emailRegistrationInputSchema,
   emailVerificationInputSchema,
   loginInputSchema,
@@ -31,10 +35,13 @@ import {
   reviewInputSchema,
   resendEmailVerificationInputSchema,
   submitProblemInputSchema,
+  tagDeactivationPreviewInputSchema,
   updatePluginInputSchema,
   updateContestInputSchema,
   updateProblemInputSchema,
   updateReviewPolicyInputSchema,
+  updateTagAliasInputSchema,
+  updateTagCatalogItemInputSchema,
   uploadProblemFileQuerySchema,
   withdrawProblemInputSchema
 } from "@urmotiv/contracts";
@@ -107,6 +114,7 @@ import {
 } from "./robot-store";
 import { PluginReviewDecisionRunner } from "./review-decision";
 import { ReviewPolicyService } from "./review-policy-service";
+import { DatabaseTagCatalogService } from "./tag-catalog-service";
 
 const sessionCookieName = "urmotiv_session";
 const sessionLifetimeSeconds = 60 * 60 * 12;
@@ -128,6 +136,10 @@ const adminPluginIdSchema = z
   .min(3)
   .max(160)
   .regex(/^[a-z0-9]+(?:[.-][a-z0-9]+)+$/);
+const tagCatalogItemIdSchema = z
+  .string()
+  .max(120)
+  .regex(/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/u);
 
 export interface ProblemFilePartsOptions {
   /** 文件元数据仓库，需要数据库存储。 */
@@ -154,6 +166,7 @@ export interface ApiAppOptions {
   transfer?: TransferService;
   reviewItems?: ReviewItemStore;
   robots?: DatabaseRobotStore;
+  tagCatalog?: DatabaseTagCatalogService;
   trustedProxyCidrs?: readonly string[];
   now?: () => Date;
 }
@@ -179,6 +192,7 @@ interface AppDependencies {
   transfer?: TransferService;
   reviewItemStore: ReviewItemStore;
   robots?: DatabaseRobotStore;
+  tagCatalog?: DatabaseTagCatalogService;
   trustedProxyCidrs: readonly string[];
 }
 
@@ -261,6 +275,24 @@ function parseFileId(request: FastifyRequest): string {
 function parseAssignmentId(request: FastifyRequest): string {
   const params = request.params as { assignmentId?: unknown };
   const result = fileIdSchema.safeParse(params.assignmentId);
+  if (!result.success) {
+    throw notFound();
+  }
+  return result.data;
+}
+
+function parseTagCatalogItemId(request: FastifyRequest): string {
+  const params = request.params as { tagId?: unknown };
+  const result = tagCatalogItemIdSchema.safeParse(params.tagId);
+  if (!result.success) {
+    throw notFound();
+  }
+  return result.data;
+}
+
+function parseTagAliasId(request: FastifyRequest): string {
+  const params = request.params as { aliasId?: unknown };
+  const result = fileIdSchema.safeParse(params.aliasId);
   if (!result.success) {
     throw notFound();
   }
@@ -483,6 +515,7 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     ...(options.transfer === undefined ? {} : { transfer: options.transfer }),
     reviewItemStore: reviewItems,
     ...(options.robots === undefined ? {} : { robots: options.robots }),
+    ...(options.tagCatalog === undefined ? {} : { tagCatalog: options.tagCatalog }),
     trustedProxyCidrs: options.trustedProxyCidrs ?? [],
     allowedOrigins: options.allowedOrigins ?? [
       "http://localhost:5173",
@@ -624,6 +657,13 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       throw forbidden();
     }
     return user;
+  }
+
+  function requireTagCatalogService(): DatabaseTagCatalogService {
+    if (dependencies.tagCatalog === undefined) {
+      throw new ApiError(503, "SERVICE_UNAVAILABLE", "知识点目录管理服务暂不可用。");
+    }
+    return dependencies.tagCatalog;
   }
 
   async function recordPluginUpdateAttemptSafely(input: {
@@ -1010,7 +1050,116 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   app.get("/api/v1/tags", async (request) => {
     await requireUser(request);
+    if (dependencies.tagCatalog !== undefined) {
+      const catalog = await dependencies.tagCatalog.listPublicCatalog();
+      return {
+        version: catalog.version,
+        items: catalog.items
+          .filter((item) => item.itemKind === "tag")
+          .map((item) => ({
+            id: item.id,
+            name: item.name,
+            group: item.group,
+            itemKind: "tag" as const,
+            active: item.active,
+            ...(item.category === undefined ? {} : { category: item.category }),
+            description: item.description,
+            aliases: item.aliases,
+          })),
+      };
+    }
     return { items: await dependencies.store.listTags() };
+  });
+
+  app.get("/api/v1/tag-catalog", async (request) => {
+    await requireUser(request);
+    return requireTagCatalogService().listPublicCatalog();
+  });
+
+  app.get("/api/v1/admin/tag-catalog", async (request) => {
+    const user = await requireUser(request);
+    return requireTagCatalogService().listManagedCatalog(user.id);
+  });
+
+  app.post("/api/v1/admin/tag-catalog/items", async (request) => {
+    const user = await requireUser(request);
+    const input = createTagCatalogItemInputSchema.parse(request.body);
+    return requireTagCatalogService().createItem(user.id, request.id, input);
+  });
+
+  app.patch("/api/v1/admin/tag-catalog/items/:tagId", async (request) => {
+    const user = await requireUser(request);
+    const tagId = parseTagCatalogItemId(request);
+    const input = updateTagCatalogItemInputSchema.parse(request.body);
+    return requireTagCatalogService().updateItem(user.id, request.id, tagId, input);
+  });
+
+  app.post("/api/v1/admin/tag-catalog/items/:tagId/aliases", async (request) => {
+    const user = await requireUser(request);
+    const tagId = parseTagCatalogItemId(request);
+    const input = createTagAliasInputSchema.parse(request.body);
+    return requireTagCatalogService().createAlias(user.id, request.id, tagId, input);
+  });
+
+  app.patch(
+    "/api/v1/admin/tag-catalog/items/:tagId/aliases/:aliasId",
+    async (request) => {
+      const user = await requireUser(request);
+      const tagId = parseTagCatalogItemId(request);
+      const aliasId = parseTagAliasId(request);
+      const input = updateTagAliasInputSchema.parse(request.body);
+      return requireTagCatalogService().updateAlias(
+        user.id,
+        request.id,
+        tagId,
+        aliasId,
+        input,
+      );
+    },
+  );
+
+  app.delete(
+    "/api/v1/admin/tag-catalog/items/:tagId/aliases/:aliasId",
+    async (request) => {
+      const user = await requireUser(request);
+      const tagId = parseTagCatalogItemId(request);
+      const aliasId = parseTagAliasId(request);
+      const input = deleteTagAliasInputSchema.parse(request.body);
+      return requireTagCatalogService().deleteAlias(
+        user.id,
+        request.id,
+        tagId,
+        aliasId,
+        input.expectedVersion,
+      );
+    },
+  );
+
+  app.post(
+    "/api/v1/admin/tag-catalog/items/:tagId/deactivation-preview",
+    async (request) => {
+      const user = await requireUser(request);
+      const tagId = parseTagCatalogItemId(request);
+      const input = tagDeactivationPreviewInputSchema.parse(request.body);
+      return requireTagCatalogService().previewDeactivation(
+        user.id,
+        tagId,
+        input.replacementTagId,
+      );
+    },
+  );
+
+  app.post("/api/v1/admin/tag-catalog/items/:tagId/deactivate", async (request) => {
+    const user = await requireUser(request);
+    const tagId = parseTagCatalogItemId(request);
+    const input = confirmTagDeactivationInputSchema.parse(request.body);
+    return requireTagCatalogService().confirmDeactivation(
+      user.id,
+      request.id,
+      tagId,
+      input.confirmationId,
+      input.catalogVersion,
+    );
   });
 
   app.get("/api/v1/problems", async (request) => {

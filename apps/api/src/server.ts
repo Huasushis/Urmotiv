@@ -41,6 +41,7 @@ import {
 } from "./builtin-plugins";
 import { DatabaseReviewItemStore } from "./review-item-store";
 import { DatabaseRobotStore } from "./robot-store";
+import { DatabaseTagCatalogService } from "./tag-catalog-service";
 import { createPluginSecretBox, TrustedPluginHost } from "./plugin-host";
 import {
   readServerAuthenticationOptions,
@@ -178,7 +179,8 @@ try {
     },
     transfer: transferService,
     reviewItems: new DatabaseReviewItemStore(database),
-    robots: new DatabaseRobotStore(database)
+    robots: new DatabaseRobotStore(database),
+    tagCatalog: new DatabaseTagCatalogService(database)
   });
   void packageWorker.run();
   app.addHook("onClose", async () => {
