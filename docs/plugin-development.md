@@ -394,15 +394,21 @@ interface ProblemFormatAdapter {
 里的普通文件，不能与 ZIP 结果混在同一次导出中。已经安装的第一版插件若只返回 `files`，
 运行时仍按 ZIP 处理；新代码应明确填写，避免含义不清。
 
-注册方式一样：
+格式适配器只能在这个插件自己的启动注册回调中登记：
 
 ```ts
-registry.registerProblemFormatAdapter(myFormatAdapter);
+const definition = {
+  source: "builtin:my-format",
+  manifest: myManifest,
+  registerHooks: (registry: PluginRegistry) => {
+    registry.registerProblemFormatAdapter(myFormatAdapter);
+  }
+};
 ```
 
-这段是注册接口的目标用法，不代表现有 Hydro 适配器已经这样接线。当前
-`packages/jobs/src/problem-package-handlers.ts` 仍直接导入 Hydro 适配器并放进固定映射，管理后台的启停状态
-不会改变题目包运行时；详见[插件规范](plugins.md)第 4.5 节和
+注册表会记录适配器所属插件并冻结登记时的函数；脱离 `registerHooks` 直接登记会被拒绝。API 只从当前已启用、
+安装身份仍与内置定义一致的插件取得适配器。导入、导出任务还会保存适配器版本，并在后台执行时重新核对；
+停用插件或升级适配器不会让排队任务改用另一份实现。详见[插件规范](plugins.md)第 4.5 节和
 [OJ 题目包兼容性文档](oj-compatibility.md)第 3 节。
 
 `registerProblemFormatAdapter` 会校验 `id`/`displayName`/`version`/`inputKind`，并确认 `detect`/`inspect`/`import`/

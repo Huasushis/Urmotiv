@@ -15,6 +15,7 @@ import {
   type ReviewDecision,
   type ReviewRoundSnapshot
 } from "@urmotiv/plugin-sdk";
+import type { ProblemFormatAdapter } from "@urmotiv/problem-package";
 import { z } from "zod";
 
 type JsonObject = Record<string, unknown>;
@@ -522,6 +523,33 @@ export class TrustedPluginHost {
     return enabled;
   }
 
+  /** Lists only bundled format adapters whose owning installed plugin is enabled and unchanged. */
+  public async listEnabledProblemFormatAdapters(): Promise<readonly ProblemFormatAdapter[]> {
+    const enabled: ProblemFormatAdapter[] = [];
+    for (const registration of this.#registry.listProblemFormatAdapters()) {
+      if (await this.#isTrustedEnabledPlugin(registration.pluginId)) {
+        enabled.push(this.#registry.getProblemFormatAdapter(registration.id));
+      }
+    }
+    return enabled;
+  }
+
+  /** Resolves an adapter through its locked bundled registration and current enabled state. */
+  public async getEnabledProblemFormatAdapter(
+    formatId: string
+  ): Promise<ProblemFormatAdapter | undefined> {
+    const registration = this.#registry
+      .listProblemFormatAdapters()
+      .find((candidate) => candidate.id === formatId);
+    if (
+      registration === undefined ||
+      !(await this.#isTrustedEnabledPlugin(registration.pluginId))
+    ) {
+      return undefined;
+    }
+    return this.#registry.getProblemFormatAdapter(registration.id);
+  }
+
   /**
    * Confirms that a rule is registered and enabled, then fills defaults using
    * the rule's own runtime validator. The returned value is safe to snapshot.
@@ -601,6 +629,21 @@ export class TrustedPluginHost {
     return this.#registry.listReviewRules()
       .filter((rule) => this.pluginIdForRegistration(rule.id) === pluginId)
       .map((rule) => rule.id);
+  }
+
+  async #isTrustedEnabledPlugin(pluginId: string): Promise<boolean> {
+    const registered = this.#plugins.get(pluginId);
+    const stored = registered === undefined ? undefined : await this.store.get(pluginId);
+    return (
+      registered !== undefined &&
+      stored !== undefined &&
+      stored.state === "enabled" &&
+      stored.id === registered.manifest.id &&
+      stored.version === registered.manifest.version &&
+      stored.apiVersion === registered.manifest.apiVersion &&
+      stored.source === registered.source &&
+      stored.manifestDigest === manifestDigest(registered.manifest)
+    );
   }
 }
 

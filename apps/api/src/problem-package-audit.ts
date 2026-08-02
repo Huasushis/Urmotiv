@@ -5,6 +5,7 @@ import { z } from "zod";
 const databaseIdSchema = z.string().regex(/^(0|[1-9]\d*)$/);
 const uuidSchema = z.string().uuid();
 const formatIdSchema = z.string().trim().min(1).max(120);
+const formatVersionSchema = z.string().trim().min(1).max(80);
 
 const sharedEventFields = {
   actorUserId: databaseIdSchema,
@@ -36,6 +37,7 @@ export const problemPackageAuditEventSchema = z.discriminatedUnion("action", [
       metadata: z
         .object({
           formatId: formatIdSchema,
+          formatVersion: formatVersionSchema,
           problemCount: z.number().int().min(0).max(1_000),
           issueCount: z.number().int().min(0).max(1_000)
         })
@@ -51,6 +53,7 @@ export const problemPackageAuditEventSchema = z.discriminatedUnion("action", [
       metadata: z
         .object({
           formatId: formatIdSchema,
+          formatVersion: formatVersionSchema,
           itemCount: z.number().int().min(1).max(1_000)
         })
         .strict()
@@ -79,6 +82,7 @@ export const problemPackageAuditEventSchema = z.discriminatedUnion("action", [
       metadata: z
         .object({
           formatId: formatIdSchema,
+          formatVersion: formatVersionSchema,
           problemCount: z.number().int().min(1).max(100),
           canExport: z.boolean()
         })
@@ -94,6 +98,7 @@ export const problemPackageAuditEventSchema = z.discriminatedUnion("action", [
       metadata: z
         .object({
           formatId: formatIdSchema,
+          formatVersion: formatVersionSchema,
           problemCount: z.number().int().min(1).max(100)
         })
         .strict()
@@ -108,6 +113,7 @@ export const problemPackageAuditEventSchema = z.discriminatedUnion("action", [
       metadata: z
         .object({
           formatId: formatIdSchema,
+          formatVersion: formatVersionSchema,
           outputFileCount: z.number().int().min(0).max(10_000)
         })
         .strict()

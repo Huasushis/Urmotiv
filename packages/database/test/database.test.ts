@@ -1019,6 +1019,17 @@ describePostgres("problem package outbox on real PostgreSQL", () => {
       )
     `);
     await migrateDatabase(database);
+    const legacyAdapterBinding = await database.query<{
+      selected_format_version: string;
+      client_request_digest: string | null;
+    }>(sql`
+      SELECT selected_format_version, client_request_digest
+      FROM import_jobs
+      WHERE id = ${legacyJobId}::uuid
+    `);
+    expect(legacyAdapterBinding).toEqual([
+      { selected_format_version: "legacy-unbound", client_request_digest: null }
+    ]);
     const legacyOutbox = await database.query<{ count: number }>(sql`
       SELECT count(*)::integer AS count
       FROM problem_package_job_outbox
@@ -1057,10 +1068,11 @@ describePostgres("problem package outbox on real PostgreSQL", () => {
       `);
       await transaction.execute(sql`
         INSERT INTO import_jobs (
-          id, requested_by_user_id, source_file_id, selected_format, input_digest,
-          idempotency_key
+          id, requested_by_user_id, source_file_id, selected_format,
+          selected_format_version, input_digest, idempotency_key
         ) VALUES (
           ${importJobId}::uuid, 0, ${importFileId}::uuid, 'synthetic',
+          'test-version',
           '2222222222222222222222222222222222222222222222222222222222222222',
           'synthetic-deferred'
         )
@@ -1129,9 +1141,10 @@ describePostgres("problem package outbox on real PostgreSQL", () => {
     await database.transaction(async (transaction) => {
       await transaction.execute(sql`
         INSERT INTO export_jobs (
-          id, requested_by_user_id, target_format, idempotency_key
+          id, requested_by_user_id, target_format, target_format_version,
+          idempotency_key
         ) VALUES (
-          ${exportJobId}::uuid, 0, 'synthetic', 'synthetic-export'
+          ${exportJobId}::uuid, 0, 'synthetic', 'test-version', 'synthetic-export'
         )
       `);
       await transaction.execute(sql`
@@ -1154,9 +1167,10 @@ describePostgres("problem package outbox on real PostgreSQL", () => {
     const invalidExportJobId = "81000000-0000-4000-8000-000000000006";
     await database.execute(sql`
       INSERT INTO export_jobs (
-        id, requested_by_user_id, target_format, state, idempotency_key
+        id, requested_by_user_id, target_format, target_format_version,
+        state, idempotency_key
       ) VALUES (
-        ${invalidExportJobId}::uuid, 0, 'synthetic', 'failed',
+        ${invalidExportJobId}::uuid, 0, 'synthetic', 'test-version', 'failed',
         'synthetic-invalid-parent'
       )
     `);
@@ -1993,8 +2007,8 @@ describePostgres("problem package outbox on real PostgreSQL", () => {
       FROM drizzle.__drizzle_migrations_id_seq
     `);
     expect(migrationState).toEqual([{
-      migration_count: 13,
-      sequence_value: "13",
+      migration_count: 14,
+      sequence_value: "14",
       sequence_called: true
     }]);
     const indexes = await database.query<{ indexname: string }>(sql`

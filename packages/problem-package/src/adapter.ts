@@ -86,6 +86,37 @@ export interface ProblemFormatAdapter {
   export(problem: CanonicalProblem, options: ExportOptions): Promise<GeneratedArchive>;
 }
 
+/**
+ * Lists and resolves only adapters that are usable at the moment of the call.
+ * Production implementations may consult an enabled trusted-plugin registry;
+ * task code must still bind and compare the returned adapter version.
+ */
+export interface ProblemFormatAdapterCatalog {
+  listEnabled(): Promise<readonly ProblemFormatAdapter[]>;
+  getEnabled(formatId: string): Promise<ProblemFormatAdapter | undefined>;
+}
+
+/** A fixed catalog for core adapters and isolated tests. */
+export function createStaticProblemFormatAdapterCatalog(
+  adapters: ReadonlyMap<string, ProblemFormatAdapter>
+): ProblemFormatAdapterCatalog {
+  const snapshot = new Map<string, ProblemFormatAdapter>();
+  for (const [key, adapter] of adapters) {
+    if (key !== adapter.id || snapshot.has(key)) {
+      throw new TypeError("题目包格式目录的编号不一致或重复。");
+    }
+    snapshot.set(key, adapter);
+  }
+  return Object.freeze({
+    async listEnabled(): Promise<readonly ProblemFormatAdapter[]> {
+      return [...snapshot.values()];
+    },
+    async getEnabled(formatId: string): Promise<ProblemFormatAdapter | undefined> {
+      return snapshot.get(formatId);
+    }
+  });
+}
+
 export function inputKindForProblemFormatAdapter(
   adapter: ProblemFormatAdapter
 ): ProblemPackageInputKind {

@@ -33,13 +33,14 @@
 
 ## 3. 当前接入状态
 
-生产题目包运行时目前只内置 `urmotiv` 和 `hydro` 两个适配器。原始 XML 分支只是统一传输能力；测试中的
-假 FPS 适配器只证明字节能被送入和送出，不能证明 FPS 字段已被解析。
+生产题目包运行时始终提供核心 `urmotiv` 适配器；`hydro` 由随服务发布的内置插件
+`org.ustc.urmotiv.hydro-format` 注册，只有管理后台中的受信任安装记录仍与当前内置清单一致且状态为“启用”
+时才会参与识别、预览、导入和导出。原始 XML 分支只是统一传输能力；测试中的假 FPS 适配器只证明字节能被
+送入和送出，不能证明 FPS 字段已被解析。
 
-这里的“内置”描述当前硬编码接线：`packages/jobs/src/problem-package-handlers.ts` 直接把 Hydro 适配器放入
-`builtinProblemPackageAdapters`。管理后台虽然登记了同名内置插件，但题目包运行时尚未读取它的启停状态；
-所以目前停用 `org.ustc.urmotiv.hydro-format` **不会**关闭 Hydro 的识别、导入或导出。该状态不是期望的
-插件开关语义，也不能把下表当作可执行配置。实现边界另见[插件规范](plugins.md)和
+创建导入或导出任务时会固定适配器编号和版本；后台真正执行前再次通过受信任插件目录解析并比较版本。
+插件在排队后被停用、安装身份改变或适配器版本改变时，任务以固定的 `format_unavailable` 失败，不会改用
+另一个实现继续处理。下表中的 Hydro 能力因此以“插件已启用”为前提。实现边界另见[插件规范](plugins.md)和
 [Hydro 适配器说明](../plugins/hydro-format/README.md)。
 
 | 能力 | Urmotiv 原生 | Hydro | FPS XML | Polygon |
@@ -302,7 +303,8 @@ Polygon 包可能包含脚本和平台相关可执行文件。导入端只能把
 - 原生往返测试：[`packages/problem-package/test/native-roundtrip.test.ts`](../packages/problem-package/test/native-roundtrip.test.ts)
 - ZIP/原始 XML 输入边界：[`packages/problem-package/src/input.ts`](../packages/problem-package/src/input.ts)
 - 适配器一次返回一题的接口：[`packages/problem-package/src/adapter.ts`](../packages/problem-package/src/adapter.ts)
-- 生产内置适配器和后台任务：[`packages/jobs/src/problem-package-handlers.ts`](../packages/jobs/src/problem-package-handlers.ts)
+- 受信任且已启用的格式目录：[`apps/api/src/problem-format-adapters.ts`](../apps/api/src/problem-format-adapters.ts)
+- 版本绑定和后台任务：[`packages/jobs/src/problem-package-handlers.ts`](../packages/jobs/src/problem-package-handlers.ts)
 - Hydro 适配器说明：[`plugins/hydro-format/README.md`](../plugins/hydro-format/README.md)
 - Hydro 适配器和显式损失规则：[`plugins/hydro-format/src/adapter.ts`](../plugins/hydro-format/src/adapter.ts)
 - Hydro 上游修订与 schema：[`plugins/hydro-format/src/schema.ts`](../plugins/hydro-format/src/schema.ts)

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   createSafeArchive,
+  createStaticProblemFormatAdapterCatalog,
   canonicalProblemSchema,
   readProblemPackageInput,
   singleFileProblemPackagePath,
@@ -57,10 +58,12 @@ class FakeProblemPackageJobStore implements ProblemPackageJobStore {
     const job = problemPackageImportJobSchema.parse({
       id: randomUUID(),
       requestedByUserId: "5",
+      clientRequestDigest: "c".repeat(64),
       sourceFileId: randomUUID(),
       inputDigest: "a".repeat(64),
       detectedFormat: null,
       selectedFormat: "urmotiv",
+      selectedFormatVersion: "1.0.0",
       choices: { conflictAction: "create" },
       itemCount: 1,
       state: "queued",
@@ -91,7 +94,9 @@ class FakeProblemPackageJobStore implements ProblemPackageJobStore {
     const job = problemPackageExportJobSchema.parse({
       id: randomUUID(),
       requestedByUserId: "5",
+      clientRequestDigest: "d".repeat(64),
       targetFormat: "urmotiv",
+      targetFormatVersion: "1.0.0",
       options: {},
       lossSummary: {
         targetFormat: "urmotiv",
@@ -485,6 +490,39 @@ describe("题目包导入任务处理器", () => {
     );
   });
 
+  it("导入任务绑定的格式版本变化后不会调用新实现", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedImport();
+    const reader = new InMemoryVerifiedImportArchiveReader();
+    reader.put(job.sourceFileId, job.inputDigest, await nativeArchiveOf(fixtureProblem()));
+    let writes = 0;
+    const changedAdapter: ProblemFormatAdapter = {
+      ...urmotivNativeAdapter,
+      version: "2.0.0"
+    };
+    const handler = createProblemPackageImportHandler({
+      jobs: store,
+      archives: reader,
+      writer: {
+        write: async () => {
+          writes += 1;
+          return { problemId: "42" };
+        }
+      },
+      adapterCatalog: createStaticProblemFormatAdapterCatalog(
+        new Map([[changedAdapter.id, changedAdapter]])
+      )
+    });
+
+    await expect(handler({ importJobId: job.id }, makeContext())).rejects.toMatchObject({
+      code: "format_unavailable"
+    });
+    expect(writes).toBe(0);
+    expect(store.imports.get(job.id)?.failure).toEqual(
+      safeProblemPackageFailure("format_unavailable")
+    );
+  });
+
   it("后台不会把原始 XML 交给默认的 ZIP 适配器", async () => {
     const store = new FakeProblemPackageJobStore();
     const job = store.seedImport();
@@ -564,7 +602,9 @@ describe("题目包导入任务处理器", () => {
           return { problemId: "42" };
         }
       },
-      adapters: new Map([[adapter.id, adapter]])
+      adapterCatalog: createStaticProblemFormatAdapterCatalog(
+        new Map([[adapter.id, adapter]])
+      )
     });
 
     await expect(handler({ importJobId: job.id }, makeContext())).resolves.toEqual({
@@ -755,6 +795,49 @@ describe("题目包导入任务处理器", () => {
 });
 
 describe("题目包导出任务处理器", () => {
+  it("导出任务绑定的格式版本变化后不会读取题目或写入产物", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedExport();
+    const changedAdapter: ProblemFormatAdapter = {
+      ...urmotivNativeAdapter,
+      version: "2.0.0"
+    };
+    const handler = createProblemPackageExportHandler({
+      jobs: store,
+      source: {
+        readRevision: async () => {
+          throw new Error("格式版本不一致时不应读取题目。");
+        },
+        readFile: async () => {
+          throw new Error("格式版本不一致时不应读取文件。");
+        }
+      },
+      authorization: {
+        canReadProblem: async () => {
+          throw new Error("格式版本不一致时不应检查题目读取权限。");
+        },
+        canReadFile: async () => {
+          throw new Error("格式版本不一致时不应检查文件读取权限。");
+        }
+      },
+      artifacts: {
+        write: async () => {
+          throw new Error("格式版本不一致时不应写入产物。");
+        }
+      },
+      adapterCatalog: createStaticProblemFormatAdapterCatalog(
+        new Map([[changedAdapter.id, changedAdapter]])
+      )
+    });
+
+    await expect(handler({ exportJobId: job.id }, makeContext())).rejects.toMatchObject({
+      code: "format_unavailable"
+    });
+    expect(store.exports.get(job.id)?.failure).toEqual(
+      safeProblemPackageFailure("format_unavailable")
+    );
+  });
+
   it("成功导出固定版本并统计输出文件", async () => {
     const store = new FakeProblemPackageJobStore();
     const job = store.seedExport();
@@ -1208,7 +1291,9 @@ describe("题目包导出任务处理器", () => {
       source,
       authorization: allowAll(),
       artifacts,
-      adapters: new Map([[adapter.id, adapter]])
+      adapterCatalog: createStaticProblemFormatAdapterCatalog(
+        new Map([[adapter.id, adapter]])
+      )
     });
 
     await expect(handler({ exportJobId: job.id }, makeContext())).resolves.toEqual({
@@ -1268,7 +1353,9 @@ describe("题目包导出任务处理器", () => {
       source,
       authorization: allowAll(),
       artifacts,
-      adapters: new Map([[legacyAdapter.id, legacyAdapter]])
+      adapterCatalog: createStaticProblemFormatAdapterCatalog(
+        new Map([[legacyAdapter.id, legacyAdapter]])
+      )
     });
 
     await expect(handler({ exportJobId: job.id }, makeContext())).resolves.toEqual({
@@ -1532,7 +1619,9 @@ describe("题目包导出任务处理器", () => {
           };
         }
       },
-      adapters: new Map([["urmotiv", adapter]]),
+      adapterCatalog: createStaticProblemFormatAdapterCatalog(
+        new Map([["urmotiv", adapter]])
+      ),
       maxInMemoryBytes: 7
     });
 

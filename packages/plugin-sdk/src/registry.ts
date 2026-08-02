@@ -44,6 +44,11 @@ interface StoredReviewDecisionRule {
   evaluate(input: ReviewRoundSnapshot, settings: unknown): Promise<unknown>;
 }
 
+interface StoredProblemFormatAdapter {
+  readonly pluginId: string;
+  readonly adapter: ProblemFormatAdapter;
+}
+
 export class PluginRegistryError extends Error {
   public constructor(message: string) {
     super(message);
@@ -56,7 +61,7 @@ export class PluginRegistry {
   readonly #beforeSubmitChecks = new Map<string, BeforeSubmitCheck>();
   readonly #reviewItemTypes = new Map<string, StoredReviewItemType>();
   readonly #reviewRules = new Map<string, StoredReviewDecisionRule>();
-  readonly #formatAdapters = new Map<string, ProblemFormatAdapter>();
+  readonly #formatAdapters = new Map<string, StoredProblemFormatAdapter>();
   #registeringPluginId: string | undefined;
   #locked = false;
 
@@ -155,8 +160,10 @@ export class PluginRegistry {
 
   public registerProblemFormatAdapter(adapter: ProblemFormatAdapter): void {
     this.ensureOpen();
+    if (this.#registeringPluginId === undefined) {
+      throw new PluginRegistryError("题目包格式必须由正在登记的内置插件注册。");
+    }
     const id = registrationIdSchema.parse(adapter.id);
-    this.ensureOwnedRegistration(id);
     z.string().trim().min(1).max(120).parse(adapter.displayName);
     z.string().trim().min(1).max(80).parse(adapter.version);
     const inputKind = z.enum(["zip", "single_file"]).parse(adapter.inputKind ?? "zip");
@@ -168,9 +175,9 @@ export class PluginRegistry {
     if (this.#formatAdapters.has(id)) {
       throw new PluginRegistryError(`题目包格式 ${id} 已经注册。`);
     }
-    this.#formatAdapters.set(
-      id,
-      Object.freeze({
+    this.#formatAdapters.set(id, {
+      pluginId: this.#registeringPluginId,
+      adapter: Object.freeze({
         id,
         displayName: adapter.displayName,
         version: adapter.version,
@@ -181,7 +188,7 @@ export class PluginRegistry {
         validateExport: adapter.validateExport.bind(adapter),
         export: adapter.export.bind(adapter)
       })
-    );
+    });
   }
 
   /** Locks registration after startup so request-time code cannot replace handlers. */
@@ -252,21 +259,23 @@ export class PluginRegistry {
     readonly id: string;
     readonly displayName: string;
     readonly version: string;
+    readonly pluginId: string;
   }[] {
-    return [...this.#formatAdapters.values()].map(({ id, displayName, version }) => ({
-      id,
-      displayName,
-      version
+    return [...this.#formatAdapters.values()].map(({ pluginId, adapter }) => ({
+      id: adapter.id,
+      displayName: adapter.displayName,
+      version: adapter.version,
+      pluginId
     }));
   }
 
   public getProblemFormatAdapter(id: string): ProblemFormatAdapter {
     this.ensureLocked();
-    const adapter = this.#formatAdapters.get(id);
-    if (adapter === undefined) {
+    const registration = this.#formatAdapters.get(id);
+    if (registration === undefined) {
       throw new PluginRegistryError(`没有注册题目包格式 ${id}。`);
     }
-    return adapter;
+    return registration.adapter;
   }
 
   /**

@@ -9,13 +9,15 @@ import {
   seedCoreDatabase
 } from "@urmotiv/database";
 import type { CreateStoredFileInput } from "@urmotiv/contracts";
+import { sql } from "drizzle-orm";
 import {
   LocalJobQueue,
+  problemExportJobType,
   problemImportJobType,
   type CreateProblemPackageExportJob,
   type CreateProblemPackageImportJob
 } from "@urmotiv/jobs";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo";
 import { DatabaseDataStore } from "../src/database-store";
 import type { StoredProblem } from "../src/domain";
@@ -71,9 +73,11 @@ function importRequest(
 ): CreateProblemPackageImportJob {
   return {
     requestedByUserId: databaseDemoUserIds.author,
+    clientRequestDigest: "c".repeat(64),
     sourceFileId,
     inputDigest: "b".repeat(64),
     selectedFormat: "urmotiv",
+    selectedFormatVersion: "1.0.0",
     choices: { conflictAction: "create" },
     itemCount: 1,
     idempotencyKey: "import-request-1",
@@ -135,7 +139,9 @@ function exportRequest(
 ): CreateProblemPackageExportJob {
   return {
     requestedByUserId: databaseDemoUserIds.author,
+    clientRequestDigest: "d".repeat(64),
     targetFormat: "urmotiv",
+    targetFormatVersion: "1.0.0",
     options: {},
     lossSummary: {
       targetFormat: "urmotiv",
@@ -162,6 +168,8 @@ describe("数据库题目包任务存储", () => {
     expect(first).toEqual(
       expect.objectContaining({
         state: "queued",
+        selectedFormat: "urmotiv",
+        selectedFormatVersion: "1.0.0",
         progressPercent: 0,
         report: expect.objectContaining({ phase: "queued", completedItems: 0 }),
         failure: null
@@ -174,10 +182,45 @@ describe("数据库题目包任务存储", () => {
     const repeated = await store.createImportJob(importRequest(source.id));
     expect(repeated.id).toBe(first.id);
 
+    const repeatedAfterAdapterUpgrade = await store.createImportJob(
+      importRequest(source.id, { selectedFormatVersion: "2.0.0" })
+    );
+    expect(repeatedAfterAdapterUpgrade.id).toBe(first.id);
+
     await expect(
       store.createImportJob(
-        importRequest(source.id, { choices: { conflictAction: "update", targetProblemId: "1" } })
+        importRequest(source.id, {
+          clientRequestDigest: "e".repeat(64),
+          choices: { conflictAction: "update", targetProblemId: "1" }
+        })
       )
+    ).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+
+    expect(
+      await store.findImportJobForReplay({
+        requestedByUserId: databaseDemoUserIds.leader,
+        idempotencyKey: first.idempotencyKey,
+        clientRequestDigest: first.clientRequestDigest ?? ""
+      })
+    ).toBeUndefined();
+  });
+
+  it("旧导入任务没有客户端请求摘要时保守拒绝重放", async () => {
+    const database = await openDatabase();
+    const files = new ProblemFileStore(database);
+    const source = await files.createStoredFile(storedFileInput("import_input"));
+    const store = new DatabaseProblemPackageJobStore(database);
+    const job = await store.createImportJob(importRequest(source.id));
+    await database.execute(sql`
+      UPDATE import_jobs SET client_request_digest = NULL WHERE id = ${job.id}::uuid
+    `);
+
+    await expect(
+      store.findImportJobForReplay({
+        requestedByUserId: job.requestedByUserId,
+        idempotencyKey: job.idempotencyKey,
+        clientRequestDigest: "c".repeat(64)
+      })
     ).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
   });
 
@@ -362,11 +405,23 @@ describe("数据库题目包任务存储", () => {
     expect(job).toEqual(
       expect.objectContaining({
         state: "queued",
+        targetFormat: "urmotiv",
+        targetFormatVersion: "1.0.0",
         problems: [
           expect.objectContaining({ problemId, revisionId, includedFileCategories: ["testdata"] })
         ]
       })
     );
+    const repeatedAfterAdapterUpgrade = await store.createExportJob(
+      exportRequest(problemId, revisionId, { targetFormatVersion: "2.0.0" })
+    );
+    expect(repeatedAfterAdapterUpgrade.id).toBe(job.id);
+    expect(
+      await store.findExportJobForReplay({
+        requestedByUserId: databaseDemoUserIds.leader,
+        idempotencyKey: job.idempotencyKey
+      })
+    ).toBeUndefined();
 
     await store.startExportJob(job.id);
     await store.updateExportJob(job.id, 50, {
@@ -444,5 +499,64 @@ describe("题目包任务协调器", () => {
     const repeated = await coordinator.createImportJob(importRequest(source.id));
     expect(repeated.id).toBe(job.id);
     expect(await queue.leaseNext({ workerId: "test-worker", leaseMs: 1_000 })).toBeUndefined();
+  });
+
+  it("数据库已提交但首次入队失败时可按原任务重试导入和导出", async () => {
+    const database = await openDatabase();
+    const files = new ProblemFileStore(database);
+    const source = await files.createStoredFile(storedFileInput("import_input"));
+    const { problemId, revisionId } = await createProblemWithRevision(database);
+    const store = new DatabaseProblemPackageJobStore(database);
+    const queue = new LocalJobQueue();
+    const coordinator = new ProblemPackageJobCoordinator(store, queue);
+    const enqueue = vi.spyOn(queue, "enqueue");
+    const importAuditRequestId = randomUUID();
+    const exportAuditRequestId = randomUUID();
+
+    enqueue.mockRejectedValueOnce(new Error("synthetic queue outage"));
+    await expect(
+      coordinator.createImportJob(
+        importRequest(source.id, { auditRequestId: importAuditRequestId })
+      )
+    ).rejects.toThrow("synthetic queue outage");
+    const replayedImport = await coordinator.replayImportJob({
+      requestedByUserId: databaseDemoUserIds.author,
+      idempotencyKey: "import-request-1",
+      clientRequestDigest: "c".repeat(64)
+    });
+    expect(replayedImport).toBeDefined();
+    expect(await queue.leaseNext({ workerId: "import-retry", leaseMs: 1_000 })).toEqual(
+      expect.objectContaining({ id: replayedImport?.id, type: problemImportJobType })
+    );
+
+    enqueue.mockRejectedValueOnce(new Error("synthetic queue outage"));
+    await expect(
+      coordinator.createExportJob(
+        exportRequest(problemId, revisionId, { auditRequestId: exportAuditRequestId })
+      )
+    ).rejects.toThrow("synthetic queue outage");
+    const replayedExport = await coordinator.findExportJobForReplay({
+      requestedByUserId: databaseDemoUserIds.author,
+      idempotencyKey: "export-request-1"
+    });
+    expect(replayedExport).toBeDefined();
+    if (replayedExport === undefined) throw new Error("导出重放任务不存在。");
+    await coordinator.reenqueueExportJob(replayedExport);
+    expect(await queue.leaseNext({ workerId: "export-retry", leaseMs: 1_000 })).toEqual(
+      expect.objectContaining({ id: replayedExport.id, type: problemExportJobType })
+    );
+
+    const creationAudits = await database.query<{ action: string; count: number }>(sql`
+      SELECT action, count(*)::integer AS count
+      FROM audit_events
+      WHERE request_id IN (${importAuditRequestId}::uuid, ${exportAuditRequestId}::uuid)
+        AND action IN ('problem.package.import.create', 'problem.package.export.create')
+      GROUP BY action
+      ORDER BY action
+    `);
+    expect(creationAudits).toEqual([
+      { action: "problem.package.export.create", count: 1 },
+      { action: "problem.package.import.create", count: 1 }
+    ]);
   });
 });

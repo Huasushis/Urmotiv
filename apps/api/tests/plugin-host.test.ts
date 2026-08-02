@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { urmotivNativeAdapter } from "@urmotiv/problem-package";
 import { createApp } from "../src/app";
 import { InMemoryDataStore } from "../src/repository";
 import { demoTags } from "../src/demo-data";
@@ -11,6 +12,7 @@ import {
   TrustedPluginHost,
   type TrustedPluginDefinition
 } from "../src/plugin-host";
+import { TrustedProblemFormatAdapterCatalog } from "../src/problem-format-adapters";
 
 const manifest = {
   id: "org.example.safe-plugin",
@@ -59,6 +61,88 @@ function createHost() {
 }
 
 describe("插件宿主", () => {
+  it("只发现已启用且安装身份未改变的内置题目格式", async () => {
+    const formatAdapter = {
+      id: "fixture-format",
+      displayName: "测试题目格式",
+      version: "2.3.4",
+      detect: async () => ({ confidence: 0, reason: "测试" }),
+      inspect: async () => ({
+        formatId: "fixture-format",
+        problemCount: 0,
+        files: [],
+        issues: []
+      }),
+      import: async () => null as never,
+      validateExport: async () => ({
+        targetFormat: "fixture-format",
+        canExport: true,
+        items: []
+      }),
+      export: async () => null as never
+    };
+    const store = new InMemoryPluginStore();
+    const host = new TrustedPluginHost([{
+      source: "builtin:format-test",
+      manifest,
+      registerHooks: (registry) => registry.registerProblemFormatAdapter(formatAdapter)
+    }], store);
+    await host.initialize();
+
+    await expect(host.listEnabledProblemFormatAdapters()).resolves.toEqual([]);
+    await expect(
+      host.getEnabledProblemFormatAdapter(formatAdapter.id)
+    ).resolves.toBeUndefined();
+
+    await host.update(manifest.id, {
+      expectedRevision: 1,
+      clearSecrets: [],
+      state: "enabled"
+    }, "9", "00000000-0000-4000-8000-000000000031");
+    await expect(host.listEnabledProblemFormatAdapters()).resolves.toEqual([
+      expect.objectContaining({ id: formatAdapter.id, version: formatAdapter.version })
+    ]);
+
+    await host.update(manifest.id, {
+      expectedRevision: 2,
+      clearSecrets: [],
+      state: "disabled"
+    }, "9", "00000000-0000-4000-8000-000000000032");
+    await expect(
+      host.getEnabledProblemFormatAdapter(formatAdapter.id)
+    ).resolves.toBeUndefined();
+
+    await host.update(manifest.id, {
+      expectedRevision: 3,
+      clearSecrets: [],
+      state: "enabled"
+    }, "9", "00000000-0000-4000-8000-000000000033");
+    const installed = store.plugins.get(manifest.id);
+    if (installed === undefined) throw new Error("测试插件没有安装记录。");
+    store.plugins.set(manifest.id, { ...installed, source: "builtin:forged" });
+    await expect(host.listEnabledProblemFormatAdapters()).resolves.toEqual([]);
+  });
+
+  it("插件登记与核心格式同名时不能替换核心实现", async () => {
+    const store = new InMemoryPluginStore();
+    const host = new TrustedPluginHost([{
+      source: "builtin:format-collision",
+      manifest,
+      initialState: "enabled",
+      registerHooks: (registry) => registry.registerProblemFormatAdapter({
+        ...urmotivNativeAdapter,
+        version: "999.0.0"
+      })
+    }], store);
+    await host.initialize();
+    const catalog = new TrustedProblemFormatAdapterCatalog(host);
+
+    await expect(catalog.getEnabled(urmotivNativeAdapter.id)).resolves.toBe(
+      urmotivNativeAdapter
+    );
+    await expect(catalog.listEnabled()).rejects.toThrow("不能替换核心格式");
+  });
+
   it("拒绝外部来源、核心权限碰撞和越界钩子", () => {
     expect(() => new TrustedPluginHost([{ source: "file:/tmp/plugin", manifest }], new InMemoryPluginStore())).toThrow("内置插件");
     expect(() => new TrustedPluginHost([{

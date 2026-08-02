@@ -1415,11 +1415,13 @@ export const importJobs = pgTable(
     requestedByUserId: bigint("requested_by_user_id", { mode: "bigint" })
       .notNull()
       .references(() => users.id, { onDelete: "restrict" }),
+    clientRequestDigest: char("client_request_digest", { length: 64 }),
     sourceFileId: uuid("source_file_id")
       .notNull()
       .references(() => storedFiles.id, { onDelete: "restrict" }),
     detectedFormat: varchar("detected_format", { length: 160 }),
     selectedFormat: varchar("selected_format", { length: 160 }).notNull(),
+    selectedFormatVersion: varchar("selected_format_version", { length: 80 }).notNull(),
     inputDigest: char("input_digest", { length: 64 }).notNull(),
     choices: jsonb("choices").$type<JsonObject>().notNull().default(emptyObject),
     state: taskState("state").notNull().default("queued"),
@@ -1439,6 +1441,14 @@ export const importJobs = pgTable(
     ),
     index("import_jobs_state_created_idx").on(table.state, table.createdAt),
     check("import_jobs_digest_ck", sql`${table.inputDigest} ~ '^[0-9a-f]{64}$'`),
+    check(
+      "import_jobs_client_request_digest_ck",
+      sql`${table.clientRequestDigest} IS NULL OR ${table.clientRequestDigest} ~ '^[0-9a-f]{64}$'`
+    ),
+    check(
+      "import_jobs_selected_format_version_ck",
+      sql`${table.selectedFormatVersion} ~ '^[0-9A-Za-z]+([._+-][0-9A-Za-z]+)*$'`
+    ),
     check(
       "import_jobs_progress_ck",
       sql`${table.progressPercent} BETWEEN 0 AND 100`
@@ -1477,7 +1487,9 @@ export const exportJobs = pgTable(
     requestedByUserId: bigint("requested_by_user_id", { mode: "bigint" })
       .notNull()
       .references(() => users.id, { onDelete: "restrict" }),
+    clientRequestDigest: char("client_request_digest", { length: 64 }),
     targetFormat: varchar("target_format", { length: 160 }).notNull(),
+    targetFormatVersion: varchar("target_format_version", { length: 80 }).notNull(),
     options: jsonb("options").$type<JsonObject>().notNull().default(emptyObject),
     lossReport: jsonb("loss_report").$type<JsonObject>().notNull().default(emptyObject),
     state: taskState("state").notNull().default("queued"),
@@ -1501,6 +1513,14 @@ export const exportJobs = pgTable(
     ),
     index("export_jobs_state_created_idx").on(table.state, table.createdAt),
     index("export_jobs_result_expiry_idx").on(table.resultExpiresAt),
+    check(
+      "export_jobs_client_request_digest_ck",
+      sql`${table.clientRequestDigest} IS NULL OR ${table.clientRequestDigest} ~ '^[0-9a-f]{64}$'`
+    ),
+    check(
+      "export_jobs_target_format_version_ck",
+      sql`${table.targetFormatVersion} ~ '^[0-9A-Za-z]+([._+-][0-9A-Za-z]+)*$'`
+    ),
     check(
       "export_jobs_progress_ck",
       sql`${table.progressPercent} BETWEEN 0 AND 100`

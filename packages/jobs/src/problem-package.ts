@@ -20,6 +20,12 @@ const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const idempotencyKeySchema = z.string().trim().min(1).max(160).regex(/^[^\u0000-\u001f\u007f]+$/);
 const countSchema = z.number().int().min(0).max(10_000);
 const progressSchema = z.number().int().min(0).max(100);
+const adapterVersionSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(80)
+  .regex(/^[0-9A-Za-z]+(?:[._+-][0-9A-Za-z]+)*$/);
 
 export const problemPackageFileCategories = [
   "asset",
@@ -174,10 +180,12 @@ export function safeProblemPackageFailure(
 export const createProblemPackageImportJobSchema = z
   .object({
     requestedByUserId: databaseIdSchema,
+    clientRequestDigest: sha256Schema,
     sourceFileId: uuidSchema,
     inputDigest: sha256Schema,
     detectedFormat: identifierSchema.nullable().optional(),
     selectedFormat: identifierSchema,
+    selectedFormatVersion: adapterVersionSchema,
     choices: problemPackageImportChoicesSchema,
     itemCount: z.number().int().min(1).max(1_000).default(1),
     idempotencyKey: idempotencyKeySchema,
@@ -190,7 +198,9 @@ export type CreateProblemPackageImportJob = z.input<typeof createProblemPackageI
 export const createProblemPackageExportJobSchema = z
   .object({
     requestedByUserId: databaseIdSchema,
+    clientRequestDigest: sha256Schema,
     targetFormat: identifierSchema,
+    targetFormatVersion: adapterVersionSchema,
     options: z.record(z.string().min(1).max(120), jsonValueSchema).default({}),
     lossSummary: problemPackageLossSummarySchema,
     problems: z.array(problemPackageExportSelectionSchema).min(1).max(100),
@@ -222,10 +232,12 @@ export const problemPackageImportJobSchema = z
   .object({
     id: uuidSchema,
     requestedByUserId: databaseIdSchema,
+    clientRequestDigest: sha256Schema.nullable(),
     sourceFileId: uuidSchema,
     inputDigest: sha256Schema,
     detectedFormat: identifierSchema.nullable(),
     selectedFormat: identifierSchema,
+    selectedFormatVersion: adapterVersionSchema,
     choices: problemPackageImportChoicesSchema,
     itemCount: z.number().int().min(1).max(1_000),
     state: jobStateSchema,
@@ -264,7 +276,9 @@ export const problemPackageExportJobSchema = z
   .object({
     id: uuidSchema,
     requestedByUserId: databaseIdSchema,
+    clientRequestDigest: sha256Schema.nullable(),
     targetFormat: identifierSchema,
+    targetFormatVersion: adapterVersionSchema,
     options: z.record(z.string(), jsonValueSchema),
     lossSummary: problemPackageLossSummarySchema,
     problems: z.array(problemPackageExportSelectionSchema).min(1).max(100),
@@ -325,6 +339,25 @@ export interface CompleteProblemPackageExport {
   readonly outputFileCount: number;
 }
 
+export const problemPackageJobReplayLookupSchema = z
+  .object({
+    requestedByUserId: databaseIdSchema,
+    idempotencyKey: idempotencyKeySchema
+  })
+  .strict();
+
+export type ProblemPackageJobReplayLookup = z.infer<
+  typeof problemPackageJobReplayLookupSchema
+>;
+
+export const problemPackageJobReplayClaimSchema = problemPackageJobReplayLookupSchema
+  .extend({ clientRequestDigest: sha256Schema })
+  .strict();
+
+export type ProblemPackageJobReplayClaim = z.infer<
+  typeof problemPackageJobReplayClaimSchema
+>;
+
 /**
  * API storage implements this interface. The worker sees only immutable task
  * snapshots and safe status updates, never a database connection or a file
@@ -345,6 +378,16 @@ export interface ProblemPackageJobStore {
   completeExportJob(jobId: string, result: CompleteProblemPackageExport): Promise<void>;
   failImportJob(jobId: string, code: ProblemPackageFailureCode, report: ProblemPackageJobReport): Promise<void>;
   failExportJob(jobId: string, code: ProblemPackageFailureCode): Promise<void>;
+}
+
+/** API-side extension used only to recover a committed create request. */
+export interface ProblemPackageJobReplayStore {
+  findImportJobForReplay(
+    input: ProblemPackageJobReplayClaim
+  ): Promise<ProblemPackageImportJob | undefined>;
+  findExportJobForReplay(
+    input: ProblemPackageJobReplayLookup
+  ): Promise<ProblemPackageExportJob | undefined>;
 }
 
 export interface ProblemPackageTaskInput {

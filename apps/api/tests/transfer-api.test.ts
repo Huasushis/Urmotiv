@@ -15,8 +15,10 @@ import {
   registerProblemPackageHandlers,
   type JobLogger
 } from "@urmotiv/jobs";
+import { hydroProblemFormatAdapter } from "@urmotiv/plugin-hydro-format";
 import {
   canonicalProblemSchema,
+  createStaticProblemFormatAdapterCatalog,
   readZipArchive,
   UnsafeArchiveError,
   urmotivNativeAdapter,
@@ -25,13 +27,18 @@ import {
   type GeneratedArchive,
   type GeneratedSingleFileArchive,
   type GeneratedZipArchive,
-  type ProblemFormatAdapter
+  type ProblemFormatAdapter,
+  type ProblemFormatAdapterCatalog
 } from "@urmotiv/problem-package";
 import { LocalFileStorage, StorageError } from "@urmotiv/storage";
 import { sql } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
+import {
+  createBuiltinPluginDefinitions,
+  hydroFormatPluginId
+} from "../src/builtin-plugins";
 import { DatabaseContestStore } from "../src/database-contest-store";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo";
 import { DatabaseDataStore } from "../src/database-store";
@@ -53,6 +60,11 @@ import {
   StorageVerifiedImportArchiveReader
 } from "../src/problem-package-runtime";
 import { ProblemFileStore } from "../src/problem-file-store";
+import {
+  InMemoryPluginStore,
+  TrustedPluginHost
+} from "../src/plugin-host";
+import { TrustedProblemFormatAdapterCatalog } from "../src/problem-format-adapters";
 import { ProblemService } from "../src/service";
 import {
   maximumProblemPackageArchiveBytes,
@@ -72,6 +84,7 @@ interface TransferTestContext {
   readonly database: LocalDatabaseHandle;
   readonly jobs: DatabaseProblemPackageJobStore;
   readonly metadata: ProblemFileStore;
+  readonly queue: LocalJobQueue;
   readonly storage: LocalFileStorage;
   readonly storageRoot: string;
   readonly store: DatabaseDataStore;
@@ -83,6 +96,8 @@ interface TransferTestContext {
 
 interface TransferTestAppOptions {
   readonly adapters?: ReadonlyMap<string, ProblemFormatAdapter>;
+  readonly adapterCatalog?: ProblemFormatAdapterCatalog;
+  readonly pluginHost?: TrustedPluginHost;
   readonly audit?: ProblemPackageAuditWriter;
   readonly failingAuditActions?: ReadonlySet<ProblemPackageAuditEvent["action"]>;
   readonly multiProblemOuterArchiveMaxBytes?: number;
@@ -169,12 +184,18 @@ async function makeTransferApp(
     storage,
     audit
   });
+  const adapterCatalog = options.adapterCatalog ?? (
+    options.adapters === undefined
+      ? undefined
+      : createStaticProblemFormatAdapterCatalog(options.adapters)
+  );
   const worker = new JobWorker(queue, { workerId: "test-worker", logger: silentLogger });
   registerProblemPackageHandlers(worker, {
     import: {
       jobs: jobStore,
       archives: new StorageVerifiedImportArchiveReader(metadata, storage),
-      writer
+      writer,
+      ...(adapterCatalog === undefined ? {} : { adapterCatalog })
     },
     export: {
       jobs: jobStore,
@@ -183,7 +204,8 @@ async function makeTransferApp(
         getUser: (userId) => store.getUser(userId),
         service
       }),
-      artifacts
+      artifacts,
+      ...(adapterCatalog === undefined ? {} : { adapterCatalog })
     }
   });
   const transfer = new TransferService({
@@ -195,7 +217,7 @@ async function makeTransferApp(
     jobs: jobStore,
     coordinator,
     exportReader,
-    ...(options.adapters === undefined ? {} : { adapters: options.adapters }),
+    ...(adapterCatalog === undefined ? {} : { adapterCatalog }),
     ...(options.problemPackageArchiveMaxBytes === undefined
       ? {}
       : { maximumArchiveBytes: options.problemPackageArchiveMaxBytes })
@@ -208,7 +230,8 @@ async function makeTransferApp(
     demoUserIds: Object.values(databaseDemoUserIds),
     demoLoginUserIds: databaseDemoUserIds,
     problemFiles: { metadata, storage },
-    transfer
+    transfer,
+    ...(options.pluginHost === undefined ? {} : { pluginHost: options.pluginHost })
   });
   openApps.push(app);
   return {
@@ -218,6 +241,7 @@ async function makeTransferApp(
     database,
     jobs: jobStore,
     metadata,
+    queue,
     storage,
     storageRoot,
     store,
@@ -285,6 +309,16 @@ async function nativeZipOf(problem: CanonicalProblem): Promise<Uint8Array> {
   });
   if (generated.kind !== "zip") {
     throw new Error("Urmotiv 原生题目包必须导出为 ZIP。");
+  }
+  return writeZipArchive(generated.files);
+}
+
+async function hydroZipOf(problem: CanonicalProblem): Promise<Uint8Array> {
+  const generated = await hydroProblemFormatAdapter.export(problem, {
+    exportedAt: "2026-07-26T00:00:00.000Z"
+  });
+  if (generated.kind !== "zip") {
+    throw new Error("Hydro 题目包必须导出为 ZIP。");
   }
   return writeZipArchive(generated.files);
 }
@@ -388,6 +422,333 @@ async function revokeExportPermissions(
 }
 
 describe("题目包导入", () => {
+  it("Hydro 格式只随受信任内置插件启用，并在任务执行时复查状态", async () => {
+    const pluginStore = new InMemoryPluginStore();
+    const pluginHost = new TrustedPluginHost(
+      createBuiltinPluginDefinitions(),
+      pluginStore
+    );
+    await pluginHost.initialize();
+    const adapterCatalog = new TrustedProblemFormatAdapterCatalog(pluginHost);
+    const { app, database, jobs, worker } = await makeTransferApp({
+      adapterCatalog,
+      pluginHost
+    });
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const hydroZip = await hydroZipOf(fixtureProblem());
+
+    const disabledUpload = await uploadPackage(app, leader, hydroZip);
+    expect(disabledUpload.statusCode).toBe(200);
+    const disabledPackage = disabledUpload.json() as {
+      fileId: string;
+      detected: Array<{ formatId: string }>;
+    };
+    expect(disabledPackage.detected.some((item) => item.formatId === "hydro")).toBe(false);
+
+    const disabledImport = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports/preview",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: { fileId: disabledPackage.fileId, formatId: "hydro" }
+    });
+    expect(disabledImport.statusCode).toBe(422);
+    const disabledExport = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports/preview",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "hydro",
+        problems: [{ problemId: "1", includeFileCategories: [] }]
+      }
+    });
+    expect(disabledExport.statusCode).toBe(422);
+
+    await pluginHost.update(
+      hydroFormatPluginId,
+      { expectedRevision: 1, clearSecrets: [], state: "enabled" },
+      databaseDemoUserIds.administrator,
+      "00000000-0000-4000-8000-000000000041"
+    );
+    const enabledUpload = await uploadPackage(app, leader, hydroZip);
+    const enabledPackage = enabledUpload.json() as {
+      fileId: string;
+      sha256: string;
+      detected: Array<{ formatId: string }>;
+    };
+    expect(enabledPackage.detected).toContainEqual(
+      expect.objectContaining({ formatId: "hydro" })
+    );
+    const enabledPreview = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports/preview",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: { fileId: enabledPackage.fileId, formatId: "hydro" }
+    });
+    expect(enabledPreview.statusCode).toBe(200);
+
+    const createImport = async (idempotencyKey: string) => app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: enabledPackage.fileId,
+        sha256: enabledPackage.sha256,
+        formatId: "hydro",
+        idempotencyKey
+      }
+    });
+    const firstCreated = await createImport("hydro-enabled-import");
+    expect(firstCreated.statusCode).toBe(200);
+    const firstJobId = (firstCreated.json() as { id: string }).id;
+    expect(await jobs.getImportJob(firstJobId)).toEqual(
+      expect.objectContaining({
+        selectedFormat: "hydro",
+        selectedFormatVersion: hydroProblemFormatAdapter.version
+      })
+    );
+    expect(await worker.runOnce()).toBe(true);
+    expect(await jobs.getImportJob(firstJobId)).toEqual(
+      expect.objectContaining({ state: "succeeded" })
+    );
+    const importedProblemId = (await jobs.getImportItems(firstJobId))[0]?.importedProblemId;
+    if (importedProblemId === null || importedProblemId === undefined) {
+      throw new Error("Hydro 测试导入任务没有生成题目。");
+    }
+    const enabledExportPreview = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports/preview",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "hydro",
+        problems: [{ problemId: importedProblemId, includeFileCategories: ["testdata"] }]
+      }
+    });
+    expect(enabledExportPreview.statusCode).toBe(200);
+    expect(enabledExportPreview.json()).toEqual(
+      expect.objectContaining({ canExport: true })
+    );
+    const enabledExport = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "hydro",
+        problems: [{ problemId: importedProblemId, includeFileCategories: ["testdata"] }],
+        idempotencyKey: "hydro-enabled-export"
+      }
+    });
+    expect(enabledExport.statusCode).toBe(200);
+    const exportJobId = (enabledExport.json() as { id: string }).id;
+    expect(await jobs.getExportJob(exportJobId)).toEqual(
+      expect.objectContaining({
+        targetFormat: "hydro",
+        targetFormatVersion: hydroProblemFormatAdapter.version
+      })
+    );
+    expect(await worker.runOnce()).toBe(true);
+    expect(await jobs.getExportJob(exportJobId)).toEqual(
+      expect.objectContaining({ state: "succeeded" })
+    );
+
+    const secondCreated = await createImport("hydro-disable-after-create");
+    expect(secondCreated.statusCode).toBe(200);
+    const secondJobId = (secondCreated.json() as { id: string }).id;
+    const queuedExport = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "hydro",
+        problems: [{ problemId: importedProblemId, includeFileCategories: ["testdata"] }],
+        idempotencyKey: "hydro-disable-after-export-create"
+      }
+    });
+    expect(queuedExport.statusCode).toBe(200);
+    const queuedExportJobId = (queuedExport.json() as { id: string }).id;
+    await pluginHost.update(
+      hydroFormatPluginId,
+      { expectedRevision: 2, clearSecrets: [], state: "disabled" },
+      databaseDemoUserIds.administrator,
+      "00000000-0000-4000-8000-000000000042"
+    );
+
+    const replayedImport = await createImport("hydro-disable-after-create");
+    expect(replayedImport.statusCode).toBe(200);
+    expect((replayedImport.json() as { id: string }).id).toBe(secondJobId);
+    const replayedExport = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "hydro",
+        problems: [{ problemId: importedProblemId, includeFileCategories: ["testdata"] }],
+        idempotencyKey: "hydro-disable-after-export-create"
+      }
+    });
+    expect(replayedExport.statusCode).toBe(200);
+    expect((replayedExport.json() as { id: string }).id).toBe(queuedExportJobId);
+
+    const differentImport = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: enabledPackage.fileId,
+        sha256: "a".repeat(64),
+        formatId: "hydro",
+        idempotencyKey: "hydro-disable-after-create"
+      }
+    });
+    expect(differentImport.statusCode).toBe(409);
+    const queuedExportSnapshot = await jobs.getExportJob(queuedExportJobId);
+    const fixedRevisionId = queuedExportSnapshot?.problems[0]?.revisionId;
+    if (fixedRevisionId === undefined) throw new Error("Hydro 导出任务没有固定版本。");
+    const omittedRevisionIsNotWildcard = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "hydro",
+        problems: [{
+          problemId: importedProblemId,
+          revisionId: fixedRevisionId,
+          includeFileCategories: ["testdata"]
+        }],
+        idempotencyKey: "hydro-disable-after-export-create"
+      }
+    });
+    expect(omittedRevisionIsNotWildcard.statusCode).toBe(409);
+
+    const creationAudits = await database.query<{ action: string; count: number }>(sql`
+      SELECT action, count(*)::integer AS count
+      FROM audit_events
+      WHERE object_id IN (${secondJobId}, ${queuedExportJobId})
+        AND action IN ('problem.package.import.create', 'problem.package.export.create')
+      GROUP BY action
+      ORDER BY action
+    `);
+    expect(creationAudits).toEqual([
+      { action: "problem.package.export.create", count: 1 },
+      { action: "problem.package.import.create", count: 1 }
+    ]);
+
+    expect(await worker.runOnce()).toBe(true);
+    expect(await jobs.getImportJob(secondJobId)).toEqual(
+      expect.objectContaining({
+        state: "failed",
+        failure: expect.objectContaining({ code: "format_unavailable" })
+      })
+    );
+    expect(await worker.runOnce()).toBe(true);
+    expect(await jobs.getExportJob(queuedExportJobId)).toEqual(
+      expect.objectContaining({
+        state: "failed",
+        failure: expect.objectContaining({ code: "format_unavailable" })
+      })
+    );
+  });
+
+  it("格式版本变化后，相同公开请求仍返回原任务且不调用新适配器", async () => {
+    let currentAdapter: ProblemFormatAdapter = urmotivNativeAdapter;
+    const getEnabled = vi.fn(async (formatId: string) =>
+      formatId === currentAdapter.id ? currentAdapter : undefined
+    );
+    const adapterCatalog: ProblemFormatAdapterCatalog = {
+      listEnabled: async () => [currentAdapter],
+      getEnabled
+    };
+    const { app, jobs, worker } = await makeTransferApp({ adapterCatalog });
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const uploaded = await uploadPackage(app, leader, await nativeZipOf(fixtureProblem()));
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+    const importPayload = {
+      fileId: upload.fileId,
+      sha256: upload.sha256,
+      formatId: "urmotiv",
+      idempotencyKey: "adapter-upgrade-import"
+    };
+    const createdImport = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: importPayload
+    });
+    expect(createdImport.statusCode).toBe(200);
+    const importJobId = (createdImport.json() as { id: string }).id;
+    expect(await worker.runOnce()).toBe(true);
+    const importedProblemId = (await jobs.getImportItems(importJobId))[0]?.importedProblemId;
+    if (importedProblemId === null || importedProblemId === undefined) {
+      throw new Error("版本重放测试没有生成题目。");
+    }
+
+    const exportPayload = {
+      targetFormat: "urmotiv",
+      problems: [{ problemId: importedProblemId, includeFileCategories: ["testdata"] }],
+      idempotencyKey: "adapter-upgrade-export"
+    };
+    const createdExport = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: exportPayload
+    });
+    expect(createdExport.statusCode).toBe(200);
+    const exportJobId = (createdExport.json() as { id: string }).id;
+
+    currentAdapter = { ...urmotivNativeAdapter, version: "9.9.9" };
+    getEnabled.mockClear();
+    const replayedImport = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: importPayload
+    });
+    expect(replayedImport.statusCode).toBe(200);
+    expect((replayedImport.json() as { id: string }).id).toBe(importJobId);
+    const replayedExport = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: exportPayload
+    });
+    expect(replayedExport.statusCode).toBe(200);
+    expect((replayedExport.json() as { id: string }).id).toBe(exportJobId);
+    expect(getEnabled).not.toHaveBeenCalled();
+    expect(await jobs.getImportJob(importJobId)).toEqual(
+      expect.objectContaining({ selectedFormatVersion: urmotivNativeAdapter.version })
+    );
+    expect(await jobs.getExportJob(exportJobId)).toEqual(
+      expect.objectContaining({ targetFormatVersion: urmotivNativeAdapter.version })
+    );
+  });
+
+  it("格式目录读取失败时不把所有插件伪装成停用，也不保存上传文件", async () => {
+    const unavailableCatalog: ProblemFormatAdapterCatalog = {
+      listEnabled: async () => {
+        throw new Error("测试格式目录不可用。");
+      },
+      getEnabled: async () => {
+        throw new Error("测试格式目录不可用。");
+      }
+    };
+    const { app, database } = await makeTransferApp({
+      adapterCatalog: unavailableCatalog
+    });
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const response = await uploadPackage(app, leader, await nativeZipOf(fixtureProblem()));
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      error: expect.objectContaining({ code: "FORMAT_REGISTRY_UNAVAILABLE" })
+    });
+    const stored = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM stored_files
+      WHERE purpose = 'import_input'
+    `);
+    expect(stored).toEqual([{ count: 0 }]);
+  });
+
   it("组长上传原生包、预览并导入成新题目，随后可以整包导出往返", async () => {
     const { app, database, worker } = await makeTransferApp();
     const leader = await login(app, databaseDemoUserIds.leader);
@@ -588,7 +949,12 @@ describe("题目包导入", () => {
         object_id: upload.fileId,
         result: "success",
         reason_code: null,
-        metadata: { formatId: "urmotiv", problemCount: 1, issueCount: 0 }
+        metadata: {
+          formatId: "urmotiv",
+          formatVersion: "1.0.0",
+          problemCount: 1,
+          issueCount: 0
+        }
       }),
       expect.objectContaining({
         actor_user_id: databaseDemoUserIds.leader,
@@ -596,7 +962,7 @@ describe("题目包导入", () => {
         object_id: createdJob.id,
         result: "success",
         reason_code: null,
-        metadata: { formatId: "urmotiv", itemCount: 1 }
+        metadata: { formatId: "urmotiv", formatVersion: "1.0.0", itemCount: 1 }
       }),
       expect.objectContaining({
         actor_user_id: databaseDemoUserIds.leader,
@@ -613,7 +979,12 @@ describe("题目包导入", () => {
         object_id: null,
         result: "success",
         reason_code: null,
-        metadata: { formatId: "urmotiv", problemCount: 1, canExport: true }
+        metadata: {
+          formatId: "urmotiv",
+          formatVersion: "1.0.0",
+          problemCount: 1,
+          canExport: true
+        }
       }),
       expect.objectContaining({
         actor_user_id: databaseDemoUserIds.leader,
@@ -621,7 +992,7 @@ describe("题目包导入", () => {
         object_id: exportJob.id,
         result: "success",
         reason_code: null,
-        metadata: { formatId: "urmotiv", problemCount: 1 }
+        metadata: { formatId: "urmotiv", formatVersion: "1.0.0", problemCount: 1 }
       }),
       expect.objectContaining({
         actor_user_id: databaseDemoUserIds.leader,
@@ -632,6 +1003,7 @@ describe("题目包导入", () => {
         reason_code: null,
         metadata: {
           formatId: "urmotiv",
+          formatVersion: "1.0.0",
           outputFileCount: expect.any(Number)
         }
       }),
@@ -2010,21 +2382,50 @@ describe("题目包导出", () => {
       secondProblem
     );
 
+    const originalSelections = [firstProblemId, secondProblemId].map((problemId) => ({
+      problemId,
+      includeFileCategories: ["asset", "testdata"]
+    }));
+
     const created = await app.inject({
       method: "POST",
       url: "/api/v1/transfer/exports",
       headers: { cookie: leader, origin: localOrigin },
       payload: {
         targetFormat: "urmotiv",
-        problems: [firstProblemId, secondProblemId].map((problemId) => ({
-          problemId,
-          includeFileCategories: ["testdata"]
-        })),
+        problems: originalSelections,
         idempotencyKey: "export-two-problems-1"
       }
     });
     expect(created.statusCode).toBe(200);
     const exportJobId = (created.json() as { id: string }).id;
+
+    const reorderedProblems = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "urmotiv",
+        problems: [...originalSelections].reverse(),
+        idempotencyKey: "export-two-problems-1"
+      }
+    });
+    expect(reorderedProblems.statusCode).toBe(409);
+    const reorderedCategories = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "urmotiv",
+        problems: originalSelections.map((selection, index) => ({
+          ...selection,
+          includeFileCategories:
+            index === 0 ? [...selection.includeFileCategories].reverse() : selection.includeFileCategories
+        })),
+        idempotencyKey: "export-two-problems-1"
+      }
+    });
+    expect(reorderedCategories.statusCode).toBe(409);
     expect(await worker.runOnce()).toBe(true);
 
     const status = await app.inject({
@@ -2286,15 +2687,23 @@ describe("题目包导出权限", () => {
         actor_user_id: databaseDemoUserIds.denied,
         action: "problem.package.export.preview",
         object_id: null,
-        metadata: { formatId: "urmotiv", problemCount: 2, canExport: false }
+        metadata: {
+          formatId: "urmotiv",
+          formatVersion: "1.0.0",
+          problemCount: 2,
+          canExport: false
+        }
       }
     ]);
-    expect(JSON.stringify(auditRows)).not.toContain(importedProblemId);
+    expect(auditRows.some((row) => row.object_id === importedProblemId)).toBe(false);
+    expect(
+      auditRows.some((row) => Object.values(row.metadata).includes(importedProblemId))
+    ).toBe(false);
     expect(JSON.stringify(auditRows)).not.toContain("导入的演示题目");
   });
 
   it("导出任务创建后权限被撤销：后台任务失败，已完成任务不能下载", async () => {
-    const { app, database, worker } = await makeTransferApp();
+    const { app, database, queue, worker } = await makeTransferApp();
     const leader = await login(app, databaseDemoUserIds.leader);
     const importedProblemId = await importFixtureProblem(app, worker, leader);
 
@@ -2309,7 +2718,67 @@ describe("题目包导出权限", () => {
 
     const secondJob = await createExportJob(app, leader, importedProblemId, "export-revoke-2");
 
+    const enqueue = vi.spyOn(queue, "enqueue");
+    await database.execute(sql`
+      INSERT INTO permission_grants (
+        id, subject_user_id, permission_name, effect, scope, granted_by_user_id, reason
+      ) VALUES (
+        ${randomUUID()}::uuid, ${BigInt(databaseDemoUserIds.leader)},
+        'problem.testdata.read', 'deny', 'global', 0, '测试：内部文件读取权限被撤销'
+      )
+    `);
+    const internalAccessRevokedReplay = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "urmotiv",
+        problems: [{ problemId: importedProblemId, includeFileCategories: ["testdata"] }],
+        idempotencyKey: "export-revoke-2"
+      }
+    });
+    expect(internalAccessRevokedReplay.statusCode).toBe(404);
+    expect(internalAccessRevokedReplay.json()).toEqual({
+      error: expect.objectContaining({ code: "NOT_FOUND", message: "未找到请求的资源。" })
+    });
+    expect(internalAccessRevokedReplay.body).not.toContain(statementText);
+    expect(enqueue).not.toHaveBeenCalled();
+
+    const mismatchedReplayAfterInternalAccessRevoked = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "urmotiv",
+        problems: [{ problemId: importedProblemId, includeFileCategories: [] }],
+        idempotencyKey: "export-revoke-2"
+      }
+    });
+    expect(mismatchedReplayAfterInternalAccessRevoked.statusCode).toBe(404);
+    expect(mismatchedReplayAfterInternalAccessRevoked.json()).toEqual({
+      error: expect.objectContaining({ code: "NOT_FOUND", message: "未找到请求的资源。" })
+    });
+    expect(mismatchedReplayAfterInternalAccessRevoked.body).not.toContain(statementText);
+    expect(enqueue).not.toHaveBeenCalled();
+
     await revokeExportPermissions(database, databaseDemoUserIds.leader);
+
+    const exportAccessRevokedReplay = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/exports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        targetFormat: "urmotiv",
+        problems: [{ problemId: importedProblemId, includeFileCategories: ["testdata"] }],
+        idempotencyKey: "export-revoke-2"
+      }
+    });
+    expect(exportAccessRevokedReplay.statusCode).toBe(404);
+    expect(exportAccessRevokedReplay.json()).toEqual({
+      error: expect.objectContaining({ code: "NOT_FOUND", message: "未找到请求的资源。" })
+    });
+    expect(exportAccessRevokedReplay.body).not.toContain(statementText);
+    expect(enqueue).not.toHaveBeenCalled();
 
     expect(await worker.runOnce()).toBe(true);
     const secondStatus = await app.inject({

@@ -10,6 +10,7 @@ import {
   inputKindForProblemFormatAdapter,
   readProblemPackageInput,
   singleFileProblemPackagePath,
+  createStaticProblemFormatAdapterCatalog,
   urmotivNativeAdapter,
   type CanonicalFile,
   type CanonicalProblem,
@@ -18,9 +19,9 @@ import {
   type GeneratedZipArchive,
   type ImportChoices,
   type ProblemFormatAdapter,
+  type ProblemFormatAdapterCatalog,
   type SafeProblemPackageInput
 } from "@urmotiv/problem-package";
-import { hydroProblemFormatAdapter } from "@urmotiv/plugin-hydro-format";
 import { problemExportJobPayloadSchema, problemImportJobPayloadSchema, type JsonValue } from "./types";
 import {
   safeProblemPackageFailure,
@@ -36,10 +37,12 @@ import {
 } from "./problem-package";
 import { PermanentJobError, type JobHandler } from "./worker-types";
 
-export const builtinProblemPackageAdapters: ReadonlyMap<string, ProblemFormatAdapter> = new Map([
-  [urmotivNativeAdapter.id, urmotivNativeAdapter],
-  [hydroProblemFormatAdapter.id, hydroProblemFormatAdapter]
+export const coreProblemPackageAdapters: ReadonlyMap<string, ProblemFormatAdapter> = new Map([
+  [urmotivNativeAdapter.id, urmotivNativeAdapter]
 ]);
+export const coreProblemFormatAdapterCatalog = createStaticProblemFormatAdapterCatalog(
+  coreProblemPackageAdapters
+);
 
 const maximumInMemoryExportBytes =
   defaultArchiveSafetyLimits.maxTotalUncompressedBytes;
@@ -78,7 +81,7 @@ export interface ProblemPackageImportHandlerDependencies {
   readonly jobs: ProblemPackageJobStore;
   readonly archives: VerifiedImportArchiveReader;
   readonly writer: AtomicImportedProblemWriter;
-  readonly adapters?: ReadonlyMap<string, ProblemFormatAdapter>;
+  readonly adapterCatalog?: ProblemFormatAdapterCatalog;
 }
 
 export interface ExportProblemFileDescriptor {
@@ -196,7 +199,7 @@ export interface ProblemPackageExportHandlerDependencies {
   readonly source: FixedRevisionExportReader;
   readonly authorization: ExportReadAuthorization;
   readonly artifacts: ExportArtifactWriter;
-  readonly adapters?: ReadonlyMap<string, ProblemFormatAdapter>;
+  readonly adapterCatalog?: ProblemFormatAdapterCatalog;
   /**
    * 一次任务所选原文件的总量与已生成文件的总量分别使用这个上限。
    * 生产环境固定不超过 128 MiB；自动化测试可以传入更小的值验证失败路径。
@@ -207,7 +210,7 @@ export interface ProblemPackageExportHandlerDependencies {
 export function createProblemPackageImportHandler(
   dependencies: ProblemPackageImportHandlerDependencies
 ): JobHandler {
-  const adapters = dependencies.adapters ?? builtinProblemPackageAdapters;
+  const adapterCatalog = dependencies.adapterCatalog ?? coreProblemFormatAdapterCatalog;
   return async (payload, context) => {
     const { importJobId } = problemImportJobPayloadSchema.parse(payload);
     let job: ProblemPackageImportJob | undefined;
@@ -254,10 +257,11 @@ export function createProblemPackageImportHandler(
         throw new PackageTaskError("source_digest_mismatch");
       }
 
-      const adapter = adapters.get(job.selectedFormat);
-      if (adapter === undefined) {
-        throw new PackageTaskError("format_unavailable");
-      }
+      const adapter = await requireBoundAdapter(
+        adapterCatalog,
+        job.selectedFormat,
+        job.selectedFormatVersion
+      );
       if (inputKindForProblemFormatAdapter(adapter) !== packageInput.kind) {
         throw new PackageTaskError("format_unavailable");
       }
@@ -377,7 +381,7 @@ export function createProblemPackageImportHandler(
 export function createProblemPackageExportHandler(
   dependencies: ProblemPackageExportHandlerDependencies
 ): JobHandler {
-  const adapters = dependencies.adapters ?? builtinProblemPackageAdapters;
+  const adapterCatalog = dependencies.adapterCatalog ?? coreProblemFormatAdapterCatalog;
   const maxInMemoryBytes =
     dependencies.maxInMemoryBytes ?? maximumInMemoryExportBytes;
   if (
@@ -406,10 +410,11 @@ export function createProblemPackageExportHandler(
         throw permanentFailure(job.failure?.code ?? "cancelled");
       }
 
-      const adapter = adapters.get(job.targetFormat);
-      if (adapter === undefined) {
-        throw new PackageTaskError("format_unavailable");
-      }
+      const adapter = await requireBoundAdapter(
+        adapterCatalog,
+        job.targetFormat,
+        job.targetFormatVersion
+      );
 
       await precheckSelectedExportFiles(
         dependencies,
@@ -880,6 +885,27 @@ class TaskStatePersistenceError extends ProblemPackageTemporaryError {
 function permanentFailure(code: ProblemPackageFailureCode): PermanentJobError {
   const failure = safeProblemPackageFailure(code);
   return new PermanentJobError(failure.code, failure.message);
+}
+
+async function requireBoundAdapter(
+  catalog: ProblemFormatAdapterCatalog,
+  formatId: string,
+  expectedVersion: string
+): Promise<ProblemFormatAdapter> {
+  let adapter: ProblemFormatAdapter | undefined;
+  try {
+    adapter = await catalog.getEnabled(formatId);
+  } catch {
+    throw new ProblemPackageTemporaryError("题目包格式目录暂时无法读取。");
+  }
+  if (
+    adapter === undefined ||
+    adapter.id !== formatId ||
+    adapter.version !== expectedVersion
+  ) {
+    throw new PackageTaskError("format_unavailable");
+  }
+  return adapter;
 }
 
 function report(

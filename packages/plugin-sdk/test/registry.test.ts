@@ -149,17 +149,42 @@ describe("PluginRegistry", () => {
       export: async () => null as never
     };
     const registry = new PluginRegistry();
-    registry.registerProblemFormatAdapter(adapter);
+    registry.registerPluginManifest(pluginManifest);
+    registry.registerPluginHooks(pluginManifest.id, () => {
+      registry.registerProblemFormatAdapter(adapter);
+    });
     registry.lock();
     expect(registry.getProblemFormatAdapter(adapter.id).inputKind).toBe("single_file");
+    expect(registry.listProblemFormatAdapters()).toEqual([
+      {
+        id: adapter.id,
+        displayName: adapter.displayName,
+        version: adapter.version,
+        pluginId: pluginManifest.id
+      }
+    ]);
+    adapter.version = "9.9.9";
+    adapter.export = async () => {
+      throw new Error("注册完成后替换的实现不应被调用。");
+    };
+    expect(registry.getProblemFormatAdapter(adapter.id).version).toBe("1.0.0");
+    expect(Object.isFrozen(registry.getProblemFormatAdapter(adapter.id))).toBe(true);
 
     const invalid = new PluginRegistry();
+    invalid.registerPluginManifest(pluginManifest);
     expect(() =>
-      invalid.registerProblemFormatAdapter({
-        ...adapter,
-        inputKind: "unknown" as never
+      invalid.registerPluginHooks(pluginManifest.id, () => {
+        invalid.registerProblemFormatAdapter({
+          ...adapter,
+          inputKind: "unknown" as never
+        });
       })
     ).toThrow();
+
+    const unowned = new PluginRegistry();
+    expect(() => unowned.registerProblemFormatAdapter(adapter)).toThrow(
+      "题目包格式必须由正在登记的内置插件注册。"
+    );
   });
 
   it("rejects plugin permissions that conflict with core permissions", () => {

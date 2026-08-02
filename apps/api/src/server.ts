@@ -43,6 +43,7 @@ import { DatabaseReviewItemStore } from "./review-item-store";
 import { DatabaseRobotStore } from "./robot-store";
 import { DatabaseTagCatalogService } from "./tag-catalog-service";
 import { createPluginSecretBox, TrustedPluginHost } from "./plugin-host";
+import { TrustedProblemFormatAdapterCatalog } from "./problem-format-adapters";
 import {
   readServerAuthenticationOptions,
   readServerDatabaseOptions,
@@ -94,6 +95,7 @@ try {
     pluginSecretBox
   );
   pluginHostReference = pluginHost;
+  const problemFormatAdapters = new TrustedProblemFormatAdapterCatalog(pluginHost);
   const store = new DatabaseDataStore(database);
   const problemFileStore = new ProblemFileStore(database);
   const problemService = new ProblemService(store);
@@ -112,6 +114,7 @@ try {
   registerProblemPackageHandlers(packageWorker, {
     import: {
       jobs: packageJobStore,
+      adapterCatalog: problemFormatAdapters,
       archives: new StorageVerifiedImportArchiveReader(problemFileStore, fileStorage),
       writer: new DatabaseImportedProblemWriter({
         database,
@@ -123,6 +126,7 @@ try {
     },
     export: {
       jobs: packageJobStore,
+      adapterCatalog: problemFormatAdapters,
       source: exportReader,
       authorization: new ServiceExportReadAuthorization({
         getUser: (userId) => store.getUser(userId),
@@ -144,7 +148,8 @@ try {
     audit: packageAudit,
     jobs: packageJobStore,
     coordinator: packageCoordinator,
-    exportReader
+    exportReader,
+    adapterCatalog: problemFormatAdapters
   });
   const casClient = authenticationOptions.cas === undefined
     ? undefined

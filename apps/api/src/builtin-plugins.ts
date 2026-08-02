@@ -12,6 +12,10 @@ import {
   defaultReviewRuleId,
   registerDefaultReviewPlugin
 } from "@urmotiv/plugin-review-default";
+import {
+  hydroAdapterVersion,
+  registerHydroFormatPlugin
+} from "@urmotiv/plugin-hydro-format";
 import type { PluginRegistry } from "@urmotiv/plugin-sdk";
 import type { TrustedPluginDefinition } from "./plugin-host";
 
@@ -39,6 +43,7 @@ export const anklangPluginId = "org.ustc.urmotiv.anklang";
 export const anklangServiceTokenSecretName = "serviceToken";
 export const fermataPluginId = "org.ustc.urmotiv.fermata-control";
 export const fermataManagementTokenSecretName = "managementToken";
+export const hydroFormatPluginId = "org.ustc.urmotiv.hydro-format";
 
 export function createBuiltinPluginDefinitions(
   runtime: BuiltinPluginRuntime = {}
@@ -164,7 +169,9 @@ export function createBuiltinPluginDefinitions(
     },
     {
       source: "builtin:hydro-format",
-      manifest: { id: "org.ustc.urmotiv.hydro-format", name: "Hydro 题目包格式", version: "0.1.0", apiVersion: "1", serverEntry: "dist/index.js", permissions: [] }
+      requiresRestart: false,
+      manifest: { id: hydroFormatPluginId, name: "Hydro 题目包格式", version: hydroAdapterVersion, apiVersion: "1", serverEntry: "dist/index.js", permissions: [] },
+      registerHooks: registerHydroFormatPlugin
     }
   ];
 }

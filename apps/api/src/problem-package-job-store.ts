@@ -8,6 +8,8 @@ import {
   problemPackageExportJobSchema,
   problemPackageImportItemSchema,
   problemPackageImportJobSchema,
+  problemPackageJobReplayClaimSchema,
+  problemPackageJobReplayLookupSchema,
   problemPackageJobReportSchema,
   safeProblemPackageFailure,
   type CompleteProblemPackageExport,
@@ -18,7 +20,10 @@ import {
   type ProblemPackageFailureCode,
   type ProblemPackageImportItem,
   type ProblemPackageImportJob,
+  type ProblemPackageJobReplayStore,
   type ProblemPackageJobReport,
+  type ProblemPackageJobReplayClaim,
+  type ProblemPackageJobReplayLookup,
   type JobQueue,
   type ProblemPackageJobStore
 } from "@urmotiv/jobs";
@@ -39,10 +44,12 @@ const taskStateSchema = z.enum(["queued", "running", "succeeded", "failed", "can
 interface ImportJobRow extends Record<string, unknown> {
   id: string;
   requested_by_user_id: string;
+  client_request_digest: string | null;
   source_file_id: string;
   input_digest: string;
   detected_format: string | null;
   selected_format: string;
+  selected_format_version: string;
   choices: unknown;
   state: string;
   progress_percent: number;
@@ -68,7 +75,9 @@ interface ImportItemRow extends Record<string, unknown> {
 interface ExportJobRow extends Record<string, unknown> {
   id: string;
   requested_by_user_id: string;
+  client_request_digest: string | null;
   target_format: string;
+  target_format_version: string;
   options: unknown;
   loss_report: unknown;
   state: string;
@@ -121,7 +130,7 @@ export interface InMemoryProblemPackageJobStoreOptions {
  */
 export class ProblemPackageJobCoordinator {
   public constructor(
-    private readonly store: ProblemPackageJobStore,
+    private readonly store: ProblemPackageJobStore & ProblemPackageJobReplayStore,
     private readonly queue: JobQueue
   ) {}
 
@@ -129,6 +138,20 @@ export class ProblemPackageJobCoordinator {
     input: CreateProblemPackageImportJob
   ): Promise<ProblemPackageImportJob> {
     const task = await this.store.createImportJob(input);
+    await this.enqueueImportJob(task);
+    return task;
+  }
+
+  public async replayImportJob(
+    input: ProblemPackageJobReplayClaim
+  ): Promise<ProblemPackageImportJob | undefined> {
+    const task = await this.store.findImportJobForReplay(input);
+    if (task === undefined) return undefined;
+    await this.enqueueImportJob(task);
+    return task;
+  }
+
+  private async enqueueImportJob(task: ProblemPackageImportJob): Promise<void> {
     await this.queue.enqueue({
       jobId: task.id,
       type: problemImportJobType,
@@ -138,13 +161,27 @@ export class ProblemPackageJobCoordinator {
       maxAttempts: 3,
       timeoutMs: 15 * 60 * 1_000
     });
-    return task;
   }
 
   public async createExportJob(
     input: CreateProblemPackageExportJob
   ): Promise<ProblemPackageExportJob> {
     const task = await this.store.createExportJob(input);
+    await this.enqueueExportJob(task);
+    return task;
+  }
+
+  public async findExportJobForReplay(
+    input: ProblemPackageJobReplayLookup
+  ): Promise<ProblemPackageExportJob | undefined> {
+    return this.store.findExportJobForReplay(input);
+  }
+
+  public async reenqueueExportJob(task: ProblemPackageExportJob): Promise<void> {
+    await this.enqueueExportJob(task);
+  }
+
+  private async enqueueExportJob(task: ProblemPackageExportJob): Promise<void> {
     await this.queue.enqueue({
       jobId: task.id,
       type: problemExportJobType,
@@ -154,7 +191,6 @@ export class ProblemPackageJobCoordinator {
       maxAttempts: 3,
       timeoutMs: 30 * 60 * 1_000
     });
-    return task;
   }
 }
 
@@ -196,10 +232,12 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
     const job = problemPackageImportJobSchema.parse({
       id: randomUUID(),
       requestedByUserId: parsed.requestedByUserId,
+      clientRequestDigest: parsed.clientRequestDigest,
       sourceFileId: parsed.sourceFileId,
       inputDigest: parsed.inputDigest,
       detectedFormat: parsed.detectedFormat ?? null,
       selectedFormat: parsed.selectedFormat,
+      selectedFormatVersion: parsed.selectedFormatVersion,
       choices: parsed.choices,
       itemCount: parsed.itemCount,
       state: "queued",
@@ -251,7 +289,9 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
     const job = problemPackageExportJobSchema.parse({
       id: randomUUID(),
       requestedByUserId: parsed.requestedByUserId,
+      clientRequestDigest: parsed.clientRequestDigest,
       targetFormat: parsed.targetFormat,
+      targetFormatVersion: parsed.targetFormatVersion,
       options: parsed.options,
       lossSummary: parsed.lossSummary,
       problems: parsed.problems,
@@ -277,6 +317,22 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
     return job === undefined ? undefined : copy(job);
   }
 
+  public async findImportJobForReplay(
+    input: ProblemPackageJobReplayClaim
+  ): Promise<ProblemPackageImportJob | undefined> {
+    const parsed = problemPackageJobReplayClaimSchema.parse(input);
+    const existingId = this.#importIdempotency.get(
+      idempotencyIndex(parsed.requestedByUserId, parsed.idempotencyKey)
+    );
+    if (existingId === undefined) return undefined;
+    const existing = this.#imports.get(existingId);
+    if (existing === undefined) {
+      throw new ProblemPackageJobStoreError("TASK_NOT_FOUND", "任务记录不存在。");
+    }
+    requireMatchingClientRequest(existing.clientRequestDigest, parsed.clientRequestDigest);
+    return copy(existing);
+  }
+
   public async getImportItems(jobId: string): Promise<readonly ProblemPackageImportItem[]> {
     uuidSchema.parse(jobId);
     return (this.#importItems.get(jobId) ?? []).map(copy);
@@ -286,6 +342,21 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
     uuidSchema.parse(jobId);
     const job = this.#exports.get(jobId);
     return job === undefined ? undefined : copy(job);
+  }
+
+  public async findExportJobForReplay(
+    input: ProblemPackageJobReplayLookup
+  ): Promise<ProblemPackageExportJob | undefined> {
+    const parsed = problemPackageJobReplayLookupSchema.parse(input);
+    const existingId = this.#exportIdempotency.get(
+      idempotencyIndex(parsed.requestedByUserId, parsed.idempotencyKey)
+    );
+    if (existingId === undefined) return undefined;
+    const existing = this.#exports.get(existingId);
+    if (existing === undefined) {
+      throw new ProblemPackageJobStoreError("TASK_NOT_FOUND", "任务记录不存在。");
+    }
+    return copy(existing);
   }
 
   public async startImportJob(jobId: string): Promise<ProblemPackageImportJob | undefined> {
@@ -471,16 +542,17 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
   public async createImportJob(input: CreateProblemPackageImportJob): Promise<ProblemPackageImportJob> {
     const parsed = createProblemPackageImportJobSchema.parse(input);
     const requesterId = requireDatabaseId(parsed.requestedByUserId, "请求用户编号");
-    return this.database.transaction(async (transaction) => {
-      const existing = await findImportByIdempotency(transaction, requesterId, parsed.idempotencyKey);
-      if (existing !== undefined) {
-        if (!sameImportRequest(existing, parsed)) {
-          throw new ProblemPackageJobStoreError("IDEMPOTENCY_CONFLICT", "同一个请求编号不能用于不同的导入任务。");
+    try {
+      return await this.database.transaction(async (transaction) => {
+        const existing = await findImportByIdempotency(transaction, requesterId, parsed.idempotencyKey);
+        if (existing !== undefined) {
+          if (!sameImportRequest(existing, parsed)) {
+            throw new ProblemPackageJobStoreError("IDEMPOTENCY_CONFLICT", "同一个请求编号不能用于不同的导入任务。");
+          }
+          return existing;
         }
-        return existing;
-      }
 
-      const source = await transaction.query<{ id: string }>(sql`
+        const source = await transaction.query<{ id: string }>(sql`
         SELECT id::text AS id
         FROM stored_files
         WHERE id = ${parsed.sourceFileId}::uuid
@@ -489,74 +561,93 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
           AND deleted_at IS NULL
           AND (expires_at IS NULL OR expires_at > ${this.now().toISOString()}::timestamptz)
       `);
-      if (source.length !== 1) {
-        throw new ProblemPackageJobStoreError("INPUT_FILE_NOT_FOUND", "导入文件不存在、已过期或已改变。");
-      }
+        if (source.length !== 1) {
+          throw new ProblemPackageJobStoreError("INPUT_FILE_NOT_FOUND", "导入文件不存在、已过期或已改变。");
+        }
 
-      const id = randomUUID();
-      const now = this.now().toISOString();
-      await transaction.execute(sql`
+        const id = randomUUID();
+        const now = this.now().toISOString();
+        await transaction.execute(sql`
         INSERT INTO import_jobs (
-          id, requested_by_user_id, source_file_id, detected_format, selected_format,
+          id, requested_by_user_id, client_request_digest,
+          source_file_id, detected_format, selected_format,
+          selected_format_version,
           input_digest, choices, state, progress_percent, report, idempotency_key, created_at
         ) VALUES (
-          ${id}::uuid, ${requesterId}, ${parsed.sourceFileId}::uuid,
-          ${parsed.detectedFormat ?? null}, ${parsed.selectedFormat}, ${parsed.inputDigest},
+          ${id}::uuid, ${requesterId}, ${parsed.clientRequestDigest},
+          ${parsed.sourceFileId}::uuid,
+          ${parsed.detectedFormat ?? null}, ${parsed.selectedFormat},
+          ${parsed.selectedFormatVersion}, ${parsed.inputDigest},
           ${json(parsed.choices)}::jsonb, 'queued', 0, ${json(initialReport())}::jsonb,
           ${parsed.idempotencyKey}, ${now}::timestamptz
         )
       `);
-      for (let position = 0; position < parsed.itemCount; position += 1) {
-        await transaction.execute(sql`
+        for (let position = 0; position < parsed.itemCount; position += 1) {
+          await transaction.execute(sql`
           INSERT INTO import_job_items (job_id, position, source_label, state, report)
           VALUES (${id}::uuid, ${position}, ${String(position + 1)}, 'queued', ${json({})}::jsonb)
         `);
-      }
-      const created = await findImportById(transaction, id);
-      if (created === undefined) throw new ProblemPackageJobStoreError("TASK_NOT_FOUND", "任务记录不存在。");
-      await this.writeImportCreationAudit(transaction, parsed, created);
-      return created;
-    });
+        }
+        const created = await findImportById(transaction, id);
+        if (created === undefined) throw new ProblemPackageJobStoreError("TASK_NOT_FOUND", "任务记录不存在。");
+        await this.writeImportCreationAudit(transaction, parsed, created);
+        return created;
+      });
+    } catch (error) {
+      const existing = await findImportByIdempotency(
+        this.database,
+        requesterId,
+        parsed.idempotencyKey
+      );
+      if (existing === undefined) throw error;
+      requireMatchingClientRequest(existing.clientRequestDigest, parsed.clientRequestDigest);
+      return existing;
+    }
   }
 
   public async createExportJob(input: CreateProblemPackageExportJob): Promise<ProblemPackageExportJob> {
     const parsed = createProblemPackageExportJobSchema.parse(input);
     const requesterId = requireDatabaseId(parsed.requestedByUserId, "请求用户编号");
-    return this.database.transaction(async (transaction) => {
-      const existing = await findExportByIdempotency(transaction, requesterId, parsed.idempotencyKey);
-      if (existing !== undefined) {
-        if (!sameExportRequest(existing, parsed)) {
-          throw new ProblemPackageJobStoreError("IDEMPOTENCY_CONFLICT", "同一个请求编号不能用于不同的导出任务。");
+    try {
+      return await this.database.transaction(async (transaction) => {
+        const existing = await findExportByIdempotency(transaction, requesterId, parsed.idempotencyKey);
+        if (existing !== undefined) {
+          if (!sameExportRequest(existing, parsed)) {
+            throw new ProblemPackageJobStoreError("IDEMPOTENCY_CONFLICT", "同一个请求编号不能用于不同的导出任务。");
+          }
+          return existing;
         }
-        return existing;
-      }
 
-      for (const selection of parsed.problems) {
-        const revision = await transaction.query<{ id: string }>(sql`
+        for (const selection of parsed.problems) {
+          const revision = await transaction.query<{ id: string }>(sql`
           SELECT id::text AS id
           FROM problem_revisions
           WHERE id = ${selection.revisionId}::uuid
             AND problem_id = ${requireDatabaseId(selection.problemId, "题目编号")}
         `);
-        if (revision.length !== 1) {
-          throw new ProblemPackageJobStoreError("FIXED_REVISION_NOT_FOUND", "所选题目版本不存在。");
+          if (revision.length !== 1) {
+            throw new ProblemPackageJobStoreError("FIXED_REVISION_NOT_FOUND", "所选题目版本不存在。");
+          }
         }
-      }
 
-      const id = randomUUID();
-      const now = this.now().toISOString();
-      await transaction.execute(sql`
+        const id = randomUUID();
+        const now = this.now().toISOString();
+        await transaction.execute(sql`
         INSERT INTO export_jobs (
-          id, requested_by_user_id, target_format, options, loss_report, state,
+          id, requested_by_user_id, client_request_digest,
+          target_format, target_format_version,
+          options, loss_report, state,
           progress_percent, report, idempotency_key, created_at
         ) VALUES (
-          ${id}::uuid, ${requesterId}, ${parsed.targetFormat}, ${json(parsed.options)}::jsonb,
+          ${id}::uuid, ${requesterId}, ${parsed.clientRequestDigest},
+          ${parsed.targetFormat},
+          ${parsed.targetFormatVersion}, ${json(parsed.options)}::jsonb,
           ${json(parsed.lossSummary)}::jsonb, 'queued', 0, ${json(initialReport())}::jsonb,
           ${parsed.idempotencyKey}, ${now}::timestamptz
         )
       `);
-      for (const [position, selection] of parsed.problems.entries()) {
-        await transaction.execute(sql`
+        for (const [position, selection] of parsed.problems.entries()) {
+          await transaction.execute(sql`
           INSERT INTO export_job_problems (
             job_id, position, problem_id, revision_id, included_file_categories
           ) VALUES (
@@ -564,12 +655,22 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
             ${selection.revisionId}::uuid, ${json(selection.includedFileCategories)}::jsonb
           )
         `);
-      }
-      const created = await findExportById(transaction, id);
-      if (created === undefined) throw new ProblemPackageJobStoreError("TASK_NOT_FOUND", "任务记录不存在。");
-      await this.writeExportCreationAudit(transaction, parsed, created);
-      return created;
-    });
+        }
+        const created = await findExportById(transaction, id);
+        if (created === undefined) throw new ProblemPackageJobStoreError("TASK_NOT_FOUND", "任务记录不存在。");
+        await this.writeExportCreationAudit(transaction, parsed, created);
+        return created;
+      });
+    } catch (error) {
+      const existing = await findExportByIdempotency(
+        this.database,
+        requesterId,
+        parsed.idempotencyKey
+      );
+      if (existing === undefined) throw error;
+      requireMatchingClientRequest(existing.clientRequestDigest, parsed.clientRequestDigest);
+      return existing;
+    }
   }
 
   private async writeImportCreationAudit(
@@ -589,6 +690,7 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
         reasonCode: null,
         metadata: {
           formatId: job.selectedFormat,
+          formatVersion: job.selectedFormatVersion,
           itemCount: job.itemCount
         }
       },
@@ -613,6 +715,7 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
         reasonCode: null,
         metadata: {
           formatId: job.targetFormat,
+          formatVersion: job.targetFormatVersion,
           problemCount: job.problems.length
         }
       },
@@ -622,6 +725,20 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
 
   public async getImportJob(jobId: string): Promise<ProblemPackageImportJob | undefined> {
     return findImportById(this.database, uuidSchema.parse(jobId));
+  }
+
+  public async findImportJobForReplay(
+    input: ProblemPackageJobReplayClaim
+  ): Promise<ProblemPackageImportJob | undefined> {
+    const parsed = problemPackageJobReplayClaimSchema.parse(input);
+    const existing = await findImportByIdempotency(
+      this.database,
+      requireDatabaseId(parsed.requestedByUserId, "请求用户编号"),
+      parsed.idempotencyKey
+    );
+    if (existing === undefined) return undefined;
+    requireMatchingClientRequest(existing.clientRequestDigest, parsed.clientRequestDigest);
+    return existing;
   }
 
   public async getImportItems(jobId: string): Promise<readonly ProblemPackageImportItem[]> {
@@ -638,6 +755,19 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
 
   public async getExportJob(jobId: string): Promise<ProblemPackageExportJob | undefined> {
     return findExportById(this.database, uuidSchema.parse(jobId));
+  }
+
+  public async findExportJobForReplay(
+    input: ProblemPackageJobReplayLookup
+  ): Promise<ProblemPackageExportJob | undefined> {
+    const parsed = problemPackageJobReplayLookupSchema.parse(input);
+    const existing = await findExportByIdempotency(
+      this.database,
+      requireDatabaseId(parsed.requestedByUserId, "请求用户编号"),
+      parsed.idempotencyKey
+    );
+    if (existing === undefined) return undefined;
+    return existing;
   }
 
   public async startImportJob(jobId: string): Promise<ProblemPackageImportJob | undefined> {
@@ -911,6 +1041,7 @@ export async function completeDatabaseExportJob(
       reasonCode: null,
       metadata: {
         formatId: current.targetFormat,
+        formatVersion: current.targetFormatVersion,
         outputFileCount: parsed.outputFileCount
       }
     },
@@ -978,47 +1109,26 @@ function sameImportRequest(
   existing: ProblemPackageImportJob,
   input: z.output<typeof createProblemPackageImportJobSchema>
 ): boolean {
-  return stableJson({
-    sourceFileId: existing.sourceFileId,
-    inputDigest: existing.inputDigest,
-    detectedFormat: existing.detectedFormat,
-    selectedFormat: existing.selectedFormat,
-    choices: existing.choices,
-    itemCount: existing.itemCount
-  }) === stableJson({
-    sourceFileId: input.sourceFileId,
-    inputDigest: input.inputDigest,
-    detectedFormat: input.detectedFormat ?? null,
-    selectedFormat: input.selectedFormat,
-    choices: input.choices,
-    itemCount: input.itemCount
-  });
+  return existing.clientRequestDigest === input.clientRequestDigest;
 }
 
 function sameExportRequest(
   existing: ProblemPackageExportJob,
   input: z.output<typeof createProblemPackageExportJobSchema>
 ): boolean {
-  return stableJson({
-    targetFormat: existing.targetFormat,
-    options: existing.options,
-    lossSummary: existing.lossSummary,
-    problems: existing.problems
-  }) === stableJson({
-    targetFormat: input.targetFormat,
-    options: input.options,
-    lossSummary: input.lossSummary,
-    problems: input.problems
-  });
+  return existing.clientRequestDigest === input.clientRequestDigest;
 }
 
-function stableJson(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  return `{${Object.entries(value as JsonObject)
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`)
-    .join(",")}}`;
+function requireMatchingClientRequest(
+  existingDigest: string | null,
+  requestedDigest: string
+): void {
+  if (existingDigest !== requestedDigest) {
+    throw new ProblemPackageJobStoreError(
+      "IDEMPOTENCY_CONFLICT",
+      "同一个请求编号不能用于不同的任务内容。"
+    );
+  }
 }
 
 async function findImportById(
@@ -1026,8 +1136,10 @@ async function findImportById(
   id: string
 ): Promise<ProblemPackageImportJob | undefined> {
   const rows = await executor.query<ImportJobRow>(sql`
-    SELECT id::text, requested_by_user_id::text, source_file_id::text, input_digest,
-           detected_format, selected_format, choices, state::text, progress_percent,
+    SELECT id::text, requested_by_user_id::text, client_request_digest,
+           source_file_id::text, input_digest,
+           detected_format, selected_format, selected_format_version,
+           choices, state::text, progress_percent,
            report, failure_code, failure_message, idempotency_key, started_at, finished_at, created_at
     FROM import_jobs WHERE id = ${id}::uuid
   `);
@@ -1046,8 +1158,10 @@ async function findImportByIdempotency(
   idempotencyKey: string
 ): Promise<ProblemPackageImportJob | undefined> {
   const rows = await executor.query<ImportJobRow>(sql`
-    SELECT id::text, requested_by_user_id::text, source_file_id::text, input_digest,
-           detected_format, selected_format, choices, state::text, progress_percent,
+    SELECT id::text, requested_by_user_id::text, client_request_digest,
+           source_file_id::text, input_digest,
+           detected_format, selected_format, selected_format_version,
+           choices, state::text, progress_percent,
            report, failure_code, failure_message, idempotency_key, started_at, finished_at, created_at
     FROM import_jobs
     WHERE requested_by_user_id = ${requesterId} AND idempotency_key = ${idempotencyKey}
@@ -1065,7 +1179,9 @@ async function findExportById(
   id: string
 ): Promise<ProblemPackageExportJob | undefined> {
   const rows = await executor.query<ExportJobRow>(sql`
-    SELECT id::text, requested_by_user_id::text, target_format, options, loss_report,
+    SELECT id::text, requested_by_user_id::text, client_request_digest,
+           target_format, target_format_version,
+           options, loss_report,
            state::text, progress_percent, report, result_file_id::text, result_expires_at,
            failure_code, failure_message, idempotency_key, started_at, finished_at, created_at
     FROM export_jobs WHERE id = ${id}::uuid
@@ -1085,7 +1201,9 @@ async function findExportByIdempotency(
   idempotencyKey: string
 ): Promise<ProblemPackageExportJob | undefined> {
   const rows = await executor.query<ExportJobRow>(sql`
-    SELECT id::text, requested_by_user_id::text, target_format, options, loss_report,
+    SELECT id::text, requested_by_user_id::text, client_request_digest,
+           target_format, target_format_version,
+           options, loss_report,
            state::text, progress_percent, report, result_file_id::text, result_expires_at,
            failure_code, failure_message, idempotency_key, started_at, finished_at, created_at
     FROM export_jobs
@@ -1104,10 +1222,12 @@ function hydrateImport(row: ImportJobRow, itemCount: number): ProblemPackageImpo
   return problemPackageImportJobSchema.parse({
     id: row.id,
     requestedByUserId: row.requested_by_user_id,
+    clientRequestDigest: row.client_request_digest,
     sourceFileId: row.source_file_id,
     inputDigest: row.input_digest,
     detectedFormat: row.detected_format,
     selectedFormat: row.selected_format,
+    selectedFormatVersion: row.selected_format_version,
     choices: jsonObject(row.choices, "导入选择"),
     itemCount,
     state: taskStateSchema.parse(row.state),
@@ -1139,7 +1259,9 @@ function hydrateExport(
   return problemPackageExportJobSchema.parse({
     id: row.id,
     requestedByUserId: row.requested_by_user_id,
+    clientRequestDigest: row.client_request_digest,
     targetFormat: row.target_format,
+    targetFormatVersion: row.target_format_version,
     options: jsonObject(row.options, "导出选项"),
     lossSummary: jsonObject(row.loss_report, "导出说明"),
     problems: selections.map((selection) => ({

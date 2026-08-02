@@ -15,7 +15,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@urmotiv/plugin-hydro-format": "workspace:*",
     "@urmotiv/problem-package": "workspace:*",
     "redis": "latest",
     "zod": "latest"

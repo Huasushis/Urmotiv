@@ -20,6 +20,7 @@
     "@urmotiv/database": "workspace:*",
     "@urmotiv/jobs": "workspace:*",
     "@urmotiv/plugin-anklang": "workspace:*",
+    "@urmotiv/plugin-hydro-format": "workspace:*",
     "@urmotiv/plugin-review-default": "workspace:*",
     "@urmotiv/plugin-sdk": "workspace:*",
     "@urmotiv/problem-package": "workspace:*",

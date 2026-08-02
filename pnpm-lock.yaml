@@ -44,6 +44,9 @@ importers:
       '@urmotiv/plugin-anklang':
         specifier: workspace:*
         version: link:../../plugins/anklang
+      '@urmotiv/plugin-hydro-format':
+        specifier: workspace:*
+        version: link:../../plugins/hydro-format
       '@urmotiv/plugin-review-default':
         specifier: workspace:*
         version: link:../../plugins/review-default
@@ -157,9 +160,6 @@ importers:
       '@urmotiv/jobs':
         specifier: workspace:*
         version: link:../../packages/jobs
-      '@urmotiv/plugin-hydro-format':
-        specifier: workspace:*
-        version: link:../../plugins/hydro-format
       '@urmotiv/problem-package':
         specifier: workspace:*
         version: link:../../packages/problem-package
@@ -248,9 +248,6 @@ importers:
 
   packages/jobs:
     dependencies:
-      '@urmotiv/plugin-hydro-format':
-        specifier: workspace:*
-        version: link:../../plugins/hydro-format
       '@urmotiv/problem-package':
         specifier: workspace:*
         version: link:../problem-package

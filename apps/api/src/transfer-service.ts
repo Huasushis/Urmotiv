@@ -14,7 +14,7 @@ import {
   type PackageUploadResponse
 } from "@urmotiv/contracts";
 import {
-  builtinProblemPackageAdapters,
+  coreProblemFormatAdapterCatalog,
   type ProblemPackageExportJob,
   type ProblemPackageExportSelection,
   type ProblemPackageImportItem,
@@ -34,6 +34,7 @@ import {
   inputKindForProblemFormatAdapter,
   readProblemPackageInput,
   type ProblemFormatAdapter,
+  type ProblemFormatAdapterCatalog,
   type SafeProblemPackageInput
 } from "@urmotiv/problem-package";
 import type { FileStorage, StoredFile } from "@urmotiv/storage";
@@ -77,7 +78,7 @@ export interface TransferServiceDependencies {
   readonly jobs: ProblemPackageJobStore;
   readonly coordinator: ProblemPackageJobCoordinator;
   readonly exportReader: FixedRevisionExportReader;
-  readonly adapters?: ReadonlyMap<string, ProblemFormatAdapter>;
+  readonly adapterCatalog?: ProblemFormatAdapterCatalog;
   /**
    * 题目包原始文件的上限。生产环境默认 128 MiB；测试和内存较小的部署可以调低，
    * 但不能调高。
@@ -96,7 +97,7 @@ export class TransferService {
   readonly #jobs: ProblemPackageJobStore;
   readonly #coordinator: ProblemPackageJobCoordinator;
   readonly #exportReader: FixedRevisionExportReader;
-  readonly #adapters: ReadonlyMap<string, ProblemFormatAdapter>;
+  readonly #adapterCatalog: ProblemFormatAdapterCatalog;
   public readonly maximumArchiveBytes: number;
   readonly #uploadTimeToLiveMs: number;
   readonly #now: () => Date;
@@ -121,7 +122,8 @@ export class TransferService {
     this.#jobs = dependencies.jobs;
     this.#coordinator = dependencies.coordinator;
     this.#exportReader = dependencies.exportReader;
-    this.#adapters = dependencies.adapters ?? builtinProblemPackageAdapters;
+    this.#adapterCatalog =
+      dependencies.adapterCatalog ?? coreProblemFormatAdapterCatalog;
     this.maximumArchiveBytes = archiveLimit;
     this.#uploadTimeToLiveMs = dependencies.uploadTimeToLiveMs ?? defaultUploadTimeToLiveMs;
     this.#now = dependencies.now ?? (() => new Date());
@@ -143,6 +145,7 @@ export class TransferService {
     const packageInput = readPackageInputOrReject(originalName, bytes, {
       maxArchiveBytes: this.maximumArchiveBytes
     });
+    const enabledAdapters = await this.#listEnabledAdapters();
 
     const staged = await this.#storage.stage({
       originalName,
@@ -215,7 +218,7 @@ export class TransferService {
     }
 
     const detected = [] as PackageUploadResponse["detected"];
-    for (const adapter of this.#adapters.values()) {
+    for (const adapter of enabledAdapters) {
       try {
         if (inputKindForProblemFormatAdapter(adapter) !== packageInput.kind) {
           continue;
@@ -255,7 +258,7 @@ export class TransferService {
   ): Promise<ImportPreviewResponse> {
     this.#requireImportPermission(user);
     const record = await this.#requireOwnImportInput(user, input.fileId);
-    const adapter = this.#requireAdapter(input.formatId);
+    const adapter = await this.#requireAdapter(input.formatId);
     const packageInput = await this.#readStoredPackageInput(record);
     this.#requireMatchingInputKind(adapter, packageInput);
     const preview = await adapter.inspect(packageInput.archive);
@@ -280,6 +283,7 @@ export class TransferService {
       reasonCode: null,
       metadata: {
         formatId: adapter.id,
+        formatVersion: adapter.version,
         problemCount: response.problemCount,
         issueCount: response.issues.length
       }
@@ -293,20 +297,37 @@ export class TransferService {
     input: CreateImportJobRequest
   ): Promise<ImportJobView> {
     this.#requireImportPermission(user);
+    const clientRequestDigest = digestImportCreateRequest(input);
+    try {
+      const replayed = await this.#coordinator.replayImportJob({
+        requestedByUserId: user.id,
+        idempotencyKey: input.idempotencyKey,
+        clientRequestDigest
+      });
+      if (replayed !== undefined) {
+        const items = await this.#jobs.getImportItems(replayed.id);
+        return toImportJobView(replayed, items);
+      }
+    } catch (error) {
+      throw translateJobStoreError(error);
+    }
+
     const record = await this.#requireOwnImportInput(user, input.fileId);
     if (record.sha256 !== input.sha256) {
       throw conflict("上传的文件已改变，请重新上传后再试。");
     }
-    const adapter = this.#requireAdapter(input.formatId);
+    const adapter = await this.#requireAdapter(input.formatId);
     const packageInput = await this.#readStoredPackageInput(record);
     this.#requireMatchingInputKind(adapter, packageInput);
 
     try {
       const job = await this.#coordinator.createImportJob({
         requestedByUserId: user.id,
+        clientRequestDigest,
         sourceFileId: record.id,
         inputDigest: record.sha256,
         selectedFormat: input.formatId,
+        selectedFormatVersion: adapter.version,
         choices: { conflictAction: "create" },
         itemCount: 1,
         idempotencyKey: input.idempotencyKey,
@@ -333,7 +354,7 @@ export class TransferService {
     requestId: string,
     input: ExportPreviewRequest
   ): Promise<ExportPreviewResponse> {
-    const adapter = this.#requireAdapter(input.targetFormat);
+    const adapter = await this.#requireAdapter(input.targetFormat);
     const problems: ExportPreviewResponse["problems"] = [];
     let canExport = true;
 
@@ -359,6 +380,7 @@ export class TransferService {
       reasonCode: null,
       metadata: {
         formatId: adapter.id,
+        formatVersion: adapter.version,
         problemCount: input.problems.length,
         canExport
       }
@@ -371,7 +393,25 @@ export class TransferService {
     requestId: string,
     input: CreateExportJobRequest
   ): Promise<ExportJobView> {
-    const adapter = this.#requireAdapter(input.targetFormat);
+    const clientRequestDigest = digestExportCreateRequest(input);
+    try {
+      const replayed = await this.#coordinator.findExportJobForReplay({
+        requestedByUserId: user.id,
+        idempotencyKey: input.idempotencyKey
+      });
+      if (replayed !== undefined) {
+        await this.#requireReplayExportAccess(user, replayed);
+        if (replayed.clientRequestDigest !== clientRequestDigest) {
+          throw conflict("同一个请求编号不能用于不同的任务内容。");
+        }
+        await this.#coordinator.reenqueueExportJob(replayed);
+        return this.#toExportJobView(replayed);
+      }
+    } catch (error) {
+      throw translateJobStoreError(error);
+    }
+
+    const adapter = await this.#requireAdapter(input.targetFormat);
     const selections: ProblemPackageExportSelection[] = [];
     const summary = { errorCount: 0, choiceCount: 0, warningCount: 0, infoCount: 0 };
 
@@ -404,7 +444,9 @@ export class TransferService {
     try {
       const job = await this.#coordinator.createExportJob({
         requestedByUserId: user.id,
+        clientRequestDigest,
         targetFormat: adapter.id,
+        targetFormatVersion: adapter.version,
         options: {},
         lossSummary: {
           targetFormat: adapter.id,
@@ -688,18 +730,62 @@ export class TransferService {
     }
   }
 
+  async #requireReplayExportAccess(
+    user: StoredUser,
+    job: ProblemPackageExportJob
+  ): Promise<void> {
+    for (const selection of job.problems) {
+      const access = await this.#tryProblemAccess(user, selection.problemId);
+      if (access === undefined || !access.capabilities.canExport) throw notFound();
+      const includesInternal = selection.includedFileCategories.some((category) =>
+        internalPackageCategories.has(category)
+      );
+      if (includesInternal && !access.capabilities.canReadTestdata) {
+        throw notFound();
+      }
+    }
+  }
+
   #requireImportPermission(user: StoredUser): void {
     if (!hasPermission(user, "problem.import", {}, this.#now())) {
       throw forbidden("导入题目包需要导入权限。");
     }
   }
 
-  #requireAdapter(formatId: string): ProblemFormatAdapter {
-    const adapter = this.#adapters.get(formatId);
+  async #requireAdapter(formatId: string): Promise<ProblemFormatAdapter> {
+    let adapter: ProblemFormatAdapter | undefined;
+    try {
+      adapter = await this.#adapterCatalog.getEnabled(formatId);
+    } catch {
+      throw new ApiError(
+        503,
+        "FORMAT_REGISTRY_UNAVAILABLE",
+        "题目包格式目录暂时不可用，请稍后重试。"
+      );
+    }
     if (adapter === undefined) {
       throw new ApiError(422, "UNKNOWN_FORMAT", "所选题目包格式当前不可用。");
     }
+    if (adapter.id !== formatId) {
+      throw new ApiError(
+        503,
+        "FORMAT_REGISTRY_UNAVAILABLE",
+        "题目包格式目录暂时不可用，请稍后重试。"
+      );
+    }
     return adapter;
+  }
+
+  async #listEnabledAdapters(): Promise<readonly ProblemFormatAdapter[]> {
+    try {
+      return await this.#adapterCatalog.listEnabled();
+    } catch {
+      throw new ApiError(
+        503,
+        "FORMAT_REGISTRY_UNAVAILABLE",
+        "题目包格式目录暂时不可用，请稍后重试。"
+      );
+    }
   }
 
   #requireMatchingInputKind(
@@ -870,6 +956,43 @@ async function collectBytes(
 
 async function* singleChunk(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
   yield bytes;
+}
+
+/**
+ * The digest binds an idempotency key to the normalized public request, not to
+ * adapter-derived data. This lets a response-loss retry recover the immutable
+ * original task after an adapter is upgraded or disabled.
+ */
+function digestImportCreateRequest(input: CreateImportJobRequest): string {
+  return sha256Text(
+    JSON.stringify({
+      version: 1,
+      kind: "problem-package-import",
+      fileId: input.fileId,
+      sha256: input.sha256,
+      formatId: input.formatId
+    })
+  );
+}
+
+function digestExportCreateRequest(input: CreateExportJobRequest): string {
+  return sha256Text(
+    JSON.stringify({
+      version: 1,
+      kind: "problem-package-export",
+      targetFormat: input.targetFormat,
+      problems: input.problems.map((problem) => ({
+        problemId: problem.problemId,
+        includeFileCategories: problem.includeFileCategories,
+        hasRevisionId: problem.revisionId !== undefined,
+        revisionId: problem.revisionId ?? null
+      }))
+    })
+  );
+}
+
+function sha256Text(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function sha256Hex(bytes: Uint8Array): string {
