@@ -58,6 +58,7 @@ export interface RobotAssignment {
   readonly expiresAt: string;
   readonly claimedProblemRevision: number;
   readonly claimedSubmittedRevisionId: string;
+  readonly claimedTagCatalogVersion: number;
 }
 
 export type RobotOperationOutcome<Result> =
@@ -364,7 +365,11 @@ export class DatabaseRobotStore {
     roundId: string,
     leaseSeconds: number,
     requestId: string,
+    tagCatalogVersion: number,
   ): Promise<{ readonly assignment: RobotAssignment; readonly user: StoredUser } | undefined> {
+    if (!Number.isSafeInteger(tagCatalogVersion) || tagCatalogVersion < 1) {
+      throw new Error("机器人领取使用了无效的知识点目录版本。");
+    }
     const reviewerId = requireDatabaseId(identity.userId);
     const problemId = requireDatabaseId(problem.id);
     const roundRows = await executor.query<LockedRoundRow>(sql`
@@ -396,6 +401,7 @@ export class DatabaseRobotStore {
              assignment.expires_at,
              assignment.claimed_problem_revision,
              assignment.claimed_submitted_revision_id::text AS claimed_submitted_revision_id,
+             assignment.claimed_tag_catalog_version,
              assignment.closure_reason
       FROM review_assignments assignment
       JOIN review_rounds round ON round.id = assignment.round_id
@@ -447,6 +453,7 @@ export class DatabaseRobotStore {
         assignment_kind,
         claimed_problem_revision,
         claimed_submitted_revision_id,
+        claimed_tag_catalog_version,
         expires_at
       ) VALUES (
         ${assignmentId}::uuid,
@@ -457,6 +464,7 @@ export class DatabaseRobotStore {
         'robot',
         ${problem.revision},
         ${round.submitted_revision_id}::uuid,
+        ${tagCatalogVersion},
         ${expiresAt}::timestamptz
       )
       RETURNING id::text AS id,
@@ -467,6 +475,7 @@ export class DatabaseRobotStore {
                 expires_at,
                 claimed_problem_revision,
                 claimed_submitted_revision_id::text AS claimed_submitted_revision_id,
+                claimed_tag_catalog_version,
                 closure_reason
     `);
     const row = inserted[0];
@@ -483,6 +492,7 @@ export class DatabaseRobotStore {
         assignmentId,
         round: problem.reviewRound,
         claimedProblemRevision: problem.revision,
+        claimedTagCatalogVersion: tagCatalogVersion,
       },
     });
     return { assignment: toAssignment(row), user };
@@ -653,8 +663,10 @@ export class DatabaseRobotStore {
       readonly requestId: string;
       readonly expectedLeaseExpiresAt: string;
       readonly expectedProblemRevision: number;
+      readonly expectedTagCatalogVersion: number;
     },
     payloadDigest: string,
+    actualTagCatalogVersion: number,
   ): Promise<
     | RobotOperationOutcome<RobotCompletionResult>
     | { readonly kind: "ready"; readonly prepared: PreparedRobotCompletion }
@@ -742,9 +754,32 @@ export class DatabaseRobotStore {
       }
       return { kind: outcome };
     }
+    const claimedTagCatalogVersion = Number(assignment.claimed_tag_catalog_version);
+    if (claimedTagCatalogVersion !== actualTagCatalogVersion) {
+      const auditId = await closeAssignment(
+        executor,
+        assignment,
+        "content_changed",
+        identity.userId,
+        input.requestId,
+        this.now().toISOString(),
+      );
+      if (auditId !== undefined) {
+        await rememberFailedOperation(executor, {
+          assignmentId,
+          requestId: input.requestId,
+          operation: "complete",
+          payloadDigest,
+          outcome: "conflict",
+          auditId,
+        });
+      }
+      return { kind: "conflict" };
+    }
     if (
       toIso(assignment.expires_at) !== input.expectedLeaseExpiresAt
       || Number(assignment.claimed_problem_revision) !== input.expectedProblemRevision
+      || claimedTagCatalogVersion !== input.expectedTagCatalogVersion
     ) {
       await recordRejectedOperation(executor, assignment, {
         requestId: input.requestId,
@@ -893,6 +928,7 @@ interface AssignmentRow extends Record<string, unknown> {
   expires_at: Date | string;
   claimed_problem_revision: number;
   claimed_submitted_revision_id: string;
+  claimed_tag_catalog_version: number | null;
   closure_reason:
     | "completed"
     | "expired"
@@ -1068,6 +1104,10 @@ function toAssignment(row: AssignmentRow): RobotAssignment {
     expiresAt: toIso(row.expires_at),
     claimedProblemRevision: Number(row.claimed_problem_revision),
     claimedSubmittedRevisionId: row.claimed_submitted_revision_id,
+    claimedTagCatalogVersion: requirePositiveInteger(
+      row.claimed_tag_catalog_version,
+      "机器人领取记录包含无效的知识点目录版本。",
+    ),
   };
 }
 
@@ -1096,6 +1136,7 @@ async function lockAssignment(
            assignment.expires_at,
            assignment.claimed_problem_revision,
            assignment.claimed_submitted_revision_id::text AS claimed_submitted_revision_id,
+           assignment.claimed_tag_catalog_version,
            assignment.closure_reason
     FROM review_assignments assignment
     JOIN review_rounds round ON round.id = assignment.round_id
@@ -1333,6 +1374,14 @@ function parseCompletionResult(value: unknown): RobotCompletionResult | undefine
     accepted: true,
     problemStatus: parsed.problemStatus as RobotCompletionResult["problemStatus"],
   };
+}
+
+function requirePositiveInteger(value: unknown, message: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(message);
+  }
+  return parsed;
 }
 
 function requireDatabaseId(value: string): bigint {

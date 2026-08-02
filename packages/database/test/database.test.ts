@@ -1993,8 +1993,8 @@ describePostgres("problem package outbox on real PostgreSQL", () => {
       FROM drizzle.__drizzle_migrations_id_seq
     `);
     expect(migrationState).toEqual([{
-      migration_count: 12,
-      sequence_value: "12",
+      migration_count: 13,
+      sequence_value: "13",
       sequence_called: true
     }]);
     const indexes = await database.query<{ indexname: string }>(sql`

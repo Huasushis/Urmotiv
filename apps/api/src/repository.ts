@@ -36,6 +36,8 @@ export interface ReviewSuggestionAuditEvent {
 
 export interface ProblemTransaction {
   getProblem(): StoredProblem | undefined;
+  /** 当前事务已在任何题目行之前取得共享锁的知识点目录版本。 */
+  getTagCatalogVersion(): number;
   /**
    * Reloads one actor while locking every existing row that contributes to
    * authentication and authorization. Permission writers must take the same
@@ -450,6 +452,7 @@ export class InMemoryDataStore implements DataStore {
 
       const transaction: ProblemTransaction = {
         getProblem: () => (problem === undefined ? undefined : copy(problem)),
+        getTagCatalogVersion: () => 1,
         lockUserForAuthorization: async (userId) => {
           const lockedUser = this.users.get(userId);
           return lockedUser === undefined ? undefined : copy(lockedUser);

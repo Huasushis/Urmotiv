@@ -25,6 +25,7 @@ import { DatabaseDataStore } from "../src/database-store";
 import { DatabaseReviewItemStore } from "../src/review-item-store";
 import { DatabaseRobotStore, digestRobotToken } from "../src/robot-store";
 import { DatabaseServiceAccountTokenStore } from "../src/service-account-store";
+import { DatabaseTagCatalogService } from "../src/tag-catalog-service";
 
 const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
 const describePostgres = adminUrl === undefined ? describe.skip : describe;
@@ -136,13 +137,45 @@ describePostgres("机器人租约的真实 PostgreSQL 并发边界", () => {
           expires_at = now() - interval '1 hour'
       WHERE reason = '真实 PostgreSQL 迁移门禁测试'
     `);
+    await migrateDatabase(database, { migrationsFolder: migrationFolderThrough(11) });
+    const catalogGateAssignmentId = randomUUID();
+    await database.execute(sql`
+      INSERT INTO review_assignments (
+        id, round_id, reviewer_user_id, assigned_by_user_id, reason,
+        assignment_kind, claimed_problem_revision, claimed_submitted_revision_id, expires_at
+      )
+      SELECT
+        ${catalogGateAssignmentId}::uuid,
+        assignment.round_id,
+        assignment.reviewer_user_id,
+        assignment.assigned_by_user_id,
+        '真实 PostgreSQL 标签目录快照迁移门禁测试',
+        'robot',
+        assignment.claimed_problem_revision,
+        assignment.claimed_submitted_revision_id,
+        now() + interval '1 hour'
+      FROM review_assignments assignment
+      WHERE assignment.reason = '真实 PostgreSQL 迁移门禁测试'
+    `);
+    await expect(migrateDatabase(database)).rejects.toThrow(
+      /robot tag catalog snapshot migration requires all robot leases to finish/
+    );
+    await database.execute(sql`
+      DELETE FROM review_assignments WHERE id = ${catalogGateAssignmentId}::uuid
+    `);
     await migrateDatabase(database);
-    const archived = await database.query<{ closure_reason: string }>(sql`
-      SELECT closure_reason::text AS closure_reason
+    const archived = await database.query<{
+      closure_reason: string;
+      claimed_tag_catalog_version: number | null;
+    }>(sql`
+      SELECT closure_reason::text AS closure_reason, claimed_tag_catalog_version
       FROM review_assignments
       WHERE reason = '真实 PostgreSQL 迁移门禁测试'
     `);
-    expect(archived).toEqual([{ closure_reason: "expired" }]);
+    expect(archived).toEqual([{
+      closure_reason: "expired",
+      claimed_tag_catalog_version: null,
+    }]);
     await database.execute(sql`
       UPDATE problems
       SET status = 'rejected'
@@ -163,7 +196,8 @@ describePostgres("机器人租约的真实 PostgreSQL 并发边界", () => {
       demoUserIds: Object.values(databaseDemoUserIds),
       demoLoginUserIds: databaseDemoUserIds,
       reviewItems: new DatabaseReviewItemStore(database),
-      robots: new DatabaseRobotStore(database)
+      robots: new DatabaseRobotStore(database),
+      tagCatalog: new DatabaseTagCatalogService(database)
     });
 
     const problem = await createPendingProblem(app);
@@ -176,6 +210,11 @@ describePostgres("机器人租约的真实 PostgreSQL 并发边界", () => {
     const task = claimedItems[0];
     if (task === undefined) throw new Error("并发领取没有返回任务。");
     expect(task.problem.id).toBe(problem.id);
+    expect(await database.query<{ claimed_tag_catalog_version: number }>(sql`
+      SELECT claimed_tag_catalog_version
+      FROM review_assignments
+      WHERE id = ${task.assignmentId}::uuid
+    `)).toEqual([{ claimed_tag_catalog_version: task.tagCatalog.version }]);
 
     const renewalPayload = {
       requestId: randomUUID(),
@@ -413,6 +452,10 @@ interface ClaimedTask {
   readonly assignmentId: string;
   readonly leaseExpiresAt: string;
   readonly problem: { readonly id: string; readonly revision: number; readonly reviewRound: number };
+  readonly tagCatalog: {
+    readonly version: number;
+    readonly tags: ReadonlyArray<{ readonly id: string }>;
+  };
 }
 
 function migrationFolderThrough(lastIndex: number): string {
@@ -602,6 +645,7 @@ function completion(task: ClaimedTask, leaseExpiresAt: string, requestId: string
     requestId,
     expectedLeaseExpiresAt: leaseExpiresAt,
     expectedProblemRevision: task.problem.revision,
+    expectedTagCatalogVersion: task.tagCatalog.version,
     experimentVersion: "postgres-concurrency-v1",
     modelProfileName: "public-fixture",
     review: {
@@ -610,6 +654,7 @@ function completion(task: ClaimedTask, leaseExpiresAt: string, requestId: string
       qualityLevel: 4,
       thinkingLevel: 3,
       codingLevel: 2,
+      tagIds: [task.tagCatalog.tags[0]?.id ?? "catalog.tag.02.09"],
       improvements: "公开构造的并发测试意见。",
       expectedRound: task.problem.reviewRound
     }

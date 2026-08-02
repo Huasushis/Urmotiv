@@ -19,6 +19,7 @@ import { DatabaseDataStore } from "../src/database-store";
 import { hasPermission } from "../src/permissions";
 import { DatabaseReviewItemStore } from "../src/review-item-store";
 import { DatabaseRobotStore, digestRobotToken } from "../src/robot-store";
+import { DatabaseTagCatalogService } from "../src/tag-catalog-service";
 
 const localOrigin = "http://localhost:5173";
 const robotToken = "urt_test_robot_token_0123456789abcdef";
@@ -31,7 +32,11 @@ interface ClaimedTask {
     readonly id: string;
     readonly revision: number;
     readonly reviewRound: number;
-    readonly basicStatement?: string;
+    readonly content: { readonly basicStatement: string };
+  };
+  readonly tagCatalog: {
+    readonly version: number;
+    readonly tags: ReadonlyArray<{ readonly id: string; readonly active: true }>;
   };
 }
 
@@ -112,6 +117,7 @@ async function makeRobotApp(
     demoLoginUserIds: databaseDemoUserIds,
     reviewItems: new DatabaseReviewItemStore(database),
     robots: new DatabaseRobotStore(database),
+    tagCatalog: new DatabaseTagCatalogService(database),
     ...(options.trustedProxyCidrs === undefined
       ? {}
       : { trustedProxyCidrs: options.trustedProxyCidrs }),
@@ -206,11 +212,13 @@ async function replaceTokenPermissions(
 function completionPayload(task: {
   readonly leaseExpiresAt: string;
   readonly problem: { readonly revision: number; readonly reviewRound: number };
+  readonly tagCatalog: { readonly version: number; readonly tags: ReadonlyArray<{ readonly id: string }> };
 }): Record<string, unknown> {
   return {
     requestId: randomUUID(),
     expectedLeaseExpiresAt: task.leaseExpiresAt,
     expectedProblemRevision: task.problem.revision,
+    expectedTagCatalogVersion: task.tagCatalog.version,
     experimentVersion: "negative-matrix-v1",
     modelProfileName: "public-fixture",
     review: {
@@ -219,6 +227,7 @@ function completionPayload(task: {
       qualityLevel: 4,
       thinkingLevel: 3,
       codingLevel: 2,
+      tagIds: [task.tagCatalog.tags[0]?.id ?? "catalog.tag.02.09"],
       improvements: "公开构造的安全测试意见。",
       expectedRound: task.problem.reviewRound,
     },
@@ -723,14 +732,23 @@ describe("机器人审题接口", () => {
       items: Array<{
         assignmentId: string;
         leaseExpiresAt: string;
-        problem: { id: string; revision: number; reviewRound: number; basicStatement: string };
+        problem: {
+          id: string;
+          revision: number;
+          reviewRound: number;
+          content: { basicStatement: string };
+        };
+        tagCatalog: { version: number; tags: Array<{ id: string }> };
       }>;
     };
     expect(claimBody.items).toHaveLength(1);
     const task = claimBody.items[0];
     if (task === undefined) throw new Error("未领取到公开构造的测试任务。");
     expect(task.problem.id).toBe(problem.id);
-    expect(task.problem.basicStatement).toContain("输出 n");
+    expect(task.problem.content.basicStatement).toContain("输出 n");
+    expect(task.tagCatalog.tags.some((tag) => tag.id === "catalog.tag.02.09")).toBe(true);
+    expect(task.problem).not.toHaveProperty("judgeConfig");
+    expect(task.problem).not.toHaveProperty("testcases");
 
     const renewed = await app.inject({
       method: "POST",
@@ -766,6 +784,7 @@ describe("机器人审题接口", () => {
         requestId: randomUUID(),
         expectedLeaseExpiresAt: newLease,
         expectedProblemRevision: task.problem.revision + 5,
+        expectedTagCatalogVersion: task.tagCatalog.version,
         experimentVersion: "exp-2026-07",
         modelProfileName: "difficulty-v1",
         review: {
@@ -774,6 +793,7 @@ describe("机器人审题接口", () => {
           qualityLevel: 4,
           thinkingLevel: 3,
           codingLevel: 2,
+          tagIds: ["catalog.tag.02.09"],
           improvements: "机器人分析：题面清晰，可以补充更强的边界样例。",
           expectedRound: task.problem.reviewRound
         }
@@ -789,6 +809,7 @@ describe("机器人审题接口", () => {
         requestId: randomUUID(),
         expectedLeaseExpiresAt: newLease,
         expectedProblemRevision: task.problem.revision,
+        expectedTagCatalogVersion: task.tagCatalog.version,
         experimentVersion: "exp-2026-07",
         modelProfileName: "difficulty-v1",
         review: {
@@ -797,6 +818,7 @@ describe("机器人审题接口", () => {
           qualityLevel: 4,
           thinkingLevel: 3,
           codingLevel: 2,
+          tagIds: ["catalog.tag.02.09"],
           improvements: "机器人分析：题面清晰，可以补充更强的边界样例。",
           expectedRound: task.problem.reviewRound
         }
@@ -828,6 +850,40 @@ describe("机器人审题接口", () => {
       payload: {}
     });
     expect((reclaimed.json() as { items: unknown[] }).items).toHaveLength(0);
+  });
+
+  it("知识点目录在租约期间变化会关闭旧快照，机器人必须按新目录重新领取", async () => {
+    const { app } = await makeRobotApp();
+    await createPendingProblem(app);
+    const staleTask = await claimOne(app);
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const changed = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/tag-catalog/items",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        expectedVersion: staleTask.tagCatalog.version,
+        id: "test.category.robot-snapshot",
+        itemKind: "category",
+        parentId: null,
+        name: "机器人快照测试分类",
+        description: "仅用于公开构造的接口测试",
+        sortOrder: 999,
+      },
+    });
+    expect(changed.statusCode).toBe(200);
+
+    const staleCompletion = await app.inject({
+      method: "POST",
+      url: `/api/v1/robot/review-tasks/${staleTask.assignmentId}/complete`,
+      headers: robotHeaders(),
+      payload: completionPayload(staleTask),
+    });
+    expect(staleCompletion.statusCode).toBe(409);
+
+    const freshTask = await claimOne(app);
+    expect(freshTask.assignmentId).not.toBe(staleTask.assignmentId);
+    expect(freshTask.tagCatalog.version).toBe(staleTask.tagCatalog.version + 1);
   });
 
   it("续租和完成在响应丢失后按请求标识重放固定结果，且拒绝不同载荷", async () => {

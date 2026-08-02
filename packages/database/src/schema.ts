@@ -1058,6 +1058,7 @@ export const reviewAssignments = pgTable(
     assignmentKind: reviewAssignmentKind("assignment_kind").notNull(),
     claimedProblemRevision: integer("claimed_problem_revision"),
     claimedSubmittedRevisionId: uuid("claimed_submitted_revision_id"),
+    claimedTagCatalogVersion: integer("claimed_tag_catalog_version"),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     revokedByUserId: bigint("revoked_by_user_id", { mode: "bigint" }).references(
@@ -1111,11 +1112,19 @@ export const reviewAssignments = pgTable(
         ${table.assignmentKind} = 'human'
         AND ${table.claimedProblemRevision} IS NULL
         AND ${table.claimedSubmittedRevisionId} IS NULL
+        AND ${table.claimedTagCatalogVersion} IS NULL
       ) OR (
         ${table.assignmentKind} = 'robot'
         AND ${table.claimedProblemRevision} IS NOT NULL
         AND ${table.claimedProblemRevision} > 0
         AND ${table.claimedSubmittedRevisionId} IS NOT NULL
+        AND (
+          ${table.claimedTagCatalogVersion} > 0
+          OR (
+            ${table.claimedTagCatalogVersion} IS NULL
+            AND ${table.closureReason} IS NOT NULL
+          )
+        )
         AND ${table.expiresAt} IS NOT NULL
       )`
     ),

@@ -1224,6 +1224,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   const robots = dependencies.robots;
   if (robots !== undefined) {
+    const robotTagCatalog = dependencies.tagCatalog;
+    if (robotTagCatalog === undefined) {
+      throw new Error("启用机器人审题时必须配置知识点目录服务。");
+    }
     const requireRobot = async (request: FastifyRequest): Promise<RobotTokenIdentity> => {
       const header = request.headers.authorization;
       const token = typeof header === "string" && header.startsWith("Bearer ")
@@ -1255,6 +1259,33 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
         throw forbidden();
       }
       const input = claimRobotReviewTasksInputSchema.parse(request.body ?? {});
+      const publicCatalog = await robotTagCatalog.listPublicCatalog();
+      const activeCategories = new Map(
+        publicCatalog.items
+          .filter((item) => item.itemKind === "category" && item.active)
+          .map((item) => [item.id, item] as const),
+      );
+      const tagCatalog = {
+        version: publicCatalog.version,
+        tags: publicCatalog.items.flatMap((item) => {
+          if (item.itemKind !== "tag" || !item.active) return [];
+          const category = activeCategories.get(item.parentId);
+          if (category === undefined) return [];
+          return [{
+            id: item.id,
+            name: item.name,
+            categoryId: category.id,
+            categoryName: category.name,
+            description: item.description,
+            aliases: item.aliases,
+            active: true as const,
+          }];
+        }),
+      };
+      const activeTagIds = new Set(tagCatalog.tags.map((tag) => tag.id));
+      if (tagCatalog.tags.length === 0) {
+        return claimRobotReviewTasksResponseSchema.parse({ items: [] });
+      }
       const visibility = createProblemVisibility(robotUser, permissionEvaluatedAt);
       const candidates = await robots.listOpenRoundCandidates(
         robotUser.id,
@@ -1276,8 +1307,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
             if (
               problem === undefined
               || executor === undefined
+              || transaction.getTagCatalogVersion() !== tagCatalog.version
               || problem.status !== "pending_review"
               || problem.reviewRound !== candidate.round
+              || problem.tagIds.some((tagId) => !activeTagIds.has(tagId))
               || (
                 input.supportedProblemTypes !== undefined
                 && !input.supportedProblemTypes.includes(problem.type)
@@ -1292,6 +1325,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
               candidate.roundId,
               input.leaseSeconds,
               request.id,
+              tagCatalog.version,
             );
             if (claimed === undefined) return undefined;
             const items = await dependencies.reviewItemStore.list(
@@ -1311,9 +1345,16 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
                 title: problem.title,
                 type: problem.type,
                 tagIds: problem.tagIds,
-                basicStatement: problem.content.basicStatement,
-                basicSolution: problem.content.basicSolution,
+                content: problem.content,
+                samples: problem.samples.map((sample, index) => ({
+                  safeId: `sample-${String(index + 1).padStart(3, "0")}`,
+                  input: sample.input,
+                  output: sample.output,
+                  explanation: sample.explanation,
+                })),
+                limits: problem.judgeConfig?.limits ?? null,
               },
+              tagCatalog,
               reviewItems: items.map((item) => ({
                 id: item.id,
                 type: item.type,
@@ -1373,6 +1414,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       const payloadDigest = digestRobotOperationPayload({
         expectedLeaseExpiresAt: input.expectedLeaseExpiresAt,
         expectedProblemRevision: input.expectedProblemRevision,
+        expectedTagCatalogVersion: input.expectedTagCatalogVersion,
         experimentVersion: input.experimentVersion,
         modelProfileName: input.modelProfileName,
         review: input.review,
@@ -1396,6 +1438,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
             assignmentId,
             input,
             payloadDigest,
+            transaction.getTagCatalogVersion(),
           );
           if (prepared.kind !== "ready") return prepared;
           const submitted = await dependencies.service.submitReviewInTransaction(

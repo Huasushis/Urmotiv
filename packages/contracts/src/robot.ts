@@ -1,8 +1,40 @@
 import { z } from "zod";
-import { problemTypeSchema } from "./problem";
+import { problemContentSchema, problemTypeSchema } from "./problem";
 import { reviewInputSchema } from "./review";
 
 const contentHashSchema = z.string().regex(/^[a-f0-9]{64}$/);
+const robotSampleSchema = z
+  .object({
+    safeId: z.string().regex(/^sample-[0-9]{3}$/),
+    input: z.string().max(100_000),
+    output: z.string().max(100_000),
+    explanation: z.string().max(500_000)
+  })
+  .strict();
+const robotTagCatalogSchema = z
+  .object({
+    version: z.number().int().positive(),
+    tags: z
+      .array(
+        z
+          .object({
+            id: z.string().min(1).max(120),
+            name: z.string().min(1).max(80),
+            categoryId: z.string().min(1).max(120),
+            categoryName: z.string().min(1).max(80),
+            description: z.string().max(2_000),
+            aliases: z.array(z.string().min(1).max(160)).max(100),
+            active: z.literal(true)
+          })
+          .strict()
+      )
+      .min(1)
+      .max(10_000)
+  })
+  .strict();
+const robotReviewInputSchema = reviewInputSchema.extend({
+  tagIds: z.array(z.string().min(1).max(120)).min(1).max(30)
+});
 
 export const robotReviewTaskSchema = z
   .object({
@@ -17,10 +49,18 @@ export const robotReviewTaskSchema = z
         title: z.string().trim().min(1).max(200),
         type: problemTypeSchema,
         tagIds: z.array(z.string().min(1).max(120)).min(1).max(30),
-        basicStatement: z.string().min(1).max(500_000),
-        basicSolution: z.string().min(1).max(500_000)
+        content: problemContentSchema.strict(),
+        samples: z.array(robotSampleSchema).max(50),
+        limits: z
+          .object({
+            timeMs: z.number().int().positive().max(600_000),
+            memoryMiB: z.number().int().positive().max(262_144)
+          })
+          .strict()
+          .nullable()
       })
       .strict(),
+    tagCatalog: robotTagCatalogSchema,
     reviewItems: z
       .array(
         z
@@ -72,9 +112,10 @@ export const completeRobotReviewTaskInputSchema = z
     requestId: z.string().uuid(),
     expectedLeaseExpiresAt: z.string().datetime(),
     expectedProblemRevision: z.number().int().positive(),
+    expectedTagCatalogVersion: z.number().int().positive(),
     experimentVersion: z.string().trim().min(1).max(120),
     modelProfileName: z.string().trim().min(1).max(120),
-    review: reviewInputSchema
+    review: robotReviewInputSchema
   })
   .strict();
 

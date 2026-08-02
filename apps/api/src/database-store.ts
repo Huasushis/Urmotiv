@@ -743,7 +743,7 @@ async function insertProblemRevision(
  * Catalogue mutations take the same row exclusively before touching tags or
  * problems, so neither side can form a problem -> tag / tag -> problem cycle.
  */
-async function lockTagCatalogReferenceWindow(executor: DatabaseExecutor): Promise<void> {
+async function lockTagCatalogReferenceWindow(executor: DatabaseExecutor): Promise<number> {
   const rows = await executor.query<{ version: number }>(sql`
     SELECT version
     FROM tag_catalog_state
@@ -754,6 +754,7 @@ async function lockTagCatalogReferenceWindow(executor: DatabaseExecutor): Promis
   if (!Number.isSafeInteger(version) || version < 1) {
     throw new Error("知识点目录版本缺失。");
   }
+  return version;
 }
 
 export interface TagCatalogProblemRevisionInput {
@@ -1847,6 +1848,7 @@ export class DatabaseDataStore implements DataStore {
     if (id === undefined) {
       return operation({
         getProblem: () => undefined,
+        getTagCatalogVersion: () => 1,
         lockUserForAuthorization: async () => undefined,
         listUsers: () => [],
         listReviews: () => [],
@@ -1860,7 +1862,7 @@ export class DatabaseDataStore implements DataStore {
     }
 
     return this.handle.transaction(async (executor) => {
-      await lockTagCatalogReferenceWindow(executor);
+      const tagCatalogVersion = await lockTagCatalogReferenceWindow(executor);
       await executor.query<{ id: string }>(sql`
         SELECT id::text AS id
         FROM problems
@@ -1895,6 +1897,7 @@ export class DatabaseDataStore implements DataStore {
       const transaction: ProblemTransaction = {
         executor,
         getProblem: () => (problem === undefined ? undefined : copy(problem)),
+        getTagCatalogVersion: () => tagCatalogVersion,
         lockUserForAuthorization: async (userId) => {
           const userDatabaseId = parseDatabaseId(userId);
           if (userDatabaseId === undefined) {
