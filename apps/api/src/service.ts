@@ -334,7 +334,9 @@ export class ProblemService {
       canManageReviewPolicy:
         isHuman && hasPermission(user, "problem.status.change", {}, now),
       canManagePlugins:
-        isHuman && hasPermission(user, "plugin.manage", {}, now)
+        isHuman && hasPermission(user, "plugin.manage", {}, now),
+      canManageTags:
+        isHuman && hasPermission(user, "tag.manage", {}, now)
     };
   }
 

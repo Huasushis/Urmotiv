@@ -24,7 +24,8 @@ const session: NonNullable<SessionResponse["user"]> = {
   roles: ["审题人"],
   isRoot: false,
   canManageReviewPolicy: false,
-  canManagePlugins: false
+  canManagePlugins: false,
+  canManageTags: false
 };
 
 let root: Root | undefined;
@@ -110,5 +111,33 @@ describe("退出登录", () => {
       ).toBeUndefined();
       expect(client.getQueryData(["session"])).toBeUndefined();
     });
+  });
+});
+
+describe("管理导航", () => {
+  it("有知识点管理权限的真人可以从主导航进入管理页", () => {
+    const client = new QueryClient();
+    const view = mount(
+      client,
+      <AppShell session={{ ...session, canManageTags: true }} demoEnabled={false}>
+        <p>题目工作区</p>
+      </AppShell>
+    );
+
+    const management = [...view.querySelectorAll<HTMLAnchorElement>("nav a")]
+      .find((link) => link.textContent === "管理");
+    expect(management?.getAttribute("href")).toBe("/admin");
+  });
+
+  it("没有任何管理权限时不显示管理入口", () => {
+    const client = new QueryClient();
+    const view = mount(
+      client,
+      <AppShell session={session} demoEnabled={false}>
+        <p>题目工作区</p>
+      </AppShell>
+    );
+
+    expect([...view.querySelectorAll("nav a")].some((link) => link.textContent === "管理")).toBe(false);
   });
 });

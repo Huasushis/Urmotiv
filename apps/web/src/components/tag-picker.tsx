@@ -24,6 +24,13 @@ function normalizeSearchText(value: string): string {
   return normalizeTagName(value);
 }
 
+function tagMatchesSearch(tag: ProblemTag, normalizedSearch: string): boolean {
+  const searchable = [tag.name, tag.description ?? "", ...(tag.aliases ?? [])]
+    .map(normalizeSearchText)
+    .join(" ");
+  return searchable.includes(normalizedSearch);
+}
+
 export function TagPicker({ tags, value, onChange, disabled = false }: TagPickerProps) {
   const helpId = useId();
   const [search, setSearch] = useState("");
@@ -79,9 +86,7 @@ export function TagPicker({ tags, value, onChange, disabled = false }: TagPicker
         if (normalizeSearchText(group.name).includes(normalizedSearch)) {
           return [group];
         }
-        const matchingTags = group.tags.filter((tag) =>
-          normalizeSearchText(tag.name).includes(normalizedSearch),
-        );
+        const matchingTags = group.tags.filter((tag) => tagMatchesSearch(tag, normalizedSearch));
         return matchingTags.length === 0 ? [] : [{ ...group, tags: matchingTags }];
       }),
     [groups, normalizedSearch],

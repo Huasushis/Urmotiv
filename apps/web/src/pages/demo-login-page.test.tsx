@@ -25,7 +25,8 @@ const previousSession: SessionResponse = {
     roles: ["审题人"],
     isRoot: false,
     canManageReviewPolicy: false,
-    canManagePlugins: false
+    canManagePlugins: false,
+    canManageTags: false
   },
   auth: {
     emailEnabled: false,

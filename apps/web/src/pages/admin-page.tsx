@@ -8,7 +8,8 @@ import {
   RefreshCw,
   Save,
   Settings,
-  ShieldAlert
+  ShieldAlert,
+  Tags
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
@@ -20,6 +21,7 @@ import type {
   UpdatePluginRequest
 } from "@urmotiv/contracts";
 import { applySettingsFormDefaults, SettingsForm } from "../components/settings-form";
+import { TagCatalogAdmin } from "../components/tag-catalog-admin";
 import {
   ApiError,
   getReviewPolicy,
@@ -28,7 +30,7 @@ import {
   updateReviewPolicy
 } from "../lib/api";
 
-type AdminMode = "review" | "plugins";
+type AdminMode = "review" | "plugins" | "tags";
 
 const pluginStateText: Record<AdminPlugin["state"], string> = {
   enabled: "已启用",
@@ -67,9 +69,15 @@ function errorMessage(error: unknown): string {
 export function AdminPage({ session }: { session: SessionUser }) {
   const canReview = session.canManageReviewPolicy;
   const canManagePlugins = session.canManagePlugins;
-  const [mode, setMode] = useState<AdminMode>(canReview ? "review" : "plugins");
+  const canManageTags = session.canManageTags;
+  const allowedModes: AdminMode[] = [
+    ...(canReview ? ["review" as const] : []),
+    ...(canManagePlugins ? ["plugins" as const] : []),
+    ...(canManageTags ? ["tags" as const] : [])
+  ];
+  const [mode, setMode] = useState<AdminMode>(allowedModes[0] ?? "review");
 
-  if (!canReview && !canManagePlugins) {
+  if (!canReview && !canManagePlugins && !canManageTags) {
     return (
       <section className="admin-page admin-no-access">
         <div className="page-heading">
@@ -82,7 +90,7 @@ export function AdminPage({ session }: { session: SessionUser }) {
         </div>
         <div className="plain-panel" role="status">
           <h2>无法打开管理设置</h2>
-          <p>如需调整审核规则或插件，请联系负责账号权限的管理员。</p>
+          <p>如需调整审核规则、插件或知识点目录，请联系负责账号权限的管理员。</p>
         </div>
       </section>
     );
@@ -94,31 +102,46 @@ export function AdminPage({ session }: { session: SessionUser }) {
         <div>
           <p className="eyebrow">管理</p>
           <h1>站点管理</h1>
-          <p>审核规则决定意见如何汇总；插件设置用于连接外部服务。每次保存都会由服务端再次核对权限和内容。</p>
+          <p>审核规则决定意见如何汇总；插件设置用于连接外部服务；知识点目录管理分类与标签。每次保存都会由服务端再次核对权限和内容。</p>
         </div>
         <Settings className="page-heading-icon" size={32} aria-hidden="true" />
       </div>
 
-      {canReview && canManagePlugins ? (
+      {allowedModes.length > 1 ? (
         <div className="segmented-control admin-mode" role="group" aria-label="管理内容">
-          <button
-            type="button"
-            className={mode === "review" ? "selected" : ""}
-            aria-pressed={mode === "review"}
-            onClick={() => setMode("review")}
-          >
-            <BookOpenCheck size={16} aria-hidden="true" />
-            审核规则
-          </button>
-          <button
-            type="button"
-            className={mode === "plugins" ? "selected" : ""}
-            aria-pressed={mode === "plugins"}
-            onClick={() => setMode("plugins")}
-          >
-            <Plug size={16} aria-hidden="true" />
-            插件
-          </button>
+          {canReview ? (
+            <button
+              type="button"
+              className={mode === "review" ? "selected" : ""}
+              aria-pressed={mode === "review"}
+              onClick={() => setMode("review")}
+            >
+              <BookOpenCheck size={16} aria-hidden="true" />
+              审核规则
+            </button>
+          ) : null}
+          {canManagePlugins ? (
+            <button
+              type="button"
+              className={mode === "plugins" ? "selected" : ""}
+              aria-pressed={mode === "plugins"}
+              onClick={() => setMode("plugins")}
+            >
+              <Plug size={16} aria-hidden="true" />
+              插件
+            </button>
+          ) : null}
+          {canManageTags ? (
+            <button
+              type="button"
+              className={mode === "tags" ? "selected" : ""}
+              aria-pressed={mode === "tags"}
+              onClick={() => setMode("tags")}
+            >
+              <Tags size={16} aria-hidden="true" />
+              知识点目录
+            </button>
+          ) : null}
         </div>
       ) : null}
 
@@ -126,6 +149,7 @@ export function AdminPage({ session }: { session: SessionUser }) {
       {mode === "plugins" && canManagePlugins ? (
         <PluginSection onOpenReviewPolicy={canReview ? () => setMode("review") : undefined} />
       ) : null}
+      {mode === "tags" && canManageTags ? <TagCatalogAdmin /> : null}
     </section>
   );
 }

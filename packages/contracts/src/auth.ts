@@ -6,7 +6,8 @@ export const sessionUserSchema = userSummarySchema.extend({
   roles: z.array(z.string()),
   isRoot: z.boolean(),
   canManageReviewPolicy: z.boolean(),
-  canManagePlugins: z.boolean()
+  canManagePlugins: z.boolean(),
+  canManageTags: z.boolean()
 });
 
 export type SessionUser = z.infer<typeof sessionUserSchema>;

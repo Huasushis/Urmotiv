@@ -8,6 +8,7 @@ import {
   exportPreviewResponseSchema,
   importJobViewSchema,
   importPreviewResponseSchema,
+  managedTagCatalogResponseSchema,
   packageUploadResponseSchema,
   problemFileListResponseSchema,
   problemFileSummarySchema,
@@ -20,6 +21,9 @@ import {
   reviewRoundSummarySchema,
   sessionResponseSchema,
   similarityCheckResponseSchema,
+  tagAliasMutationResponseSchema,
+  tagCatalogMutationResponseSchema,
+  tagDeactivationPreviewSchema,
   okResponseSchema,
   tagSchema,
   type AdminPlugin,
@@ -36,6 +40,7 @@ import {
   type ImportJobView,
   type ImportPreviewRequest,
   type ImportPreviewResponse,
+  type ManagedTagCatalogResponse,
   type PackageUploadResponse,
   type Problem,
   type ProblemFileCategory,
@@ -51,6 +56,16 @@ import {
   type ReviewSuggestionView,
   type SessionResponse,
   type SimilarityCheckResponse,
+  type ConfirmTagDeactivationInput,
+  type CreateTagAliasInput,
+  type CreateTagCatalogItemInput,
+  type DeleteTagAliasInput,
+  type TagAliasMutationResponse,
+  type TagCatalogMutationResponse,
+  type TagDeactivationPreview,
+  type TagDeactivationPreviewInput,
+  type UpdateTagAliasInput,
+  type UpdateTagCatalogItemInput,
   type UpdateContestInput,
   type UpdatePluginRequest,
   type UpdateReviewPolicyInput,
@@ -209,6 +224,84 @@ export function logout(): Promise<{ ok: true }> {
 
 export function listAdminPlugins(): Promise<AdminPluginListResponse> {
   return request("/admin/plugins", { method: "GET" }, adminPluginListResponseSchema);
+}
+
+export function listManagedTagCatalog(): Promise<ManagedTagCatalogResponse> {
+  return request("/admin/tag-catalog", { method: "GET" }, managedTagCatalogResponseSchema);
+}
+
+export function createTagCatalogItem(
+  input: CreateTagCatalogItemInput
+): Promise<TagCatalogMutationResponse> {
+  return request("/admin/tag-catalog/items", json(input), tagCatalogMutationResponseSchema);
+}
+
+export function updateTagCatalogItem(
+  tagId: string,
+  input: UpdateTagCatalogItemInput
+): Promise<TagCatalogMutationResponse> {
+  return request(
+    `/admin/tag-catalog/items/${encodeURIComponent(tagId)}`,
+    { ...json(input), method: "PATCH" },
+    tagCatalogMutationResponseSchema
+  );
+}
+
+export function createTagAlias(
+  tagId: string,
+  input: CreateTagAliasInput
+): Promise<TagAliasMutationResponse> {
+  return request(
+    `/admin/tag-catalog/items/${encodeURIComponent(tagId)}/aliases`,
+    json(input),
+    tagAliasMutationResponseSchema
+  );
+}
+
+export function updateTagAlias(
+  tagId: string,
+  aliasId: string,
+  input: UpdateTagAliasInput
+): Promise<TagCatalogMutationResponse> {
+  return request(
+    `/admin/tag-catalog/items/${encodeURIComponent(tagId)}/aliases/${encodeURIComponent(aliasId)}`,
+    { ...json(input), method: "PATCH" },
+    tagCatalogMutationResponseSchema
+  );
+}
+
+export function deleteTagAlias(
+  tagId: string,
+  aliasId: string,
+  input: DeleteTagAliasInput
+): Promise<TagCatalogMutationResponse> {
+  return request(
+    `/admin/tag-catalog/items/${encodeURIComponent(tagId)}/aliases/${encodeURIComponent(aliasId)}`,
+    { ...json(input), method: "DELETE" },
+    tagCatalogMutationResponseSchema
+  );
+}
+
+export function previewTagDeactivation(
+  tagId: string,
+  input: TagDeactivationPreviewInput
+): Promise<TagDeactivationPreview> {
+  return request(
+    `/admin/tag-catalog/items/${encodeURIComponent(tagId)}/deactivation-preview`,
+    json(input),
+    tagDeactivationPreviewSchema
+  );
+}
+
+export function confirmTagDeactivation(
+  tagId: string,
+  input: ConfirmTagDeactivationInput
+): Promise<TagCatalogMutationResponse> {
+  return request(
+    `/admin/tag-catalog/items/${encodeURIComponent(tagId)}/deactivate`,
+    json(input),
+    tagCatalogMutationResponseSchema
+  );
 }
 
 export async function updateAdminPlugin(

@@ -298,6 +298,7 @@ export async function getDemoSession(): Promise<SessionResponse> {
   const user = demoUsers[saved as DemoUserId];
   const canManageReviewPolicy = saved === "leader";
   const canManagePlugins = saved === "administrator";
+  const canManageTags = saved === "leader" || saved === "administrator";
   return {
     user: {
       id: user.id,
@@ -307,10 +308,12 @@ export async function getDemoSession(): Promise<SessionResponse> {
       isRoot: false,
       permissions: [
         ...(canManageReviewPolicy ? ["problem.status.change"] : []),
-        ...(canManagePlugins ? ["plugin.manage"] : [])
+        ...(canManagePlugins ? ["plugin.manage"] : []),
+        ...(canManageTags ? ["tag.manage"] : [])
       ],
       canManageReviewPolicy,
-      canManagePlugins
+      canManagePlugins,
+      canManageTags
     },
     auth: { emailEnabled: false, emailRegistrationEnabled: false, casEnabled: false, demoEnabled: true }
   };

@@ -86,15 +86,23 @@ describe("会话中的管理能力", () => {
       grant("problem.status.change")
     ]);
     const pluginManager = createUser("plugin-manager", "human", [grant("plugin.manage")]);
-    const app = await makeApp([reviewManager, pluginManager]);
+    const tagManager = createUser("tag-manager", "human", [grant("tag.manage")]);
+    const app = await makeApp([reviewManager, pluginManager, tagManager]);
 
     await expect(readSession(app, reviewManager.id)).resolves.toMatchObject({
       canManageReviewPolicy: true,
-      canManagePlugins: false
+      canManagePlugins: false,
+      canManageTags: false
     });
     await expect(readSession(app, pluginManager.id)).resolves.toMatchObject({
       canManageReviewPolicy: false,
-      canManagePlugins: true
+      canManagePlugins: true,
+      canManageTags: false
+    });
+    await expect(readSession(app, tagManager.id)).resolves.toMatchObject({
+      canManageReviewPolicy: false,
+      canManagePlugins: false,
+      canManageTags: true
     });
   });
 
@@ -102,13 +110,15 @@ describe("会话中的管理能力", () => {
     const scopedUser = createUser("scoped", "human", [
       grant("problem.status.change", { scope: "object", objectId: "problem-1" }),
       grant("plugin.manage", { scope: "own" }),
+      grant("tag.manage", { scope: "object", objectId: "tag-1" }),
       grant("system.manage")
     ]);
     const app = await makeApp([scopedUser]);
 
     await expect(readSession(app, scopedUser.id)).resolves.toMatchObject({
       canManageReviewPolicy: false,
-      canManagePlugins: false
+      canManagePlugins: false,
+      canManageTags: false
     });
   });
 
@@ -117,13 +127,16 @@ describe("会话中的管理能力", () => {
       grant("problem.status.change"),
       grant("problem.status.change", { effect: "deny" }),
       grant("plugin.manage"),
-      grant("plugin.manage", { effect: "deny" })
+      grant("plugin.manage", { effect: "deny" }),
+      grant("tag.manage"),
+      grant("tag.manage", { effect: "deny" })
     ]);
     const app = await makeApp([deniedUser]);
 
     await expect(readSession(app, deniedUser.id)).resolves.toMatchObject({
       canManageReviewPolicy: false,
-      canManagePlugins: false
+      canManagePlugins: false,
+      canManageTags: false
     });
   });
 
@@ -134,6 +147,7 @@ describe("会话中的管理能力", () => {
       [
         grant("problem.status.change"),
         grant("plugin.manage"),
+        grant("tag.manage"),
         grant("system.manage")
       ],
       ["组长", "系统管理员"]
@@ -142,7 +156,8 @@ describe("会话中的管理能力", () => {
 
     await expect(readSession(app, robot.id)).resolves.toMatchObject({
       canManageReviewPolicy: false,
-      canManagePlugins: false
+      canManagePlugins: false,
+      canManageTags: false
     });
   });
 });

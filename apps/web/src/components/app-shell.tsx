@@ -27,7 +27,7 @@ const baseNavItems = [
 ];
 
 export function AppShell({ session, demoEnabled, children }: AppShellProps) {
-  const navItems = session.canManageReviewPolicy || session.canManagePlugins
+  const navItems = session.canManageReviewPolicy || session.canManagePlugins || session.canManageTags
     ? [...baseNavItems, { to: "/admin", label: "管理", icon: Settings }]
     : baseNavItems;
   const client = useQueryClient();

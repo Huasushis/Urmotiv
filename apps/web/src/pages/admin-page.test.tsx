@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const api = vi.hoisted(() => ({
   getReviewPolicy: vi.fn(),
   listAdminPlugins: vi.fn(),
+  listManagedTagCatalog: vi.fn(),
   updateAdminPlugin: vi.fn(),
   updateReviewPolicy: vi.fn()
 }));
@@ -94,6 +95,7 @@ function session(overrides: Partial<SessionUser> = {}): SessionUser {
     permissions: [],
     canManageReviewPolicy: false,
     canManagePlugins: false,
+    canManageTags: false,
     ...overrides
   };
 }
@@ -179,6 +181,7 @@ describe("管理页面", () => {
     expect(view.textContent).toContain("当前账号没有可用的管理设置");
     expect(api.getReviewPolicy).not.toHaveBeenCalled();
     expect(api.listAdminPlugins).not.toHaveBeenCalled();
+    expect(api.listManagedTagCatalog).not.toHaveBeenCalled();
   });
 
   it("只有审核规则权限时只读取审核规则", async () => {
@@ -218,6 +221,17 @@ describe("管理页面", () => {
     expect(view.textContent).not.toContain("完整密钥内容");
     expect(view.textContent).not.toContain(plugin.apiVersion);
     expect(view.textContent).not.toContain(plugin.source);
+  });
+
+  it("只有知识点管理权限时直接打开目录且不读取其他管理设置", async () => {
+    api.listManagedTagCatalog.mockResolvedValue({ version: 1, items: [], aliases: [] });
+    const view = mount(<AdminPage session={session({ canManageTags: true })} />);
+
+    await waitFor(() => expect(view.textContent).toContain("还没有目录项"));
+    expect(api.listManagedTagCatalog).toHaveBeenCalledTimes(1);
+    expect(api.getReviewPolicy).not.toHaveBeenCalled();
+    expect(api.listAdminPlugins).not.toHaveBeenCalled();
+    expect(view.textContent).toContain("新增分类");
   });
 
   it("同一审核规则升级后允许管理员重新确认当前版本", async () => {

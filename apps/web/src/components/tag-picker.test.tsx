@@ -96,6 +96,27 @@ describe("知识点选择器", () => {
     expect(view.textContent).toContain("没有匹配的知识点或分类");
   });
 
+  it("搜索管理员别名和帮助说明时仍显示正式名称与所属分类", () => {
+    const searchable: ProblemTag = {
+      id: "shortest-path",
+      name: "最短路",
+      group: "图论",
+      description: "求带权图中两点之间的最小距离",
+      aliases: ["Shortest Path", "最短路径"],
+    };
+    const view = mount(<TagPicker tags={[...tags, searchable]} value={[]} onChange={() => undefined} />);
+
+    setSearch(view, " shortest path ");
+    expect(view.textContent).toContain("图论");
+    expect(view.textContent).toContain("最短路");
+    expect(view.textContent).not.toContain("Shortest Path");
+
+    setSearch(view, "带权图");
+    expect(view.textContent).toContain("图论");
+    expect(view.textContent).toContain("最短路");
+    expect(view.textContent).not.toContain("最小距离");
+  });
+
   it("同步用户折叠状态，并在搜索及搜索变化期间可靠保持匹配分类展开", async () => {
     const view = mount(<TagPicker tags={tags} value={["kmp"]} onChange={() => undefined} />);
     const initialGroup = [...view.querySelectorAll("details")].find((group) =>

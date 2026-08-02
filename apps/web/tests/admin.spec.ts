@@ -97,6 +97,55 @@ const plugin = {
   requiresRestart: false
 };
 
+const tagCatalog = {
+  version: 12,
+  items: [
+    {
+      id: "category.graph",
+      itemKind: "category",
+      parentId: null,
+      name: "图论",
+      description: "图上的算法",
+      sortOrder: 1,
+      active: true
+    },
+    {
+      id: "tag.shortest-path",
+      itemKind: "tag",
+      parentId: "category.graph",
+      name: "最短路",
+      group: "图论",
+      description: "求带权图中的最小距离",
+      normalizedName: "最短路",
+      sortOrder: 1,
+      active: true,
+      category: { id: "category.graph", name: "图论" },
+      aliases: ["Shortest Path"]
+    },
+    {
+      id: "tag.graph-traversal",
+      itemKind: "tag",
+      parentId: "category.graph",
+      name: "图遍历",
+      group: "图论",
+      description: "遍历图上的节点和边",
+      normalizedName: "图遍历",
+      sortOrder: 2,
+      active: true,
+      category: { id: "category.graph", name: "图论" },
+      aliases: []
+    }
+  ],
+  aliases: [
+    {
+      id: "33333333-3333-4333-8333-333333333333",
+      tagId: "tag.shortest-path",
+      name: "最短路径",
+      normalizedName: "最短路径"
+    }
+  ]
+};
+
 async function fulfillJson(route: Route, body: unknown, status = 200): Promise<void> {
   await route.fulfill({
     status,
@@ -248,4 +297,70 @@ test("手机视口中的审核规则没有横向溢出", async ({ page }, testIn
   );
   expect(overflow).toBeLessThanOrEqual(1);
   await page.screenshot({ path: testInfo.outputPath("admin-review-mobile.png"), fullPage: true });
+});
+
+test("知识点管理员可以展开分类并查看安全的停用影响汇总", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "完整停用预览流程只需运行一次");
+  await page.route("**/api/v1/admin/plugins", async (route) => {
+    await fulfillJson(route, { items: [plugin] });
+  });
+  await page.route("**/api/v1/admin/tag-catalog", async (route) => {
+    await fulfillJson(route, tagCatalog);
+  });
+  await page.route("**/api/v1/admin/tag-catalog/items/tag.shortest-path/deactivation-preview", async (route) => {
+    await fulfillJson(route, {
+      confirmationId: "44444444-4444-4444-8444-444444444444",
+      catalogVersion: 12,
+      expiresAt: "2026-08-02T12:00:00.000Z",
+      impact: {
+        currentProblemCount: 3,
+        soleCurrentTagCount: 1,
+        historicalRevisionCount: 7,
+        reviewOpinionCount: 2,
+        childTagCount: 0
+      }
+    });
+  });
+
+  await loginAs(page, /系统管理员/);
+  await page.goto("/admin");
+  await page.getByRole("button", { name: "知识点目录" }).click();
+  await expect(page.getByText("目录版本 12")).toBeVisible();
+  await page.getByRole("button", { name: /图论/ }).first().click();
+  await page.getByRole("button", { name: "最短路" }).click();
+  await expect(page.getByRole("textbox", { name: "别名“最短路径”" })).toHaveValue("最短路径");
+  await page.getByRole("button", { name: "预览停用影响" }).click();
+
+  const impact = page.getByLabel("停用影响汇总");
+  await expect(impact.getByText("当前题目", { exact: true })).toBeVisible();
+  await expect(impact.getByText("历史修订", { exact: true })).toBeVisible();
+  await expect(impact.getByText("审题意见", { exact: true })).toBeVisible();
+  await expect(impact.getByText("直属子标签", { exact: true })).toBeVisible();
+  await expect(impact.getByText(/历史修订和审题意见会保留原引用/)).toBeVisible();
+  await expect(page.getByRole("button", { name: /确认停用“最短路”/ })).toBeDisabled();
+  await expect(page.getByText(/私密题目甲|private-author-id/)).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("admin-tags-desktop.png"), fullPage: true });
+});
+
+test("手机视口中的知识点目录可展开且没有横向溢出", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chromium", "只检查手机布局");
+  await page.route("**/api/v1/admin/plugins", async (route) => {
+    await fulfillJson(route, { items: [plugin] });
+  });
+  await page.route("**/api/v1/admin/tag-catalog", async (route) => {
+    await fulfillJson(route, tagCatalog);
+  });
+
+  await loginAs(page, /系统管理员/);
+  await page.goto("/admin");
+  await page.getByRole("button", { name: "知识点目录" }).click();
+  await page.getByRole("button", { name: /图论/ }).first().click();
+  await page.getByRole("button", { name: "最短路" }).click();
+  await expect(page.getByRole("heading", { name: "最短路" })).toBeVisible();
+
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath("admin-tags-mobile.png"), fullPage: true });
 });
