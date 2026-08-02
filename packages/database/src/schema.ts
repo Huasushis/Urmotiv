@@ -99,6 +99,10 @@ export const taskState = pgEnum("task_state", [
   "failed",
   "cancelled"
 ]);
+export const problemPackageJobKind = pgEnum("problem_package_job_kind", [
+  "import",
+  "export"
+]);
 export const auditResult = pgEnum("audit_result", ["success", "denied", "failure"]);
 export const adminBootstrapStatus = pgEnum("admin_bootstrap_status", [
   "blocked",
@@ -1420,6 +1424,105 @@ export const exportJobProblems = pgTable(
       name: "export_job_problems_problem_revision_fk"
     }).onDelete("restrict"),
     check("export_job_problems_position_ck", sql`${table.position} >= 0`)
+  ]
+);
+
+export const problemPackageJobOutbox = pgTable(
+  "problem_package_job_outbox",
+  {
+    jobId: uuid("job_id").primaryKey(),
+    jobKind: problemPackageJobKind("job_kind").notNull(),
+    importJobId: uuid("import_job_id"),
+    exportJobId: uuid("export_job_id"),
+    deliveryGeneration: integer("delivery_generation").notNull().default(1),
+    maxDeliveryGenerations: smallint("max_delivery_generations").notNull().default(3),
+    queueJobId: uuid("queue_job_id").notNull(),
+    queueJobIds: uuid("queue_job_ids").array().notNull(),
+    queueIdempotencyScope: varchar("queue_idempotency_scope", { length: 200 }).notNull(),
+    queueIdempotencyKey: varchar("queue_idempotency_key", { length: 200 }).notNull(),
+    queueRequestDigest: char("queue_request_digest", { length: 64 }).notNull(),
+    maxAttempts: smallint("max_attempts").notNull(),
+    timeoutMs: integer("timeout_ms").notNull(),
+    nextDispatchAt: timestamp("next_dispatch_at", { withTimezone: true }),
+    dispatchAttempts: integer("dispatch_attempts").notNull().default(0),
+    dispatchClaimId: uuid("dispatch_claim_id"),
+    dispatchClaimedBy: varchar("dispatch_claimed_by", { length: 200 }),
+    dispatchClaimedAt: timestamp("dispatch_claimed_at", { withTimezone: true }),
+    dispatchClaimExpiresAt: timestamp("dispatch_claim_expires_at", {
+      withTimezone: true
+    }),
+    dispatchClaimGeneration: integer("dispatch_claim_generation"),
+    dispatchClaimQueueJobId: uuid("dispatch_claim_queue_job_id"),
+    lastDispatchedAt: timestamp("last_dispatched_at", { withTimezone: true }),
+    lastDispatchErrorCode: varchar("last_dispatch_error_code", { length: 120 }),
+    executionFence: bigint("execution_fence", { mode: "bigint" }).notNull().default(0n),
+    executionDeliveryGeneration: integer("execution_delivery_generation"),
+    executionQueueJobId: uuid("execution_queue_job_id"),
+    executionQueueLeaseId: uuid("execution_queue_lease_id"),
+    executionWorkerId: varchar("execution_worker_id", { length: 200 }),
+    executionQueueAttempt: smallint("execution_queue_attempt"),
+    executionClaimedAt: timestamp("execution_claimed_at", { withTimezone: true }),
+    executionLeaseExpiresAt: timestamp("execution_lease_expires_at", {
+      withTimezone: true
+    }),
+    retiredAt: timestamp("retired_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    check(
+      "problem_package_job_outbox_parent_ck",
+      sql`(${table.jobKind} = 'import' AND ${table.importJobId} = ${table.jobId} AND ${table.exportJobId} IS NULL AND ${table.queueIdempotencyScope} = 'problem-package-import') OR (${table.jobKind} = 'export' AND ${table.exportJobId} = ${table.jobId} AND ${table.importJobId} IS NULL AND ${table.queueIdempotencyScope} = 'problem-package-export')`
+    ),
+    check(
+      "problem_package_job_outbox_queue_identity_ck",
+      sql`${table.deliveryGeneration} BETWEEN 1 AND ${table.maxDeliveryGenerations} AND ${table.maxDeliveryGenerations} BETWEEN 1 AND 20 AND ${table.queueJobId} <> ${table.jobId} AND array_ndims(${table.queueJobIds}) = 1 AND array_lower(${table.queueJobIds}, 1) = 1 AND array_upper(${table.queueJobIds}, 1) = ${table.deliveryGeneration} AND ${table.queueJobIds}[${table.deliveryGeneration}] = ${table.queueJobId} AND array_position(${table.queueJobIds}, NULL) IS NULL AND ${table.queueIdempotencyKey} = ${table.queueJobId}::text AND ${table.queueRequestDigest} ~ '^[0-9a-f]{64}$' AND ${table.maxAttempts} BETWEEN 1 AND 20 AND ${table.timeoutMs} BETWEEN 100 AND 86400000`
+    ),
+    check(
+      "problem_package_job_outbox_dispatch_ck",
+      sql`${table.dispatchAttempts} >= 0 AND num_nonnulls(${table.dispatchClaimId}, ${table.dispatchClaimedBy}, ${table.dispatchClaimedAt}, ${table.dispatchClaimExpiresAt}, ${table.dispatchClaimGeneration}, ${table.dispatchClaimQueueJobId}) IN (0, 6) AND (${table.dispatchClaimId} IS NULL OR (${table.dispatchAttempts} > 0 AND ${table.dispatchClaimGeneration} = ${table.deliveryGeneration} AND ${table.dispatchClaimQueueJobId} = ${table.queueJobId} AND ${table.dispatchClaimExpiresAt} > ${table.dispatchClaimedAt} AND length(btrim(${table.dispatchClaimedBy})) > 0 AND ${table.dispatchClaimedBy} !~ '[[:cntrl:]]')) AND (${table.lastDispatchErrorCode} IS NULL OR ${table.lastDispatchErrorCode} ~ '^[a-z0-9]+(?:[._-][a-z0-9]+)*$')`
+    ),
+    check(
+      "problem_package_job_outbox_execution_ck",
+      sql`${table.executionFence} >= 0 AND (num_nonnulls(${table.executionDeliveryGeneration}, ${table.executionQueueJobId}, ${table.executionQueueLeaseId}, ${table.executionWorkerId}, ${table.executionQueueAttempt}, ${table.executionClaimedAt}, ${table.executionLeaseExpiresAt}) = 0 OR (${table.executionFence} > 0 AND ${table.lastDispatchedAt} IS NOT NULL AND ${table.nextDispatchAt} IS NULL AND num_nonnulls(${table.executionDeliveryGeneration}, ${table.executionQueueJobId}, ${table.executionQueueLeaseId}, ${table.executionWorkerId}, ${table.executionQueueAttempt}, ${table.executionClaimedAt}, ${table.executionLeaseExpiresAt}) = 7 AND ${table.executionDeliveryGeneration} = ${table.deliveryGeneration} AND ${table.executionQueueJobId} = ${table.queueJobId} AND ${table.executionQueueAttempt} BETWEEN 1 AND 20 AND ${table.executionQueueAttempt} <= ${table.maxAttempts} AND ${table.executionLeaseExpiresAt} > ${table.executionClaimedAt} AND length(btrim(${table.executionWorkerId})) > 0 AND ${table.executionWorkerId} !~ '[[:cntrl:]]'))`
+    ),
+    check(
+      "problem_package_job_outbox_lifecycle_ck",
+      sql`${table.retiredAt} IS NULL OR (${table.nextDispatchAt} IS NULL AND num_nonnulls(${table.dispatchClaimId}, ${table.dispatchClaimedBy}, ${table.dispatchClaimedAt}, ${table.dispatchClaimExpiresAt}, ${table.dispatchClaimGeneration}, ${table.dispatchClaimQueueJobId}) = 0 AND num_nonnulls(${table.executionDeliveryGeneration}, ${table.executionQueueJobId}, ${table.executionQueueLeaseId}, ${table.executionWorkerId}, ${table.executionQueueAttempt}, ${table.executionClaimedAt}, ${table.executionLeaseExpiresAt}) = 0)`
+    ),
+    check(
+      "problem_package_job_outbox_timestamps_ck",
+      sql`${table.updatedAt} >= ${table.createdAt} AND (${table.nextDispatchAt} IS NULL OR ${table.nextDispatchAt} >= ${table.createdAt}) AND (${table.lastDispatchedAt} IS NULL OR ${table.lastDispatchedAt} >= ${table.createdAt}) AND (${table.retiredAt} IS NULL OR ${table.retiredAt} >= ${table.createdAt})`
+    ),
+    uniqueIndex("problem_package_job_outbox_import_uq")
+      .on(table.importJobId)
+      .where(sql`${table.importJobId} IS NOT NULL`),
+    uniqueIndex("problem_package_job_outbox_export_uq")
+      .on(table.exportJobId)
+      .where(sql`${table.exportJobId} IS NOT NULL`),
+    uniqueIndex("problem_package_job_outbox_queue_job_uq").on(table.queueJobId),
+    uniqueIndex("problem_package_job_outbox_queue_identity_uq").on(
+      table.queueIdempotencyScope,
+      table.queueIdempotencyKey
+    ),
+    index("problem_package_job_outbox_ready_idx")
+      .on(
+        table.nextDispatchAt,
+        table.dispatchClaimExpiresAt,
+        table.createdAt,
+        table.jobId
+      )
+      .where(sql`${table.retiredAt} IS NULL AND ${table.nextDispatchAt} IS NOT NULL`),
+    index("problem_package_job_outbox_execution_expiry_idx")
+      .on(
+        table.executionLeaseExpiresAt,
+        table.executionDeliveryGeneration,
+        table.executionQueueJobId,
+        table.jobId
+      )
+      .where(
+        sql`${table.retiredAt} IS NULL AND ${table.executionQueueLeaseId} IS NOT NULL`
+      )
   ]
 );
 

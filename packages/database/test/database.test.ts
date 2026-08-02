@@ -1,4 +1,4 @@
-import { sql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
 import {
   cpSync,
   existsSync,
@@ -10,13 +10,16 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   createLocalDatabase,
-  type LocalDatabaseHandle,
+  createPostgresDatabase,
   isDatabaseEmptyForAdminBootstrap,
+  type LocalDatabaseHandle,
   migrateDatabase,
   openAdminBootstrapForFreshSeed,
+  type PostgresDatabaseHandle,
   readAdminBootstrapState,
   releaseAdminBootstrapMigrationLease,
   seedCoreDatabase,
@@ -25,6 +28,8 @@ import {
 
 const openDatabases: LocalDatabaseHandle[] = [];
 const temporaryDirectories: string[] = [];
+const postgresAdminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
+const describePostgres = postgresAdminUrl === undefined ? describe.skip : describe;
 
 async function createMigratedDatabase(): Promise<LocalDatabaseHandle> {
   const handle = createEmptyDatabase();
@@ -718,3 +723,1368 @@ describe("robot review lease migration", () => {
     `)).rejects.toBeDefined();
   });
 });
+
+describe("problem package outbox state machine in PGlite", () => {
+  it("rejects undispatched execution, queue identity reuse, and active retirement", async () => {
+    const handle = await createMigratedDatabase();
+    const jobId = "83000000-0000-4000-8000-000000000001";
+    const firstQueueJobId = "83000000-0000-4000-8000-000000000002";
+    const secondQueueJobId = "83000000-0000-4000-8000-000000000003";
+
+    await handle.execute(sql`
+      INSERT INTO problem_package_job_outbox (
+        job_id, job_kind, import_job_id, queue_job_id, queue_job_ids,
+        queue_idempotency_scope, queue_idempotency_key, queue_request_digest,
+        max_attempts, timeout_ms, max_delivery_generations, next_dispatch_at
+      ) VALUES (
+        ${jobId}::uuid, 'import', ${jobId}::uuid, ${firstQueueJobId}::uuid,
+        ARRAY[${firstQueueJobId}::uuid], 'problem-package-import', ${firstQueueJobId},
+        'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+        3, 900000, 3, clock_timestamp()
+      )
+    `);
+
+    await expectDatabaseError(handle.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_fence = execution_fence + 1,
+          execution_delivery_generation = delivery_generation,
+          execution_queue_job_id = queue_job_id,
+          execution_queue_lease_id = '83000000-0000-4000-8000-000000000004',
+          execution_worker_id = 'pglite-worker-before-dispatch',
+          execution_queue_attempt = 1,
+          execution_claimed_at = clock_timestamp() - interval '2 minutes',
+          execution_lease_expires_at = clock_timestamp() + interval '5 minutes',
+          updated_at = clock_timestamp()
+      WHERE job_id = ${jobId}::uuid
+    `), "PP_JOB_OUTBOX_EXECUTION_NOT_DISPATCHED");
+
+    await handle.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET dispatch_attempts = 1,
+          dispatch_claim_id = '83000000-0000-4000-8000-000000000005',
+          dispatch_claimed_by = 'pglite-dispatcher-one',
+          dispatch_claimed_at = clock_timestamp(),
+          dispatch_claim_expires_at = clock_timestamp() + interval '5 minutes',
+          dispatch_claim_generation = delivery_generation,
+          dispatch_claim_queue_job_id = queue_job_id,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${jobId}::uuid
+    `);
+    await handle.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET dispatch_claim_id = NULL,
+          dispatch_claimed_by = NULL,
+          dispatch_claimed_at = NULL,
+          dispatch_claim_expires_at = NULL,
+          dispatch_claim_generation = NULL,
+          dispatch_claim_queue_job_id = NULL,
+          last_dispatched_at = clock_timestamp(),
+          next_dispatch_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${jobId}::uuid
+    `);
+    await handle.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET delivery_generation = delivery_generation + 1,
+          queue_job_id = ${secondQueueJobId}::uuid,
+          queue_job_ids = array_append(queue_job_ids, ${secondQueueJobId}::uuid),
+          queue_idempotency_key = ${secondQueueJobId},
+          dispatch_attempts = 0,
+          last_dispatched_at = NULL,
+          next_dispatch_at = clock_timestamp(),
+          updated_at = clock_timestamp()
+      WHERE job_id = ${jobId}::uuid
+    `);
+    await expectDatabaseError(handle.execute(sql`
+      INSERT INTO problem_package_job_outbox (
+        job_id, job_kind, import_job_id, queue_job_id, queue_job_ids,
+        queue_idempotency_scope, queue_idempotency_key, queue_request_digest,
+        max_attempts, timeout_ms, next_dispatch_at
+      ) VALUES (
+        '83000000-0000-4000-8000-000000000008', 'import',
+        '83000000-0000-4000-8000-000000000008', ${firstQueueJobId}::uuid,
+        ARRAY[${firstQueueJobId}::uuid], 'problem-package-import', ${firstQueueJobId},
+        'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+        3, 900000, clock_timestamp()
+      )
+    `), "PP_JOB_OUTBOX_DELIVERY_IDENTITY_GLOBALLY_REUSED");
+    await handle.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET dispatch_attempts = 1,
+          dispatch_claim_id = '83000000-0000-4000-8000-000000000006',
+          dispatch_claimed_by = 'pglite-dispatcher-two',
+          dispatch_claimed_at = clock_timestamp(),
+          dispatch_claim_expires_at = clock_timestamp() + interval '5 minutes',
+          dispatch_claim_generation = delivery_generation,
+          dispatch_claim_queue_job_id = queue_job_id,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${jobId}::uuid
+    `);
+    await handle.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET dispatch_claim_id = NULL,
+          dispatch_claimed_by = NULL,
+          dispatch_claimed_at = NULL,
+          dispatch_claim_expires_at = NULL,
+          dispatch_claim_generation = NULL,
+          dispatch_claim_queue_job_id = NULL,
+          last_dispatched_at = clock_timestamp(),
+          next_dispatch_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${jobId}::uuid
+    `);
+
+    await expectDatabaseError(handle.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET delivery_generation = delivery_generation + 1,
+          queue_job_id = ${firstQueueJobId}::uuid,
+          queue_job_ids = array_append(queue_job_ids, ${firstQueueJobId}::uuid),
+          queue_idempotency_key = ${firstQueueJobId},
+          dispatch_attempts = 0,
+          last_dispatched_at = NULL,
+          next_dispatch_at = clock_timestamp(),
+          updated_at = clock_timestamp()
+      WHERE job_id = ${jobId}::uuid
+    `), "PP_JOB_OUTBOX_DELIVERY_IDENTITY_REUSED");
+
+    await handle.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_fence = execution_fence + 1,
+          execution_delivery_generation = delivery_generation,
+          execution_queue_job_id = queue_job_id,
+          execution_queue_lease_id = '83000000-0000-4000-8000-000000000007',
+          execution_worker_id = 'pglite-worker-two',
+          execution_queue_attempt = 1,
+          execution_claimed_at = clock_timestamp() - interval '2 minutes',
+          execution_lease_expires_at = clock_timestamp() + interval '5 minutes',
+          updated_at = clock_timestamp()
+      WHERE job_id = ${jobId}::uuid
+    `);
+    await expectDatabaseError(handle.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET retired_at = clock_timestamp(),
+          next_dispatch_at = NULL,
+          execution_delivery_generation = NULL,
+          execution_queue_job_id = NULL,
+          execution_queue_lease_id = NULL,
+          execution_worker_id = NULL,
+          execution_queue_attempt = NULL,
+          execution_claimed_at = NULL,
+          execution_lease_expires_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${jobId}::uuid
+    `), "PP_JOB_OUTBOX_RETIREMENT_EXECUTION_ACTIVE");
+    await handle.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_lease_expires_at = execution_claimed_at + interval '1 second',
+          updated_at = clock_timestamp()
+      WHERE job_id = ${jobId}::uuid
+    `);
+    await handle.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET retired_at = clock_timestamp(),
+          next_dispatch_at = NULL,
+          execution_delivery_generation = NULL,
+          execution_queue_job_id = NULL,
+          execution_queue_lease_id = NULL,
+          execution_worker_id = NULL,
+          execution_queue_attempt = NULL,
+          execution_claimed_at = NULL,
+          execution_lease_expires_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${jobId}::uuid
+    `);
+
+    const state = await handle.query<{
+      delivery_generation: number;
+      history_count: number;
+      first_queue_job_id: string;
+      second_queue_job_id: string;
+      retired: boolean;
+      execution_identity_count: number;
+    }>(sql`
+      SELECT delivery_generation,
+             cardinality(queue_job_ids)::integer AS history_count,
+             queue_job_ids[1]::text AS first_queue_job_id,
+             queue_job_ids[2]::text AS second_queue_job_id,
+             retired_at IS NOT NULL AS retired,
+             num_nonnulls(
+               execution_delivery_generation, execution_queue_job_id,
+               execution_queue_lease_id, execution_worker_id,
+               execution_queue_attempt, execution_claimed_at,
+               execution_lease_expires_at
+             )::integer AS execution_identity_count
+      FROM problem_package_job_outbox
+      WHERE job_id = ${jobId}::uuid
+    `);
+    expect(state).toEqual([{
+      delivery_generation: 2,
+      history_count: 2,
+      first_queue_job_id: firstQueueJobId,
+      second_queue_job_id: secondQueueJobId,
+      retired: true,
+      execution_identity_count: 0
+    }]);
+  });
+});
+
+describePostgres("problem package outbox on real PostgreSQL", () => {
+  let databaseName = "";
+  let databaseUrl = "";
+  let database: PostgresDatabaseHandle | undefined;
+
+  beforeAll(async () => {
+    if (postgresAdminUrl === undefined) return;
+    databaseName = `urmotiv_outbox_${process.pid}_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    if (!/^urmotiv_outbox_[a-z0-9_]+$/.test(databaseName)) {
+      throw new Error("测试数据库名称无效。");
+    }
+    const admin = createPostgresDatabase({
+      connectionString: postgresAdminUrl,
+      maxConnections: 2,
+      statementTimeoutMs: 10_000,
+      applicationName: "urmotiv-outbox-test-admin"
+    });
+    try {
+      await admin.execute(sql`CREATE DATABASE ${sql.identifier(databaseName)}`);
+    } finally {
+      await admin.close();
+    }
+    databaseUrl = databaseConnectionString(postgresAdminUrl, databaseName);
+    database = createPostgresDatabase({
+      connectionString: databaseUrl,
+      maxConnections: 8,
+      statementTimeoutMs: 10_000,
+      applicationName: "urmotiv-outbox-test"
+    });
+  });
+
+  afterAll(async () => {
+    await database?.close();
+    if (postgresAdminUrl === undefined || databaseName.length === 0) return;
+    const admin = createPostgresDatabase({
+      connectionString: postgresAdminUrl,
+      maxConnections: 2,
+      statementTimeoutMs: 10_000,
+      applicationName: "urmotiv-outbox-test-cleanup"
+    });
+    try {
+      await admin.execute(sql`DROP DATABASE ${sql.identifier(databaseName)}`);
+    } finally {
+      await admin.close();
+    }
+  });
+
+  it("keeps C1 compatible and protects delivery generations and execution fences", async () => {
+    if (database === undefined) {
+      throw new Error("未建立真实 PostgreSQL 测试数据库。");
+    }
+
+    await migrateDatabase(database, { migrationsFolder: migrationFolderThrough(9) });
+    await seedCoreDatabase(database);
+
+    const legacyFileId = "81000000-0000-4000-8000-000000000001";
+    const legacyJobId = "81000000-0000-4000-8000-000000000002";
+    await database.execute(sql`
+      INSERT INTO stored_files (
+        id, purpose, storage_key, original_name, media_type, byte_size, sha256,
+        created_by_user_id
+      ) VALUES (
+        ${legacyFileId}::uuid, 'import_input', 'synthetic-outbox-source-one',
+        'synthetic-one.zip', 'application/zip', 1,
+        '1111111111111111111111111111111111111111111111111111111111111111', 0
+      )
+    `);
+    await database.execute(sql`
+      INSERT INTO import_jobs (
+        id, requested_by_user_id, source_file_id, selected_format, input_digest,
+        state, idempotency_key
+      ) VALUES (
+        ${legacyJobId}::uuid, 0, ${legacyFileId}::uuid, 'synthetic',
+        '1111111111111111111111111111111111111111111111111111111111111111',
+        'running', 'synthetic-running-compatible'
+      )
+    `);
+    await migrateDatabase(database);
+    const legacyOutbox = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM problem_package_job_outbox
+      WHERE job_id = ${legacyJobId}::uuid
+    `);
+    expect(legacyOutbox).toEqual([{ count: 0 }]);
+    await database.execute(sql`
+      INSERT INTO problem_package_job_outbox (
+        job_id, job_kind, import_job_id, queue_job_id, queue_job_ids,
+        queue_idempotency_scope, queue_idempotency_key, queue_request_digest,
+        max_attempts, timeout_ms,
+        max_delivery_generations, next_dispatch_at
+      ) VALUES (
+        ${legacyJobId}::uuid, 'import', ${legacyJobId}::uuid,
+        '82000000-0000-4000-8000-000000000001',
+        ARRAY['82000000-0000-4000-8000-000000000001'::uuid],
+        'problem-package-import', '82000000-0000-4000-8000-000000000001',
+        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        3, 900000, 3, clock_timestamp()
+      )
+    `);
+
+    const importFileId = "81000000-0000-4000-8000-000000000003";
+    const importJobId = "81000000-0000-4000-8000-000000000004";
+    let queuedInsertReachedEnd = false;
+    await database.transaction(async (transaction) => {
+      await transaction.execute(sql`
+        INSERT INTO stored_files (
+          id, purpose, storage_key, original_name, media_type, byte_size, sha256,
+          created_by_user_id
+        ) VALUES (
+          ${importFileId}::uuid, 'import_input', 'synthetic-outbox-source-two',
+          'synthetic-two.zip', 'application/zip', 1,
+          '2222222222222222222222222222222222222222222222222222222222222222', 0
+        )
+      `);
+      await transaction.execute(sql`
+        INSERT INTO import_jobs (
+          id, requested_by_user_id, source_file_id, selected_format, input_digest,
+          idempotency_key
+        ) VALUES (
+          ${importJobId}::uuid, 0, ${importFileId}::uuid, 'synthetic',
+          '2222222222222222222222222222222222222222222222222222222222222222',
+          'synthetic-deferred'
+        )
+      `);
+      queuedInsertReachedEnd = true;
+    });
+    expect(queuedInsertReachedEnd).toBe(true);
+    await database.execute(sql`
+      UPDATE import_jobs SET state = 'running' WHERE id = ${importJobId}::uuid
+    `);
+    await database.execute(sql`
+      UPDATE import_jobs SET state = 'queued' WHERE id = ${importJobId}::uuid
+    `);
+    const compatibleQueuedJob = await database.query<{
+      state: string;
+      outbox_count: number;
+    }>(sql`
+      SELECT task.state::text AS state,
+             (SELECT count(*)::integer
+              FROM problem_package_job_outbox outbox
+              WHERE outbox.job_id = task.id) AS outbox_count
+      FROM import_jobs task
+      WHERE task.id = ${importJobId}::uuid
+    `);
+    expect(compatibleQueuedJob).toEqual([{ state: "queued", outbox_count: 0 }]);
+
+    const firstQueueJobId = "82000000-0000-4000-8000-000000000002";
+    await database.execute(sql`
+        INSERT INTO problem_package_job_outbox (
+          job_id, job_kind, import_job_id, queue_job_id, queue_job_ids,
+          queue_idempotency_scope, queue_idempotency_key, queue_request_digest,
+          max_attempts, timeout_ms,
+          max_delivery_generations, next_dispatch_at
+        ) VALUES (
+          ${importJobId}::uuid, 'import', ${importJobId}::uuid,
+          ${firstQueueJobId}::uuid, ARRAY[${firstQueueJobId}::uuid],
+          'problem-package-import', ${firstQueueJobId},
+          'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          3, 900000, 3, clock_timestamp()
+        )
+    `);
+
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_fence = execution_fence + 1,
+          execution_delivery_generation = delivery_generation,
+          execution_queue_job_id = queue_job_id,
+          execution_queue_lease_id = '82000000-0000-4000-8000-000000000015',
+          execution_worker_id = 'synthetic-worker-before-dispatch',
+          execution_queue_attempt = 1,
+          execution_claimed_at = clock_timestamp() - interval '2 minutes',
+          execution_lease_expires_at = clock_timestamp() + interval '5 minutes',
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_EXECUTION_NOT_DISPATCHED");
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET queue_job_ids = array_append(
+            queue_job_ids,
+            '82000000-0000-4000-8000-000000000016'::uuid
+          )
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_DELIVERY_HISTORY_IMMUTABLE");
+
+    const exportJobId = "81000000-0000-4000-8000-000000000005";
+    await database.transaction(async (transaction) => {
+      await transaction.execute(sql`
+        INSERT INTO export_jobs (
+          id, requested_by_user_id, target_format, idempotency_key
+        ) VALUES (
+          ${exportJobId}::uuid, 0, 'synthetic', 'synthetic-export'
+        )
+      `);
+      await transaction.execute(sql`
+        INSERT INTO problem_package_job_outbox (
+          job_id, job_kind, export_job_id, queue_job_id, queue_job_ids,
+          queue_idempotency_scope, queue_idempotency_key, queue_request_digest,
+          max_attempts, timeout_ms,
+          next_dispatch_at
+        ) VALUES (
+          ${exportJobId}::uuid, 'export', ${exportJobId}::uuid,
+          '82000000-0000-4000-8000-000000000003',
+          ARRAY['82000000-0000-4000-8000-000000000003'::uuid],
+          'problem-package-export', '82000000-0000-4000-8000-000000000003',
+          'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+          3, 1800000, clock_timestamp()
+        )
+      `);
+    });
+
+    const invalidExportJobId = "81000000-0000-4000-8000-000000000006";
+    await database.execute(sql`
+      INSERT INTO export_jobs (
+        id, requested_by_user_id, target_format, state, idempotency_key
+      ) VALUES (
+        ${invalidExportJobId}::uuid, 0, 'synthetic', 'failed',
+        'synthetic-invalid-parent'
+      )
+    `);
+    await expectDatabaseError(database.execute(sql`
+      INSERT INTO problem_package_job_outbox (
+        job_id, job_kind, export_job_id, queue_job_id, queue_job_ids,
+        queue_idempotency_scope, queue_idempotency_key, queue_request_digest,
+        max_attempts, timeout_ms,
+        next_dispatch_at
+      ) VALUES (
+        ${invalidExportJobId}::uuid, 'import', ${invalidExportJobId}::uuid,
+        '82000000-0000-4000-8000-000000000004',
+        ARRAY['82000000-0000-4000-8000-000000000004'::uuid],
+        'problem-package-import', '82000000-0000-4000-8000-000000000004',
+        'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+        3, 900000, clock_timestamp()
+      )
+    `), "PP_JOB_OUTBOX_PARENT_INVALID");
+
+    await database.execute(sql`
+      UPDATE export_jobs SET state = 'running' WHERE id = ${exportJobId}::uuid
+    `);
+
+    let activeDeleteReachedEnd = false;
+    await expectDatabaseError(database.transaction(async (transaction) => {
+      await transaction.execute(sql`
+        DELETE FROM problem_package_job_outbox WHERE job_id = ${exportJobId}::uuid
+      `);
+      activeDeleteReachedEnd = true;
+    }), "PP_JOB_OUTBOX_DELETE_FORBIDDEN");
+    expect(activeDeleteReachedEnd).toBe(false);
+    await expectDatabaseError(
+      database.execute(sql`TRUNCATE TABLE problem_package_job_outbox`),
+      "PP_JOB_OUTBOX_TRUNCATE_FORBIDDEN"
+    );
+
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET queue_request_digest = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_IDENTITY_IMMUTABLE");
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET created_at = created_at + interval '1 second'
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_IDENTITY_IMMUTABLE");
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET queue_job_id = '82000000-0000-4000-8000-000000000005',
+          queue_idempotency_key = '82000000-0000-4000-8000-000000000005'
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_DELIVERY_IDENTITY");
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET delivery_generation = 3,
+          queue_job_id = '82000000-0000-4000-8000-000000000006',
+          queue_idempotency_key = '82000000-0000-4000-8000-000000000006'
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_DELIVERY_STEP");
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET delivery_generation = 2,
+          queue_job_id = '82000000-0000-4000-8000-000000000007',
+          queue_idempotency_key = '82000000-0000-4000-8000-000000000007'
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_DELIVERY_NOT_DISPATCHED");
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET last_dispatched_at = clock_timestamp(),
+          next_dispatch_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_DISPATCH_EVIDENCE");
+
+    const firstDispatchClaimId = "82000000-0000-4000-8000-000000000008";
+    await database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET dispatch_attempts = 1,
+          dispatch_claim_id = ${firstDispatchClaimId}::uuid,
+          dispatch_claimed_by = 'synthetic-dispatcher-one',
+          dispatch_claimed_at = clock_timestamp(),
+          dispatch_claim_expires_at = clock_timestamp() + interval '5 minutes',
+          dispatch_claim_generation = delivery_generation,
+          dispatch_claim_queue_job_id = queue_job_id,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `);
+    await database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET dispatch_claim_id = NULL,
+          dispatch_claimed_by = NULL,
+          dispatch_claimed_at = NULL,
+          dispatch_claim_expires_at = NULL,
+          dispatch_claim_generation = NULL,
+          dispatch_claim_queue_job_id = NULL,
+          last_dispatched_at = clock_timestamp(),
+          next_dispatch_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `);
+
+    const secondQueueJobId = "82000000-0000-4000-8000-000000000009";
+    const secondGeneration = await database.query<{
+      delivery_generation: number;
+      queue_job_id: string;
+      queue_request_digest: string;
+    }>(sql`
+      UPDATE problem_package_job_outbox
+      SET delivery_generation = delivery_generation + 1,
+          queue_job_id = ${secondQueueJobId}::uuid,
+          queue_job_ids = array_append(queue_job_ids, ${secondQueueJobId}::uuid),
+          queue_idempotency_key = ${secondQueueJobId},
+          dispatch_attempts = 0,
+          last_dispatched_at = NULL,
+          last_dispatch_error_code = NULL,
+          next_dispatch_at = clock_timestamp(),
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+      RETURNING delivery_generation, queue_job_id::text AS queue_job_id,
+                queue_request_digest::text AS queue_request_digest
+    `);
+    expect(secondGeneration).toEqual([{
+      delivery_generation: 2,
+      queue_job_id: secondQueueJobId,
+      queue_request_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }]);
+    await expectDatabaseError(database.execute(sql`
+      INSERT INTO problem_package_job_outbox (
+        job_id, job_kind, import_job_id, queue_job_id, queue_job_ids,
+        queue_idempotency_scope, queue_idempotency_key, queue_request_digest,
+        max_attempts, timeout_ms, next_dispatch_at
+      ) VALUES (
+        '81000000-0000-4000-8000-000000000009', 'import',
+        '81000000-0000-4000-8000-000000000009', ${firstQueueJobId}::uuid,
+        ARRAY[${firstQueueJobId}::uuid], 'problem-package-import', ${firstQueueJobId},
+        '9999999999999999999999999999999999999999999999999999999999999999',
+        3, 900000, clock_timestamp()
+      )
+    `), "PP_JOB_OUTBOX_DELIVERY_IDENTITY_GLOBALLY_REUSED");
+
+    const secondDispatchClaimId = "82000000-0000-4000-8000-000000000010";
+    await database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET dispatch_attempts = 1,
+          dispatch_claim_id = ${secondDispatchClaimId}::uuid,
+          dispatch_claimed_by = 'synthetic-dispatcher-two',
+          dispatch_claimed_at = clock_timestamp(),
+          dispatch_claim_expires_at = clock_timestamp() + interval '5 minutes',
+          dispatch_claim_generation = delivery_generation,
+          dispatch_claim_queue_job_id = queue_job_id,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `);
+    await database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET dispatch_claim_id = NULL,
+          dispatch_claimed_by = NULL,
+          dispatch_claimed_at = NULL,
+          dispatch_claim_expires_at = NULL,
+          dispatch_claim_generation = NULL,
+          dispatch_claim_queue_job_id = NULL,
+          last_dispatched_at = clock_timestamp(),
+          next_dispatch_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `);
+
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET delivery_generation = delivery_generation + 1,
+          queue_job_id = ${firstQueueJobId}::uuid,
+          queue_job_ids = array_append(queue_job_ids, ${firstQueueJobId}::uuid),
+          queue_idempotency_key = ${firstQueueJobId},
+          dispatch_attempts = 0,
+          last_dispatched_at = NULL,
+          last_dispatch_error_code = NULL,
+          next_dispatch_at = clock_timestamp(),
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_DELIVERY_IDENTITY_REUSED");
+
+    const firstLeaseId = "81000000-0000-4000-8000-000000000007";
+    await database.transaction(async (transaction) => {
+      await transaction.execute(sql`
+        UPDATE problem_package_job_outbox
+        SET execution_fence = execution_fence + 1,
+            execution_delivery_generation = delivery_generation,
+            execution_queue_job_id = queue_job_id,
+            execution_queue_lease_id = ${firstLeaseId}::uuid,
+            execution_worker_id = 'synthetic-worker-one',
+            execution_queue_attempt = 1,
+            execution_claimed_at = clock_timestamp() - interval '2 minutes',
+            execution_lease_expires_at = clock_timestamp() - interval '1 minute',
+            updated_at = clock_timestamp()
+        WHERE job_id = ${importJobId}::uuid
+      `);
+      await transaction.execute(sql`
+        UPDATE import_jobs SET state = 'running' WHERE id = ${importJobId}::uuid
+      `);
+    });
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_fence = execution_fence + 1,
+          execution_lease_expires_at = clock_timestamp() + interval '5 minutes',
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_FENCE_IDENTITY");
+
+    const secondLeaseId = "81000000-0000-4000-8000-000000000008";
+    const secondFence = await database.query<{ execution_fence: string }>(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_fence = execution_fence + 1,
+          execution_delivery_generation = delivery_generation,
+          execution_queue_job_id = queue_job_id,
+          execution_queue_lease_id = ${secondLeaseId}::uuid,
+          execution_worker_id = 'synthetic-worker-two',
+          execution_queue_attempt = 2,
+          execution_claimed_at = clock_timestamp() - interval '2 minutes',
+          execution_lease_expires_at = clock_timestamp() + interval '5 minutes',
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+      RETURNING execution_fence::text AS execution_fence
+    `);
+    expect(secondFence).toEqual([{ execution_fence: "2" }]);
+
+    const staleWrite = await database.query<{ progress_percent: number }>(sql`
+      UPDATE import_jobs task
+      SET progress_percent = 25
+      WHERE task.id = ${importJobId}::uuid
+        AND EXISTS (
+          SELECT 1
+          FROM problem_package_job_outbox outbox
+          WHERE outbox.job_id = task.id
+            AND outbox.retired_at IS NULL
+            AND outbox.execution_fence = 1
+            AND outbox.execution_delivery_generation = 2
+            AND outbox.execution_queue_job_id = ${secondQueueJobId}::uuid
+            AND outbox.execution_queue_lease_id = ${firstLeaseId}::uuid
+            AND outbox.execution_lease_expires_at > clock_timestamp()
+        )
+      RETURNING progress_percent
+    `);
+    expect(staleWrite).toEqual([]);
+    const currentWrite = await database.query<{ progress_percent: number }>(sql`
+      UPDATE import_jobs task
+      SET progress_percent = 40
+      WHERE task.id = ${importJobId}::uuid
+        AND EXISTS (
+          SELECT 1
+          FROM problem_package_job_outbox outbox
+          WHERE outbox.job_id = task.id
+            AND outbox.retired_at IS NULL
+            AND outbox.execution_fence = 2
+            AND outbox.execution_delivery_generation = 2
+            AND outbox.execution_queue_job_id = ${secondQueueJobId}::uuid
+            AND outbox.execution_queue_lease_id = ${secondLeaseId}::uuid
+            AND outbox.execution_lease_expires_at > clock_timestamp()
+        )
+      RETURNING progress_percent
+    `);
+    expect(currentWrite).toEqual([{ progress_percent: 40 }]);
+
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_fence = 1
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_FENCE_REGRESSION");
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_queue_lease_id = ${firstLeaseId}::uuid
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_FENCE_REUSE");
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_fence = 4
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_FENCE_STEP");
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_fence = 3,
+          execution_delivery_generation = delivery_generation,
+          execution_queue_job_id = queue_job_id,
+          execution_queue_lease_id = ${firstLeaseId}::uuid,
+          execution_worker_id = 'synthetic-worker-three',
+          execution_queue_attempt = 3,
+          execution_claimed_at = clock_timestamp(),
+          execution_lease_expires_at = clock_timestamp() + interval '5 minutes'
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_FENCE_ACTIVE");
+
+    const thirdQueueJobId = "82000000-0000-4000-8000-000000000011";
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET delivery_generation = delivery_generation + 1,
+          queue_job_id = ${thirdQueueJobId}::uuid,
+          queue_job_ids = array_append(queue_job_ids, ${thirdQueueJobId}::uuid),
+          queue_idempotency_key = ${thirdQueueJobId},
+          dispatch_attempts = 0,
+          last_dispatched_at = NULL,
+          last_dispatch_error_code = NULL,
+          next_dispatch_at = clock_timestamp(),
+          execution_delivery_generation = NULL,
+          execution_queue_job_id = NULL,
+          execution_queue_lease_id = NULL,
+          execution_worker_id = NULL,
+          execution_queue_attempt = NULL,
+          execution_claimed_at = NULL,
+          execution_lease_expires_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_FENCE_ACTIVE");
+
+    await database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_lease_expires_at = execution_claimed_at + interval '1 second',
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `);
+    const thirdGeneration = await database.query<{
+      delivery_generation: number;
+      execution_fence: string;
+      execution_queue_lease_id: string | null;
+    }>(sql`
+      UPDATE problem_package_job_outbox
+      SET delivery_generation = delivery_generation + 1,
+          queue_job_id = ${thirdQueueJobId}::uuid,
+          queue_job_ids = array_append(queue_job_ids, ${thirdQueueJobId}::uuid),
+          queue_idempotency_key = ${thirdQueueJobId},
+          dispatch_attempts = 0,
+          last_dispatched_at = NULL,
+          last_dispatch_error_code = NULL,
+          next_dispatch_at = clock_timestamp(),
+          execution_delivery_generation = NULL,
+          execution_queue_job_id = NULL,
+          execution_queue_lease_id = NULL,
+          execution_worker_id = NULL,
+          execution_queue_attempt = NULL,
+          execution_claimed_at = NULL,
+          execution_lease_expires_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+      RETURNING delivery_generation, execution_fence::text AS execution_fence,
+                execution_queue_lease_id::text AS execution_queue_lease_id
+    `);
+    expect(thirdGeneration).toEqual([{
+      delivery_generation: 3,
+      execution_fence: "2",
+      execution_queue_lease_id: null
+    }]);
+
+    const thirdDispatchClaimId = "82000000-0000-4000-8000-000000000012";
+    await database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET dispatch_attempts = 1,
+          dispatch_claim_id = ${thirdDispatchClaimId}::uuid,
+          dispatch_claimed_by = 'synthetic-dispatcher-three',
+          dispatch_claimed_at = clock_timestamp(),
+          dispatch_claim_expires_at = clock_timestamp() + interval '5 minutes',
+          dispatch_claim_generation = delivery_generation,
+          dispatch_claim_queue_job_id = queue_job_id,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `);
+    await database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET dispatch_claim_id = NULL,
+          dispatch_claimed_by = NULL,
+          dispatch_claimed_at = NULL,
+          dispatch_claim_expires_at = NULL,
+          dispatch_claim_generation = NULL,
+          dispatch_claim_queue_job_id = NULL,
+          last_dispatched_at = clock_timestamp(),
+          next_dispatch_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `);
+
+    const thirdLeaseId = "82000000-0000-4000-8000-000000000013";
+    const thirdFence = await database.query<{
+      execution_fence: string;
+      execution_delivery_generation: number;
+      execution_queue_job_id: string;
+      execution_queue_attempt: number;
+    }>(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_fence = execution_fence + 1,
+          execution_delivery_generation = delivery_generation,
+          execution_queue_job_id = queue_job_id,
+          execution_queue_lease_id = ${thirdLeaseId}::uuid,
+          execution_worker_id = 'synthetic-worker-three',
+          execution_queue_attempt = 1,
+          execution_claimed_at = clock_timestamp() - interval '2 minutes',
+          execution_lease_expires_at = clock_timestamp() + interval '5 minutes',
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+      RETURNING execution_fence::text AS execution_fence,
+                execution_delivery_generation, execution_queue_job_id::text AS execution_queue_job_id,
+                execution_queue_attempt
+    `);
+    expect(thirdFence).toEqual([{
+      execution_fence: "3",
+      execution_delivery_generation: 3,
+      execution_queue_job_id: thirdQueueJobId,
+      execution_queue_attempt: 1
+    }]);
+
+    const staleGenerationWrite = await database.query<{ progress_percent: number }>(sql`
+      UPDATE import_jobs task
+      SET progress_percent = 60
+      WHERE task.id = ${importJobId}::uuid
+        AND EXISTS (
+          SELECT 1
+          FROM problem_package_job_outbox outbox
+          WHERE outbox.job_id = task.id
+            AND outbox.retired_at IS NULL
+            AND outbox.execution_fence = 2
+            AND outbox.execution_delivery_generation = 2
+            AND outbox.execution_queue_job_id = ${secondQueueJobId}::uuid
+            AND outbox.execution_queue_lease_id = ${secondLeaseId}::uuid
+            AND outbox.execution_lease_expires_at > clock_timestamp()
+        )
+      RETURNING progress_percent
+    `);
+    expect(staleGenerationWrite).toEqual([]);
+    const currentGenerationWrite = await database.query<{ progress_percent: number }>(sql`
+      UPDATE import_jobs task
+      SET progress_percent = 70
+      WHERE task.id = ${importJobId}::uuid
+        AND EXISTS (
+          SELECT 1
+          FROM problem_package_job_outbox outbox
+          WHERE outbox.job_id = task.id
+            AND outbox.retired_at IS NULL
+            AND outbox.execution_fence = 3
+            AND outbox.execution_delivery_generation = 3
+            AND outbox.execution_queue_job_id = ${thirdQueueJobId}::uuid
+            AND outbox.execution_queue_lease_id = ${thirdLeaseId}::uuid
+            AND outbox.execution_lease_expires_at > clock_timestamp()
+        )
+      RETURNING progress_percent
+    `);
+    expect(currentGenerationWrite).toEqual([{ progress_percent: 70 }]);
+
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET delivery_generation = delivery_generation + 1,
+          queue_job_id = '82000000-0000-4000-8000-000000000014',
+          queue_idempotency_key = '82000000-0000-4000-8000-000000000014'
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_DELIVERY_LIMIT");
+
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET retired_at = clock_timestamp(),
+          next_dispatch_at = NULL,
+          execution_delivery_generation = NULL,
+          execution_queue_job_id = NULL,
+          execution_queue_lease_id = NULL,
+          execution_worker_id = NULL,
+          execution_queue_attempt = NULL,
+          execution_claimed_at = NULL,
+          execution_lease_expires_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_RETIREMENT_EXECUTION_ACTIVE");
+    await database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET execution_lease_expires_at = execution_claimed_at + interval '1 second',
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `);
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET retired_at = clock_timestamp(),
+          next_dispatch_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_RETIREMENT_EXECUTION_IDENTITY");
+
+    await database.execute(sql`
+      UPDATE import_jobs SET state = 'failed' WHERE id = ${importJobId}::uuid
+    `);
+    await database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET retired_at = clock_timestamp(),
+          next_dispatch_at = NULL,
+          execution_delivery_generation = NULL,
+          execution_queue_job_id = NULL,
+          execution_queue_lease_id = NULL,
+          execution_worker_id = NULL,
+          execution_queue_attempt = NULL,
+          execution_claimed_at = NULL,
+          execution_lease_expires_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `);
+    await expectDatabaseError(database.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET retired_at = NULL, next_dispatch_at = clock_timestamp()
+      WHERE job_id = ${importJobId}::uuid
+    `), "PP_JOB_OUTBOX_RETIREMENT_IMMUTABLE");
+
+    const concurrencyDatabase = database;
+    if (concurrencyDatabase === undefined) {
+      throw new Error("真实 PostgreSQL 测试连接已经关闭。");
+    }
+    const insertConcurrentOutbox = (
+      jobId: string,
+      queueJobId: string,
+      requestDigest: string
+    ): Promise<void> => concurrencyDatabase.transaction(async (transaction) => {
+      await transaction.execute(sql`
+        INSERT INTO problem_package_job_outbox (
+          job_id, job_kind, import_job_id, queue_job_id, queue_job_ids,
+          queue_idempotency_scope, queue_idempotency_key, queue_request_digest,
+          max_attempts, timeout_ms, next_dispatch_at
+        ) VALUES (
+          ${jobId}::uuid, 'import', ${jobId}::uuid, ${queueJobId}::uuid,
+          ARRAY[${queueJobId}::uuid], 'problem-package-import', ${queueJobId},
+          ${requestDigest}, 3, 900000, clock_timestamp()
+        )
+      `);
+    });
+
+    const historicalQueueJobId = "85000000-0000-4000-8000-000000000001";
+    const replacementQueueJobId = "85000000-0000-4000-8000-000000000002";
+    const historyOwnerJobId = "85000000-0000-4000-8000-000000000003";
+    const blockedHistoryJobId = "85000000-0000-4000-8000-000000000004";
+    const rotationReady = createDeferred<void>();
+    const releaseRotation = createDeferred<void>();
+    const historyOwnerTransaction = concurrencyDatabase.transaction(async (transaction) => {
+      await transaction.execute(sql`
+        INSERT INTO problem_package_job_outbox (
+          job_id, job_kind, import_job_id, queue_job_id, queue_job_ids,
+          queue_idempotency_scope, queue_idempotency_key, queue_request_digest,
+          max_attempts, timeout_ms, next_dispatch_at
+        ) VALUES (
+          ${historyOwnerJobId}::uuid, 'import', ${historyOwnerJobId}::uuid,
+          ${historicalQueueJobId}::uuid, ARRAY[${historicalQueueJobId}::uuid],
+          'problem-package-import', ${historicalQueueJobId},
+          '8181818181818181818181818181818181818181818181818181818181818181',
+          3, 900000, clock_timestamp()
+        )
+      `);
+      await transaction.execute(sql`
+        UPDATE problem_package_job_outbox
+        SET dispatch_attempts = 1,
+            dispatch_claim_id = '85000000-0000-4000-8000-000000000005',
+            dispatch_claimed_by = 'synthetic-history-dispatcher',
+            dispatch_claimed_at = clock_timestamp(),
+            dispatch_claim_expires_at = clock_timestamp() + interval '5 minutes',
+            dispatch_claim_generation = delivery_generation,
+            dispatch_claim_queue_job_id = queue_job_id,
+            updated_at = clock_timestamp()
+        WHERE job_id = ${historyOwnerJobId}::uuid
+      `);
+      await transaction.execute(sql`
+        UPDATE problem_package_job_outbox
+        SET dispatch_claim_id = NULL,
+            dispatch_claimed_by = NULL,
+            dispatch_claimed_at = NULL,
+            dispatch_claim_expires_at = NULL,
+            dispatch_claim_generation = NULL,
+            dispatch_claim_queue_job_id = NULL,
+            last_dispatched_at = clock_timestamp(),
+            next_dispatch_at = NULL,
+            updated_at = clock_timestamp()
+        WHERE job_id = ${historyOwnerJobId}::uuid
+      `);
+      await transaction.execute(sql`
+        UPDATE problem_package_job_outbox
+        SET delivery_generation = delivery_generation + 1,
+            queue_job_id = ${replacementQueueJobId}::uuid,
+            queue_job_ids = array_append(queue_job_ids, ${replacementQueueJobId}::uuid),
+            queue_idempotency_key = ${replacementQueueJobId},
+            dispatch_attempts = 0,
+            last_dispatched_at = NULL,
+            next_dispatch_at = clock_timestamp(),
+            updated_at = clock_timestamp()
+        WHERE job_id = ${historyOwnerJobId}::uuid
+      `);
+      rotationReady.resolve();
+      await releaseRotation.promise;
+    });
+    historyOwnerTransaction.then(undefined, rotationReady.reject);
+    await rotationReady.promise;
+
+    const blockedBackend = createDeferred<number>();
+    const blockedHistoryTransaction = concurrencyDatabase.transaction(async (transaction) => {
+      const backend = await transaction.query<{ pid: number }>(sql`
+        SELECT pg_backend_pid()::integer AS pid
+      `);
+      const backendProcessId = backend[0]?.pid;
+      if (backend.length !== 1 || backendProcessId === undefined) {
+        throw new Error("未取得并发历史身份测试的数据库进程号。");
+      }
+      blockedBackend.resolve(backendProcessId);
+      await transaction.execute(sql`
+        INSERT INTO problem_package_job_outbox (
+          job_id, job_kind, import_job_id, queue_job_id, queue_job_ids,
+          queue_idempotency_scope, queue_idempotency_key, queue_request_digest,
+          max_attempts, timeout_ms, next_dispatch_at
+        ) VALUES (
+          ${blockedHistoryJobId}::uuid, 'import', ${blockedHistoryJobId}::uuid,
+          ${historicalQueueJobId}::uuid, ARRAY[${historicalQueueJobId}::uuid],
+          'problem-package-import', ${historicalQueueJobId},
+          '9292929292929292929292929292929292929292929292929292929292929292',
+          3, 900000, clock_timestamp()
+        )
+      `);
+    });
+    blockedHistoryTransaction.then(undefined, blockedBackend.reject);
+    let advisoryWaitError: unknown;
+    try {
+      const blockedBackendProcessId = await blockedBackend.promise;
+      await waitForOutboxIdentityAdvisoryWait(
+        concurrencyDatabase,
+        blockedBackendProcessId
+      );
+    } catch (error) {
+      advisoryWaitError = error;
+    } finally {
+      releaseRotation.resolve();
+    }
+    const historicalConcurrency = await Promise.allSettled([
+      historyOwnerTransaction,
+      blockedHistoryTransaction
+    ]);
+    if (advisoryWaitError !== undefined) throw advisoryWaitError;
+    expect(historicalConcurrency[0]?.status).toBe("fulfilled");
+    const blockedHistoricalResult = historicalConcurrency[1];
+    if (
+      blockedHistoricalResult?.status !== "rejected"
+      || !databaseErrorIncludes(
+        blockedHistoricalResult.reason,
+        "PP_JOB_OUTBOX_DELIVERY_IDENTITY_GLOBALLY_REUSED"
+      )
+    ) {
+      throw new Error("等待事务锁后的历史队列身份未被拒绝。");
+    }
+    const historicalConcurrencyState = await database.query<{
+      current_queue_job_id: string;
+      historical_count: number;
+      blocked_count: number;
+    }>(sql`
+      SELECT queue_job_id::text AS current_queue_job_id,
+             cardinality(queue_job_ids)::integer AS historical_count,
+             (SELECT count(*)::integer
+              FROM problem_package_job_outbox
+              WHERE job_id = ${blockedHistoryJobId}::uuid) AS blocked_count
+      FROM problem_package_job_outbox
+      WHERE job_id = ${historyOwnerJobId}::uuid
+    `);
+    expect(historicalConcurrencyState).toEqual([{
+      current_queue_job_id: replacementQueueJobId,
+      historical_count: 2,
+      blocked_count: 0
+    }]);
+
+    await expectDatabaseError(concurrencyDatabase.transaction(async (transaction) => {
+      await transaction.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
+      await transaction.query(sql`SELECT count(*) FROM problem_package_job_outbox`);
+      await transaction.execute(sql`
+        INSERT INTO problem_package_job_outbox (
+          job_id, job_kind, import_job_id, queue_job_id, queue_job_ids,
+          queue_idempotency_scope, queue_idempotency_key, queue_request_digest,
+          max_attempts, timeout_ms, next_dispatch_at
+        ) VALUES (
+          '85000000-0000-4000-8000-000000000006', 'import',
+          '85000000-0000-4000-8000-000000000006',
+          '85000000-0000-4000-8000-000000000007',
+          ARRAY['85000000-0000-4000-8000-000000000007'::uuid],
+          'problem-package-import', '85000000-0000-4000-8000-000000000007',
+          'a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3',
+          3, 900000, clock_timestamp()
+        )
+      `);
+    }), "PP_JOB_OUTBOX_IDENTITY_ISOLATION_UNSUPPORTED");
+    await expectDatabaseError(concurrencyDatabase.transaction(async (transaction) => {
+      await transaction.execute(sql`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE`);
+      await transaction.query(sql`SELECT count(*) FROM problem_package_job_outbox`);
+      await transaction.execute(sql`
+        INSERT INTO problem_package_job_outbox (
+          job_id, job_kind, import_job_id, queue_job_id, queue_job_ids,
+          queue_idempotency_scope, queue_idempotency_key, queue_request_digest,
+          max_attempts, timeout_ms, next_dispatch_at
+        ) VALUES (
+          '85000000-0000-4000-8000-000000000008', 'import',
+          '85000000-0000-4000-8000-000000000008',
+          '85000000-0000-4000-8000-000000000009',
+          ARRAY['85000000-0000-4000-8000-000000000009'::uuid],
+          'problem-package-import', '85000000-0000-4000-8000-000000000009',
+          'b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4',
+          3, 900000, clock_timestamp()
+        )
+      `);
+    }), "PP_JOB_OUTBOX_IDENTITY_ISOLATION_UNSUPPORTED");
+    const repeatableReadLeaseUpdate = await concurrencyDatabase.transaction(
+      async (transaction) => {
+        await transaction.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
+        await transaction.query(sql`SELECT count(*) FROM problem_package_job_outbox`);
+        await transaction.execute(sql`
+          UPDATE problem_package_job_outbox
+          SET dispatch_attempts = dispatch_attempts + 1,
+              dispatch_claim_id = '85000000-0000-4000-8000-000000000010',
+              dispatch_claimed_by = 'synthetic-rr-dispatcher',
+              dispatch_claimed_at = clock_timestamp(),
+              dispatch_claim_expires_at = clock_timestamp() + interval '5 minutes',
+              dispatch_claim_generation = delivery_generation,
+              dispatch_claim_queue_job_id = queue_job_id,
+              updated_at = clock_timestamp()
+          WHERE job_id = ${historyOwnerJobId}::uuid
+        `);
+        return transaction.query<{
+          dispatch_claim_id: string;
+          dispatch_claim_generation: number;
+          dispatch_claim_queue_job_id: string;
+        }>(sql`
+          UPDATE problem_package_job_outbox
+          SET dispatch_claim_expires_at = dispatch_claim_expires_at + interval '1 minute',
+              updated_at = clock_timestamp()
+          WHERE job_id = ${historyOwnerJobId}::uuid
+          RETURNING dispatch_claim_id::text AS dispatch_claim_id,
+                    dispatch_claim_generation,
+                    dispatch_claim_queue_job_id::text AS dispatch_claim_queue_job_id
+        `);
+      }
+    );
+    expect(repeatableReadLeaseUpdate).toEqual([{
+      dispatch_claim_id: "85000000-0000-4000-8000-000000000010",
+      dispatch_claim_generation: 2,
+      dispatch_claim_queue_job_id: replacementQueueJobId
+    }]);
+    await concurrencyDatabase.execute(sql`
+      UPDATE problem_package_job_outbox
+      SET dispatch_claim_id = NULL,
+          dispatch_claimed_by = NULL,
+          dispatch_claimed_at = NULL,
+          dispatch_claim_expires_at = NULL,
+          dispatch_claim_generation = NULL,
+          dispatch_claim_queue_job_id = NULL,
+          last_dispatched_at = clock_timestamp(),
+          next_dispatch_at = NULL,
+          updated_at = clock_timestamp()
+      WHERE job_id = ${historyOwnerJobId}::uuid
+    `);
+    await expectDatabaseError(concurrencyDatabase.transaction(async (transaction) => {
+      await transaction.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`);
+      await transaction.query(sql`SELECT count(*) FROM problem_package_job_outbox`);
+      await transaction.execute(sql`
+        UPDATE problem_package_job_outbox
+        SET delivery_generation = delivery_generation + 1,
+            queue_job_id = '85000000-0000-4000-8000-000000000011',
+            queue_job_ids = array_append(
+              queue_job_ids,
+              '85000000-0000-4000-8000-000000000011'::uuid
+            ),
+            queue_idempotency_key = '85000000-0000-4000-8000-000000000011',
+            dispatch_attempts = 0,
+            last_dispatched_at = NULL,
+            next_dispatch_at = clock_timestamp(),
+            updated_at = clock_timestamp()
+        WHERE job_id = ${historyOwnerJobId}::uuid
+      `);
+    }), "PP_JOB_OUTBOX_IDENTITY_ISOLATION_UNSUPPORTED");
+
+    const sharedConcurrentQueueJobId = "84000000-0000-4000-8000-000000000001";
+    const concurrentSameIdentity = await Promise.allSettled([
+      insertConcurrentOutbox(
+        "84000000-0000-4000-8000-000000000002",
+        sharedConcurrentQueueJobId,
+        "1212121212121212121212121212121212121212121212121212121212121212"
+      ),
+      insertConcurrentOutbox(
+        "84000000-0000-4000-8000-000000000003",
+        sharedConcurrentQueueJobId,
+        "3434343434343434343434343434343434343434343434343434343434343434"
+      )
+    ]);
+    expect(concurrentSameIdentity.map(({ status }) => status).sort()).toEqual([
+      "fulfilled",
+      "rejected"
+    ]);
+    const rejectedConcurrentIdentity = concurrentSameIdentity.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected"
+    );
+    if (
+      rejectedConcurrentIdentity === undefined
+      || !databaseErrorIncludes(
+        rejectedConcurrentIdentity.reason,
+        "PP_JOB_OUTBOX_DELIVERY_IDENTITY_GLOBALLY_REUSED"
+      )
+    ) {
+      throw new Error("并发重复队列身份未被全局历史检查拒绝。");
+    }
+    const sharedIdentityCount = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM problem_package_job_outbox
+      WHERE ${sharedConcurrentQueueJobId}::uuid = ANY(queue_job_ids)
+    `);
+    expect(sharedIdentityCount).toEqual([{ count: 1 }]);
+
+    await Promise.all([
+      insertConcurrentOutbox(
+        "84000000-0000-4000-8000-000000000006",
+        "84000000-0000-4000-8000-000000000004",
+        "5656565656565656565656565656565656565656565656565656565656565656"
+      ),
+      insertConcurrentOutbox(
+        "84000000-0000-4000-8000-000000000007",
+        "84000000-0000-4000-8000-000000000005",
+        "7878787878787878787878787878787878787878787878787878787878787878"
+      )
+    ]);
+    const distinctIdentityCount = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM problem_package_job_outbox
+      WHERE queue_job_id IN (
+        '84000000-0000-4000-8000-000000000004',
+        '84000000-0000-4000-8000-000000000005'
+      )
+    `);
+    expect(distinctIdentityCount).toEqual([{ count: 2 }]);
+
+    const migrationState = await database.query<{
+      migration_count: number;
+      sequence_value: string;
+      sequence_called: boolean;
+    }>(sql`
+      SELECT
+        (SELECT count(*)::integer FROM drizzle.__drizzle_migrations) AS migration_count,
+        last_value::text AS sequence_value,
+        is_called AS sequence_called
+      FROM drizzle.__drizzle_migrations_id_seq
+    `);
+    expect(migrationState).toEqual([{
+      migration_count: 11,
+      sequence_value: "11",
+      sequence_called: true
+    }]);
+    const indexes = await database.query<{ indexname: string }>(sql`
+      SELECT indexname
+      FROM pg_indexes
+      WHERE schemaname = 'public'
+        AND tablename = 'problem_package_job_outbox'
+      ORDER BY indexname
+    `);
+    expect(indexes.map(({ indexname }) => indexname)).toEqual([
+      "problem_package_job_outbox_execution_expiry_idx",
+      "problem_package_job_outbox_export_uq",
+      "problem_package_job_outbox_import_uq",
+      "problem_package_job_outbox_pkey",
+      "problem_package_job_outbox_queue_identity_uq",
+      "problem_package_job_outbox_queue_job_uq",
+      "problem_package_job_outbox_ready_idx"
+    ]);
+  }, 60_000);
+});
+
+function databaseConnectionString(connectionString: string, databaseName: string): string {
+  const queryIndex = connectionString.indexOf("?");
+  const endpoint = queryIndex === -1 ? connectionString : connectionString.slice(0, queryIndex);
+  const query = queryIndex === -1 ? "" : connectionString.slice(queryIndex);
+  const separator = endpoint.lastIndexOf("/");
+  if (separator < "postgresql://".length) {
+    throw new Error("测试数据库连接地址无效。");
+  }
+  return `${endpoint.slice(0, separator + 1)}${databaseName}${query}`;
+}
+
+async function expectDatabaseError(
+  operation: Promise<unknown>,
+  expectedCode: string
+): Promise<void> {
+  try {
+    await operation;
+  } catch (error) {
+    if (databaseErrorIncludes(error, expectedCode)) return;
+    throw new Error(`未观察到固定数据库错误码 ${expectedCode}。`);
+  }
+  throw new Error(`数据库操作未返回固定错误码 ${expectedCode}。`);
+}
+
+function databaseErrorIncludes(error: unknown, expectedCode: string): boolean {
+  let current: unknown = error;
+  const seen = new Set<unknown>();
+  while (typeof current === "object" && current !== null && !seen.has(current)) {
+    seen.add(current);
+    if (
+      "message" in current
+      && typeof current.message === "string"
+      && current.message.includes(expectedCode)
+    ) {
+      return true;
+    }
+    current = "cause" in current ? current.cause : undefined;
+  }
+  return false;
+}
+
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+  readonly reject: (reason: unknown) => void;
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolvePromise: ((value: T) => void) | undefined;
+  let rejectPromise: ((reason: unknown) => void) | undefined;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  if (resolvePromise === undefined || rejectPromise === undefined) {
+    throw new Error("未能创建测试同步信号。");
+  }
+  return {
+    promise,
+    resolve: resolvePromise,
+    reject: rejectPromise
+  };
+}
+
+async function waitForOutboxIdentityAdvisoryWait(
+  database: PostgresDatabaseHandle,
+  backendProcessId: number
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const waiting = await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM pg_catalog.pg_locks
+      WHERE pid = ${backendProcessId}
+        AND locktype = 'advisory'
+        AND classid = 1431453002::oid
+        AND objid = 1651666805::oid
+        AND objsubid = 2
+        AND granted = false
+    `);
+    if (waiting[0]?.count === 1) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("并发身份登记未观察到等待专用事务锁。");
+}
