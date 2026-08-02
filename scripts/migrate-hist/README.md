@@ -359,3 +359,196 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts package \
 本工作流能安全处理 UTF-8 文本，以及最多两层历史 ZIP 路径链中明确选择的 UTF-8 文本条目。PDF、图片、
 评测数据、附件、二进制文档和无法明确划分的混合资料仍需人工处理，不能因为已有安全清单就称为完成真实
 历史题目的全部迁移。审核意见不导入；它们既不进入候选，也不进入最终题目包。
+
+## 历史审核 Gold 上游证据：为 Fermata 人工准备标定答案
+
+`prepare-review-gold.py` 只为 Fermata 的 `reviewFlow` 准确性实验准备人工答案，不属于题目迁移和导入流程。
+它放在这里是因为必须复核本目录生成的 `MATERIALIZE_COMPLETE`、`report.json` 和
+`source-confirmation.private.json`；题面继续引用物化目录中的原文件，不复制到 Fermata 仓库或另一个私有
+目录。
+
+这里的封存结果**不是 Fermata 标定 loader 可直接读取的数据集 manifest**。物化源仍可能是题面、题解和迁移
+备注的合并文本；这里的 `accepted`/`rejected` 也是历史二元结论，不等于 Fermata loader 的
+`approve`/`request_changes`/`reject` 三态结构。后续必须有一项单独审阅、失败即关闭的私有转换步骤：先验证
+本工具的完成标记，按 `source-bindings.private.json` 重新读取源文件，人工确认并生成准确的 statement、
+solution 和 RobotReviewTask 输入字节，再分别计算 Fermata 内容与 Gold 文件摘要，并按 Fermata 当时的严格
+schema 生成真正的数据集 manifest。没有这一步时不得把本目录传给 Fermata 或声称标定集已经就绪。
+
+工具不会从状态文字、审核意见、题号、题名、文件名或表内顺序推断 Gold，也不会自动把表格行配给物化题目。
+一次完整准备分三步：
+
+1. `inspect` 只检查一份或两份 XLSX/SpreadsheetML XML 的安全结构，并写出安全输入编号、文件摘要、工作表
+   数量、行数和列数；不读取任何列作为 Gold，也不写标题、题号、人员、单元格内容或列名。每个输入必须
+   恰好只有一个工作表；工具尚未实现可靠的工作表显示顺序，遇到多个工作表会直接拒绝。XLSX 合并单元格、
+   SpreadsheetML 的合并/跨列声明及倒退的显式行列索引也会直接拒绝，不能靠猜测还原表格。
+2. 人工填写布局后，`init` 只把逐列明确绑定的元数据题号、身份、最终结果、比赛使用和审核意见写入
+   `0600` 的 `review-worksheet.private.json`，同时生成 `confirmed: false` 的空白计划。工具不根据列名猜测
+   含义，也没有“已知难度列名”黑名单：每个非空表头都必须由人填写精确的规范化表头、角色和独立确认，
+   实际表头不一致或有非空表头未登记即拒绝。投题者自报难度列必须结构性标成
+   `excluded_submitter_difficulty`，其他不需要的列标成 `excluded_other`；两者都不会输出。每个输入至少要有
+   一个明确排除的自报难度列，布局和最终计划还要分别再次确认排除。
+3. 人逐项阅读私有工作表和原审核意见，显式选择一行和一个已经确认的 `sourceId`，再填写通过/否决、是否
+   比赛使用、development/holdout 和评测范围。`seal` 只接受每项都有 `confirmed: true` 的独立计划，且会
+   重新读取表格、物化完成链和全部源摘要；它不替人补空值或改判断。
+
+先把私有根及其中目录权限设为 `0700`、文件设为 `0600`。检查输入：
+
+```bash
+python3 scripts/migrate-hist/prepare-review-gold.py inspect \
+  --private-root <private-root> \
+  --input <private-root>/history/review-list-older.xlsx \
+  --input <private-root>/history/review-list-newer.xml \
+  --out <private-root>/history/review-input-inspection.private.json
+```
+
+人工查看原表后，新建 `review-layout.private.json`。列号从 1 开始，并严格递增。每个输入必须正好绑定一个
+`metadata_number`、一个 `final_decision`、一个 `contest_use`，以及至少一个 `identity`、一个
+`review_comment` 和一个 `excluded_submitter_difficulty`。表头行中其余所有非空列也必须登记为合适的业务
+角色或 `excluded_other`，空表头列可以省略。`expectedHeader` 必须先做 Unicode NFKC 规范化、移除全部空白
+并转成大小写无关形式；这里的中文示例规范化前后相同。身份列只选人工配对所需的最少字段，不要选择作者、
+联系方式或其他无关列。下面假设原表正好有这六个非空表头：
+
+```json
+{
+  "version": 3,
+  "confirmed": true,
+  "submitterDifficultyColumnsExcluded": true,
+  "inputSetSha256": "inspection 中的 64 位摘要",
+  "inputs": [
+    {
+      "inputId": "input-000001",
+      "worksheetId": "worksheet-000001",
+      "headerRow": 1,
+      "columns": [
+        {"column": 1, "role": "metadata_number", "expectedHeader": "题号", "confirmed": true},
+        {"column": 2, "role": "identity", "expectedHeader": "题名", "confirmed": true},
+        {"column": 3, "role": "excluded_submitter_difficulty", "expectedHeader": "投稿者自报难度", "confirmed": true},
+        {"column": 4, "role": "final_decision", "expectedHeader": "最终结果", "confirmed": true},
+        {"column": 5, "role": "contest_use", "expectedHeader": "比赛使用", "confirmed": true},
+        {"column": 6, "role": "review_comment", "expectedHeader": "审核意见一", "confirmed": true}
+      ]
+    }
+  ]
+}
+```
+
+生成私有人工工作表和空白计划：
+
+```bash
+python3 scripts/migrate-hist/prepare-review-gold.py init \
+  --private-root <private-root> \
+  --input <private-root>/history/review-list-older.xlsx \
+  --input <private-root>/history/review-list-newer.xml \
+  --inspection <private-root>/history/review-input-inspection.private.json \
+  --layout <private-root>/history/review-layout.private.json \
+  --materialized <private-root>/history/materialized-001 \
+  --out <private-root>/history/review-gold-worksheet-001
+```
+
+复制空白计划到一个新文件再填写。`rowId` 和 `sourceId` 必须由人对照私有工作表逐项配对；工具只在配对后
+核对双方的元数据题号相同，不会据此寻找或推荐来源。`subjectId` 是跨多次数据集保持不变的私有安全身份，
+用于防止同一道题改了 `caseId` 后混入 holdout。确认属于原题或重复题的样本必须填
+`"evaluationScope": "originality_only"`；这类样本的封存 Gold 从结构上不含 `verdict` 和 `contestUse`，只
+记录 `sameProblemAsExisting: true`，因此只能评原题识别，不能计入通过/否决或命题品味准确率。它不要求
+历史最终结果单元格非空。其他样本使用 `verdict_and_taste`，必须有非空的历史最终结果；两个范围是严格的
+判别联合，不能把另一范围的字段混进来：
+
+```json
+{
+  "version": 3,
+  "confirmed": true,
+  "submitterDifficultyColumnsExcludedReconfirmed": true,
+  "datasetId": "history-review-development-v1",
+  "worksheetSha256": "工作表文件摘要",
+  "sourceConfirmationSha256": "工作表内记录的源确认摘要",
+  "cases": [
+    {
+      "caseId": "case-000001",
+      "subjectId": "subject-000001",
+      "rowId": "review-row-000001",
+      "sourceId": "source-000001",
+      "sourceSha256": "物化源摘要",
+      "purpose": "development",
+      "evaluationScope": "verdict_and_taste",
+      "verdict": "accepted",
+      "contestUse": "used",
+      "confirmed": true
+    }
+  ]
+}
+```
+
+原题识别样本的 case 则只把上例最后三个业务字段换成：
+
+```json
+{
+  "evaluationScope": "originality_only",
+  "sameProblemAsExisting": true,
+  "confirmed": true
+}
+```
+
+这里仅展示范围相关字段；完整 case 仍需保留 `caseId`、`subjectId`、`rowId`、`sourceId`、`sourceSha256` 和
+`purpose` 等公共字段，且不得出现 `verdict` 或 `contestUse`。`verdict_and_taste` 的 `contestUse` 必须人工
+明确填写为 `used`、`not_used` 或 `unknown`；不能用布尔值把“不知道”误写成“未使用”。
+
+还要从 `tuning-history.skeleton.private.json` 复制并人工维护一份完整调参历史。凡是曾用于看结果、改提示词、
+阈值或流程的样本都登记为 development；即使之后换了文件或 `caseId`，也要沿用同一 `subjectId`。同一道题
+可以因历史内容版本不同而出现多个不同摘要；完全相同的 `(subjectId, contentSha256)` 不能重复，同一内容摘要
+也不能归到不同题目。`seal` 还会核对当前 development：若某个历史内容摘要已经属于一个 `subjectId`，当前
+计划不能把该摘要改归另一个 `subjectId`；同一题新增不同内容版本仍然允许。空历史也必须明确改成
+`confirmedComplete: true`。`seal` 同时按所有历史 `subjectId` 和所有历史内容摘要拒绝 holdout 与当前或
+历史 development 重叠：
+
+```json
+{
+  "version": 1,
+  "confirmedComplete": true,
+  "developmentSamples": [
+    {
+      "subjectId": "subject-000001",
+      "contentSha256": "曾用于调参的内容摘要"
+    }
+  ]
+}
+```
+
+最后封存；运行这一步前仍要完整人工复核计划，不能把 `inspect` 或 `init` 当成确认：
+
+```bash
+python3 scripts/migrate-hist/prepare-review-gold.py seal \
+  --private-root <private-root> \
+  --input <private-root>/history/review-list-older.xlsx \
+  --input <private-root>/history/review-list-newer.xml \
+  --inspection <private-root>/history/review-input-inspection.private.json \
+  --layout <private-root>/history/review-layout.private.json \
+  --materialized <private-root>/history/materialized-001 \
+  --worksheet <private-root>/history/review-gold-worksheet-001 \
+  --plan <private-root>/history/review-plan-001.private.json \
+  --tuning-history <private-root>/history/tuning-history.private.json \
+  --out <private-root>/history/review-gold-dataset-001
+```
+
+封存目录不复制题面，只包含上游证据：
+
+- `review-gold-evidence.private.json`：带明确 `historical_review_gold_evidence` 类型的安全 `caseId`、
+  development/holdout、评测范围、物化源内容摘要、Gold 文件名与 Gold 文件摘要；它不是 Fermata manifest，
+  不含姓名、题号、题名或原评语；
+- `gold/<caseId>.json`：逐题规范化人工答案，不含原评语；
+- `source-bindings.private.json`：把安全 `caseId` 连接回现有物化源，仅供之后受保护的私有转换步骤使用；
+- `tuning-history-additions.private.json`：本次 development 项，人工合并进下一版完整调参历史；
+- `REVIEW_GOLD_COMPLETE`：绑定计划、调参历史、上游证据、来源连接和全部 Gold 摘要的完成标记。
+
+原始审核意见只存在 `review-worksheet.private.json`。私有根从 `/` 开始逐段以禁止跟随符号链接的目录句柄
+打开；读写都锚定在该句柄，读取还会做双读、文件状态和重新打开核验，以便路径或文件在处理中被替换时
+失败关闭。`init`/`seal` 创建 `output`（以及 `seal` 的 `gold`）后，会持有对应目录的句柄与设备号、inode
+直到命令结束；阶段文件和完成标记都通过这些相同句柄写入。写完成标记前会在所持句柄上核对精确目录清单
+和每个预期文件的完整字节，完成标记是最后一次写入；随后再按公开路径重新打开 `output`/`gold`，确认仍是
+原 inode。新文件直接以最终目标名和 `O_EXCL`（目标已存在就失败）创建为 `0600`；新目录也只创建一次，
+不覆盖已有对象。写文件或建目录发生异常后绝不按路径删除，因为检查身份与删除之间仍可能发生并发替换；
+因此失败目录可能保留私有 partial（只写了一部分的文件），必须改用新的 `--out`，不能原地续写或覆盖。
+目录中单个文件存在不表示阶段完成：只有命令最后写出的 `REVIEW_WORKSHEET_COMPLETE` 或
+`REVIEW_GOLD_COMPLETE` 能完整解析，且其中全部摘要和计数经重新计算一致时，目录才有效；标记缺失、截断或
+校验失败一律视为不完整。`inspect` 命令若失败，也必须丢弃该目标路径并换新文件。终端无论成功或失败都只
+打印计数或固定错误，不打印原内容、原路径或人员信息。这个工具只准备人工 Gold，不调用外部模型；真实私有
+数据不得在测试里运行 `seal`，应先用合成 XLSX/XML 完成测试，再由人按上述流程处理。

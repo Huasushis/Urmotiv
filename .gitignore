@@ -38,6 +38,8 @@ coverage/
 playwright-report/
 test-results/
 .eslintcache
+__pycache__/
+*.py[cod]
 *.log
 
 # Editors and operating systems
