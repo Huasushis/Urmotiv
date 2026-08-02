@@ -112,7 +112,10 @@ const normalizedHistoryProblemSchema = z
       )
       .max(50)
       .default([]),
-    tags: z.array(z.string().trim().min(1).max(120)).max(30).default([]),
+    tags: z
+      .array(z.string().trim().min(1).max(120))
+      .max(0, "历史整理模型不能自行选择知识点标签。")
+      .default([]),
     confidence: z.number().min(0).max(1).default(0.5),
     migrationNote: z.string().max(10_000).default("")
   })

@@ -36,6 +36,8 @@ export interface LlmHistoryNormalizerOptions {
   readonly maximumAttempts?: number;
   readonly retryBaseDelayMs?: number;
   readonly maximumResponseBytes?: number;
+  /** 单次整理允许模型生成的最大 token 数，写入请求并绑定 prepare 执行身份。 */
+  readonly maximumOutputTokens?: number;
   /** 人工停止任务或上层不再允许继续时，明确取消正在运行的请求。 */
   readonly signal?: AbortSignal;
   /** 只供合成测试或受控传输层使用。 */
@@ -43,6 +45,10 @@ export interface LlmHistoryNormalizerOptions {
 }
 
 export const maximumNormalizationResponseBytes = 10_000_000;
+export const maximumNormalizationOutputTokens = 65_536;
+export const defaultNormalizationOutputTokens = maximumNormalizationOutputTokens;
+export const historyNormalizationRequestProfileVersion =
+  "history-normalization-request-v2" as const;
 export const defaultNormalizationFirstOutputTimeoutMs = 30 * 60 * 1_000;
 export const defaultNormalizationOutputIdleTimeoutMs = 10 * 60 * 1_000;
 export const defaultNormalizationMaximumDurationMs = 4 * 60 * 60 * 1_000;
@@ -57,6 +63,7 @@ interface NormalizationRuntime {
   readonly maximumAttempts: number;
   readonly retryBaseDelayMs: number;
   readonly maximumResponseBytes: number;
+  readonly maximumOutputTokens: number;
   readonly signal: AbortSignal | undefined;
   readonly fetch: HistoryNormalizerFetch;
 }
@@ -65,7 +72,8 @@ export function createLlmHistoryNormalizer(
   options: LlmHistoryNormalizerOptions,
 ): IdentifiedHistoryNormalizer {
   const endpoint = new URL("chat/completions", ensureTrailingSlash(options.baseUrl));
-  if (options.apiKey.length === 0 || options.model.trim().length === 0) {
+  const model = options.model.trim();
+  if (options.apiKey.length === 0 || model.length === 0) {
     throw new HistoryMigrationError(
       "INVALID_ARGUMENTS",
       "模型地址、密钥和模型名称必须通过私有环境配置提供。",
@@ -90,6 +98,10 @@ export function createLlmHistoryNormalizer(
       options.maximumResponseBytes ?? maximumNormalizationResponseBytes,
       maximumNormalizationResponseBytes,
     ),
+    maximumOutputTokens: positiveInteger(
+      options.maximumOutputTokens ?? defaultNormalizationOutputTokens,
+      maximumNormalizationOutputTokens,
+    ),
     signal: options.signal,
     fetch: options.fetch ?? defaultStreamingFetch,
   };
@@ -99,7 +111,7 @@ export function createLlmHistoryNormalizer(
       version: 1,
       codeSha256: options.codeSha256,
       promptSha256: sha256Hex(normalizationInstructions),
-      modelSha256: sha256Hex(options.model.trim()),
+      modelSha256: sha256Hex(model),
       configSha256: sha256Hex(
         JSON.stringify({
           endpointSha256: sha256Hex(endpoint.toString()),
@@ -109,7 +121,7 @@ export function createLlmHistoryNormalizer(
           maximumAttempts: runtime.maximumAttempts,
           retryBaseDelayMs: runtime.retryBaseDelayMs,
           maximumResponseBytes: runtime.maximumResponseBytes,
-          streaming: true,
+          requestProfile: normalizationRequestProfile(runtime.maximumOutputTokens),
           streamingProtocol: "sse-eof-benign-controls-v2",
           retryPolicy: "http-429-only",
         }),
@@ -119,7 +131,7 @@ export function createLlmHistoryNormalizer(
       const response = await requestNormalization(
         endpoint,
         options.apiKey,
-        options.model,
+        model,
         input,
         runtime,
       );
@@ -165,7 +177,7 @@ async function requestNormalization(
     );
     if (attemptResult.kind === "content") {
       try {
-        return JSON.parse(extractJsonObject(attemptResult.content)) as unknown;
+        return JSON.parse(attemptResult.content.trim()) as unknown;
       } catch {
         throw normalizationFailure(
           "invalid_json",
@@ -217,6 +229,7 @@ async function requestNormalizationOnce(
   let responseReceived = false;
 
   try {
+    const requestProfile = normalizationRequestProfile(runtime.maximumOutputTokens);
     const response = await waitForOrAbort(
       runtime.fetch(endpoint, {
         method: "POST",
@@ -228,13 +241,15 @@ async function requestNormalizationOnce(
         },
         body: JSON.stringify({
           model,
-          temperature: 0.1,
-          stream: true,
+          ...requestProfile.parameters,
           messages: [
-            { role: "system", content: normalizationInstructions },
             {
-              role: "user",
-              content: ["原始文本：", input.text].join("\n"),
+              role: requestProfile.messageLayout.systemRole,
+              content: normalizationInstructions,
+            },
+            {
+              role: requestProfile.messageLayout.userRole,
+              content: [requestProfile.messageLayout.userPrefix, input.text].join("\n"),
             },
           ],
         }),
@@ -1008,25 +1023,55 @@ function readCompletedResponseContent(payload: unknown): string {
   return first.message.content;
 }
 
-function extractJsonObject(value: string): string {
-  const firstBrace = value.indexOf("{");
-  const lastBrace = value.lastIndexOf("}");
-  if (firstBrace < 0 || lastBrace < firstBrace) {
-    throw invalidResponseFormat();
-  }
-  return value.slice(firstBrace, lastBrace + 1);
-}
-
 const normalizationInstructions = [
-  "你是算法竞赛题库历史资料整理助手。输入已经由人工确认对应关系，但你的输出仍然只是候选内容，不能直接导入。",
-  "请只整理原文，不要补写原文没有的事实。若一个文件确实包含多道题，可拆成 problems 数组的多项；后续系统会要求人工分别确认。",
-  "basicStatement 必须是完整可读的 Markdown 题面。缺少题解时，basicSolution 写“（迁移时缺题解，待补充）”。",
-  "type 只能是 traditional、interactive 或 submit_answer。",
+  "你是算法竞赛题库历史资料整理助手。输入材料已经过人工分组，但你的结果仍只是待人工批准的候选，不能直接导入。",
+  "请按以下步骤整理，并且只依据本次给出的原始文本：",
+  "1. 先辨认材料中实际包含几道题。一份源含多道题时必须逐题拆成 problems 数组的独立项目；不要把多题合并，也不要凭题名、编号或顺序补出材料中没有的题。",
+  "2. 题面和题解是核心。逐题提取明确出现的题意、输入、输出、约束、样例和题解；不得臆造规则、数据范围、样例、算法、结论或缺失段落。材料不明确时保留空字段，并在 migrationNote 简短说明不确定项。",
+  "3. basicStatement 写成完整、可读且自洽的 Markdown 核心题面；background、statement、inputFormat、outputFormat、constraints、hints 和 samples 只放各自对应且原文确有的内容。不要把同一整段题面原样复制到 basicStatement 与任一拆分字段，也不要在多个拆分字段间重复整段正文。",
+  "4. basicSolution 写原文已有的完整核心题解；solution 只放原文中可明确区分的补充题解内容，不能与 basicSolution 重复整段。原文没有题解时，basicSolution 必须恰好写“（迁移时缺题解，待补充）”，solution 留空，并在 migrationNote 如实记录缺失。",
+  "5. title 只取材料中明确的题名；type 只能是 traditional、interactive 或 submit_answer。只有材料明确要求交互或提交答案时才使用后两种，否则使用 traditional。",
+  "6. samples 只登记材料中明确成对出现的输入、输出及解释；不要把正文代码块猜成样例。保留原有公式、代码和 Markdown 含义，不要擅自改题或润色成不同规则。",
+  "7. tags 必须始终是空数组 []。不要选择或创造知识点标签，不要读取、采信或推断投题者自报难度，也不要输出任何难度字段。",
+  "8. confidence 只表示本次整理对材料边界和字段归属的把握，不表示题目质量、难度或审核结论。",
+  "9. 完成后在内部逐项核对题目数量、题面题解证据、缺失项、整段重复、tags 为空以及下方结构；不要输出核对过程、推理、评论或 Markdown 代码围栏。",
+  "最终响应必须是且只能是一个严格符合下方结构的 JSON object。JSON 前后不得出现说明、寒暄、reasoning、commentary、代码围栏或其他非空字节。不得增加结构之外的字段。",
   "所有字符串都必须完整输出，不能为了缩短响应而截断。无法完整整理时应让请求失败，不要返回半段内容。",
-  "只输出 JSON，不要输出代码围栏或说明文字。",
-  "格式：",
+  "唯一允许的结构：",
   '{"problems":[{"title":"","type":"traditional","basicStatement":"","basicSolution":"","background":"","statement":"","inputFormat":"","outputFormat":"","constraints":"","solution":"","hints":"","samples":[{"input":"","output":"","explanation":""}],"tags":[],"confidence":0.5,"migrationNote":""}]}',
 ].join("\n");
+
+function normalizationRequestProfile(maximumOutputTokens: number): {
+  readonly version: typeof historyNormalizationRequestProfileVersion;
+  readonly parameters: {
+    readonly temperature: 0.1;
+    readonly max_tokens: number;
+    readonly thinking: { readonly type: "disabled" };
+    readonly response_format: { readonly type: "json_object" };
+    readonly stream: true;
+  };
+  readonly messageLayout: {
+    readonly systemRole: "system";
+    readonly userRole: "user";
+    readonly userPrefix: "原始文本：";
+  };
+} {
+  return {
+    version: historyNormalizationRequestProfileVersion,
+    parameters: {
+      temperature: 0.1,
+      max_tokens: maximumOutputTokens,
+      thinking: { type: "disabled" },
+      response_format: { type: "json_object" },
+      stream: true,
+    },
+    messageLayout: {
+      systemRole: "system",
+      userRole: "user",
+      userPrefix: "原始文本：",
+    },
+  };
+}
 
 function cancelledRequest(sourceId: string): HistoryMigrationError {
   return normalizationFailure("cancelled", `${sourceId} 的模型请求已明确取消。`);

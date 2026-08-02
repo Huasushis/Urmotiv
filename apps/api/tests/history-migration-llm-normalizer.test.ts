@@ -1,10 +1,14 @@
+import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createLlmHistoryNormalizer,
+  defaultNormalizationOutputTokens,
   defaultNormalizationMaximumDurationMs,
+  historyNormalizationRequestProfileVersion,
   loadHistoryPreparationCodeSha256,
+  maximumNormalizationOutputTokens,
   type LlmHistoryNormalizerOptions,
 } from "../src/history-migration/index";
 
@@ -40,6 +44,96 @@ afterEach(async () => {
 describe("历史题目模型整理流式请求", () => {
   it("执行身份绑定实际受信代码文件而不是手填版本号", async () => {
     await expect(loadHistoryPreparationCodeSha256()).resolves.toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("发送版本化 JSON 请求配置，并把每个影响输出的固定参数绑定进执行身份", async () => {
+    let requestBody: unknown;
+    const fetch = vi.fn(async (_input: URL, init: RequestInit) => {
+      requestBody = JSON.parse(String(init.body)) as unknown;
+      return eventStreamResponse(
+        `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\n`,
+      );
+    });
+    const normalizer = createNormalizer({
+      fetch,
+      model: "  synthetic-model  ",
+    });
+
+    await expect(normalizer.normalize(sourceInput)).resolves.toMatchObject({
+      problems: [{ title: "合成候选题" }],
+    });
+    expect(requestBody).toEqual({
+      model: "synthetic-model",
+      temperature: 0.1,
+      max_tokens: 65_536,
+      thinking: { type: "disabled" },
+      response_format: { type: "json_object" },
+      stream: true,
+      messages: [
+        { role: "system", content: expect.any(String) },
+        { role: "user", content: `原始文本：\n${sourceInput.text}` },
+      ],
+    });
+    expect(Object.keys(requestBody as Record<string, unknown>)).toEqual([
+      "model",
+      "temperature",
+      "max_tokens",
+      "thinking",
+      "response_format",
+      "stream",
+      "messages",
+    ]);
+    const messages = (requestBody as { messages: Array<{ content: string }> }).messages;
+    expect(messages[0]?.content).toContain("题面和题解是核心");
+    expect(messages[0]?.content).toContain("tags 必须始终是空数组 []");
+    expect(messages[0]?.content).toContain("不要读取、采信或推断投题者自报难度");
+    expect(messages[0]?.content).toContain("JSON 前后不得出现说明");
+
+    const expectedConfig = {
+      endpointSha256: sha256("https://synthetic.invalid/v1/chat/completions"),
+      firstOutputTimeoutMs: 200,
+      outputIdleTimeoutMs: 200,
+      maximumDurationMs: defaultNormalizationMaximumDurationMs,
+      maximumAttempts: 1,
+      retryBaseDelayMs: 3_000,
+      maximumResponseBytes: 100_000,
+      requestProfile: {
+        version: historyNormalizationRequestProfileVersion,
+        parameters: {
+          temperature: 0.1,
+          max_tokens: defaultNormalizationOutputTokens,
+          thinking: { type: "disabled" },
+          response_format: { type: "json_object" },
+          stream: true,
+        },
+        messageLayout: {
+          systemRole: "system",
+          userRole: "user",
+          userPrefix: "原始文本：",
+        },
+      },
+      streamingProtocol: "sse-eof-benign-controls-v2",
+      retryPolicy: "http-429-only",
+    };
+    expect(normalizer.preparationIdentity.configSha256).toBe(
+      sha256(JSON.stringify(expectedConfig)),
+    );
+    expect(normalizer.preparationIdentity.modelSha256).toBe(
+      sha256("synthetic-model"),
+    );
+  });
+
+  it("输出 token 上限变化会改变执行身份，且拒绝超出已验证上限的配置", () => {
+    expect(defaultNormalizationOutputTokens).toBe(65_536);
+    expect(maximumNormalizationOutputTokens).toBe(65_536);
+    const current = createNormalizer();
+    const reduced = createNormalizer({ maximumOutputTokens: 65_535 });
+    expect(current.preparationIdentity.configSha256).not.toBe(
+      reduced.preparationIdentity.configSha256,
+    );
+    expect(() =>
+      createNormalizer({ maximumOutputTokens: maximumNormalizationOutputTokens + 1 }),
+    ).toThrow("模型请求限制配置不正确。");
   });
 
   it("持续输出超过首段等待时仍继续，并在 stop 与 DONE 后等待 HTTP 正文真正结束", async () => {
@@ -112,6 +206,47 @@ describe("历史题目模型整理流式请求", () => {
     expect(requestBody).not.toContain("参考题名");
     expect(requestBody).not.toContain("CF 难度参考");
     expect(requestBody).not.toContain("difficultyGuess");
+  });
+
+  it.each([
+    `\`\`\`json\n${normalizedContent}\n\`\`\``,
+    `整理结果如下：${normalizedContent}`,
+    `${normalizedContent}\n以上为整理结果。`,
+  ])("拒绝 JSON 对象之外的说明或代码围栏", async (content) => {
+    const fetch = vi.fn(async () =>
+      eventStreamResponse(`${completionEvent(content, "stop")}data: [DONE]\n\n`),
+    );
+
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "invalid_json",
+      message: "source-000001 的模型响应不包含有效候选 JSON。",
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("模型自行选择知识点标签时按候选结构失败", async () => {
+    const withInventedTag = JSON.stringify({
+      ...JSON.parse(normalizedContent),
+      problems: [
+        {
+          ...JSON.parse(normalizedContent).problems[0],
+          tags: ["合成但未经人工选择的标签"],
+        },
+      ],
+    });
+    const fetch = vi.fn(async () =>
+      eventStreamResponse(
+        `${completionEvent(withInventedTag, "stop")}data: [DONE]\n\n`,
+      ),
+    );
+
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "schema",
+      message: "source-000001 的模型结果不符合候选内容格式。",
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it("SSE heartbeat 和空事件不冒充首段有效输出", async () => {
@@ -1017,6 +1152,10 @@ function localBaseUrl(server: Server): string {
 
 function appendNoProxy(value: string | undefined, host: string): string {
   return value === undefined || value.length === 0 ? host : `${value},${host}`;
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function wait(milliseconds: number): Promise<void> {

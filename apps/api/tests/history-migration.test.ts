@@ -452,6 +452,17 @@ describe("历史题目迁移安全核心", () => {
         normalizer: fixedNormalizer(),
       }),
     ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
+    await expect(
+      prepareHistoryCandidates({
+        ...current.prepareOptions,
+        resume: true,
+        executionIdentity: {
+          ...current.prepareOptions.executionIdentity,
+          configSha256: "5".repeat(64),
+        },
+        normalizer: fixedNormalizer(),
+      }),
+    ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
   });
 
   it("续跑拒绝权限被放宽的目录或检查点", async () => {
@@ -1207,7 +1218,7 @@ function normalizedProblem(title: string): NormalizedHistoryOutput["problems"][n
     solution: "",
     hints: "",
     samples: [],
-    tags: ["synthetic"],
+    tags: [],
     confidence: 0.9,
     migrationNote: "合成测试备注。",
   };
