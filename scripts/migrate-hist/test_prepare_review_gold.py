@@ -42,6 +42,18 @@ def _compact(value: object) -> bytes:
 
 
 class PrepareReviewGoldTest(unittest.TestCase):
+    def test_blank_shared_string_cell_is_empty_but_invalid_index_is_rejected(self) -> None:
+        blank = ET.fromstring(
+            f'<c xmlns="{XLSX_NS}" t="s"><v /></c>'
+        )
+        self.assertEqual(TOOL._xlsx_selected_token(blank), ("text", ""))
+
+        invalid = ET.fromstring(
+            f'<c xmlns="{XLSX_NS}" t="s"><v>-1</v></c>'
+        )
+        with self.assertRaises(TOOL._SafeFailure):
+            TOOL._xlsx_selected_token(invalid)
+
     def test_xlsx_requires_explicit_plan_and_seals_only_safe_gold(self) -> None:
         with tempfile.TemporaryDirectory(prefix="urmotiv-review-gold-") as directory:
             root = self._private_root(Path(directory))

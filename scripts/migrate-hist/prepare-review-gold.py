@@ -1128,6 +1128,12 @@ def _xlsx_selected_token(cell: ET.Element) -> tuple[str, str | int]:
     if kind == "s":
         value = cell.find(f"{_XLSX_NS}v")
         raw = "" if value is None else value.text or ""
+        # Excel may retain an explicitly typed shared-string cell after its
+        # value has been cleared.  It is an ordinary empty cell, not a shared
+        # string index.  The established metadata parser applies the same
+        # distinction; non-empty, non-canonical indexes still fail closed.
+        if raw == "":
+            return ("text", "")
         if re.fullmatch(r"(?:0|[1-9][0-9]*)", raw) is None:
             raise _SafeFailure()
         return ("shared", int(raw))
