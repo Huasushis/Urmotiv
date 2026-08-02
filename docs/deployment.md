@@ -6,7 +6,7 @@
 
 ## 初次部署
 
-1. 在服务器上准备私有环境文件和备份目录。环境文件含有数据库、会话和文件服务的访问凭据，必须只允许当前账号读取。
+1. 在服务器上准备私有环境文件和备份目录。环境文件含有数据库、认证和文件服务的访问凭据，必须只允许当前账号读取。
 
    ```bash
    install -d -m 700 /home/ubuntu/urmotiv-codex/private /home/ubuntu/urmotiv-codex/backups
@@ -14,7 +14,7 @@
    chmod 600 /home/ubuntu/urmotiv-codex/private/urmotiv.env
    ```
 
-   填写 `urmotiv.env` 时请使用密码管理器生成随机值。`SESSION_SECRET` 必须是足够长的随机字符串；`URMOTIV_PLUGIN_SECRET_KEY` 必须是 32 字节随机值的 Base64URL 编码（把随机字节写成只含字母、数字、下划线和短横线的文本），用于加密保存插件令牌。两者都不能复用数据库或 MinIO 密码。PostgreSQL 密码会进入连接地址，因此只使用字母、数字、连字符和下划线。`URMOTIV_WEB_ORIGIN` 写用户实际打开的网站地址，例如 `https://problems.example.edu.cn`，不能带路径。
+   填写 `urmotiv.env` 时请使用密码管理器生成随机值。`URMOTIV_PLUGIN_SECRET_KEY` 必须是 32 字节随机值的 Base64URL 编码（把随机字节写成只含字母、数字、下划线和短横线的文本），用于加密保存插件令牌，不能复用数据库或 MinIO 密码。网页会话使用服务端生成的随机令牌，数据库只保存摘要，不需要另配一个未使用的 `SESSION_SECRET`。启用 CAS 时，`URMOTIV_CAS_STATE_SECRET` 必须单独生成恰好 32 字节的无填充 Base64URL 值，也不能与前述密钥复用。PostgreSQL 密码会进入连接地址，因此只使用字母、数字、连字符和下划线。`URMOTIV_WEB_ORIGIN` 写用户实际打开的网站地址，例如 `https://problems.example.edu.cn`，不能带路径。
 
 2. 检查私有环境文件。脚本只报告缺少的字段，不会打印字段值。
 
@@ -119,7 +119,7 @@ bash scripts/deploy/backup.sh \
 - 正式环境必须配置 `URMOTIV_PLUGIN_SECRET_KEY`。如果数据库已经保存插件令牌而这个值缺失，API 会在监听端口前停止启动，避免插件改用无认证请求。
 - `URMOTIV_TRUSTED_PROXY_CIDRS` 默认留空。只有明确掌握每一层代理地址并确认其正确处理转发头时才可配置；应用不会自动信任回环地址、私网、容器网络或固定跳数。
 - `URMOTIV_EMAIL_REGISTRATION_ENABLED` 默认为 `false`。在完成真实邮件验证和投递配置前，不要开启它。
-- CAS 的地址、稳定身份字段和状态密钥需要在真实 USTC 联调后写入私有环境文件；确认前不能把学号当作永久唯一身份。
+- CAS 的地址、稳定身份字段和状态密钥需要在真实 USTC 联调后写入私有环境文件；确认前不能把学号当作永久唯一身份。CAS 配置和状态密钥只注入 API 容器，不进入迁移、后台任务、网站或其他容器。
 
 ## 邮箱注册与验证
 
@@ -151,17 +151,23 @@ Fermata 的难度评定与等级标定实验（结果与当前校准状态）见
 ## 首次接入 USTC 统一身份认证（CAS）
 
 系统按标准 CAS 协议接入 `id.ustc.edu.cn`，但**具体返回哪些属性字段（学号、GID、邮箱等的字段名）
-必须以真实联调为准**，不能凭猜测写死。因此实现采用“配置字段名 + 失败时自曝可用字段”的方式：
+必须以真实联调为准**，不能凭猜测写死。程序只接收明确配置的字段名，登录失败时返回固定的未登录响应，
+不会在响应或日志里列出认证服务返回的字段和值：
 
 1. 在私有环境文件里打开 CAS 并填入地址与占位字段名（见 `deploy/env.production.example` 的 CAS 段）：
    `URMOTIV_CAS_ENABLED=true`、登录/校验/回调地址、`URMOTIV_CAS_SUBJECT_ATTRIBUTE`（先用占位如
-   `cas:user`）、`URMOTIV_CAS_STATE_SECRET`（32 字节以上随机值的 Base64URL）。
-2. 部署后**用一个真实统一身份账号点一次登录**。如果占位字段取不到稳定身份，登录会失败并返回错误码
-   `subject_attribute_missing`，**错误信息里会列出这次 CAS 实际返回的全部字段名**。
-3. 从这个列表里挑出真正稳定唯一的字段（GID 或学号），回填 `URMOTIV_CAS_SUBJECT_ATTRIBUTE`；
+   `cas:user`）、`URMOTIV_CAS_STATE_SECRET`（恰好 32 字节随机值的无填充 Base64URL）。当前认证契约
+   只有 `login`、`serviceValidate` 和本站 `callback` 三个地址，没有未使用的 base/logout 配置；正式环境
+   三个地址必须全部使用 HTTPS，也不能带账号密码。回调必须精确等于 `URMOTIV_WEB_ORIGIN` 加
+   `/api/v1/auth/cas/callback`，不能指向其他站点、其他路径，也不能预带查询参数或片段。
+2. 部署前运行 `validate-env.sh`。CAS 开关只接受 `true` 或 `false`；为 `false` 时其余 CAS 字段可以留空，
+   为 `true` 时缺项、HTTP 地址、畸形字段或长度/编码不规范的状态密钥都会在部署检查或 API 启动阶段以固定错误失败，不会输出配置值。
+3. 在受控测试实例中**用一个真实统一身份账号点一次登录**，并依据 USTC 认证服务的受控文档或由身份服务
+   管理员确认实际属性名称。不要通过打开调试日志、回显原始 XML 或把原始响应发到聊天来探测字段。
+4. 挑出真正稳定唯一的字段（GID 或学号），回填 `URMOTIV_CAS_SUBJECT_ATTRIBUTE`；
    把含学号的字段名逗号分隔填进 `URMOTIV_CAS_STUDENT_ID_ATTRIBUTES`（登录时写入用户标识表，供历史
    题目按学号匹配）；邮箱、昵称字段同理填入对应变量。改完重启 api 即可。
-4. 一个人可能有多个学号（本科+研究生），系统按“认证来源 + 稳定身份编号”识别账号、学号只作辅助匹配；
+5. 一个人可能有多个学号（本科+研究生），系统按“认证来源 + 稳定身份编号”识别账号、学号只作辅助匹配；
    稳定字段确认前不要把学号当作永久唯一主键。
 
 这一步需要一个真实统一身份账号，只能由本人在浏览器里完成，无法在服务器端自动化。

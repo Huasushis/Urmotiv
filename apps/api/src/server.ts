@@ -51,6 +51,7 @@ import {
 import { assertAdminBootstrapReadyForServer } from "./bootstrap-admin";
 
 const appOptions = readServerOptions(process.env);
+const authenticationOptions = readServerAuthenticationOptions(process.env);
 const databaseOptions = readServerDatabaseOptions(process.env);
 const storageOptions = readServerStorageOptions(process.env);
 const fileStorage = createFileStorage(storageOptions);
@@ -144,7 +145,6 @@ try {
     coordinator: packageCoordinator,
     exportReader
   });
-  const authenticationOptions = readServerAuthenticationOptions(process.env);
   const casClient = authenticationOptions.cas === undefined
     ? undefined
     : new CasClient({

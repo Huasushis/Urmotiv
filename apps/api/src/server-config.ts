@@ -12,6 +12,8 @@ const maximumStorageMaxFileBytes = 512 * 1024 * 1024;
 const maximumTrustedProxyCidrs = 32;
 const trustedProxyConfigurationError =
   "URMOTIV_TRUSTED_PROXY_CIDRS 必须是最多 32 项、逗号分隔且不含全网范围的 IPv4 或 IPv6 CIDR。";
+const casConfigurationError = "URMOTIV_CAS_CONFIGURATION_INVALID";
+const casStateSecretPattern = /^[A-Za-z0-9_-]{43}$/;
 
 export interface ServerEnvironment {
   readonly [name: string]: string | undefined;
@@ -33,6 +35,7 @@ export interface ServerEnvironment {
   URMOTIV_CAS_NICKNAME_ATTRIBUTE?: string;
   URMOTIV_CAS_STUDENT_ID_ATTRIBUTES?: string;
   URMOTIV_CAS_STATE_SECRET?: string;
+  URMOTIV_PLUGIN_SECRET_KEY?: string;
   URMOTIV_PGLITE_PATH?: string;
   URMOTIV_TRUSTED_PROXY_CIDRS?: string;
   URMOTIV_WEB_ORIGIN?: string;
@@ -136,40 +139,105 @@ export function readServerAuthenticationOptions(
     throw new Error("开启邮箱注册前必须开启邮箱登录。");
   }
   const verification = readEmailVerificationOptions(environment, emailRegistrationEnabled);
-  if (environment.URMOTIV_CAS_ENABLED !== "true") {
+  const casEnabled = environment.URMOTIV_CAS_ENABLED;
+  if (casEnabled === undefined || casEnabled === "false") {
     return {
       emailLoginEnabled,
       emailRegistrationEnabled,
       ...(verification === undefined ? {} : { emailVerification: verification })
     };
   }
-  const secretText = environment.URMOTIV_CAS_STATE_SECRET?.trim() ?? "";
-  let stateSecret: Uint8Array;
+  if (casEnabled !== "true") {
+    throw new Error(casConfigurationError);
+  }
+
+  const secretText = environment.URMOTIV_CAS_STATE_SECRET ?? "";
+  if (
+    !casStateSecretPattern.test(secretText) ||
+    secretText === environment.URMOTIV_PLUGIN_SECRET_KEY
+  ) {
+    throw new Error(casConfigurationError);
+  }
+  const decodedStateSecret = Buffer.from(secretText, "base64url");
+  if (
+    decodedStateSecret.byteLength !== 32 ||
+    decodedStateSecret.toString("base64url") !== secretText
+  ) {
+    throw new Error(casConfigurationError);
+  }
+  const stateSecret = new Uint8Array(decodedStateSecret);
+
+  const textualConfigurationValues = [
+    environment.URMOTIV_CAS_LOGIN_URL,
+    environment.URMOTIV_CAS_VALIDATE_URL,
+    environment.URMOTIV_CAS_CALLBACK_URL,
+    environment.URMOTIV_CAS_SUBJECT_ATTRIBUTE,
+    environment.URMOTIV_CAS_EMAIL_ATTRIBUTE,
+    environment.URMOTIV_CAS_NICKNAME_ATTRIBUTE,
+    environment.URMOTIV_CAS_STUDENT_ID_ATTRIBUTES
+  ];
+  if (textualConfigurationValues.some((value) => value !== undefined && value !== value.trim())) {
+    throw new Error(casConfigurationError);
+  }
+  const studentIdAttributeText = environment.URMOTIV_CAS_STUDENT_ID_ATTRIBUTES ?? "";
+  const studentIdAttributes =
+    studentIdAttributeText === "" ? [] : studentIdAttributeText.split(",");
+  let configuration: CasConfiguration;
   try {
-    stateSecret = Buffer.from(secretText, "base64url");
+    configuration = casConfigurationSchema.parse({
+      loginUrl: environment.URMOTIV_CAS_LOGIN_URL,
+      validateUrl: environment.URMOTIV_CAS_VALIDATE_URL,
+      callbackUrl: environment.URMOTIV_CAS_CALLBACK_URL,
+      subjectAttribute: environment.URMOTIV_CAS_SUBJECT_ATTRIBUTE,
+      ...(environment.URMOTIV_CAS_EMAIL_ATTRIBUTE
+        ? { emailAttribute: environment.URMOTIV_CAS_EMAIL_ATTRIBUTE }
+        : {}),
+      ...(environment.URMOTIV_CAS_NICKNAME_ATTRIBUTE
+        ? { nicknameAttribute: environment.URMOTIV_CAS_NICKNAME_ATTRIBUTE }
+        : {}),
+      ...(studentIdAttributes.length > 0 ? { studentIdAttributes } : {})
+    });
   } catch {
-    throw new Error("URMOTIV_CAS_STATE_SECRET 必须是 Base64URL 编码的随机密钥。");
+    throw new Error(casConfigurationError);
   }
-  if (stateSecret.byteLength < 32) {
-    throw new Error("URMOTIV_CAS_STATE_SECRET 解码后至少需要 32 字节。");
+  if (
+    environment.NODE_ENV === "production" &&
+    [configuration.loginUrl, configuration.validateUrl, configuration.callbackUrl]
+      .some((value) => new URL(value).protocol !== "https:")
+  ) {
+    throw new Error(casConfigurationError);
   }
-  const studentIdAttributes = (environment.URMOTIV_CAS_STUDENT_ID_ATTRIBUTES ?? "")
-    .split(",")
-    .map((value) => value.trim())
-    .filter((value) => value.length > 0);
-  const configuration = casConfigurationSchema.parse({
-    loginUrl: environment.URMOTIV_CAS_LOGIN_URL,
-    validateUrl: environment.URMOTIV_CAS_VALIDATE_URL,
-    callbackUrl: environment.URMOTIV_CAS_CALLBACK_URL,
-    subjectAttribute: environment.URMOTIV_CAS_SUBJECT_ATTRIBUTE,
-    ...(environment.URMOTIV_CAS_EMAIL_ATTRIBUTE?.trim()
-      ? { emailAttribute: environment.URMOTIV_CAS_EMAIL_ATTRIBUTE.trim() }
-      : {}),
-    ...(environment.URMOTIV_CAS_NICKNAME_ATTRIBUTE?.trim()
-      ? { nicknameAttribute: environment.URMOTIV_CAS_NICKNAME_ATTRIBUTE.trim() }
-      : {}),
-    ...(studentIdAttributes.length > 0 ? { studentIdAttributes } : {})
-  });
+  const callbackUrl = new URL(configuration.callbackUrl);
+  if (
+    callbackUrl.pathname !== "/api/v1/auth/cas/callback" ||
+    callbackUrl.search.length > 0 ||
+    callbackUrl.hash.length > 0
+  ) {
+    throw new Error(casConfigurationError);
+  }
+  if (environment.NODE_ENV === "production") {
+    const webOriginText = environment.URMOTIV_WEB_ORIGIN ?? "";
+    let webOrigin: URL;
+    try {
+      if (webOriginText !== webOriginText.trim() || webOriginText.includes(",")) {
+        throw new Error("invalid web origin");
+      }
+      webOrigin = new URL(webOriginText);
+    } catch {
+      throw new Error(casConfigurationError);
+    }
+    if (
+      webOrigin.protocol !== "https:" ||
+      webOrigin.username.length > 0 ||
+      webOrigin.password.length > 0 ||
+      (webOrigin.pathname !== "" && webOrigin.pathname !== "/") ||
+      webOrigin.search.length > 0 ||
+      webOrigin.hash.length > 0 ||
+      callbackUrl.origin !== webOrigin.origin
+    ) {
+      throw new Error(casConfigurationError);
+    }
+  }
   return {
     emailLoginEnabled,
     emailRegistrationEnabled,

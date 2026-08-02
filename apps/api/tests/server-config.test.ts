@@ -101,18 +101,165 @@ describe("认证启动配置", () => {
     ).toThrow("开启邮箱注册前必须开启邮箱登录");
   });
 
-  it("要求 CAS 明确配置稳定身份字段和足够长的状态密钥", () => {
-    expect(() => readServerAuthenticationOptions({ URMOTIV_CAS_ENABLED: "true" })).toThrow();
+  const validCasEnvironment = {
+    URMOTIV_CAS_ENABLED: "true",
+    URMOTIV_CAS_LOGIN_URL: "https://id.example/cas/login",
+    URMOTIV_CAS_VALIDATE_URL: "https://id.example/cas/serviceValidate",
+    URMOTIV_CAS_CALLBACK_URL: "https://problems.example/api/v1/auth/cas/callback",
+    URMOTIV_WEB_ORIGIN: "https://problems.example",
+    URMOTIV_CAS_SUBJECT_ATTRIBUTE: "accountId",
+    URMOTIV_CAS_STATE_SECRET: Buffer.alloc(32, 7).toString("base64url"),
+    URMOTIV_PLUGIN_SECRET_KEY: Buffer.alloc(32, 8).toString("base64url")
+  } as const;
+
+  it("CAS 关闭时不要求也不解析 CAS 配置", () => {
+    expect(readServerAuthenticationOptions({}).cas).toBeUndefined();
     expect(
       readServerAuthenticationOptions({
-        URMOTIV_CAS_ENABLED: "true",
-        URMOTIV_CAS_LOGIN_URL: "https://id.example/cas/login",
-        URMOTIV_CAS_VALIDATE_URL: "https://id.example/cas/serviceValidate",
-        URMOTIV_CAS_CALLBACK_URL: "https://problems.example/api/v1/auth/cas/callback",
-        URMOTIV_CAS_SUBJECT_ATTRIBUTE: "accountId",
-        URMOTIV_CAS_STATE_SECRET: Buffer.alloc(32, 7).toString("base64url")
-      }).cas?.configuration.subjectAttribute
+        URMOTIV_CAS_ENABLED: "false",
+        URMOTIV_CAS_LOGIN_URL: "not-a-url",
+        URMOTIV_CAS_STATE_SECRET: "not-a-secret"
+      }).cas
+    ).toBeUndefined();
+  });
+
+  it("只接受明确的 CAS 开关值", () => {
+    for (const value of ["TRUE", "1", "yes", " false "]) {
+      expectCasConfigurationError({ URMOTIV_CAS_ENABLED: value }, value);
+    }
+  });
+
+  it("要求 CAS 明确配置稳定身份字段和规范的 32 字节状态密钥", () => {
+    expect(
+      readServerAuthenticationOptions(validCasEnvironment).cas?.configuration.subjectAttribute
     ).toBe("accountId");
+
+    for (const key of [
+      "URMOTIV_CAS_LOGIN_URL",
+      "URMOTIV_CAS_VALIDATE_URL",
+      "URMOTIV_CAS_CALLBACK_URL",
+      "URMOTIV_CAS_SUBJECT_ATTRIBUTE",
+      "URMOTIV_CAS_STATE_SECRET"
+    ] as const) {
+      const incomplete = { ...validCasEnvironment } as Record<string, string | undefined>;
+      delete incomplete[key];
+      expectCasConfigurationError(incomplete, key);
+    }
+  });
+
+  it("对畸形或非规范状态密钥只返回固定安全错误", () => {
+    const invalidSecrets = [
+      "secret-sentinel",
+      Buffer.alloc(31, 3).toString("base64url"),
+      Buffer.alloc(33, 3).toString("base64url"),
+      `${Buffer.alloc(32, 3).toString("base64url")}=`,
+      ` ${Buffer.alloc(32, 3).toString("base64url")}`
+    ];
+    for (const secret of invalidSecrets) {
+      expectCasConfigurationError(
+        { ...validCasEnvironment, URMOTIV_CAS_STATE_SECRET: secret },
+        secret
+      );
+    }
+  });
+
+  it("拒绝把 CAS 状态密钥与插件加密密钥复用", () => {
+    expectCasConfigurationError(
+      {
+        ...validCasEnvironment,
+        URMOTIV_CAS_STATE_SECRET: validCasEnvironment.URMOTIV_PLUGIN_SECRET_KEY
+      },
+      validCasEnvironment.URMOTIV_PLUGIN_SECRET_KEY
+    );
+  });
+
+  it("生产环境要求当前 CAS 契约的三个地址全部使用 HTTPS", () => {
+    for (const key of [
+      "URMOTIV_CAS_LOGIN_URL",
+      "URMOTIV_CAS_VALIDATE_URL",
+      "URMOTIV_CAS_CALLBACK_URL"
+    ] as const) {
+      const unsafeUrl = `http://unsafe-${key.toLowerCase()}.example.test/path`;
+      expectCasConfigurationError(
+        { ...validCasEnvironment, NODE_ENV: "production", [key]: unsafeUrl },
+        unsafeUrl
+      );
+    }
+  });
+
+  it("把 CAS 回调精确绑定到本站公开来源和固定路径", () => {
+    const invalidCallbacks = [
+      "https://other.example/api/v1/auth/cas/callback",
+      "https://problems.example/api/v1/auth/cas/callback/",
+      "https://problems.example/api/v1/auth/cas/other",
+      "https://problems.example/api/v1/auth/cas/callback?fixed=value",
+      "https://problems.example/api/v1/auth/cas/callback#fragment"
+    ];
+    for (const callbackUrl of invalidCallbacks) {
+      expectCasConfigurationError(
+        {
+          ...validCasEnvironment,
+          NODE_ENV: "production",
+          URMOTIV_CAS_CALLBACK_URL: callbackUrl
+        },
+        callbackUrl
+      );
+    }
+    expect(
+      readServerAuthenticationOptions({
+        ...validCasEnvironment,
+        NODE_ENV: "production",
+        URMOTIV_WEB_ORIGIN: "https://problems.example/"
+      }).cas
+    ).toBeDefined();
+  });
+
+  it("正式环境启用 CAS 时要求单一 HTTPS 本站来源", () => {
+    for (const webOrigin of [
+      "http://problems.example",
+      "https://problems.example/path",
+      "https://problems.example?query=value",
+      "https://problems.example,https://other.example",
+      " https://problems.example"
+    ]) {
+      expectCasConfigurationError(
+        { ...validCasEnvironment, NODE_ENV: "production", URMOTIV_WEB_ORIGIN: webOrigin },
+        webOrigin
+      );
+    }
+  });
+
+  it("不透传 URL 和字段校验器的原始错误或配置值", () => {
+    const invalidConfigurations = [
+      {
+        ...validCasEnvironment,
+        URMOTIV_CAS_LOGIN_URL: "not-a-url-sentinel"
+      },
+      {
+        ...validCasEnvironment,
+        URMOTIV_CAS_VALIDATE_URL: "https://account:password-sentinel@id.example/validate"
+      },
+      {
+        ...validCasEnvironment,
+        URMOTIV_CAS_SUBJECT_ATTRIBUTE: "invalid attribute sentinel"
+      }
+    ];
+    for (const configuration of invalidConfigurations) {
+      const sentinel = Object.values(configuration).find((value) => value.includes("sentinel"));
+      expectCasConfigurationError(configuration, sentinel ?? "sentinel");
+    }
+  });
+
+  it("非生产测试环境可以显式连接本机 HTTP CAS 替身", () => {
+    expect(
+      readServerAuthenticationOptions({
+        ...validCasEnvironment,
+        NODE_ENV: "test",
+        URMOTIV_CAS_LOGIN_URL: "http://127.0.0.1:4100/login",
+        URMOTIV_CAS_VALIDATE_URL: "http://127.0.0.1:4100/serviceValidate",
+        URMOTIV_CAS_CALLBACK_URL: "http://127.0.0.1:3000/api/v1/auth/cas/callback"
+      }).cas
+    ).toBeDefined();
   });
 
   it("only allows the in-memory delivery sink in automated tests", () => {
@@ -129,6 +276,20 @@ describe("认证启动配置", () => {
     ).toEqual({ mode: "test", webUrl: "http://localhost:5173" });
   });
 });
+
+function expectCasConfigurationError(
+  environment: Parameters<typeof readServerAuthenticationOptions>[0],
+  forbiddenOutput: string
+): void {
+  let message = "没有拒绝";
+  try {
+    readServerAuthenticationOptions(environment);
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+  expect(message).toBe("URMOTIV_CAS_CONFIGURATION_INVALID");
+  expect(message).not.toContain(forbiddenOutput);
+}
 
 describe("数据库启动配置", () => {
   it("开发环境默认使用有文件目录的 PGlite", () => {

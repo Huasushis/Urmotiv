@@ -66,7 +66,20 @@ services:
       context: .
       dockerfile: Dockerfile.api
     restart: "no"
-    environment: &app-environment
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["pnpm", "--filter", "@urmotiv/api", "migrate"]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    environment:
       NODE_ENV: production
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
@@ -79,22 +92,18 @@ services:
       S3_FORCE_PATH_STYLE: "true"
       URMOTIV_WEB_ORIGIN: ${URMOTIV_WEB_ORIGIN:?请在私有环境文件中设置 URMOTIV_WEB_ORIGIN}
       URMOTIV_TRUSTED_PROXY_CIDRS: ${URMOTIV_TRUSTED_PROXY_CIDRS:-}
-      SESSION_SECRET: ${SESSION_SECRET:?请在私有环境文件中设置 SESSION_SECRET}
       URMOTIV_PLUGIN_SECRET_KEY: ${URMOTIV_PLUGIN_SECRET_KEY:?请在私有环境文件中设置 URMOTIV_PLUGIN_SECRET_KEY}
       URMOTIV_EMAIL_LOGIN_ENABLED: ${URMOTIV_EMAIL_LOGIN_ENABLED:-true}
       URMOTIV_EMAIL_REGISTRATION_ENABLED: ${URMOTIV_EMAIL_REGISTRATION_ENABLED:-false}
       URMOTIV_CAS_ENABLED: ${URMOTIV_CAS_ENABLED:-false}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    command: ["pnpm", "--filter", "@urmotiv/api", "migrate"]
-
-  api:
-    build:
-      context: .
-      dockerfile: Dockerfile.api
-    restart: unless-stopped
-    environment: *app-environment
+      URMOTIV_CAS_LOGIN_URL: ${URMOTIV_CAS_LOGIN_URL:-}
+      URMOTIV_CAS_VALIDATE_URL: ${URMOTIV_CAS_VALIDATE_URL:-}
+      URMOTIV_CAS_CALLBACK_URL: ${URMOTIV_CAS_CALLBACK_URL:-}
+      URMOTIV_CAS_SUBJECT_ATTRIBUTE: ${URMOTIV_CAS_SUBJECT_ATTRIBUTE:-}
+      URMOTIV_CAS_EMAIL_ATTRIBUTE: ${URMOTIV_CAS_EMAIL_ATTRIBUTE:-}
+      URMOTIV_CAS_NICKNAME_ATTRIBUTE: ${URMOTIV_CAS_NICKNAME_ATTRIBUTE:-}
+      URMOTIV_CAS_STUDENT_ID_ATTRIBUTES: ${URMOTIV_CAS_STUDENT_ID_ATTRIBUTES:-}
+      URMOTIV_CAS_STATE_SECRET: ${URMOTIV_CAS_STATE_SECRET:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -116,7 +125,10 @@ services:
       context: .
       dockerfile: Dockerfile.worker
     restart: unless-stopped
-    environment: *app-environment
+    environment:
+      NODE_ENV: production
+      REDIS_URL: redis://redis:6379/0
+      JOB_REDIS_PREFIX: ${JOB_REDIS_PREFIX:-urmotiv:jobs}
     depends_on:
       redis:
         condition: service_healthy
