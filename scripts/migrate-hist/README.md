@@ -539,6 +539,46 @@ python3 scripts/migrate-hist/prepare-review-gold.py seal \
 - `tuning-history-additions.private.json`：本次 development 项，人工合并进下一版完整调参历史；
 - `REVIEW_GOLD_COMPLETE`：绑定计划、调参历史、上游证据、来源连接和全部 Gold 摘要的完成标记。
 
+需要把这份上游证据交给 Fermata 的私有转换步骤前，先用只读命令重新验封：
+
+```bash
+python3 scripts/migrate-hist/prepare-review-gold.py verify-sealed \
+  --private-root <private-root> \
+  --input <private-root>/history/review-list-older.xlsx \
+  --input <private-root>/history/review-list-newer.xml \
+  --inspection <private-root>/history/review-input-inspection.private.json \
+  --layout <private-root>/history/review-layout.private.json \
+  --materialized <private-root>/history/materialized-001 \
+  --worksheet <private-root>/history/review-gold-worksheet-001 \
+  --plan <private-root>/history/review-plan-001.private.json \
+  --tuning-history <private-root>/history/tuning-history.private.json \
+  --sealed <private-root>/history/review-gold-dataset-001 \
+  --verifier-code-version <可信调用方确认的40位Git提交> \
+  --verifier-runner-sha256 <当前prepare-review-gold.py摘要> \
+  --verifier-dependency-code-sha256 <两份固定Python依赖的代码摘要>
+```
+
+`verify-sealed` 不写文件或目录。它复用 `seal` 的完整只读重算链，重新读取一至两份原表、inspection、layout、
+真实工作表行与 `rowEvidenceSha256`、物化报告与源文件清单、工作表完成标记、计划和完整调参历史；随后按计划
+顺序重建并逐字节核对 evidence、bindings、additions、每份 Gold 和最后写入的完成标记。物化目录、工作表
+目录、sealed 顶层及 `gold/` 都会在验证前后核对严格清单；验证期间持续持有最初打开的目录句柄，结束前还会
+从同一句柄逐字节重读物化报告、全部物化源、工作表成果和 sealed 成果，并确认公开路径仍指向原设备号和
+inode。额外对象、读后替换、符号链接、硬链接、非 `0600` 文件、错误目录权限或目录身份变化全部失败。
+验封数据集必须至少有一条 development 样本。
+
+成功时 stdout 只包含 UTF-8、`ensure_ascii=false`、两空格缩进并以恰好一个换行结束的
+`urmotiv_review_gold_verification_attestation` JSON，stderr 为空。字段固定包含协议版本、上游 datasetId、
+verifier 身份、逐层原始或规范化摘要、按 inspection 顺序的输入、按 plan 顺序的 case、安全计数和
+`verificationFingerprint`；不包含私有根路径、原表路径、题面、题解、题名、人员或审核原文。指纹计算时先
+移除指纹字段，再递归按键名字典序排列对象、保持数组顺序，以无空白 UTF-8 JSON 计算 SHA-256。失败时
+stdout 为空，stderr 仍只有本工具固定的安全错误。
+
+verifier 会稳定复读当前 runner，并要求摘要等于参数；依赖代码摘要固定覆盖仓库相对路径
+`scripts/migrate-hist/parse-metadata.py` 和 `scripts/migrate-hist/prepare-review-gold.py`。按路径排序后，每项依次
+写入“ASCII 路径字节数、冒号、路径字节、NUL、ASCII 文件字节数、冒号、文件字节、NUL”，再计算整段
+SHA-256。Python 工具不自行运行 Git；可信调用方仍须在调用前后核对工作树、HEAD 和这两份文件，并把同一
+提交号和摘要传入。
+
 原始审核意见只存在 `review-worksheet.private.json`。私有根从 `/` 开始逐段以禁止跟随符号链接的目录句柄
 打开；读写都锚定在该句柄，读取还会做双读、文件状态和重新打开核验，以便路径或文件在处理中被替换时
 失败关闭。`init`/`seal` 创建 `output`（以及 `seal` 的 `gold`）后，会持有对应目录的句柄与设备号、inode

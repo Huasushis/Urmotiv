@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.util
 import json
 import os
 import copy
+import shutil
 import stat
 import subprocess
 import sys
@@ -1251,6 +1253,676 @@ class PrepareReviewGoldTest(unittest.TestCase):
                     created.close()
             finally:
                 anchor.close()
+
+    def test_verify_sealed_xml_emits_exact_safe_attestation_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="urmotiv-review-gold-verify-") as directory:
+            root = self._private_root(Path(directory))
+            fixture = self._create_verification_fixture(root)
+            before = self._tree_snapshot(root)
+            verified = self._verify_fixture(fixture)
+            expected = self._expected_attestation(fixture)
+            expected_stdout = json.dumps(
+                expected,
+                ensure_ascii=False,
+                allow_nan=False,
+                indent=2,
+            ) + "\n"
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+            self.assertEqual(verified.stderr, "")
+            self.assertEqual(verified.stdout, expected_stdout)
+            self.assertEqual(verified.stdout.count("\n", len(verified.stdout.rstrip("\n"))), 1)
+            self.assertEqual(self._tree_snapshot(root), before)
+            self.assertEqual(
+                list(json.loads(verified.stdout)),
+                [
+                    "schemaVersion",
+                    "artifactKind",
+                    "protocolVersion",
+                    "verificationStatus",
+                    "upstreamDatasetId",
+                    "verifier",
+                    "artifacts",
+                    "reviewInputs",
+                    "cases",
+                    "counts",
+                    "verificationFingerprint",
+                ],
+            )
+            for private_value in (
+                PRIVATE_DIFFICULTY,
+                PRIVATE_TITLE_A,
+                PRIVATE_REVIEW_A,
+                "SYNTHETIC ACCEPTED RAW",
+                str(root),
+            ):
+                self.assertNotIn(private_value, verified.stdout)
+
+    def test_verify_sealed_recomputes_every_layer_and_rejects_tampering(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="urmotiv-review-gold-tamper-") as directory:
+            parent = Path(directory)
+            baseline = self._private_root(parent)
+            self._create_verification_fixture(baseline)
+            tamper_cases = [
+                ("raw-input", "synthetic.xml", "append"),
+                ("inspection", "inspection.private.json", "append"),
+                ("layout", "layout.private.json", "append"),
+                ("source-confirmation", "materialized/source-confirmation.private.json", "confirmation"),
+                ("materialization-report", "materialized/report.json", "report"),
+                ("materialized-source", "materialized/sources/source-000001.md", "append"),
+                ("materialization-complete", "materialized/MATERIALIZE_COMPLETE", "append"),
+                ("worksheet", "worksheet/review-worksheet.private.json", "append"),
+                ("plan-skeleton", "worksheet/review-plan.skeleton.private.json", "append"),
+                ("tuning-skeleton", "worksheet/tuning-history.skeleton.private.json", "append"),
+                ("worksheet-complete", "worksheet/REVIEW_WORKSHEET_COMPLETE", "append"),
+                ("plan", "plan.private.json", "append"),
+                ("tuning", "tuning.private.json", "append"),
+                ("sealed-marker", "sealed/REVIEW_GOLD_COMPLETE", "append"),
+                ("evidence", "sealed/review-gold-evidence.private.json", "append"),
+                ("bindings", "sealed/source-bindings.private.json", "append"),
+                ("gold", "sealed/gold/case-synthetic-a.json", "append"),
+                ("additions", "sealed/tuning-history-additions.private.json", "append"),
+            ]
+            for index, (name, relative, action) in enumerate(tamper_cases, 1):
+                with self.subTest(layer=name):
+                    clone = parent / f"tampered-{index:02d}"
+                    shutil.copytree(baseline, clone)
+                    os.chmod(clone, 0o700)
+                    target = clone / relative
+                    if action == "report":
+                        value = self._read_json(target)
+                        value["fragmentCount"] += 1
+                        self._write_json(target, value, replace=True)
+                    elif action == "confirmation":
+                        value = self._read_json(target)
+                        value["metadataFileSha256"] = "f" * 64
+                        self._write_json(target, value, replace=True)
+                    else:
+                        self._append_tamper(target)
+                    failed = self._verify_fixture(
+                        self._verification_fixture_paths(clone)
+                    )
+                    self._assert_fixed_failure(failed)
+                    self.assertEqual(failed.stdout, "")
+
+    def test_verify_sealed_rejects_inventory_links_and_permissions(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="urmotiv-review-gold-inventory-") as directory:
+            parent = Path(directory)
+            baseline = self._private_root(parent)
+            self._create_verification_fixture(baseline)
+
+            def extra_top(root: Path) -> None:
+                path = root / "sealed" / "extra.private.json"
+                path.write_bytes(b"{}\n")
+                os.chmod(path, 0o600)
+
+            def extra_gold(root: Path) -> None:
+                path = root / "sealed" / "gold" / "extra.json"
+                path.write_bytes(b"{}\n")
+                os.chmod(path, 0o600)
+
+            def hard_link(root: Path) -> None:
+                os.link(
+                    root / "sealed" / "review-gold-evidence.private.json",
+                    root / "outside-hard-link.private.json",
+                )
+
+            def symbolic_link(root: Path) -> None:
+                gold = root / "sealed" / "gold" / "case-synthetic-a.json"
+                detached = root / "detached-gold.private.json"
+                gold.rename(detached)
+                gold.symlink_to(detached)
+
+            def file_permission(root: Path) -> None:
+                os.chmod(
+                    root / "sealed" / "source-bindings.private.json",
+                    0o640,
+                )
+
+            def directory_permission(root: Path) -> None:
+                os.chmod(root / "sealed" / "gold", 0o750)
+
+            scenarios = (
+                ("extra-top", extra_top),
+                ("extra-gold", extra_gold),
+                ("hard-link", hard_link),
+                ("symbolic-link", symbolic_link),
+                ("file-permission", file_permission),
+                ("directory-permission", directory_permission),
+            )
+            for index, (name, mutate) in enumerate(scenarios, 1):
+                with self.subTest(case=name):
+                    clone = parent / f"unsafe-{index:02d}"
+                    shutil.copytree(baseline, clone)
+                    os.chmod(clone, 0o700)
+                    mutate(clone)
+                    failed = self._verify_fixture(
+                        self._verification_fixture_paths(clone)
+                    )
+                    self._assert_fixed_failure(failed)
+                    self.assertEqual(failed.stdout, "")
+
+    def test_verify_sealed_rejects_false_verifier_identity_parameters(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="urmotiv-review-gold-identity-") as directory:
+            root = self._private_root(Path(directory))
+            fixture = self._create_verification_fixture(root)
+            scenarios = (
+                {"code_version": "0" * 40},
+                {"code_version": "g" * 40},
+                {"runner_sha256": "0" * 64},
+                {"runner_sha256": "f" * 64},
+                {"dependency_sha256": "0" * 64},
+                {"dependency_sha256": "e" * 64},
+            )
+            before = self._tree_snapshot(root)
+            for values in scenarios:
+                with self.subTest(values=values):
+                    failed = self._verify_fixture(fixture, **values)
+                    self._assert_fixed_failure(failed)
+                    self.assertEqual(failed.stdout, "")
+            self.assertEqual(self._tree_snapshot(root), before)
+
+    def test_verify_sealed_holds_materialized_and_worksheet_directory_identity(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="urmotiv-review-gold-anchor-") as directory:
+            parent = Path(directory)
+            baseline = self._private_root(parent)
+            self._create_verification_fixture(baseline)
+            scenarios = (
+                ("materialized", "MATERIALIZE_COMPLETE"),
+                ("worksheet", "REVIEW_WORKSHEET_COMPLETE"),
+            )
+            for index, (fixture_key, trigger_name) in enumerate(scenarios, 1):
+                with self.subTest(directory=fixture_key):
+                    clone = parent / f"anchor-race-{index}"
+                    shutil.copytree(baseline, clone)
+                    os.chmod(clone, 0o700)
+                    fixture = self._verification_fixture_paths(clone)
+                    target = fixture[fixture_key]
+                    detached = clone / f"detached-{fixture_key}"
+                    arguments = self._verification_arguments(fixture)
+                    real_read = TOOL._read_private_json_at
+                    replaced = False
+
+                    def replace_after_completion_read(
+                        anchored: object,
+                        name: str,
+                    ) -> tuple[object, bytes]:
+                        nonlocal replaced
+                        value = real_read(anchored, name)
+                        if (
+                            not replaced
+                            and anchored.path == target
+                            and name == trigger_name
+                        ):
+                            replaced = True
+                            target.rename(detached)
+                            shutil.copytree(detached, target)
+                            os.chmod(target, 0o700)
+                        return value
+
+                    with mock.patch.object(
+                        TOOL,
+                        "_read_private_json_at",
+                        replace_after_completion_read,
+                    ):
+                        with self.assertRaises(TOOL._SafeFailure):
+                            TOOL._command_verify_sealed(arguments)
+                    self.assertTrue(replaced)
+                    self.assertTrue(target.is_dir())
+                    self.assertTrue(detached.is_dir())
+
+    def test_verify_sealed_rereads_exact_derived_bytes_after_validation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="urmotiv-review-gold-reread-") as directory:
+            parent = Path(directory)
+            baseline = self._private_root(parent)
+            self._create_verification_fixture(baseline)
+            scenarios = (
+                "materialized-report",
+                "materialized-source",
+                "worksheet-skeleton",
+            )
+            for index, scenario in enumerate(scenarios, 1):
+                with self.subTest(artifact=scenario):
+                    clone = parent / f"reread-race-{index}"
+                    shutil.copytree(baseline, clone)
+                    os.chmod(clone, 0o700)
+                    fixture = self._verification_fixture_paths(clone)
+                    arguments = self._verification_arguments(fixture)
+                    real_json_read = TOOL._read_private_json_at
+                    real_bytes_read = TOOL._read_private_bytes_at
+                    replaced = False
+
+                    def replace_json_after_read(
+                        anchored: object,
+                        name: str,
+                    ) -> tuple[object, bytes]:
+                        nonlocal replaced
+                        value = real_json_read(anchored, name)
+                        target: Path | None = None
+                        if (
+                            scenario == "materialized-report"
+                            and anchored.path == fixture["materialized"]
+                            and name == "MATERIALIZE_COMPLETE"
+                        ):
+                            target = fixture["materialized"] / "report.json"
+                        elif (
+                            scenario == "worksheet-skeleton"
+                            and anchored.path == fixture["worksheet"]
+                            and name == "REVIEW_WORKSHEET_COMPLETE"
+                        ):
+                            target = (
+                                fixture["worksheet"]
+                                / "review-plan.skeleton.private.json"
+                            )
+                        if target is not None and not replaced:
+                            replaced = True
+                            target.unlink()
+                            target.write_bytes(b'{"replacement":true}\n')
+                            os.chmod(target, 0o600)
+                        return value
+
+                    def replace_source_after_read(
+                        anchored: object,
+                        name: str,
+                        maximum: int,
+                    ) -> bytes:
+                        nonlocal replaced
+                        content = real_bytes_read(anchored, name, maximum)
+                        if (
+                            scenario == "materialized-source"
+                            and not replaced
+                            and anchored.path == fixture["materialized"] / "sources"
+                            and name == "source-000001.md"
+                        ):
+                            replaced = True
+                            target = anchored.path / name
+                            target.unlink()
+                            target.write_bytes(b"replacement source bytes\n")
+                            os.chmod(target, 0o600)
+                        return content
+
+                    patches = (
+                        mock.patch.object(
+                            TOOL, "_read_private_json_at", replace_json_after_read
+                        ),
+                        mock.patch.object(
+                            TOOL, "_read_private_bytes_at", replace_source_after_read
+                        ),
+                    )
+                    with patches[0], patches[1]:
+                        with self.assertRaises(TOOL._SafeFailure):
+                            TOOL._command_verify_sealed(arguments)
+                    self.assertTrue(replaced)
+
+    def test_verify_sealed_requires_exact_0600_for_derived_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="urmotiv-review-gold-modes-") as directory:
+            parent = Path(directory)
+            baseline = self._private_root(parent)
+            self._create_verification_fixture(baseline)
+            protected_files = (
+                "materialized/source-confirmation.private.json",
+                "materialized/report.json",
+                "materialized/MATERIALIZE_COMPLETE",
+                "materialized/sources/source-000001.md",
+                "worksheet/review-worksheet.private.json",
+                "worksheet/review-plan.skeleton.private.json",
+                "worksheet/tuning-history.skeleton.private.json",
+                "worksheet/REVIEW_WORKSHEET_COMPLETE",
+            )
+            for index, relative in enumerate(protected_files, 1):
+                with self.subTest(file=relative):
+                    clone = parent / f"mode-{index:02d}"
+                    shutil.copytree(baseline, clone)
+                    os.chmod(clone, 0o700)
+                    os.chmod(clone / relative, 0o400)
+                    failed = self._verify_fixture(
+                        self._verification_fixture_paths(clone)
+                    )
+                    self._assert_fixed_failure(failed)
+                    self.assertEqual(failed.stdout, "")
+
+    def test_non_verifier_seal_keeps_owner_only_read_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="urmotiv-review-gold-compat-") as directory:
+            root = self._private_root(Path(directory))
+            fixture = self._create_verification_fixture(root)
+            os.chmod(
+                fixture["materialized"] / "sources" / "source-000001.md",
+                0o400,
+            )
+            os.chmod(
+                fixture["worksheet"] / "review-worksheet.private.json",
+                0o400,
+            )
+            output = root / "sealed-owner-read-compatible"
+            sealed = self._seal(
+                root,
+                fixture["source"],
+                fixture["inspection"],
+                fixture["layout"],
+                fixture["materialized"],
+                fixture["worksheet"],
+                fixture["plan"],
+                fixture["tuning"],
+                output,
+            )
+            self.assertEqual(sealed.returncode, 0, sealed.stderr)
+
+    def test_verify_sealed_rejects_dataset_without_development_case(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="urmotiv-review-gold-no-development-") as directory:
+            root = self._private_root(Path(directory))
+            fixture = self._create_verification_fixture(root)
+            plan = self._read_json(fixture["plan"])
+            plan["cases"][0]["purpose"] = "holdout"
+            holdout_plan = root / "holdout-only-plan.private.json"
+            self._write_json(holdout_plan, plan)
+            holdout_sealed = root / "holdout-only-sealed"
+            sealed = self._seal(
+                root,
+                fixture["source"],
+                fixture["inspection"],
+                fixture["layout"],
+                fixture["materialized"],
+                fixture["worksheet"],
+                holdout_plan,
+                fixture["tuning"],
+                holdout_sealed,
+            )
+            self.assertEqual(sealed.returncode, 0, sealed.stderr)
+            holdout_fixture = {
+                **fixture,
+                "plan": holdout_plan,
+                "sealed": holdout_sealed,
+            }
+            failed = self._verify_fixture(holdout_fixture)
+            self._assert_fixed_failure(failed)
+            self.assertEqual(failed.stdout, "")
+
+    def _create_verification_fixture(self, root: Path) -> dict[str, Path]:
+        source = root / "synthetic.xml"
+        self._write_spreadsheetml(source)
+        materialized = self._write_materialization(root)
+        inspection = root / "inspection.private.json"
+        inspected = self._run(
+            "inspect",
+            "--private-root",
+            str(root),
+            "--input",
+            str(source),
+            "--out",
+            str(inspection),
+        )
+        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+        layout = root / "layout.private.json"
+        self._write_layout(layout, self._read_json(inspection)["inputSetSha256"])
+        worksheet = root / "worksheet"
+        initialized = self._run(
+            "init",
+            "--private-root",
+            str(root),
+            "--input",
+            str(source),
+            "--inspection",
+            str(inspection),
+            "--layout",
+            str(layout),
+            "--materialized",
+            str(materialized),
+            "--out",
+            str(worksheet),
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        worksheet_file = worksheet / "review-worksheet.private.json"
+        worksheet_value = self._read_json(worksheet_file)
+        plan = root / "plan.private.json"
+        self._write_json(
+            plan,
+            self._plan_value(
+                worksheet_value,
+                worksheet_file,
+                row_id="review-row-000001",
+                source=worksheet_value["sources"][0],
+                purpose="development",
+            ),
+        )
+        tuning = root / "tuning.private.json"
+        self._write_json(
+            tuning,
+            {"version": 1, "confirmedComplete": True, "developmentSamples": []},
+        )
+        sealed = root / "sealed"
+        completed = self._seal(
+            root,
+            source,
+            inspection,
+            layout,
+            materialized,
+            worksheet,
+            plan,
+            tuning,
+            sealed,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return self._verification_fixture_paths(root)
+
+    @staticmethod
+    def _verification_fixture_paths(root: Path) -> dict[str, Path]:
+        return {
+            "root": root,
+            "source": root / "synthetic.xml",
+            "inspection": root / "inspection.private.json",
+            "layout": root / "layout.private.json",
+            "materialized": root / "materialized",
+            "worksheet": root / "worksheet",
+            "plan": root / "plan.private.json",
+            "tuning": root / "tuning.private.json",
+            "sealed": root / "sealed",
+        }
+
+    def _verify_fixture(
+        self,
+        fixture: dict[str, Path],
+        *,
+        code_version: str | None = None,
+        runner_sha256: str | None = None,
+        dependency_sha256: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        expected_runner, expected_dependency = self._verifier_hashes()
+        return self._run(
+            "verify-sealed",
+            "--private-root",
+            str(fixture["root"]),
+            "--input",
+            str(fixture["source"]),
+            "--inspection",
+            str(fixture["inspection"]),
+            "--layout",
+            str(fixture["layout"]),
+            "--materialized",
+            str(fixture["materialized"]),
+            "--worksheet",
+            str(fixture["worksheet"]),
+            "--plan",
+            str(fixture["plan"]),
+            "--tuning-history",
+            str(fixture["tuning"]),
+            "--sealed",
+            str(fixture["sealed"]),
+            "--verifier-code-version",
+            code_version or "1" * 40,
+            "--verifier-runner-sha256",
+            runner_sha256 or expected_runner,
+            "--verifier-dependency-code-sha256",
+            dependency_sha256 or expected_dependency,
+        )
+
+    def _verification_arguments(
+        self, fixture: dict[str, Path]
+    ) -> argparse.Namespace:
+        runner_sha256, dependency_sha256 = self._verifier_hashes()
+        return TOOL.argparse.Namespace(
+            private_root=str(fixture["root"]),
+            input=[str(fixture["source"])],
+            inspection=str(fixture["inspection"]),
+            layout=str(fixture["layout"]),
+            materialized=str(fixture["materialized"]),
+            worksheet=str(fixture["worksheet"]),
+            plan=str(fixture["plan"]),
+            tuning_history=str(fixture["tuning"]),
+            sealed=str(fixture["sealed"]),
+            verifier_code_version="1" * 40,
+            verifier_runner_sha256=runner_sha256,
+            verifier_dependency_code_sha256=dependency_sha256,
+        )
+
+    @staticmethod
+    def _verifier_hashes() -> tuple[str, str]:
+        paths = (
+            "scripts/migrate-hist/parse-metadata.py",
+            "scripts/migrate-hist/prepare-review-gold.py",
+        )
+        repository = SCRIPT.parents[2]
+        contents = {path: (repository / path).read_bytes() for path in sorted(paths)}
+        payload = bytearray()
+        for path in sorted(contents):
+            path_bytes = path.encode("ascii")
+            file_bytes = contents[path]
+            payload.extend(str(len(path_bytes)).encode("ascii"))
+            payload.extend(b":")
+            payload.extend(path_bytes)
+            payload.extend(b"\x00")
+            payload.extend(str(len(file_bytes)).encode("ascii"))
+            payload.extend(b":")
+            payload.extend(file_bytes)
+            payload.extend(b"\x00")
+        return _sha256(contents["scripts/migrate-hist/prepare-review-gold.py"]), _sha256(
+            bytes(payload)
+        )
+
+    def _expected_attestation(self, fixture: dict[str, Path]) -> dict[str, object]:
+        inspection = self._read_json(fixture["inspection"])
+        layout_bytes = fixture["layout"].read_bytes()
+        confirmation = self._read_json(
+            fixture["materialized"] / "source-confirmation.private.json"
+        )
+        report = self._read_json(fixture["materialized"] / "report.json")
+        materialization_marker_path = fixture["materialized"] / "MATERIALIZE_COMPLETE"
+        materialization_marker = self._read_json(materialization_marker_path)
+        worksheet_path = fixture["worksheet"] / "review-worksheet.private.json"
+        worksheet_completion_path = fixture["worksheet"] / "REVIEW_WORKSHEET_COMPLETE"
+        worksheet = self._read_json(worksheet_path)
+        plan = self._read_json(fixture["plan"])
+        evidence_path = fixture["sealed"] / "review-gold-evidence.private.json"
+        bindings_path = fixture["sealed"] / "source-bindings.private.json"
+        additions_path = fixture["sealed"] / "tuning-history-additions.private.json"
+        marker_path = fixture["sealed"] / "REVIEW_GOLD_COMPLETE"
+        evidence = self._read_json(evidence_path)
+        bindings = self._read_json(bindings_path)
+        marker = self._read_json(marker_path)
+        runner_sha256, dependency_sha256 = self._verifier_hashes()
+        bound_by_case = {case["caseId"]: case for case in bindings["cases"]}
+        evidence_by_case = {entry["caseId"]: entry for entry in evidence["entries"]}
+        cases = []
+        for planned in plan["cases"]:
+            binding = bound_by_case[planned["caseId"]]
+            evidence_entry = evidence_by_case[planned["caseId"]]
+            cases.append(
+                {
+                    "caseId": planned["caseId"],
+                    "subjectId": planned["subjectId"],
+                    "purpose": planned["purpose"],
+                    "evaluationScope": planned["evaluationScope"],
+                    "sourceId": planned["sourceId"],
+                    "sourcePath": binding["sourcePath"],
+                    "sourceSha256": planned["sourceSha256"],
+                    "rowEvidenceSha256": binding["rowEvidenceSha256"],
+                    "goldSha256": evidence_entry["goldSha256"],
+                }
+            )
+        attestation: dict[str, object] = {
+            "schemaVersion": 1,
+            "artifactKind": "urmotiv_review_gold_verification_attestation",
+            "protocolVersion": "urmotiv-review-gold-verify-sealed-v1",
+            "verificationStatus": "complete",
+            "upstreamDatasetId": plan["datasetId"],
+            "verifier": {
+                "repository": "Urmotiv",
+                "codeVersion": "1" * 40,
+                "runnerPath": "scripts/migrate-hist/prepare-review-gold.py",
+                "runnerSha256": runner_sha256,
+                "dependencyCodeSha256": dependency_sha256,
+                "dependencyFileCount": 2,
+            },
+            "artifacts": {
+                "reviewGoldCompleteSha256": _sha256(marker_path.read_bytes()),
+                "evidenceSha256": _sha256(evidence_path.read_bytes()),
+                "sourceBindingsSha256": _sha256(bindings_path.read_bytes()),
+                "tuningHistorySha256": _sha256(fixture["tuning"].read_bytes()),
+                "tuningHistoryAdditionsSha256": _sha256(additions_path.read_bytes()),
+                "planSha256": _sha256(fixture["plan"].read_bytes()),
+                "worksheetSha256": _sha256(worksheet_path.read_bytes()),
+                "worksheetCompletionSha256": _sha256(worksheet_completion_path.read_bytes()),
+                "inspectionSha256": _sha256(fixture["inspection"].read_bytes()),
+                "layoutSha256": _sha256(layout_bytes),
+                "inputSetSha256": inspection["inputSetSha256"],
+                "sourceConfirmationCanonicalSha256": _sha256(_compact(confirmation)),
+                "materializationCompleteSha256": _sha256(
+                    materialization_marker_path.read_bytes()
+                ),
+                "materializationReportCanonicalSha256": _sha256(_compact(report)),
+                "materializationSourceSetSha256": materialization_marker[
+                    "sourceSetSha256"
+                ],
+            },
+            "reviewInputs": [
+                {
+                    "inputId": item["inputId"],
+                    "format": item["format"],
+                    "inputSha256": item["inputSha256"],
+                }
+                for item in inspection["inputs"]
+            ],
+            "cases": cases,
+            "counts": {
+                "caseCount": marker["caseCount"],
+                "developmentCount": marker["developmentCount"],
+                "holdoutCount": marker["holdoutCount"],
+                "verdictAndTasteCount": marker["verdictAndTasteCount"],
+                "originalityOnlyCount": marker["originalityOnlyCount"],
+                "reviewInputCount": len(inspection["inputs"]),
+                "materializedSourceCount": report["sourceCount"],
+            },
+        }
+        canonical = json.dumps(
+            attestation,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        attestation["verificationFingerprint"] = _sha256(canonical)
+        return attestation
+
+    @staticmethod
+    def _tree_snapshot(root: Path) -> list[tuple[str, str, int, str]]:
+        snapshot: list[tuple[str, str, int, str]] = []
+        paths = [root, *sorted(root.rglob("*"), key=lambda path: path.as_posix())]
+        for path in paths:
+            metadata = path.lstat()
+            relative = "." if path == root else path.relative_to(root).as_posix()
+            mode = stat.S_IMODE(metadata.st_mode)
+            if stat.S_ISREG(metadata.st_mode):
+                snapshot.append((relative, "file", mode, _sha256(path.read_bytes())))
+            elif stat.S_ISDIR(metadata.st_mode):
+                snapshot.append((relative, "directory", mode, str(metadata.st_nlink)))
+            elif stat.S_ISLNK(metadata.st_mode):
+                snapshot.append((relative, "symlink", mode, os.readlink(path)))
+            else:
+                snapshot.append((relative, "other", mode, ""))
+        return snapshot
+
+    @staticmethod
+    def _append_tamper(path: Path) -> None:
+        path.write_bytes(path.read_bytes() + b" ")
+        os.chmod(path, 0o600)
 
     def _seal(
         self,

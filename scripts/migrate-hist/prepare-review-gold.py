@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import stat
@@ -19,7 +20,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 _HERE = Path(__file__).resolve().parent
@@ -59,6 +60,15 @@ _GROUP_ID = re.compile(r"^group-[0-9]{6}$")
 _CASE_ID = re.compile(r"^case-[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$")
 _SUBJECT_ID = re.compile(r"^subject-[a-z0-9](?:[a-z0-9-]{0,43}[a-z0-9])?$")
 _DATASET_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
+_CODE_VERSION = re.compile(r"^[0-9a-f]{40}$")
+_RUNNER_PATH = "scripts/migrate-hist/prepare-review-gold.py"
+_DEPENDENCY_PATHS = (
+    "scripts/migrate-hist/parse-metadata.py",
+    _RUNNER_PATH,
+)
+_VERIFICATION_PROTOCOL = "urmotiv-review-gold-verify-sealed-v1"
+
+
 class _SafeFailure(Exception):
     """Expected rejection whose details must never reach the terminal."""
 
@@ -115,6 +125,48 @@ def _require_digest(value: object) -> str:
     return value
 
 
+def _require_nonzero_digest(value: object) -> str:
+    digest = _require_digest(value)
+    if digest == "0" * 64:
+        raise _SafeFailure()
+    return digest
+
+
+def _require_code_version(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or _CODE_VERSION.fullmatch(value) is None
+        or value == "0" * 40
+    ):
+        raise _SafeFailure()
+    return value
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _SafeFailure()
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> object:
+    del value
+    raise _SafeFailure()
+
+
+def _decode_private_json(data: bytes) -> object:
+    try:
+        return json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as error:
+        raise _SafeFailure() from error
+
+
 def _json_compact(value: object) -> bytes:
     try:
         return json.dumps(
@@ -137,6 +189,38 @@ def _json_pretty(value: object) -> bytes:
     if len(encoded) > _MAX_PRIVATE_JSON_BYTES:
         raise _SafeFailure()
     return encoded
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    def canonicalize(item: object) -> object:
+        if item is None or isinstance(item, (str, bool)):
+            return item
+        if isinstance(item, int) and not isinstance(item, bool):
+            return item
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise _SafeFailure()
+            return item
+        if isinstance(item, list):
+            return [canonicalize(entry) for entry in item]
+        if isinstance(item, dict):
+            if any(not isinstance(key, str) for key in item):
+                raise _SafeFailure()
+            return {
+                key: canonicalize(item[key])
+                for key in sorted(item)
+            }
+        raise _SafeFailure()
+
+    try:
+        return json.dumps(
+            canonicalize(value),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, UnicodeError, ValueError) as error:
+        raise _SafeFailure() from error
 
 
 _DIRECTORY_FLAGS = (
@@ -348,6 +432,97 @@ def _read_all(descriptor: int, maximum: int) -> bytes:
     return content
 
 
+def _read_stable_verifier_file(relative_path: str) -> bytes:
+    if relative_path not in _DEPENDENCY_PATHS:
+        raise _SafeFailure()
+    expected_name = relative_path.removeprefix("scripts/migrate-hist/")
+    if not expected_name or "/" in expected_name:
+        raise _SafeFailure()
+    path = _HERE / expected_name
+    descriptor: int | None = None
+    verification: int | None = None
+    try:
+        path_metadata = os.lstat(path)
+        if not stat.S_ISREG(path_metadata.st_mode) or stat.S_ISLNK(path_metadata.st_mode):
+            raise _SafeFailure()
+        descriptor = os.open(path, _READ_FLAGS)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino)
+            != (path_metadata.st_dev, path_metadata.st_ino)
+            or before.st_size <= 0
+            or before.st_size > _MAX_PRIVATE_JSON_BYTES
+        ):
+            raise _SafeFailure()
+        content = _read_all(descriptor, _MAX_PRIVATE_JSON_BYTES)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        repeated = _read_all(descriptor, _MAX_PRIVATE_JSON_BYTES)
+        after = os.fstat(descriptor)
+        verification = os.open(path, _READ_FLAGS)
+        current = os.fstat(verification)
+        current_path = os.lstat(path)
+        if (
+            _file_fingerprint(before) != _file_fingerprint(after)
+            or _file_fingerprint(before) != _file_fingerprint(current)
+            or (before.st_dev, before.st_ino)
+            != (current_path.st_dev, current_path.st_ino)
+            or not stat.S_ISREG(current_path.st_mode)
+            or stat.S_ISLNK(current_path.st_mode)
+            or content != repeated
+            or len(content) != before.st_size
+        ):
+            raise _SafeFailure()
+        return content
+    except Exception as error:
+        if isinstance(error, _SafeFailure):
+            raise
+        raise _SafeFailure() from error
+    finally:
+        if verification is not None:
+            os.close(verification)
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _verify_verifier_identity(arguments: argparse.Namespace) -> dict[str, object]:
+    code_version = _require_code_version(arguments.verifier_code_version)
+    runner_parameter = _require_nonzero_digest(arguments.verifier_runner_sha256)
+    dependency_parameter = _require_nonzero_digest(
+        arguments.verifier_dependency_code_sha256
+    )
+    contents = {
+        path: _read_stable_verifier_file(path)
+        for path in sorted(_DEPENDENCY_PATHS)
+    }
+    runner_sha256 = _sha256(contents[_RUNNER_PATH])
+    if runner_sha256 != runner_parameter:
+        raise _SafeFailure()
+    dependency_payload = bytearray()
+    for path in sorted(contents):
+        path_bytes = path.encode("ascii")
+        file_bytes = contents[path]
+        dependency_payload.extend(str(len(path_bytes)).encode("ascii"))
+        dependency_payload.extend(b":")
+        dependency_payload.extend(path_bytes)
+        dependency_payload.extend(b"\x00")
+        dependency_payload.extend(str(len(file_bytes)).encode("ascii"))
+        dependency_payload.extend(b":")
+        dependency_payload.extend(file_bytes)
+        dependency_payload.extend(b"\x00")
+    dependency_sha256 = _sha256(bytes(dependency_payload))
+    if dependency_sha256 != dependency_parameter:
+        raise _SafeFailure()
+    return {
+        "repository": "Urmotiv",
+        "codeVersion": code_version,
+        "runnerPath": _RUNNER_PATH,
+        "runnerSha256": runner_sha256,
+        "dependencyCodeSha256": dependency_sha256,
+        "dependencyFileCount": len(contents),
+    }
+
+
 def _read_private_bytes(root: _PrivateRoot, path: Path, maximum: int) -> bytes:
     if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum <= 0:
         raise _SafeFailure()
@@ -404,11 +579,7 @@ def _read_private_bytes(root: _PrivateRoot, path: Path, maximum: int) -> bytes:
 
 def _read_private_json(root: _PrivateRoot, path: Path) -> tuple[object, bytes]:
     data = _read_private_bytes(root, path, _MAX_PRIVATE_JSON_BYTES)
-    try:
-        value = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
-        raise _SafeFailure() from error
-    return value, data
+    return _decode_private_json(data), data
 
 
 def _write_private_json(root: _PrivateRoot, path: Path, value: object) -> bytes:
@@ -605,6 +776,130 @@ def _create_private_child_directory(
             os.close(descriptor)
 
 
+def _open_private_directory(root: _PrivateRoot, path: Path) -> _PrivateDirectory:
+    checked = _assert_inside(root, path, directory=True)
+    _, parts = _relative_parts(root, checked)
+    descriptor = _open_relative_directory(root, parts)
+    try:
+        metadata = os.fstat(descriptor)
+        if not _directory_metadata_is_private(metadata):
+            raise _SafeFailure()
+        result = _PrivateDirectory(
+            checked,
+            descriptor,
+            metadata.st_dev,
+            metadata.st_ino,
+        )
+        _verify_private_directory_path(root, result)
+        descriptor = -1
+        return result
+    except Exception as error:
+        if isinstance(error, _SafeFailure):
+            raise
+        raise _SafeFailure() from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _open_private_child_directory(
+    root: _PrivateRoot,
+    parent: _PrivateDirectory,
+    name: str,
+) -> _PrivateDirectory:
+    if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+        raise _SafeFailure()
+    descriptor: int | None = None
+    try:
+        _verify_private_directory_descriptor(parent)
+        descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent.descriptor)
+        metadata = os.fstat(descriptor)
+        if not _directory_metadata_is_private(metadata):
+            raise _SafeFailure()
+        result = _PrivateDirectory(
+            parent.path / name,
+            descriptor,
+            metadata.st_dev,
+            metadata.st_ino,
+        )
+        _verify_private_directory_path(root, parent)
+        _verify_private_directory_path(root, result)
+        descriptor = None
+        return result
+    except Exception as error:
+        if isinstance(error, _SafeFailure):
+            raise
+        raise _SafeFailure() from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _read_private_bytes_at(
+    directory: _PrivateDirectory,
+    name: str,
+    maximum: int,
+) -> bytes:
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\x00" in name
+        or not isinstance(maximum, int)
+        or isinstance(maximum, bool)
+        or maximum <= 0
+    ):
+        raise _SafeFailure()
+    descriptor: int | None = None
+    verification: int | None = None
+    try:
+        _verify_private_directory_descriptor(directory)
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=directory.descriptor)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or before.st_size > maximum
+        ):
+            raise _SafeFailure()
+        content = _read_all(descriptor, maximum)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        repeated = _read_all(descriptor, maximum)
+        after = os.fstat(descriptor)
+        verification = os.open(name, _READ_FLAGS, dir_fd=directory.descriptor)
+        current = os.fstat(verification)
+        if (
+            _file_fingerprint(before) != _file_fingerprint(after)
+            or _file_fingerprint(before) != _file_fingerprint(current)
+            or current.st_nlink != 1
+            or content != repeated
+            or len(content) != before.st_size
+        ):
+            raise _SafeFailure()
+        _verify_private_directory_descriptor(directory)
+        return content
+    except Exception as error:
+        if isinstance(error, _SafeFailure):
+            raise
+        raise _SafeFailure() from error
+    finally:
+        if verification is not None:
+            os.close(verification)
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _read_private_json_at(
+    directory: _PrivateDirectory,
+    name: str,
+) -> tuple[object, bytes]:
+    data = _read_private_bytes_at(directory, name, _MAX_PRIVATE_JSON_BYTES)
+    return _decode_private_json(data), data
+
+
 def _write_private_json_at(
     directory: _PrivateDirectory,
     name: str,
@@ -735,6 +1030,88 @@ def _verify_private_artifact_group(
         if isinstance(error, _SafeFailure):
             raise
         raise _SafeFailure() from error
+
+
+def _verify_private_inventory(
+    directory: _PrivateDirectory,
+    expected_files: set[str],
+    expected_directories: set[str] | None = None,
+) -> None:
+    child_directories = expected_directories or set()
+    expected = expected_files | child_directories
+    if (
+        len(expected) != len(expected_files) + len(child_directories)
+        or any(
+            not name or name in {".", ".."} or "/" in name or "\x00" in name
+            for name in expected
+        )
+    ):
+        raise _SafeFailure()
+    try:
+        _verify_private_directory_descriptor(directory)
+        names = os.listdir(directory.descriptor)
+        if set(names) != expected or len(names) != len(expected):
+            raise _SafeFailure()
+        for name in expected_files:
+            metadata = os.stat(name, dir_fd=directory.descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_nlink != 1
+            ):
+                raise _SafeFailure()
+        for name in child_directories:
+            metadata = os.stat(name, dir_fd=directory.descriptor, follow_symlinks=False)
+            if not _directory_metadata_is_private(metadata):
+                raise _SafeFailure()
+        if set(os.listdir(directory.descriptor)) != expected:
+            raise _SafeFailure()
+        _verify_private_directory_descriptor(directory)
+    except Exception as error:
+        if isinstance(error, _SafeFailure):
+            raise
+        raise _SafeFailure() from error
+
+
+def _verify_private_child_identity(
+    parent: _PrivateDirectory,
+    name: str,
+    child: _PrivateDirectory,
+) -> None:
+    if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+        raise _SafeFailure()
+    descriptor: int | None = None
+    try:
+        _verify_private_directory_descriptor(parent)
+        _verify_private_directory_descriptor(child)
+        descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent.descriptor)
+        metadata = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) != (child.device, child.inode):
+            raise _SafeFailure()
+        _verify_private_directory_descriptor(parent)
+        _verify_private_directory_descriptor(child)
+    except Exception as error:
+        if isinstance(error, _SafeFailure):
+            raise
+        raise _SafeFailure() from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _verify_private_inventory_path(
+    root: _PrivateRoot,
+    path: Path,
+    expected_files: set[str],
+    expected_directories: set[str] | None = None,
+) -> None:
+    directory = _open_private_directory(root, path)
+    try:
+        _verify_private_inventory(directory, expected_files, expected_directories)
+        _verify_private_directory_path(root, directory)
+    finally:
+        directory.close()
 
 
 def _list_private_regular_names(root: _PrivateRoot, path: Path) -> set[str]:
@@ -1523,14 +1900,98 @@ def _validate_materialize_marker(value: object) -> dict[str, object]:
     return root
 
 
-def _load_materialization(root: _PrivateRoot, directory: Path) -> dict[str, object]:
+def _load_materialization(
+    root: _PrivateRoot,
+    directory: Path,
+    *,
+    strict_verification: bool = False,
+) -> dict[str, object]:
     materialized = _assert_inside(root, directory, directory=True)
     sources_directory = _assert_inside(root, materialized / "sources", directory=True)
-    confirmation_value, _ = _read_private_json(
-        root, materialized / "source-confirmation.private.json"
-    )
-    report_value, _ = _read_private_json(root, materialized / "report.json")
-    marker_value, marker_bytes = _read_private_json(root, materialized / "MATERIALIZE_COMPLETE")
+    if not strict_verification:
+        def verify_sources(expected: set[str]) -> None:
+            if _list_private_regular_names(root, sources_directory) != expected:
+                raise _SafeFailure()
+
+        return _load_materialization_artifacts(
+            lambda name: _read_private_json(root, materialized / name),
+            lambda name: _read_private_bytes(
+                root, sources_directory / name, _MAX_SOURCE_BYTES
+            ),
+            verify_sources,
+            verify_sources_before_read=False,
+        )
+
+    top_files = {
+        "source-confirmation.private.json",
+        "report.json",
+        "MATERIALIZE_COMPLETE",
+    }
+    anchored_materialized = _open_private_directory(root, materialized)
+    anchored_sources: _PrivateDirectory | None = None
+    try:
+        anchored_sources = _open_private_child_directory(
+            root, anchored_materialized, "sources"
+        )
+        _verify_private_inventory(
+            anchored_materialized, top_files, {"sources"}
+        )
+        _verify_private_child_identity(
+            anchored_materialized, "sources", anchored_sources
+        )
+        top_artifacts: dict[str, bytes] = {}
+        source_artifacts: dict[str, bytes] = {}
+
+        def read_top(name: str) -> tuple[object, bytes]:
+            value, content = _read_private_json_at(anchored_materialized, name)
+            if name in top_artifacts:
+                raise _SafeFailure()
+            top_artifacts[name] = content
+            return value, content
+
+        def read_source(name: str) -> bytes:
+            content = _read_private_bytes_at(
+                anchored_sources, name, _MAX_SOURCE_BYTES
+            )
+            if name in source_artifacts:
+                raise _SafeFailure()
+            source_artifacts[name] = content
+            return content
+
+        result = _load_materialization_artifacts(
+            read_top,
+            read_source,
+            lambda expected: _verify_private_inventory(anchored_sources, expected),
+            verify_sources_before_read=True,
+        )
+        _verify_private_artifact_group(anchored_sources, source_artifacts)
+        _verify_private_artifact_group(
+            anchored_materialized,
+            top_artifacts,
+            {"sources": anchored_sources},
+        )
+        _verify_private_child_identity(
+            anchored_materialized, "sources", anchored_sources
+        )
+        _verify_private_directory_path(root, anchored_sources)
+        _verify_private_directory_path(root, anchored_materialized)
+        return result
+    finally:
+        if anchored_sources is not None:
+            anchored_sources.close()
+        anchored_materialized.close()
+
+
+def _load_materialization_artifacts(
+    read_top_json: Callable[[str], tuple[object, bytes]],
+    read_source_bytes: Callable[[str], bytes],
+    verify_source_inventory: Callable[[set[str]], None],
+    *,
+    verify_sources_before_read: bool,
+) -> dict[str, object]:
+    confirmation_value, _ = read_top_json("source-confirmation.private.json")
+    report_value, _ = read_top_json("report.json")
+    marker_value, marker_bytes = read_top_json("MATERIALIZE_COMPLETE")
     confirmation = _validate_source_confirmation(confirmation_value)
     report = _validate_materialize_report(report_value)
     marker = _validate_materialize_marker(marker_value)
@@ -1550,6 +2011,17 @@ def _load_materialization(root: _PrivateRoot, directory: Path) -> dict[str, obje
     sources: list[dict[str, object]] = []
     expected_names: set[str] = set()
     source_set: list[dict[str, object]] = []
+    expected_source_names = {
+        str(mapping["sourcePath"])
+        for mapping in mappings
+        if isinstance(mapping, dict)
+    }
+    if (
+        len(expected_source_names) != len(mappings)
+    ):
+        raise _SafeFailure()
+    if verify_sources_before_read:
+        verify_source_inventory(expected_source_names)
     for index, (mapping, report_source) in enumerate(zip(mappings, report_sources, strict=True), 1):
         if not isinstance(mapping, dict) or not isinstance(report_source, dict):
             raise _SafeFailure()
@@ -1560,7 +2032,7 @@ def _load_materialization(root: _PrivateRoot, directory: Path) -> dict[str, obje
             or report_source["sourceSha256"] != mapping["sourceSha256"]
         ):
             raise _SafeFailure()
-        content = _read_private_bytes(root, sources_directory / source_path, _MAX_SOURCE_BYTES)
+        content = read_source_bytes(source_path)
         try:
             text = content.decode("utf-8")
         except UnicodeDecodeError as error:
@@ -1586,9 +2058,7 @@ def _load_materialization(root: _PrivateRoot, directory: Path) -> dict[str, obje
                 "metadataNumber": mapping["metadataNumber"],
             }
         )
-    actual_names = _list_private_regular_names(root, sources_directory)
-    if actual_names != expected_names:
-        raise _SafeFailure()
+    verify_source_inventory(expected_names)
     if marker["sourceSetSha256"] != _sha256(
         _json_compact({"version": 1, "sources": source_set})
     ):
@@ -1596,6 +2066,8 @@ def _load_materialization(root: _PrivateRoot, directory: Path) -> dict[str, obje
     return {
         "sourceConfirmationSha256": _sha256(_json_compact(confirmation)),
         "materializationCompleteSha256": _sha256(marker_bytes),
+        "materializationReportSha256": _sha256(_json_compact(report)),
+        "materializationSourceSetSha256": marker["sourceSetSha256"],
         "sources": sources,
     }
 
@@ -1620,19 +2092,55 @@ def _worksheet_value(
 
 
 def _load_init_artifacts(
-    root: _PrivateRoot, directory: Path
-) -> tuple[dict[str, object], bytes]:
+    root: _PrivateRoot,
+    directory: Path,
+    *,
+    strict_verification: bool = False,
+) -> tuple[dict[str, object], bytes, bytes]:
     checked = _assert_inside(root, directory, directory=True)
-    worksheet_value, worksheet_bytes = _read_private_json(
-        root, checked / "review-worksheet.private.json"
-    )
-    skeleton_value, skeleton_bytes = _read_private_json(
-        root, checked / "review-plan.skeleton.private.json"
-    )
-    tuning_value, tuning_bytes = _read_private_json(
-        root, checked / "tuning-history.skeleton.private.json"
-    )
-    marker_value, _ = _read_private_json(root, checked / "REVIEW_WORKSHEET_COMPLETE")
+    expected_names = {
+        "review-worksheet.private.json",
+        "review-plan.skeleton.private.json",
+        "tuning-history.skeleton.private.json",
+        "REVIEW_WORKSHEET_COMPLETE",
+    }
+    if not strict_verification:
+        return _load_init_artifact_values(
+            lambda name: _read_private_json(root, checked / name),
+            strict_verification=False,
+        )
+    anchored = _open_private_directory(root, checked)
+    try:
+        _verify_private_inventory(anchored, expected_names)
+        artifacts: dict[str, bytes] = {}
+
+        def read_artifact(name: str) -> tuple[object, bytes]:
+            value, content = _read_private_json_at(anchored, name)
+            if name in artifacts:
+                raise _SafeFailure()
+            artifacts[name] = content
+            return value, content
+
+        result = _load_init_artifact_values(
+            read_artifact,
+            strict_verification=True,
+        )
+        _verify_private_artifact_group(anchored, artifacts)
+        _verify_private_directory_path(root, anchored)
+        return result
+    finally:
+        anchored.close()
+
+
+def _load_init_artifact_values(
+    read_json: Callable[[str], tuple[object, bytes]],
+    *,
+    strict_verification: bool,
+) -> tuple[dict[str, object], bytes, bytes]:
+    worksheet_value, worksheet_bytes = read_json("review-worksheet.private.json")
+    skeleton_value, skeleton_bytes = read_json("review-plan.skeleton.private.json")
+    tuning_value, tuning_bytes = read_json("tuning-history.skeleton.private.json")
+    marker_value, marker_bytes = read_json("REVIEW_WORKSHEET_COMPLETE")
     marker = _require_dict(
         marker_value,
         {
@@ -1656,22 +2164,55 @@ def _load_init_artifacts(
     _require_integer(marker["rowCount"], minimum=1, maximum=_MAX_ROWS)
     _require_integer(marker["sourceCount"], minimum=1, maximum=_MAX_ROWS)
     _require_integer(marker["reviewCommentRowCount"], maximum=_MAX_ROWS)
-    if (
-        marker["worksheetSha256"] != _sha256(worksheet_bytes)
-        or marker["planSkeletonSha256"] != _sha256(skeleton_bytes)
-        or marker["tuningHistorySkeletonSha256"] != _sha256(tuning_bytes)
-        or not isinstance(worksheet_value, dict)
-        or marker["rowCount"] != len(worksheet_value.get("rows", []))
-        or marker["sourceCount"] != len(worksheet_value.get("sources", []))
-        or marker["reviewCommentRowCount"]
-        != sum(
-            1
-            for row in worksheet_value.get("rows", [])
-            if isinstance(row, dict) and row.get("reviewCommentPresent") is True
-        )
-    ):
+    if not isinstance(worksheet_value, dict):
         raise _SafeFailure()
-    return worksheet_value, worksheet_bytes
+    rows = worksheet_value.get("rows")
+    sources = worksheet_value.get("sources")
+    if not isinstance(rows, list) or not isinstance(sources, list):
+        raise _SafeFailure()
+    expected_marker = {
+        "version": 1,
+        "phase": "review_gold_worksheet",
+        "worksheetSha256": _sha256(worksheet_bytes),
+        "planSkeletonSha256": _sha256(skeleton_bytes),
+        "tuningHistorySkeletonSha256": _sha256(tuning_bytes),
+        "rowCount": len(rows),
+        "sourceCount": len(sources),
+        "reviewCommentRowCount": sum(
+            1
+            for row in rows
+            if isinstance(row, dict) and row.get("reviewCommentPresent") is True
+        ),
+    }
+    if marker != expected_marker:
+        raise _SafeFailure()
+    if strict_verification:
+        expected_skeleton = {
+            "version": 3,
+            "confirmed": False,
+            "submitterDifficultyColumnsExcludedReconfirmed": False,
+            "datasetId": "",
+            "worksheetSha256": _sha256(worksheet_bytes),
+            "sourceConfirmationSha256": worksheet_value.get(
+                "sourceConfirmationSha256"
+            ),
+            "cases": [],
+        }
+        expected_tuning = {
+            "version": 1,
+            "confirmedComplete": False,
+            "developmentSamples": [],
+        }
+        if (
+            worksheet_bytes != _json_pretty(worksheet_value)
+            or skeleton_value != expected_skeleton
+            or skeleton_bytes != _json_pretty(expected_skeleton)
+            or tuning_value != expected_tuning
+            or tuning_bytes != _json_pretty(expected_tuning)
+            or marker_bytes != _json_pretty(expected_marker)
+        ):
+            raise _SafeFailure()
+    return worksheet_value, worksheet_bytes, marker_bytes
 
 
 def _parse_plan(
@@ -1938,17 +2479,12 @@ def _command_init_anchored(
         output.close()
 
 
-def _command_seal(arguments: argparse.Namespace) -> dict[str, int]:
-    root = _assert_private_root(Path(arguments.private_root))
-    try:
-        return _command_seal_anchored(root, arguments)
-    finally:
-        root.close()
-
-
-def _command_seal_anchored(
-    root: _PrivateRoot, arguments: argparse.Namespace
-) -> dict[str, int]:
+def _validate_seal_chain(
+    root: _PrivateRoot,
+    arguments: argparse.Namespace,
+    *,
+    strict_verification: bool = False,
+) -> dict[str, object]:
     inspection_raw, inspection_bytes = _read_private_json(root, Path(arguments.inspection))
     if not isinstance(inspection_raw, dict):
         raise _SafeFailure()
@@ -1957,7 +2493,11 @@ def _command_seal_anchored(
         raise _SafeFailure()
     layout_raw, layout_bytes = _read_private_json(root, Path(arguments.layout))
     layouts = _parse_layout(layout_raw, recomputed)
-    materialization = _load_materialization(root, Path(arguments.materialized))
+    materialization = _load_materialization(
+        root,
+        Path(arguments.materialized),
+        strict_verification=strict_verification,
+    )
     rows = _extract_review_rows(recomputed, contents, layouts)
     expected_worksheet = _worksheet_value(
         recomputed,
@@ -1966,8 +2506,10 @@ def _command_seal_anchored(
         rows,
         materialization,
     )
-    saved_worksheet, saved_worksheet_bytes = _load_init_artifacts(
-        root, Path(arguments.worksheet)
+    saved_worksheet, saved_worksheet_bytes, worksheet_completion_bytes = _load_init_artifacts(
+        root,
+        Path(arguments.worksheet),
+        strict_verification=strict_verification,
     )
     if saved_worksheet != expected_worksheet:
         raise _SafeFailure()
@@ -2002,6 +2544,74 @@ def _command_seal_anchored(
             or case["sourceSha256"] in prior_contents | current_development_contents
         ):
             raise _SafeFailure()
+    return {
+        "inspection": recomputed,
+        "inspectionBytes": inspection_bytes,
+        "layoutBytes": layout_bytes,
+        "materialization": materialization,
+        "worksheet": saved_worksheet,
+        "worksheetBytes": saved_worksheet_bytes,
+        "worksheetCompletionBytes": worksheet_completion_bytes,
+        "planBytes": plan_bytes,
+        "datasetId": dataset_id,
+        "cases": cases,
+        "tuningBytes": tuning_bytes,
+    }
+
+
+def _gold_value_for_case(case: dict[str, object]) -> dict[str, object]:
+    row = case.get("row")
+    if not isinstance(row, dict):
+        raise _SafeFailure()
+    gold: dict[str, object] = {
+        "version": 2,
+        "artifactKind": "historical_review_gold",
+        "caseId": case["caseId"],
+        "reviewCommentPresent": row.get("reviewCommentPresent"),
+        "evaluationScope": case["evaluationScope"],
+    }
+    if case["evaluationScope"] == "verdict_and_taste":
+        gold.update(
+            {
+                "verdict": case["verdict"],
+                "contestUse": case["contestUse"],
+            }
+        )
+    elif case["evaluationScope"] == "originality_only":
+        # No verdict field means a scorer cannot include this case in verdict accuracy.
+        gold["sameProblemAsExisting"] = case["sameProblemAsExisting"]
+    else:
+        raise _SafeFailure()
+    return gold
+
+
+def _command_seal(arguments: argparse.Namespace) -> dict[str, int]:
+    root = _assert_private_root(Path(arguments.private_root))
+    try:
+        return _command_seal_anchored(root, arguments)
+    finally:
+        root.close()
+
+
+def _command_seal_anchored(
+    root: _PrivateRoot, arguments: argparse.Namespace
+) -> dict[str, int]:
+    validation = _validate_seal_chain(root, arguments)
+    materialization = validation["materialization"]
+    cases = validation["cases"]
+    dataset_id = validation["datasetId"]
+    saved_worksheet_bytes = validation["worksheetBytes"]
+    plan_bytes = validation["planBytes"]
+    tuning_bytes = validation["tuningBytes"]
+    if (
+        not isinstance(materialization, dict)
+        or not isinstance(cases, list)
+        or not isinstance(dataset_id, str)
+        or not isinstance(saved_worksheet_bytes, bytes)
+        or not isinstance(plan_bytes, bytes)
+        or not isinstance(tuning_bytes, bytes)
+    ):
+        raise _SafeFailure()
 
     output = _create_private_directory(root, Path(arguments.out))
     gold_directory: _PrivateDirectory | None = None
@@ -2016,24 +2626,7 @@ def _command_seal_anchored(
             source = case["source"]
             if not isinstance(row, dict) or not isinstance(source, dict):
                 raise _SafeFailure()
-            gold: dict[str, object] = {
-                "version": 2,
-                "artifactKind": "historical_review_gold",
-                "caseId": case["caseId"],
-                "reviewCommentPresent": row["reviewCommentPresent"],
-                "evaluationScope": case["evaluationScope"],
-            }
-            if case["evaluationScope"] == "verdict_and_taste":
-                gold.update(
-                    {
-                        "verdict": case["verdict"],
-                        "contestUse": case["contestUse"],
-                    }
-                )
-            else:
-                # An originality-only case has no verdict field by construction, so a
-                # scorer cannot accidentally include it in pass/reject accuracy.
-                gold["sameProblemAsExisting"] = case["sameProblemAsExisting"]
+            gold = _gold_value_for_case(case)
             gold_name = f"{case['caseId']}.json"
             gold_bytes = _write_private_json_at(gold_directory, gold_name, gold)
             gold_artifacts[gold_name] = gold_bytes
@@ -2157,6 +2750,365 @@ def _command_seal_anchored(
         output.close()
 
 
+def _validate_sealed_artifacts(
+    root: _PrivateRoot,
+    directory: Path,
+    validation: dict[str, object],
+) -> dict[str, object]:
+    cases = validation.get("cases")
+    materialization = validation.get("materialization")
+    dataset_id = validation.get("datasetId")
+    worksheet_bytes = validation.get("worksheetBytes")
+    plan_bytes = validation.get("planBytes")
+    tuning_bytes = validation.get("tuningBytes")
+    if (
+        not isinstance(cases, list)
+        or not cases
+        or not isinstance(materialization, dict)
+        or not isinstance(dataset_id, str)
+        or not isinstance(worksheet_bytes, bytes)
+        or not isinstance(plan_bytes, bytes)
+        or not isinstance(tuning_bytes, bytes)
+    ):
+        raise _SafeFailure()
+    development_count = sum(
+        1
+        for case in cases
+        if isinstance(case, dict) and case.get("purpose") == "development"
+    )
+    if development_count < 1:
+        raise _SafeFailure()
+
+    output = _open_private_directory(root, directory)
+    gold_directory: _PrivateDirectory | None = None
+    try:
+        gold_directory = _open_private_directory(root, output.path / "gold")
+        expected_gold_names = {
+            f"{case['caseId']}.json"
+            for case in cases
+            if isinstance(case, dict) and isinstance(case.get("caseId"), str)
+        }
+        if len(expected_gold_names) != len(cases):
+            raise _SafeFailure()
+        _verify_private_inventory(
+            output,
+            {
+                "review-gold-evidence.private.json",
+                "source-bindings.private.json",
+                "tuning-history-additions.private.json",
+                "REVIEW_GOLD_COMPLETE",
+            },
+            {"gold"},
+        )
+        _verify_private_inventory(gold_directory, expected_gold_names)
+        gold_artifacts: dict[str, bytes] = {}
+        evidence_entries: list[dict[str, object]] = []
+        source_bindings: list[dict[str, object]] = []
+        development_additions: list[dict[str, str]] = []
+        attested_cases: list[dict[str, object]] = []
+        for case_value in cases:
+            if not isinstance(case_value, dict):
+                raise _SafeFailure()
+            source = case_value.get("source")
+            row = case_value.get("row")
+            case_id = case_value.get("caseId")
+            if (
+                not isinstance(source, dict)
+                or not isinstance(row, dict)
+                or not isinstance(case_id, str)
+                or _CASE_ID.fullmatch(case_id) is None
+            ):
+                raise _SafeFailure()
+            gold_name = f"{case_id}.json"
+            gold_value, gold_bytes = _read_private_json_at(gold_directory, gold_name)
+            expected_gold = _gold_value_for_case(case_value)
+            if gold_value != expected_gold or gold_bytes != _json_pretty(expected_gold):
+                raise _SafeFailure()
+            gold_sha256 = _sha256(gold_bytes)
+            gold_artifacts[gold_name] = gold_bytes
+            evidence_entries.append(
+                {
+                    "caseId": case_id,
+                    "purpose": case_value["purpose"],
+                    "evaluationScope": case_value["evaluationScope"],
+                    "materializedSourceSha256": case_value["sourceSha256"],
+                    "goldFile": f"gold/{gold_name}",
+                    "goldSha256": gold_sha256,
+                }
+            )
+            source_bindings.append(
+                {
+                    "caseId": case_id,
+                    "subjectId": case_value["subjectId"],
+                    "sourceId": case_value["sourceId"],
+                    "sourcePath": source.get("sourcePath"),
+                    "sourceSha256": case_value["sourceSha256"],
+                    "rowEvidenceSha256": row.get("rowEvidenceSha256"),
+                }
+            )
+            if case_value["purpose"] == "development":
+                development_additions.append(
+                    {
+                        "subjectId": str(case_value["subjectId"]),
+                        "contentSha256": str(case_value["sourceSha256"]),
+                    }
+                )
+            attested_cases.append(
+                {
+                    "caseId": case_id,
+                    "subjectId": case_value["subjectId"],
+                    "purpose": case_value["purpose"],
+                    "evaluationScope": case_value["evaluationScope"],
+                    "sourceId": case_value["sourceId"],
+                    "sourcePath": source.get("sourcePath"),
+                    "sourceSha256": case_value["sourceSha256"],
+                    "rowEvidenceSha256": row.get("rowEvidenceSha256"),
+                    "goldSha256": gold_sha256,
+                }
+            )
+
+        evidence_value, evidence_bytes = _read_private_json_at(
+            output, "review-gold-evidence.private.json"
+        )
+        expected_evidence = {
+            "version": 1,
+            "artifactKind": "historical_review_gold_evidence",
+            "datasetId": dataset_id,
+            "entries": evidence_entries,
+        }
+        bindings_value, bindings_bytes = _read_private_json_at(
+            output, "source-bindings.private.json"
+        )
+        expected_bindings = {
+            "version": 1,
+            "sourceConfirmationSha256": materialization.get(
+                "sourceConfirmationSha256"
+            ),
+            "materializationCompleteSha256": materialization.get(
+                "materializationCompleteSha256"
+            ),
+            "worksheetSha256": _sha256(worksheet_bytes),
+            "cases": source_bindings,
+        }
+        additions_value, additions_bytes = _read_private_json_at(
+            output, "tuning-history-additions.private.json"
+        )
+        expected_additions = {
+            "version": 1,
+            "priorTuningHistorySha256": _sha256(tuning_bytes),
+            "developmentSamples": development_additions,
+        }
+        if (
+            evidence_value != expected_evidence
+            or evidence_bytes != _json_pretty(expected_evidence)
+            or bindings_value != expected_bindings
+            or bindings_bytes != _json_pretty(expected_bindings)
+            or additions_value != expected_additions
+            or additions_bytes != _json_pretty(expected_additions)
+        ):
+            raise _SafeFailure()
+
+        verdict_count = sum(
+            1
+            for case in cases
+            if isinstance(case, dict)
+            and case.get("evaluationScope") == "verdict_and_taste"
+        )
+        originality_count = sum(
+            1
+            for case in cases
+            if isinstance(case, dict)
+            and case.get("evaluationScope") == "originality_only"
+        )
+        holdout_count = sum(
+            1
+            for case in cases
+            if isinstance(case, dict) and case.get("purpose") == "holdout"
+        )
+        gold_set_sha256 = _sha256(
+            _json_compact(
+                {
+                    "version": 1,
+                    "gold": [
+                        {
+                            "caseId": entry["caseId"],
+                            "goldSha256": entry["goldSha256"],
+                        }
+                        for entry in evidence_entries
+                    ],
+                }
+            )
+        )
+        expected_marker = {
+            "version": 1,
+            "phase": "historical_review_gold_evidence",
+            "evidenceSha256": _sha256(evidence_bytes),
+            "sourceBindingsSha256": _sha256(bindings_bytes),
+            "tuningHistorySha256": _sha256(tuning_bytes),
+            "tuningHistoryAdditionsSha256": _sha256(additions_bytes),
+            "planSha256": _sha256(plan_bytes),
+            "goldSetSha256": gold_set_sha256,
+            "caseCount": len(cases),
+            "developmentCount": development_count,
+            "holdoutCount": holdout_count,
+            "verdictAndTasteCount": verdict_count,
+            "originalityOnlyCount": originality_count,
+        }
+        # The completion marker is deliberately read only after every artifact.
+        # Its deterministic bytes and final exact inventory prove the marker-last
+        # completed result rather than accepting a partial directory.
+        marker_value, marker_bytes = _read_private_json_at(
+            output, "REVIEW_GOLD_COMPLETE"
+        )
+        if marker_value != expected_marker or marker_bytes != _json_pretty(expected_marker):
+            raise _SafeFailure()
+        output_artifacts = {
+            "review-gold-evidence.private.json": evidence_bytes,
+            "source-bindings.private.json": bindings_bytes,
+            "tuning-history-additions.private.json": additions_bytes,
+            "REVIEW_GOLD_COMPLETE": marker_bytes,
+        }
+        _verify_private_artifact_group(gold_directory, gold_artifacts)
+        _verify_private_artifact_group(
+            output,
+            output_artifacts,
+            {"gold": gold_directory},
+        )
+        _verify_private_directory_path(root, gold_directory)
+        _verify_private_directory_path(root, output)
+        return {
+            "markerBytes": marker_bytes,
+            "evidenceBytes": evidence_bytes,
+            "bindingsBytes": bindings_bytes,
+            "additionsBytes": additions_bytes,
+            "cases": attested_cases,
+            "counts": {
+                "caseCount": len(cases),
+                "developmentCount": development_count,
+                "holdoutCount": holdout_count,
+                "verdictAndTasteCount": verdict_count,
+                "originalityOnlyCount": originality_count,
+            },
+        }
+    finally:
+        if gold_directory is not None:
+            gold_directory.close()
+        output.close()
+
+
+def _command_verify_sealed(arguments: argparse.Namespace) -> bytes:
+    verifier = _verify_verifier_identity(arguments)
+    root = _assert_private_root(Path(arguments.private_root))
+    try:
+        validation = _validate_seal_chain(
+            root, arguments, strict_verification=True
+        )
+        sealed = _validate_sealed_artifacts(root, Path(arguments.sealed), validation)
+    finally:
+        root.close()
+    inspection = validation.get("inspection")
+    materialization = validation.get("materialization")
+    sealed_counts = sealed.get("counts")
+    if (
+        not isinstance(inspection, dict)
+        or not isinstance(materialization, dict)
+        or not isinstance(sealed_counts, dict)
+    ):
+        raise _SafeFailure()
+    inspected_inputs = inspection.get("inputs")
+    materialized_sources = materialization.get("sources")
+    if not isinstance(inspected_inputs, list) or not isinstance(materialized_sources, list):
+        raise _SafeFailure()
+    review_inputs: list[dict[str, object]] = []
+    for input_value in inspected_inputs:
+        if not isinstance(input_value, dict):
+            raise _SafeFailure()
+        review_inputs.append(
+            {
+                "inputId": input_value.get("inputId"),
+                "format": input_value.get("format"),
+                "inputSha256": input_value.get("inputSha256"),
+            }
+        )
+    marker_bytes = sealed.get("markerBytes")
+    evidence_bytes = sealed.get("evidenceBytes")
+    bindings_bytes = sealed.get("bindingsBytes")
+    additions_bytes = sealed.get("additionsBytes")
+    for content in (marker_bytes, evidence_bytes, bindings_bytes, additions_bytes):
+        if not isinstance(content, bytes):
+            raise _SafeFailure()
+    raw_fields = {
+        "inspectionBytes": validation.get("inspectionBytes"),
+        "layoutBytes": validation.get("layoutBytes"),
+        "worksheetBytes": validation.get("worksheetBytes"),
+        "worksheetCompletionBytes": validation.get("worksheetCompletionBytes"),
+        "planBytes": validation.get("planBytes"),
+        "tuningBytes": validation.get("tuningBytes"),
+    }
+    if any(not isinstance(value, bytes) for value in raw_fields.values()):
+        raise _SafeFailure()
+    artifacts = {
+        "reviewGoldCompleteSha256": _sha256(marker_bytes),
+        "evidenceSha256": _sha256(evidence_bytes),
+        "sourceBindingsSha256": _sha256(bindings_bytes),
+        "tuningHistorySha256": _sha256(raw_fields["tuningBytes"]),
+        "tuningHistoryAdditionsSha256": _sha256(additions_bytes),
+        "planSha256": _sha256(raw_fields["planBytes"]),
+        "worksheetSha256": _sha256(raw_fields["worksheetBytes"]),
+        "worksheetCompletionSha256": _sha256(
+            raw_fields["worksheetCompletionBytes"]
+        ),
+        "inspectionSha256": _sha256(raw_fields["inspectionBytes"]),
+        "layoutSha256": _sha256(raw_fields["layoutBytes"]),
+        "inputSetSha256": inspection.get("inputSetSha256"),
+        "sourceConfirmationCanonicalSha256": materialization.get(
+            "sourceConfirmationSha256"
+        ),
+        "materializationCompleteSha256": materialization.get(
+            "materializationCompleteSha256"
+        ),
+        "materializationReportCanonicalSha256": materialization.get(
+            "materializationReportSha256"
+        ),
+        "materializationSourceSetSha256": materialization.get(
+            "materializationSourceSetSha256"
+        ),
+    }
+    if any(_DIGEST.fullmatch(value) is None for value in artifacts.values() if isinstance(value, str)):
+        raise _SafeFailure()
+    if any(not isinstance(value, str) for value in artifacts.values()):
+        raise _SafeFailure()
+    counts = {
+        "caseCount": sealed_counts.get("caseCount"),
+        "developmentCount": sealed_counts.get("developmentCount"),
+        "holdoutCount": sealed_counts.get("holdoutCount"),
+        "verdictAndTasteCount": sealed_counts.get("verdictAndTasteCount"),
+        "originalityOnlyCount": sealed_counts.get("originalityOnlyCount"),
+        "reviewInputCount": len(review_inputs),
+        "materializedSourceCount": len(materialized_sources),
+    }
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in counts.values()):
+        raise _SafeFailure()
+    if counts["developmentCount"] < 1:
+        raise _SafeFailure()
+    attestation: dict[str, object] = {
+        "schemaVersion": 1,
+        "artifactKind": "urmotiv_review_gold_verification_attestation",
+        "protocolVersion": _VERIFICATION_PROTOCOL,
+        "verificationStatus": "complete",
+        "upstreamDatasetId": validation.get("datasetId"),
+        "verifier": verifier,
+        "artifacts": artifacts,
+        "reviewInputs": review_inputs,
+        "cases": sealed.get("cases"),
+        "counts": counts,
+    }
+    attestation["verificationFingerprint"] = _sha256(
+        _canonical_json_bytes(attestation)
+    )
+    return _json_pretty(attestation)
+
+
 def _arguments(argv: list[str]) -> argparse.Namespace:
     parser = _SafeArgumentParser(add_help=True)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -2181,6 +3133,19 @@ def _arguments(argv: list[str]) -> argparse.Namespace:
     seal.add_argument("--plan", required=True)
     seal.add_argument("--tuning-history", required=True)
     seal.add_argument("--out", required=True)
+    verify = commands.add_parser("verify-sealed")
+    verify.add_argument("--private-root", required=True)
+    verify.add_argument("--input", action="append", required=True)
+    verify.add_argument("--inspection", required=True)
+    verify.add_argument("--layout", required=True)
+    verify.add_argument("--materialized", required=True)
+    verify.add_argument("--worksheet", required=True)
+    verify.add_argument("--plan", required=True)
+    verify.add_argument("--tuning-history", required=True)
+    verify.add_argument("--sealed", required=True)
+    verify.add_argument("--verifier-code-version", required=True)
+    verify.add_argument("--verifier-runner-sha256", required=True)
+    verify.add_argument("--verifier-dependency-code-sha256", required=True)
     return parser.parse_args(argv)
 
 
@@ -2205,6 +3170,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"已封存 {summary['cases']} 条人工 Gold：development {summary['development']}，"
                 f"holdout {summary['holdout']}，originality_only {summary['originalityOnly']}。\n"
             )
+        elif arguments.command == "verify-sealed":
+            sys.stdout.buffer.write(_command_verify_sealed(arguments))
         else:  # pragma: no cover - argparse enforces the command
             raise _SafeFailure()
         return 0
