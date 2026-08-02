@@ -3,6 +3,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createLlmHistoryNormalizer,
+  defaultNormalizationMaximumDurationMs,
   loadHistoryPreparationCodeSha256,
   type LlmHistoryNormalizerOptions,
 } from "../src/history-migration/index";
@@ -144,6 +145,252 @@ describe("历史题目模型整理流式请求", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("DONE 后只接受空 data、重复 DONE 与严格有界元数据，并继续等待真实 HTTP EOF", async () => {
+    const encoder = new TextEncoder();
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    let cancelled = false;
+    const fetch = vi.fn(async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { headers: { "Content-Type": "text/event-stream" } },
+      ),
+    );
+    const resultPromise = createNormalizer({
+      fetch,
+      firstOutputTimeoutMs: 1_000,
+      outputIdleTimeoutMs: 1_000,
+      maximumDurationMs: 5_000,
+    }).normalize(sourceInput);
+    let settled = false;
+    void resultPromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    streamController.enqueue(
+      encoder.encode(
+        [
+          completionEvent(normalizedContent, "stop").trimEnd(),
+          "",
+          `data: ${JSON.stringify(strictUsageMetadataEvent())}`,
+          "",
+          "data: [DONE]",
+          "",
+          "data:",
+          "",
+          "data",
+          "",
+          "data: [DONE]",
+          "",
+          `data: ${JSON.stringify(strictUsageMetadataEvent())}`,
+          "",
+          "",
+        ].join("\r\n"),
+      ),
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    expect(cancelled).toBe(false);
+
+    streamController.close();
+    await expect(resultPromise).resolves.toMatchObject({
+      problems: [{ title: "合成候选题" }],
+    });
+    expect(cancelled).toBe(false);
+  });
+
+  it("逐字节分片和 CRLF 不改变 benign 控制尾部的接受条件", async () => {
+    const bytes = new TextEncoder().encode(
+      [
+        completionEvent(normalizedContent, "stop").trim(),
+        "",
+        "data: [DONE]",
+        "",
+        "data:",
+        "",
+        "data: [DONE]",
+        "",
+        `data: ${JSON.stringify(strictUsageMetadataEvent())}`,
+      ].join("\r\n"),
+    );
+    let offset = 0;
+    const fetch = vi.fn(async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (offset < bytes.byteLength) {
+              controller.enqueue(bytes.slice(offset, offset + 1));
+              offset += 1;
+            } else {
+              controller.close();
+            }
+          },
+        }),
+        { headers: { "Content-Type": "text/event-stream; charset=utf-8" } },
+      ),
+    );
+
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).resolves.toMatchObject({
+      problems: [{ title: "合成候选题" }],
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { name: "非法 JSON", tail: "{not-json}" },
+    { name: "未知对象", tail: JSON.stringify({ provider_payload: true }) },
+    {
+      name: "越界 usage",
+      tail: JSON.stringify({ choices: [], usage: { total_tokens: -1 } }),
+    },
+    {
+      name: "过深 usage",
+      tail: JSON.stringify({
+        choices: [],
+        usage: { a: { b: { c: { d: { total_tokens: 1 } } } } },
+      }),
+    },
+    { name: "非空 choices", tail: JSON.stringify({ choices: [{ index: 0 }] }) },
+    {
+      name: "正文或工具字段",
+      tail: JSON.stringify({ choices: [], content: "合成尾部正文", tool_calls: [] }),
+    },
+  ])("DONE 后的$name清空候选并排空到真实 EOF 后才固定失败", async ({ tail }) => {
+    const encoder = new TextEncoder();
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    let cancelled = false;
+    const fetch = vi.fn(async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { headers: { "Content-Type": "text/event-stream" } },
+      ),
+    );
+    const resultPromise = createNormalizer({
+      fetch,
+      firstOutputTimeoutMs: 1_000,
+      outputIdleTimeoutMs: 1_000,
+      maximumDurationMs: 5_000,
+    }).normalize(sourceInput);
+    let settled = false;
+    void resultPromise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    streamController.enqueue(
+      encoder.encode(
+        `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: ${tail}\n\n`,
+      ),
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    expect(cancelled).toBe(false);
+
+    streamController.enqueue(encoder.encode("排空阶段不应保存的合成字节"));
+    streamController.close();
+    const error = await resultPromise.catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "protocol",
+      message: "模型响应缺少完整候选内容。",
+    });
+    expect(String(error)).not.toContain("合成尾部正文");
+    expect(String(error)).not.toContain("排空阶段");
+    expect(cancelled).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("DONE 前的 choices:[] 必须通过同一封闭元数据校验", async () => {
+    const unsafeMarker = "不应静默忽略的合成正文";
+    const fetch = vi.fn(async () =>
+      eventStreamResponse(
+        `${completionEvent(normalizedContent, "stop")}data: ${JSON.stringify({
+          choices: [],
+          content: unsafeMarker,
+        })}\n\ndata: [DONE]\n\n`,
+      ),
+    );
+
+    const error = await createNormalizer({ fetch }).normalize(sourceInput).catch((caught) => caught);
+    expect(error).toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "protocol",
+    });
+    expect(String(error)).not.toContain(unsafeMarker);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { mode: "stream_interrupted", failureKind: "eof_incomplete" },
+    { mode: "cancelled", failureKind: "cancelled" },
+  ] as const)(
+    "协议首错排空期间 $mode 仍保持不完整",
+    async ({ mode, failureKind }) => {
+      const encoder = new TextEncoder();
+      const cancellation = new AbortController();
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const fetch = vi.fn(async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              streamController = controller;
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
+      );
+      const resultPromise = createNormalizer({
+        fetch,
+        signal: cancellation.signal,
+        firstOutputTimeoutMs: 1_000,
+        outputIdleTimeoutMs: 1_000,
+        maximumDurationMs: 5_000,
+      }).normalize(sourceInput);
+      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+      streamController.enqueue(
+        encoder.encode(
+          `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: {not-json}\n\n`,
+        ),
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (mode === "stream_interrupted") {
+        streamController.error(new Error("不应泄漏的合成传输错误"));
+      } else {
+        cancellation.abort();
+      }
+
+      const error = await resultPromise.catch((caught: unknown) => caught);
+      expect(error).toMatchObject({
+        code: "NORMALIZATION_FAILED",
+        failureKind,
+      });
+      expect(String(error)).not.toContain("不应泄漏");
+      expect(fetch).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it("非空 reasoning 输出会续期，最终仍必须收到非空 content 和 stop", async () => {
     let generation: ReturnType<typeof setInterval> | undefined;
     const fetch = vi.fn(async () => {
@@ -208,6 +455,200 @@ describe("历史题目模型整理流式请求", () => {
       message: "source-000001 的模型输出长时间没有继续。",
     });
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("默认最终保护是四小时，首段有效输出后不会成为正常生成总时限", async () => {
+    expect(defaultNormalizationMaximumDurationMs).toBe(4 * 60 * 60 * 1_000);
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const fetch = vi.fn(async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              streamController = controller;
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
+      );
+      const normalizer = createNormalizer({
+        fetch,
+        firstOutputTimeoutMs: 20,
+        outputIdleTimeoutMs: 1_000,
+        maximumDurationMs: 50,
+      });
+      const resultPromise = normalizer.normalize(sourceInput);
+      await vi.advanceTimersByTimeAsync(0);
+      streamController.enqueue(encoder.encode(completionEvent(normalizedContent)));
+      await vi.advanceTimersByTimeAsync(0);
+
+      await vi.advanceTimersByTimeAsync(60);
+      streamController.enqueue(
+        encoder.encode(`${completionEvent("", "stop")}data: [DONE]\n\n`),
+      );
+      streamController.close();
+      await expect(resultPromise).resolves.toMatchObject({
+        problems: [{ title: "合成候选题" }],
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("协议排空重启最终保护，原始分块只刷新 idle 而不能延长绝对边界", async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      let cancelled = false;
+      const fetch = vi.fn(async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              streamController = controller;
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
+      );
+      const resultPromise = createNormalizer({
+        fetch,
+        firstOutputTimeoutMs: 20,
+        outputIdleTimeoutMs: 30,
+        maximumDurationMs: 50,
+      }).normalize(sourceInput);
+      const rejection = expect(resultPromise).rejects.toMatchObject({
+        code: "NORMALIZATION_FAILED",
+        failureKind: "maximum_duration_timeout",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      streamController.enqueue(
+        encoder.encode(
+          `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: {not-json}\n\n`,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      await vi.advanceTimersByTimeAsync(20);
+      streamController.enqueue(encoder.encode("合成排空分块一"));
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(20);
+      streamController.enqueue(encoder.encode("合成排空分块二"));
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(11);
+
+      await rejection;
+      expect(cancelled).toBe(true);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("协议排空没有原始分块继续到达时仍按 idle 判为不完整", async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      let cancelled = false;
+      const fetch = vi.fn(async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              streamController = controller;
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
+      );
+      const resultPromise = createNormalizer({
+        fetch,
+        firstOutputTimeoutMs: 20,
+        outputIdleTimeoutMs: 30,
+        maximumDurationMs: 100,
+      }).normalize(sourceInput);
+      const rejection = expect(resultPromise).rejects.toMatchObject({
+        code: "NORMALIZATION_FAILED",
+        failureKind: "output_idle_timeout",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      streamController.enqueue(
+        encoder.encode(
+          `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: {not-json}\n\n`,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(31);
+
+      await rejection;
+      expect(cancelled).toBe(true);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("DONE 后 benign 控制事件不冒充有效输出刷新 idle", async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let streamController!: ReadableStreamDefaultController<Uint8Array>;
+      const fetch = vi.fn(async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              streamController = controller;
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
+      );
+      const resultPromise = createNormalizer({
+        fetch,
+        firstOutputTimeoutMs: 20,
+        outputIdleTimeoutMs: 30,
+        maximumDurationMs: 100,
+      }).normalize(sourceInput);
+      const rejection = expect(resultPromise).rejects.toMatchObject({
+        code: "NORMALIZATION_FAILED",
+        failureKind: "output_idle_timeout",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      streamController.enqueue(
+        encoder.encode(`${completionEvent(normalizedContent, "stop")}data: [DONE]\n\n`),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(20);
+      streamController.enqueue(
+        encoder.encode(
+          `data: [DONE]\n\ndata: ${JSON.stringify(strictUsageMetadataEvent())}\n\n`,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(11);
+
+      await rejection;
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("最终保护时长属于 prepare 执行身份", () => {
+    const first = createNormalizer({ maximumDurationMs: 10_000 });
+    const second = createNormalizer({ maximumDurationMs: 10_001 });
+    expect(first.preparationIdentity.configSha256).not.toBe(
+      second.preparationIdentity.configSha256,
+    );
   });
 
   it("只有 DONE 而没有 finish_reason=stop 时不接受部分内容", async () => {
@@ -424,6 +865,38 @@ describe("历史题目模型整理重试与完整性", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("SSE 正文超过硬字节上限时立即失败并且不自动重发", async () => {
+    let cancelled = false;
+    const fetch = vi.fn(async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array(20));
+            controller.enqueue(new Uint8Array(20));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { headers: { "Content-Type": "text/event-stream" } },
+      ),
+    );
+
+    await expect(
+      createNormalizer({
+        fetch,
+        maximumAttempts: 3,
+        maximumResponseBytes: 32,
+      }).normalize(sourceInput),
+    ).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "response_too_large",
+      message: "模型响应超过明确大小上限。",
+    });
+    expect(cancelled).toBe(true);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("非流式兼容响应也必须完整结束、非空且 finish_reason=stop", async () => {
     const validFetch = vi.fn(async () => {
       return Response.json({
@@ -492,6 +965,24 @@ function reasoningEvent(reasoning: string): string {
       },
     ],
   })}\n\n`;
+}
+
+function strictUsageMetadataEvent(): Record<string, unknown> {
+  return {
+    id: "synthetic-completion-id",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "synthetic-model",
+    system_fingerprint: null,
+    service_tier: "default",
+    choices: [],
+    usage: {
+      prompt_tokens: 3,
+      completion_tokens: 4,
+      total_tokens: 7,
+      prompt_tokens_details: { cached_tokens: 0 },
+    },
+  };
 }
 
 function eventStreamResponse(body: string): Response {

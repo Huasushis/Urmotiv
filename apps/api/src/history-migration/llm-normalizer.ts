@@ -27,6 +27,11 @@ export interface LlmHistoryNormalizerOptions {
   readonly firstOutputTimeoutMs?: number;
   /** 已经开始输出后，连续没有非空模型输出的等待时间。 */
   readonly outputIdleTimeoutMs?: number;
+  /**
+   * 首段有效输出前以及不可逆协议错误排空阶段的最终保护。正常生成一旦
+   * 出现有效输出就清除此计时，不能把它当成生成总时限。
+   */
+  readonly maximumDurationMs?: number;
   /** 总尝试次数；只有服务端明确返回 429 时才会使用后续尝试。 */
   readonly maximumAttempts?: number;
   readonly retryBaseDelayMs?: number;
@@ -40,6 +45,7 @@ export interface LlmHistoryNormalizerOptions {
 export const maximumNormalizationResponseBytes = 10_000_000;
 export const defaultNormalizationFirstOutputTimeoutMs = 30 * 60 * 1_000;
 export const defaultNormalizationOutputIdleTimeoutMs = 10 * 60 * 1_000;
+export const defaultNormalizationMaximumDurationMs = 4 * 60 * 60 * 1_000;
 export interface IdentifiedHistoryNormalizer extends HistoryNormalizer {
   readonly preparationIdentity: HistoryPreparationExecutionIdentity;
 }
@@ -47,6 +53,7 @@ export interface IdentifiedHistoryNormalizer extends HistoryNormalizer {
 interface NormalizationRuntime {
   readonly firstOutputTimeoutMs: number;
   readonly outputIdleTimeoutMs: number;
+  readonly maximumDurationMs: number;
   readonly maximumAttempts: number;
   readonly retryBaseDelayMs: number;
   readonly maximumResponseBytes: number;
@@ -74,6 +81,9 @@ export function createLlmHistoryNormalizer(
     outputIdleTimeoutMs: positiveDuration(
       options.outputIdleTimeoutMs ?? defaultNormalizationOutputIdleTimeoutMs,
     ),
+    maximumDurationMs: positiveDuration(
+      options.maximumDurationMs ?? defaultNormalizationMaximumDurationMs,
+    ),
     maximumAttempts: positiveInteger(options.maximumAttempts ?? 3, 10),
     retryBaseDelayMs: positiveInteger(options.retryBaseDelayMs ?? 3_000, 60_000),
     maximumResponseBytes: positiveInteger(
@@ -95,10 +105,12 @@ export function createLlmHistoryNormalizer(
           endpointSha256: sha256Hex(endpoint.toString()),
           firstOutputTimeoutMs: runtime.firstOutputTimeoutMs,
           outputIdleTimeoutMs: runtime.outputIdleTimeoutMs,
+          maximumDurationMs: runtime.maximumDurationMs,
           maximumAttempts: runtime.maximumAttempts,
           retryBaseDelayMs: runtime.retryBaseDelayMs,
           maximumResponseBytes: runtime.maximumResponseBytes,
           streaming: true,
+          streamingProtocol: "sse-eof-benign-controls-v2",
           retryPolicy: "http-429-only",
         }),
       ),
@@ -196,6 +208,7 @@ async function requestNormalizationOnce(
     controller,
     runtime.firstOutputTimeoutMs,
     runtime.outputIdleTimeoutMs,
+    runtime.maximumDurationMs,
   );
   const cancelFromParent = (): void => {
     controller.abort();
@@ -259,6 +272,12 @@ async function requestNormalizationOnce(
     if (timeoutKind === "output_idle") {
       throw normalizationFailure("output_idle_timeout", `${sourceId} 的模型输出长时间没有继续。`);
     }
+    if (timeoutKind === "maximum_duration") {
+      throw normalizationFailure(
+        "maximum_duration_timeout",
+        `${sourceId} 的模型请求超过最终保护时长。`,
+      );
+    }
     if (isSignalAborted(runtime.signal)) {
       throw cancelledRequest(sourceId);
     }
@@ -277,33 +296,76 @@ async function requestNormalizationOnce(
   }
 }
 
-type NormalizationTimeoutKind = "first_output" | "output_idle";
+type NormalizationTimeoutKind = "first_output" | "output_idle" | "maximum_duration";
 
 class NormalizationOutputWatchdog {
   readonly #controller: AbortController;
   readonly #outputIdleTimeoutMs: number;
+  readonly #maximumDurationMs: number;
   #firstOutputTimer: ReturnType<typeof setTimeout> | null;
   #outputIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  #maximumDurationTimer: ReturnType<typeof setTimeout> | null;
   #timeoutKind: NormalizationTimeoutKind | null = null;
+  #receivedValidOutput = false;
+  #drainingInvalidResponse = false;
 
   public constructor(
     controller: AbortController,
     firstOutputTimeoutMs: number,
     outputIdleTimeoutMs: number,
+    maximumDurationMs: number,
   ) {
     this.#controller = controller;
     this.#outputIdleTimeoutMs = outputIdleTimeoutMs;
+    this.#maximumDurationMs = maximumDurationMs;
     this.#firstOutputTimer = setTimeout(() => {
       this.#abort("first_output");
     }, firstOutputTimeoutMs);
+    this.#maximumDurationTimer = setTimeout(() => {
+      this.#abort("maximum_duration");
+    }, maximumDurationMs);
   }
 
   public receivedValidOutput(): void {
     if (this.#timeoutKind !== null) return;
+    if (!this.#receivedValidOutput) {
+      this.#receivedValidOutput = true;
+      if (this.#firstOutputTimer !== null) {
+        clearTimeout(this.#firstOutputTimer);
+        this.#firstOutputTimer = null;
+      }
+      // 四小时是首段前的最终保护，不是正常持续生成的总时限。
+      if (this.#maximumDurationTimer !== null) {
+        clearTimeout(this.#maximumDurationTimer);
+        this.#maximumDurationTimer = null;
+      }
+    }
+    this.#resetOutputIdleTimer();
+  }
+
+  public invalidResponseDrainStarted(): void {
+    if (this.#timeoutKind !== null || this.#drainingInvalidResponse) return;
+    this.#drainingInvalidResponse = true;
     if (this.#firstOutputTimer !== null) {
       clearTimeout(this.#firstOutputTimer);
       this.#firstOutputTimer = null;
     }
+    // 协议首错后只排空，不再生成候选；从排空开始重新建立四小时最终边界。
+    if (this.#maximumDurationTimer !== null) {
+      clearTimeout(this.#maximumDurationTimer);
+    }
+    this.#maximumDurationTimer = setTimeout(() => {
+      this.#abort("maximum_duration");
+    }, this.#maximumDurationMs);
+    this.receivedInvalidResponseDrainActivity();
+  }
+
+  public receivedInvalidResponseDrainActivity(): void {
+    if (this.#timeoutKind !== null || !this.#drainingInvalidResponse) return;
+    this.#resetOutputIdleTimer();
+  }
+
+  #resetOutputIdleTimer(): void {
     if (this.#outputIdleTimer !== null) {
       clearTimeout(this.#outputIdleTimer);
     }
@@ -324,6 +386,10 @@ class NormalizationOutputWatchdog {
     if (this.#outputIdleTimer !== null) {
       clearTimeout(this.#outputIdleTimer);
       this.#outputIdleTimer = null;
+    }
+    if (this.#maximumDurationTimer !== null) {
+      clearTimeout(this.#maximumDurationTimer);
+      this.#maximumDurationTimer = null;
     }
   }
 
@@ -460,21 +526,31 @@ async function readEventStream(
   let trailingCarriageReturn = false;
   let totalBytes = 0;
   let readerFinished = false;
+  let firstProtocolError: HistoryNormalizationError | undefined;
 
   try {
     for (;;) {
       const chunk = await waitForOrAbort(reader.read(), requestController.signal);
       if (chunk.done) {
         readerFinished = true;
-        ({ pending, trailingCarriageReturn } = appendEventStreamText(
-          pending,
-          trailingCarriageReturn,
-          decodeEventStreamText(decoder),
-          true,
-        ));
-        pending = consumeCompleteEvents(pending, state, watchdog);
-        if (pending.trim().length > 0) {
-          consumeCompletionEvent(pending, state, watchdog);
+        if (firstProtocolError !== undefined) {
+          throw firstProtocolError;
+        }
+        try {
+          ({ pending, trailingCarriageReturn } = appendEventStreamText(
+            pending,
+            trailingCarriageReturn,
+            decodeEventStreamText(decoder),
+            true,
+          ));
+          pending = consumeCompleteEvents(pending, state, watchdog);
+          if (pending.trim().length > 0) {
+            consumeCompletionEvent(pending, state, watchdog);
+          }
+        } catch (error) {
+          if (!isDrainableNormalizationProtocolError(error)) throw error;
+          state.content = "";
+          throw error;
         }
         if (!state.sawChoice || !state.sawStop || state.content.trim().length === 0) {
           throw interruptedResponse();
@@ -489,13 +565,25 @@ async function readEventStream(
         requestController,
       );
       if (chunk.value.byteLength === 0) continue;
-      ({ pending, trailingCarriageReturn } = appendEventStreamText(
-        pending,
-        trailingCarriageReturn,
-        decodeEventStreamText(decoder, chunk.value),
-        false,
-      ));
-      pending = consumeCompleteEvents(pending, state, watchdog);
+      if (firstProtocolError !== undefined) {
+        watchdog.receivedInvalidResponseDrainActivity();
+        continue;
+      }
+      try {
+        ({ pending, trailingCarriageReturn } = appendEventStreamText(
+          pending,
+          trailingCarriageReturn,
+          decodeEventStreamText(decoder, chunk.value),
+          false,
+        ));
+        pending = consumeCompleteEvents(pending, state, watchdog);
+      } catch (error) {
+        if (!isDrainableNormalizationProtocolError(error)) throw error;
+        firstProtocolError = error;
+        state.content = "";
+        pending = "";
+        watchdog.invalidResponseDrainStarted();
+      }
     }
   } finally {
     if (!readerFinished) {
@@ -507,6 +595,15 @@ async function readEventStream(
       // 已经得到固定结果或固定错误，不再用清理错误替换它。
     }
   }
+}
+
+function isDrainableNormalizationProtocolError(
+  error: unknown,
+): error is HistoryNormalizationError {
+  return (
+    error instanceof HistoryNormalizationError &&
+    (error.failureKind === "protocol" || error.failureKind === "invalid_utf8")
+  );
 }
 
 function consumeCompleteEvents(
@@ -529,14 +626,21 @@ function consumeCompletionEvent(
   state: CompletionStreamState,
   watchdog: NormalizationOutputWatchdog,
 ): void {
-  const data = event
+  const dataFields = event
     .split("\n")
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice("data:".length).trimStart())
-    .join("\n")
-    .trim();
+    .flatMap((line) =>
+      line === "data"
+        ? [""]
+        : line.startsWith("data:")
+          ? [line.slice("data:".length).trimStart()]
+          : [],
+    );
+  if (dataFields.length === 0) return;
+  const data = dataFields.join("\n").trim();
   if (data.length === 0) return;
   if (state.sawDone) {
+    if (data === "[DONE]") return;
+    if (isStrictStreamUsageMetadata(parseCompletionEventData(data))) return;
     throw invalidResponseFormat();
   }
   if (data === "[DONE]") {
@@ -544,25 +648,23 @@ function consumeCompletionEvent(
     return;
   }
 
-  let raw: unknown;
-  try {
-    raw = JSON.parse(data) as unknown;
-  } catch {
+  const raw = parseCompletionEventData(data);
+  if (!isPlainJsonRecord(raw)) {
     throw invalidResponseFormat();
   }
-  if (typeof raw !== "object" || raw === null) {
-    throw invalidResponseFormat();
-  }
-  const record = raw as Record<string, unknown>;
+  const record = raw;
   if (Object.hasOwn(record, "error")) {
     throw invalidResponseFormat();
+  }
+  if (isStrictStreamUsageMetadata(record)) {
+    return;
   }
   if (!Array.isArray(record.choices)) {
     throw invalidResponseFormat();
   }
   if (record.choices.length === 0) {
-    // 部分兼容服务会在答案后发送只含用量的事件。
-    return;
+    // 空 choices 只有通过上面的封闭元数据校验才可忽略。
+    throw invalidResponseFormat();
   }
   if (record.choices.length !== 1 || state.sawStop) {
     throw invalidResponseFormat();
@@ -610,6 +712,139 @@ function consumeCompletionEvent(
     }
     state.sawStop = true;
   }
+}
+
+const streamUsageMetadataKeys = new Set([
+  "choices",
+  "usage",
+  "id",
+  "object",
+  "created",
+  "model",
+  "system_fingerprint",
+  "service_tier",
+]);
+const maximumStreamUsageNodes = 256;
+const maximumStreamUsageDepth = 4;
+const maximumStreamUsageKeys = 64;
+const maximumStreamMetadataStringLength = 1_024;
+
+function parseCompletionEventData(data: string): unknown {
+  try {
+    return JSON.parse(data) as unknown;
+  } catch {
+    throw invalidResponseFormat();
+  }
+}
+
+function isPlainJsonRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isStrictStreamUsageMetadata(raw: unknown): boolean {
+  if (!isPlainJsonRecord(raw)) return false;
+  const entries = Object.entries(raw);
+  if (
+    entries.length === 0 ||
+    entries.some(([key]) => !streamUsageMetadataKeys.has(key))
+  ) {
+    return false;
+  }
+  if (
+    Object.hasOwn(raw, "choices") &&
+    (!Array.isArray(raw.choices) || raw.choices.length !== 0)
+  ) {
+    return false;
+  }
+  if (
+    Object.hasOwn(raw, "usage") &&
+    !isBoundedStreamUsageCounterStructure(raw.usage)
+  ) {
+    return false;
+  }
+  const hasControlEvidence =
+    (Object.hasOwn(raw, "choices") &&
+      Array.isArray(raw.choices) &&
+      raw.choices.length === 0) ||
+    Object.hasOwn(raw, "usage");
+  if (!hasControlEvidence) return false;
+
+  for (const key of ["id", "object", "model"] as const) {
+    if (Object.hasOwn(raw, key) && !isBoundedStreamMetadataString(raw[key])) {
+      return false;
+    }
+  }
+  for (const key of ["system_fingerprint", "service_tier"] as const) {
+    if (
+      Object.hasOwn(raw, key) &&
+      !isBoundedStreamMetadataString(raw[key], true)
+    ) {
+      return false;
+    }
+  }
+  if (
+    Object.hasOwn(raw, "created") &&
+    (typeof raw.created !== "number" ||
+      !Number.isSafeInteger(raw.created) ||
+      raw.created < 0)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function isBoundedStreamMetadataString(value: unknown, nullable = false): boolean {
+  return (
+    (nullable && value === null) ||
+    (typeof value === "string" &&
+      value.length <= maximumStreamMetadataStringLength &&
+      value.trim().length > 0 &&
+      !/[\u0000-\u001f\u007f]/u.test(value))
+  );
+}
+
+function isBoundedStreamUsageCounterStructure(value: unknown): boolean {
+  if (!isPlainJsonRecord(value)) return false;
+  const result = scanBoundedStreamUsageCounter(value, 0, {
+    remaining: maximumStreamUsageNodes,
+  });
+  return result.valid && result.hasNumericCounter;
+}
+
+function scanBoundedStreamUsageCounter(
+  value: unknown,
+  depth: number,
+  budget: { remaining: number },
+): { readonly valid: boolean; readonly hasNumericCounter: boolean } {
+  if (typeof value === "number") {
+    const valid = Number.isSafeInteger(value) && value >= 0;
+    return { valid, hasNumericCounter: valid };
+  }
+  if (!isPlainJsonRecord(value) || depth >= maximumStreamUsageDepth) {
+    return { valid: false, hasNumericCounter: false };
+  }
+  const entries = Object.entries(value);
+  if (entries.length === 0 || entries.length > maximumStreamUsageKeys) {
+    return { valid: false, hasNumericCounter: false };
+  }
+  let hasNumericCounter = false;
+  for (const [key, child] of entries) {
+    budget.remaining -= 1;
+    if (budget.remaining < 0 || !/^[A-Za-z0-9_]{1,64}$/u.test(key)) {
+      return { valid: false, hasNumericCounter: false };
+    }
+    if (child === null) continue;
+    const childResult = scanBoundedStreamUsageCounter(child, depth + 1, budget);
+    if (!childResult.valid) {
+      return { valid: false, hasNumericCounter: false };
+    }
+    hasNumericCounter ||= childResult.hasNumericCounter;
+  }
+  return { valid: true, hasNumericCounter };
 }
 
 function decodeEventStreamText(decoder: TextDecoder, bytes?: Uint8Array): string {

@@ -39,6 +39,7 @@ export const historyNormalizationFailureKinds = [
   "connection",
   "first_output_timeout",
   "output_idle_timeout",
+  "maximum_duration_timeout",
   "protocol",
   "schema",
   "eof_incomplete",
