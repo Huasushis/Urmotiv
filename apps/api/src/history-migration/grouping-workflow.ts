@@ -5,7 +5,6 @@ import {
   type ArchiveIssue,
   defaultArchiveSafetyLimits,
   isSafeArchivePath,
-  looksLikeZipArchive,
   readZipArchive,
   UnsafeArchiveError,
 } from "@urmotiv/problem-package";
@@ -32,6 +31,7 @@ import {
   createNewPrivateDirectory,
   maximumHistorySourceBytes,
   maximumHistorySourceTextUnits,
+  maximumPrivateJsonBytes,
   readConfirmedSource,
   readPrivateJson,
   readPrivateJsonWithDigest,
@@ -50,6 +50,145 @@ import {
 const maximumCatalogFiles = 10_000;
 const maximumCatalogTotalBytes = 512 * 1024 * 1024;
 const maximumCatalogSourceBytes = defaultArchiveSafetyLimits.maxArchiveBytes;
+/**
+ * 清单写出上限是 10,000,000 bytes。按两层各 240 个 UTF-16 代码单元的
+ * 最坏路径、UTF-8 每代码单元最多 3 bytes，以及 pretty JSON 的缩进逐项
+ * 计费后，5,000 个“源文件 + ZIP 声明记录”仍留有明确余量。
+ */
+const maximumHistoryCatalogItems = 5_000;
+const maximumHistoryArchiveEntries = maximumHistoryCatalogItems;
+/** 根 ZIP 算第一层；历史资料只允许再进入一层单题 ZIP。 */
+const maximumHistoryArchiveDepth = 2;
+const maximumHistoryArchiveExpandedBytes = maximumCatalogSourceBytes;
+const maximumHistoryArchiveCompressionRatio = 200;
+const maximumHistoryArchivePathSegmentUnits = 120;
+const historyZipEndSignature = 0x06054b50;
+const historyZipCentralSignature = 0x02014b50;
+const historyZipLocalSignature = 0x04034b50;
+const historyZipDescriptorSignature = 0x08074b50;
+const historyZip64EndSignature = 0x06064b50;
+const historyZip64LocatorSignature = 0x07064b50;
+const historyZip64ExtraId = 0x0001;
+const historyZip64MarkerU16 = 0xffff;
+const historyZip64MarkerU32 = 0xffffffff;
+const historyZipCommonFlags = 0x0808;
+const historyZipDeflateFlags = 0x0006;
+const maximumHistoryZipEndScanBytes = 22 + 65_535;
+
+interface HistoryArchiveTreeLimits {
+  readonly maxArchiveBytes: number;
+  readonly maxEntries: number;
+  readonly maxSingleFileBytes: number;
+  readonly maxExpandedBytes: number;
+  readonly maxCompressionRatio: number;
+  readonly maxDepth: number;
+}
+
+const productionHistoryArchiveTreeLimits: HistoryArchiveTreeLimits = {
+  maxArchiveBytes: maximumCatalogSourceBytes,
+  maxEntries: maximumHistoryArchiveEntries,
+  maxSingleFileBytes: maximumCatalogSourceBytes,
+  maxExpandedBytes: maximumHistoryArchiveExpandedBytes,
+  maxCompressionRatio: maximumHistoryArchiveCompressionRatio,
+  maxDepth: maximumHistoryArchiveDepth,
+};
+
+const maximumSerializedHistoryPath = `${"\u0800".repeat(
+  maximumHistoryArchivePathSegmentUnits,
+)}/${"\u0800".repeat(
+  defaultArchiveSafetyLimits.maxPathLength - maximumHistoryArchivePathSegmentUnits - 1,
+)}`;
+const maximumSerializedDigest = "f".repeat(64);
+const maximumSerializedSourceId = "source-999999";
+const maximumSerializedEntryId = "entry-999999";
+
+const emptyLocationCatalog = { version: 2, sources: [] };
+const maximumLocationSource = {
+  sourceId: maximumSerializedSourceId,
+  sourcePath: maximumSerializedHistoryPath,
+  entries: [],
+};
+const maximumLocationEntry = {
+  entryId: maximumSerializedEntryId,
+  entryPathChain: [maximumSerializedHistoryPath, maximumSerializedHistoryPath],
+};
+const oneMaximumLocationSource = {
+  version: 2,
+  sources: [maximumLocationSource],
+};
+const oneMaximumLocationEntry = {
+  version: 2,
+  sources: [{ ...maximumLocationSource, entries: [maximumLocationEntry] }],
+};
+
+const emptyInventoryCatalog = { version: 1, sources: [] };
+const maximumInventorySource = {
+  sourceId: maximumSerializedSourceId,
+  kind: "zip",
+  contentSha256: maximumSerializedDigest,
+  byteLength: maximumCatalogSourceBytes,
+  entries: [],
+};
+const maximumInventoryEntry = {
+  entryId: maximumSerializedEntryId,
+  contentSha256: maximumSerializedDigest,
+  byteLength: maximumCatalogSourceBytes,
+};
+const oneMaximumInventorySource = {
+  version: 1,
+  sources: [maximumInventorySource],
+};
+const oneMaximumInventoryTextSource = {
+  version: 1,
+  sources: [
+    {
+      sourceId: maximumSerializedSourceId,
+      kind: "text",
+      contentSha256: maximumSerializedDigest,
+      byteLength: maximumCatalogSourceBytes,
+      characterCount: maximumHistorySourceTextUnits,
+    },
+  ],
+};
+const oneMaximumInventoryEntry = {
+  version: 1,
+  sources: [{ ...maximumInventorySource, entries: [maximumInventoryEntry] }],
+};
+
+const locationCatalogBaseBytes = serializedPrivateJsonBytes(emptyLocationCatalog);
+const maximumLocationItemBytes = Math.max(
+  serializedPrivateJsonBytes(oneMaximumLocationSource) - locationCatalogBaseBytes + 1,
+  serializedPrivateJsonBytes(oneMaximumLocationEntry) -
+    serializedPrivateJsonBytes(oneMaximumLocationSource) +
+    1,
+);
+const inventoryCatalogBaseBytes = serializedPrivateJsonBytes(emptyInventoryCatalog);
+const maximumInventoryItemBytes = Math.max(
+  serializedPrivateJsonBytes(oneMaximumInventorySource) - inventoryCatalogBaseBytes + 1,
+  serializedPrivateJsonBytes(oneMaximumInventoryTextSource) - inventoryCatalogBaseBytes + 1,
+  serializedPrivateJsonBytes(oneMaximumInventoryEntry) -
+    serializedPrivateJsonBytes(oneMaximumInventorySource) +
+    1,
+);
+const maximumLocationCatalogBytes =
+  locationCatalogBaseBytes + maximumHistoryCatalogItems * maximumLocationItemBytes;
+const maximumInventoryCatalogBytes =
+  inventoryCatalogBaseBytes + maximumHistoryCatalogItems * maximumInventoryItemBytes;
+
+if (
+  maximumLocationCatalogBytes > maximumPrivateJsonBytes ||
+  maximumInventoryCatalogBytes > maximumPrivateJsonBytes
+) {
+  throw new Error("历史清单批次上限不能保证私有 JSON 可完整写出。");
+}
+
+/** 仅供合成测试核对生产批次上限的最坏 JSON 字节证明；公共 index 不导出。 */
+export const historyCatalogBatchSafetyForTest = Object.freeze({
+  maximumItems: maximumHistoryCatalogItems,
+  maximumLocationCatalogBytes,
+  maximumInventoryCatalogBytes,
+  maximumPrivateJsonBytes,
+});
 
 type HistorySourceInspectionReason =
   | ArchiveIssue["code"]
@@ -75,16 +214,23 @@ class HistorySourceInspectionFailure extends HistoryMigrationError {
   }
 }
 
+class HistoryCatalogItemLimitFailure extends HistoryMigrationError {
+  public constructor() {
+    super("SOURCE_TOO_LARGE", "本批源文件与压缩包声明记录的总数量超过安全清单上限。");
+    this.name = "HistoryCatalogItemLimitFailure";
+  }
+}
+
 const privateRelativePathSchema = z
   .string()
   .min(1)
   .max(240)
-  .refine((value) => isSafeArchivePath(value), "私有相对路径不安全。");
+  .refine((value) => isSafeHistoryRelativePath(value), "私有相对路径不安全。");
 
 const historyZipEntryLocationSchema = z
   .object({
     entryId: historyZipEntryIdSchema,
-    entryPath: privateRelativePathSchema,
+    entryPathChain: z.array(privateRelativePathSchema).min(1).max(maximumHistoryArchiveDepth),
   })
   .strict();
 
@@ -103,16 +249,16 @@ const historySourceLocationSchema = z
       "同一个压缩包条目安全编号不能重复。",
     );
     addDuplicateIssues(
-      value.entries.map((entry) => foldPrivatePath(entry.entryPath)),
+      value.entries.map((entry) => foldPrivatePathChain(entry.entryPathChain)),
       context,
       ["entries"],
-      "同一个压缩包条目路径不能重复或只靠大小写区分。",
+      "同一个压缩包条目路径链不能重复或只靠大小写区分。",
     );
   });
 
 export const historySourceLocationsSchema = z
   .object({
-    version: z.literal(1),
+    version: z.literal(2),
     sources: z.array(historySourceLocationSchema).min(1).max(maximumCatalogFiles),
   })
   .strict()
@@ -160,7 +306,7 @@ const historyManualReviewSchema = z
 
 const historyInventoryCompleteSchema = z
   .object({
-    version: z.literal(2),
+    version: z.literal(3),
     phase: z.literal("inventory"),
     inventorySha256: historyContentDigestSchema,
     sourceLocationsSha256: historyContentDigestSchema,
@@ -389,8 +535,47 @@ interface CatalogSourceLocation {
   readonly sourcePath: string;
   readonly entries: readonly {
     readonly entryId: string;
-    readonly entryPath: string;
+    readonly entryPathChain: readonly string[];
   }[];
+}
+
+interface SafeHistoryArchiveEntry {
+  readonly pathChain: readonly string[];
+  readonly content: Uint8Array;
+}
+
+interface SafeHistoryArchiveTree {
+  readonly entries: readonly SafeHistoryArchiveEntry[];
+  readonly declaredEntryCount: number;
+}
+
+interface StrictHistoryZipEntry {
+  readonly path: string;
+  readonly nameBytes: Uint8Array;
+  readonly versionMade: number;
+  readonly versionNeeded: number;
+  readonly flags: number;
+  readonly compressionMethod: number;
+  readonly modifiedTime: number;
+  readonly modifiedDate: number;
+  readonly crc32: number;
+  readonly compressedSize: number;
+  readonly uncompressedSize: number;
+  readonly localHeaderOffset: number;
+  readonly isDirectory: boolean;
+}
+
+interface StrictHistoryZipSummary {
+  readonly entries: readonly StrictHistoryZipEntry[];
+  readonly declaredEntryCount: number;
+  readonly declaredUncompressedBytes: number;
+}
+
+interface PreparedHistoryArchive {
+  readonly bytes: Uint8Array;
+  readonly depth: number;
+  readonly parentPathChain: readonly string[];
+  readonly summary: StrictHistoryZipSummary;
 }
 
 interface LoadedHistorySource {
@@ -433,6 +618,9 @@ export async function inventoryHistorySources(
   if (sourcePaths.length === 0) {
     throw new HistoryMigrationError("SOURCE_FILE_INVALID", "私有源目录中没有可登记的普通文件。");
   }
+  if (sourcePaths.length > maximumHistoryCatalogItems) {
+    throw new HistoryCatalogItemLimitFailure();
+  }
 
   const sources: HistorySourceInventory["sources"] = [];
   const locations: CatalogSourceLocation[] = [];
@@ -448,13 +636,30 @@ export async function inventoryHistorySources(
   }> = [];
   let totalSourceBytes = 0;
   let archiveEntryCount = 0;
+  let archiveDeclaredEntryCount = 0;
 
   for (const [index, sourcePath] of sourcePaths.entries()) {
     const sourceId = makeSafeId("source", index + 1);
+    const remainingArchiveRecords =
+      maximumHistoryCatalogItems - sourcePaths.length - archiveDeclaredEntryCount;
     let inspected: Awaited<ReturnType<typeof inspectSourceForInventory>>;
     try {
-      inspected = await inspectSourceForInventory(options.sourceDirectory, sourcePath, sourceId);
+      inspected = await inspectSourceForInventory(
+        options.sourceDirectory,
+        sourcePath,
+        sourceId,
+        remainingArchiveRecords,
+        (declaredEntries) => {
+          archiveDeclaredEntryCount += declaredEntries;
+          if (sourcePaths.length + archiveDeclaredEntryCount > maximumHistoryCatalogItems) {
+            throw new HistoryCatalogItemLimitFailure();
+          }
+        },
+      );
     } catch (error) {
+      if (error instanceof HistoryCatalogItemLimitFailure) {
+        throw error;
+      }
       if (
         error instanceof HistoryMigrationError &&
         (error.code === "SOURCE_FILE_INVALID" || error.code === "SOURCE_TOO_LARGE")
@@ -509,7 +714,7 @@ export async function inventoryHistorySources(
   );
   const sourceLocations = parsePrivateInput(
     historySourceLocationsSchema,
-    { version: 1, sources: locations },
+    { version: 2, sources: locations },
     "INVALID_GROUPING",
     "生成的私有源位置清单格式不正确。",
   );
@@ -530,7 +735,7 @@ export async function inventoryHistorySources(
   const manualReviewSha256 = sha256Hex(JSON.stringify(manualReview));
   const catalogSha256 = sha256Hex(
     JSON.stringify({
-      version: 2,
+      version: 3,
       inventorySha256,
       sourceLocationsSha256,
       manualReviewSha256,
@@ -548,7 +753,7 @@ export async function inventoryHistorySources(
     );
     await writeNewPrivateJson(join(stagingDirectory, "manual-review.json"), manualReview);
     await writeNewPrivateJson(join(stagingDirectory, "INVENTORY_COMPLETE"), {
-      version: 2,
+      version: 3,
       phase: "inventory",
       inventorySha256,
       sourceLocationsSha256,
@@ -1479,23 +1684,40 @@ async function inspectSourceForInventory(
   sourceDirectory: string,
   sourcePath: string,
   sourceId: string,
+  maximumDeclaredEntries: number = productionHistoryArchiveTreeLimits.maxEntries,
+  consumeDeclaredEntries?: (count: number) => void,
 ): Promise<{
   readonly inventory: HistorySourceInventory["sources"][number];
   readonly location: CatalogSourceLocation;
   readonly manualReasons?: readonly HistorySourceInspectionReason[];
+  readonly archiveDeclaredEntryCount: number;
 }> {
   const absolutePath = await resolvePrivateSourceFile(sourceDirectory, sourcePath);
   const bytes = await readPrivateRegularBytes(absolutePath, maximumCatalogSourceBytes);
   const contentSha256 = sha256Hex(bytes);
   const lowerExtension = extname(sourcePath).toLocaleLowerCase("en-US");
 
-  if (lowerExtension === ".zip" || looksLikeZipArchive(bytes)) {
-    let entries: ReturnType<typeof readSafeHistoryZip>;
+  // OOXML（例如 .xlsx）等格式本身也是 ZIP 容器，但不是历史题目压缩包。
+  // 只有文件名明确以 .zip 结尾时才进入历史资料压缩包流程。
+  if (lowerExtension === ".zip") {
+    let tree: SafeHistoryArchiveTree;
     try {
-      entries = [...readSafeHistoryZip(bytes)].sort((first, second) =>
-        compareCodeUnits(first.path, second.path),
+      tree = readSafeHistoryZipTree(
+        bytes,
+        {
+          ...productionHistoryArchiveTreeLimits,
+          maxEntries: maximumDeclaredEntries,
+        },
+        consumeDeclaredEntries,
       );
     } catch (error) {
+      if (
+        error instanceof HistorySourceInspectionFailure &&
+        error.reasons.includes("too_many_entries") &&
+        maximumDeclaredEntries < productionHistoryArchiveTreeLimits.maxEntries
+      ) {
+        throw new HistoryCatalogItemLimitFailure();
+      }
       if (error instanceof HistorySourceInspectionFailure) {
         return {
           inventory: {
@@ -1506,10 +1728,14 @@ async function inspectSourceForInventory(
           },
           location: { sourceId, sourcePath, entries: [] },
           manualReasons: error.reasons,
+          archiveDeclaredEntryCount: 0,
         };
       }
       throw error;
     }
+    const entries = [...tree.entries].sort((first, second) =>
+      compareCodeUnits(pathChainKey(first.pathChain), pathChainKey(second.pathChain)),
+    );
     if (entries.length === 0) {
       return {
         inventory: {
@@ -1520,6 +1746,7 @@ async function inspectSourceForInventory(
         },
         location: { sourceId, sourcePath, entries: [] },
         manualReasons: ["empty_file"],
+        archiveDeclaredEntryCount: tree.declaredEntryCount,
       };
     }
     return {
@@ -1539,9 +1766,10 @@ async function inspectSourceForInventory(
         sourcePath,
         entries: entries.map((entry, index) => ({
           entryId: makeSafeId("entry", index + 1),
-          entryPath: entry.path,
+          entryPathChain: entry.pathChain,
         })),
       },
+      archiveDeclaredEntryCount: tree.declaredEntryCount,
     };
   }
 
@@ -1560,6 +1788,7 @@ async function inspectSourceForInventory(
           },
           location: { sourceId, sourcePath, entries: [] },
           manualReasons: error.reasons,
+          archiveDeclaredEntryCount: 0,
         };
       }
       throw error;
@@ -1573,6 +1802,7 @@ async function inspectSourceForInventory(
         characterCount: text.length,
       },
       location: { sourceId, sourcePath, entries: [] },
+      archiveDeclaredEntryCount: 0,
     };
   }
 
@@ -1585,6 +1815,7 @@ async function inspectSourceForInventory(
     },
     location: { sourceId, sourcePath, entries: [] },
     manualReasons: ["manual_binary"],
+    archiveDeclaredEntryCount: 0,
   };
 }
 
@@ -1676,7 +1907,7 @@ async function loadVerifiedCatalogArtifacts(
   const manualReviewSha256 = sha256Hex(JSON.stringify(manualReview));
   const catalogSha256 = sha256Hex(
     JSON.stringify({
-      version: 2,
+      version: 3,
       inventorySha256,
       sourceLocationsSha256,
       manualReviewSha256,
@@ -1756,15 +1987,15 @@ async function loadCurrentSource(
   }
 
   if (expected.kind === "zip") {
-    const archiveEntries = readSafeHistoryZip(bytes);
+    const archiveEntries = readSafeHistoryZipTree(bytes).entries;
     if (archiveEntries.length !== location.entries.length) {
       throw new HistoryMigrationError(
         "GROUPING_CHANGED",
         `${expected.sourceId} 的压缩包条目集合已经变化。`,
       );
     }
-    const archiveByPath = new Map(
-      archiveEntries.map((entry) => [entry.path, entry.content] as const),
+    const archiveByPathChain = new Map(
+      archiveEntries.map((entry) => [pathChainKey(entry.pathChain), entry.content] as const),
     );
     const expectedEntriesById = new Map(
       expected.entries.map((entry) => [entry.entryId, entry] as const),
@@ -1772,7 +2003,7 @@ async function loadCurrentSource(
     const zipEntriesById = new Map<string, Uint8Array>();
     for (const entryLocation of location.entries) {
       const expectedEntry = expectedEntriesById.get(entryLocation.entryId);
-      const content = archiveByPath.get(entryLocation.entryPath);
+      const content = archiveByPathChain.get(pathChainKey(entryLocation.entryPathChain));
       if (
         expectedEntry === undefined ||
         content === undefined ||
@@ -1788,7 +2019,7 @@ async function loadCurrentSource(
     }
     if (
       zipEntriesById.size !== expected.entries.length ||
-      archiveByPath.size !== location.entries.length
+      archiveByPathChain.size !== location.entries.length
     ) {
       throw new HistoryMigrationError(
         "GROUPING_CHANGED",
@@ -1923,7 +2154,7 @@ async function listPrivateSourcePaths(sourceDirectory: string): Promise<string[]
     for (const entry of entries) {
       const sourcePath =
         relativeDirectory.length === 0 ? entry.name : `${relativeDirectory}/${entry.name}`;
-      if (!isSafeArchivePath(sourcePath)) {
+      if (!isSafeHistoryRelativePath(sourcePath)) {
         throw new HistoryMigrationError(
           "SOURCE_FILE_INVALID",
           "私有源目录包含不安全或过深的相对路径。",
@@ -1958,8 +2189,8 @@ async function listPrivateSourcePaths(sourceDirectory: string): Promise<string[]
       }
       foldedPaths.add(folded);
       paths.push(sourcePath);
-      if (paths.length > maximumCatalogFiles) {
-        throw new HistoryMigrationError("SOURCE_TOO_LARGE", "私有源目录中的文件数量超过明确上限。");
+      if (paths.length > maximumHistoryCatalogItems) {
+        throw new HistoryCatalogItemLimitFailure();
       }
     }
   }
@@ -1972,7 +2203,7 @@ async function resolvePrivateSourceFile(
   sourceDirectory: string,
   sourcePath: string,
 ): Promise<string> {
-  if (!isSafeArchivePath(sourcePath)) {
+  if (!isSafeHistoryRelativePath(sourcePath)) {
     throw new HistoryMigrationError("SOURCE_FILE_INVALID", "私有源文件的相对路径不安全。");
   }
   let rootRealPath: string;
@@ -1991,19 +2222,34 @@ async function resolvePrivateSourceFile(
   return fileRealPath;
 }
 
-function readSafeHistoryZip(
+/**
+ * 历史资料允许“批量 ZIP -> 单题 ZIP -> 普通文件”这一种受限嵌套。
+ * 标准题目包仍由 problem-package 使用 allowNestedArchives=false 读取；这里不会
+ * 改变正式导入格式。路径链只交给私有位置清单，公开清单只取得摘要和大小。
+ */
+function readSafeHistoryZipTree(
   bytes: Uint8Array,
-): ReturnType<ReturnType<typeof readZipArchive>["list"]> {
+  limits: HistoryArchiveTreeLimits = productionHistoryArchiveTreeLimits,
+  consumeDeclaredEntries?: (count: number) => void,
+): SafeHistoryArchiveTree {
+  const leaves: SafeHistoryArchiveEntry[] = [];
+  const seenPathChains = new Set<string>();
+  let expandedBytes = 0;
+  let entryCount = 0;
+  const rootRatioBytes = Math.floor(bytes.byteLength * limits.maxCompressionRatio);
+
   try {
-    return readZipArchive(bytes, {
-      maxArchiveBytes: maximumCatalogSourceBytes,
-      maxEntries: 100_000,
-      maxSingleFileBytes: maximumCatalogSourceBytes,
-      maxTotalUncompressedBytes: maximumCatalogSourceBytes,
-      maxCompressionRatio: 200,
-      allowNestedArchives: false,
-    }).list();
+    const root = prepareArchive(bytes, 1, []);
+    const rootAllowance = reserveArchives([root]);
+    visitPreparedArchive(root, rootAllowance);
+    return { entries: leaves, declaredEntryCount: entryCount };
   } catch (error) {
+    if (error instanceof HistoryCatalogItemLimitFailure) {
+      throw error;
+    }
+    if (error instanceof HistorySourceInspectionFailure) {
+      throw error;
+    }
     const reasons: readonly HistorySourceInspectionReason[] =
       error instanceof UnsafeArchiveError
         ? [...new Set(error.issues.map((issue) => issue.code))].sort()
@@ -2014,6 +2260,469 @@ function readSafeHistoryZip(
       "私有压缩包未通过路径、类型、大小或完整性安全检查。",
     );
   }
+
+  function prepareArchive(
+    archiveBytes: Uint8Array,
+    depth: number,
+    parentPathChain: readonly string[],
+  ): PreparedHistoryArchive {
+    if (depth > limits.maxDepth) {
+      throw archiveInspectionFailure("nested_archive");
+    }
+    if (archiveBytes.byteLength > limits.maxArchiveBytes) {
+      throw archiveInspectionFailure("archive_too_large");
+    }
+    const summary = validateStrictHistoryZipStructure(
+      archiveBytes,
+      Math.max(0, limits.maxEntries - entryCount),
+      consumeDeclaredEntries,
+    );
+    if (summary.declaredEntryCount === 0) {
+      throw archiveInspectionFailure("empty_file");
+    }
+    if (
+      depth >= limits.maxDepth &&
+      summary.entries.some(
+        (entry) => !entry.isDirectory && extname(entry.path).toLocaleLowerCase("en-US") === ".zip",
+      )
+    ) {
+      throw archiveInspectionFailure("nested_archive");
+    }
+    return { bytes: archiveBytes, depth, parentPathChain, summary };
+  }
+
+  function reserveArchives(prepared: readonly PreparedHistoryArchive[]): {
+    readonly maxEntries: number;
+    readonly maxExpandedBytes: number;
+  } {
+    const availableEntries = limits.maxEntries - entryCount;
+    const availableExpandedBytes = Math.min(
+      limits.maxExpandedBytes - expandedBytes,
+      rootRatioBytes - expandedBytes,
+    );
+    let addedEntries = 0;
+    let addedExpandedBytes = 0;
+    let hasOversizedFile = false;
+    for (const archive of prepared) {
+      addedEntries += archive.summary.declaredEntryCount;
+      addedExpandedBytes += archive.summary.declaredUncompressedBytes;
+      hasOversizedFile ||= archive.summary.entries.some(
+        (entry) => entry.uncompressedSize > limits.maxSingleFileBytes,
+      );
+    }
+    const reasons: HistorySourceInspectionReason[] = [];
+    if (addedEntries > availableEntries) reasons.push("too_many_entries");
+    if (hasOversizedFile) reasons.push("file_too_large");
+    if (addedExpandedBytes > limits.maxExpandedBytes - expandedBytes) {
+      reasons.push("archive_too_large");
+    }
+    if (addedExpandedBytes > rootRatioBytes - expandedBytes) {
+      reasons.push("compression_ratio_too_high");
+    }
+    if (reasons.length > 0) {
+      throw archiveInspectionFailures(reasons);
+    }
+    entryCount += addedEntries;
+    expandedBytes += addedExpandedBytes;
+    return {
+      maxEntries: availableEntries,
+      maxExpandedBytes: availableExpandedBytes,
+    };
+  }
+
+  function visitPreparedArchive(
+    prepared: PreparedHistoryArchive,
+    allowance: { readonly maxEntries: number; readonly maxExpandedBytes: number },
+  ): void {
+    const archive = readZipArchive(prepared.bytes, {
+      maxArchiveBytes: limits.maxArchiveBytes,
+      maxEntries: allowance.maxEntries,
+      maxSingleFileBytes: limits.maxSingleFileBytes,
+      maxTotalUncompressedBytes: Math.max(1, allowance.maxExpandedBytes),
+      maxCompressionRatio: limits.maxCompressionRatio,
+      // 严格原始预检和跨层预算已先完成；通用读取器仍逐层独立复核并解压 CRC。
+      allowNestedArchives: true,
+    });
+    const entries = archive.list();
+    const declaredFiles = prepared.summary.entries.filter((entry) => !entry.isDirectory);
+    if (
+      entries.length !== declaredFiles.length ||
+      entries.some((entry, index) => {
+        const declared = declaredFiles[index];
+        return (
+          declared === undefined ||
+          entry.path !== declared.path ||
+          entry.compressedSize !== declared.compressedSize ||
+          entry.uncompressedSize !== declared.uncompressedSize
+        );
+      })
+    ) {
+      throw archiveInspectionFailure("archive_invalid");
+    }
+
+    const nested: PreparedHistoryArchive[] = [];
+    for (const entry of entries) {
+      const pathChain = [...prepared.parentPathChain, entry.path];
+      if (extname(entry.path).toLocaleLowerCase("en-US") === ".zip") {
+        if (prepared.depth >= limits.maxDepth) {
+          throw archiveInspectionFailure("nested_archive");
+        }
+        nested.push(prepareArchive(entry.content, prepared.depth + 1, pathChain));
+        continue;
+      }
+
+      const folded = foldPrivatePathChain(pathChain);
+      if (seenPathChains.has(folded)) {
+        throw archiveInspectionFailure("duplicate_path");
+      }
+      seenPathChains.add(folded);
+      leaves.push({ pathChain, content: entry.content });
+    }
+
+    if (nested.length > 0) {
+      // 同一层所有内包先完成原始结构检查并整体预占，再解压任意一个内包；
+      // 因此预算结果不受兄弟 ZIP 的目录顺序影响。
+      const nestedAllowance = reserveArchives(nested);
+      for (const child of nested) {
+        visitPreparedArchive(child, nestedAllowance);
+      }
+    }
+  }
+}
+
+/** 仅供合成安全测试以小上限真正触发跨层计数；生产流程不调用。 */
+export function assertSafeHistoryZipTreeForTest(
+  bytes: Uint8Array,
+  limits: HistoryArchiveTreeLimits,
+): void {
+  assertStricterTestArchiveLimits(limits);
+  readSafeHistoryZipTree(bytes, limits);
+}
+
+function assertStricterTestArchiveLimits(limits: HistoryArchiveTreeLimits): void {
+  const integerLimits = [
+    [limits.maxArchiveBytes, productionHistoryArchiveTreeLimits.maxArchiveBytes],
+    [limits.maxEntries, productionHistoryArchiveTreeLimits.maxEntries],
+    [limits.maxSingleFileBytes, productionHistoryArchiveTreeLimits.maxSingleFileBytes],
+    [limits.maxExpandedBytes, productionHistoryArchiveTreeLimits.maxExpandedBytes],
+    [limits.maxDepth, productionHistoryArchiveTreeLimits.maxDepth],
+  ] as const;
+  if (
+    integerLimits.some(
+      ([value, maximum]) => !Number.isSafeInteger(value) || value <= 0 || value > maximum,
+    ) ||
+    !Number.isFinite(limits.maxCompressionRatio) ||
+    limits.maxCompressionRatio <= 0 ||
+    limits.maxCompressionRatio > productionHistoryArchiveTreeLimits.maxCompressionRatio ||
+    limits.maxSingleFileBytes > limits.maxExpandedBytes
+  ) {
+    throw new TypeError("历史压缩包测试上限必须为不超过生产值的正数。");
+  }
+}
+
+function validateStrictHistoryZipStructure(
+  bytes: Uint8Array,
+  maximumDeclaredEntries: number,
+  consumeDeclaredEntries?: (count: number) => void,
+): StrictHistoryZipSummary {
+  if (bytes.byteLength < 22) {
+    throw archiveInspectionFailure("not_a_zip_archive");
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const scanStart = Math.max(0, bytes.byteLength - maximumHistoryZipEndScanBytes);
+  const endCandidates: number[] = [];
+  for (let offset = bytes.byteLength - 22; offset >= scanStart; offset -= 1) {
+    if (view.getUint32(offset, true) !== historyZipEndSignature) {
+      continue;
+    }
+    const commentLength = view.getUint16(offset + 20, true);
+    if (offset + 22 + commentLength === bytes.byteLength) {
+      endCandidates.push(offset);
+    }
+  }
+  if (endCandidates.length !== 1) {
+    throw archiveInspectionFailure("not_a_zip_archive");
+  }
+
+  const endOffset = endCandidates[0] as number;
+  const diskNumber = view.getUint16(endOffset + 4, true);
+  const centralDisk = view.getUint16(endOffset + 6, true);
+  const entriesOnDisk = view.getUint16(endOffset + 8, true);
+  const entryCount = view.getUint16(endOffset + 10, true);
+  const centralSize = view.getUint32(endOffset + 12, true);
+  const centralOffset = view.getUint32(endOffset + 16, true);
+  if (diskNumber !== 0 || centralDisk !== 0 || entriesOnDisk !== entryCount) {
+    throw archiveInspectionFailure("unsupported_archive_feature");
+  }
+  if (
+    entryCount === historyZip64MarkerU16 ||
+    centralSize === historyZip64MarkerU32 ||
+    centralOffset === historyZip64MarkerU32
+  ) {
+    throw archiveInspectionFailure("unsupported_archive_feature");
+  }
+  if (entryCount > maximumDeclaredEntries) {
+    throw archiveInspectionFailure("too_many_entries");
+  }
+  // 一旦唯一的普通 EOCD 给出了合法且未超出剩余额度的条目数，就立即占用
+  // 整批预算。后续中央目录、本地头、路径或 CRC 即使失败并转入人工队列，
+  // 也不能让同一批后续源文件重新使用这些声明名额。
+  consumeDeclaredEntries?.(entryCount);
+  const declaredCentralEnd = centralOffset + centralSize;
+  if (declaredCentralEnd !== endOffset) {
+    if (
+      (declaredCentralEnd + 4 <= endOffset &&
+        view.getUint32(declaredCentralEnd, true) === historyZip64EndSignature) ||
+      (endOffset >= 20 && view.getUint32(endOffset - 20, true) === historyZip64LocatorSignature)
+    ) {
+      throw archiveInspectionFailure("unsupported_archive_feature");
+    }
+    throw archiveInspectionFailure("not_a_zip_archive");
+  }
+
+  const utf8 = new TextDecoder("utf-8", { fatal: true });
+  const entries: StrictHistoryZipEntry[] = [];
+  const foldedPaths = new Set<string>();
+  let declaredUncompressedBytes = 0;
+  let cursor = centralOffset;
+  for (let index = 0; index < entryCount; index += 1) {
+    if (cursor + 46 > endOffset || view.getUint32(cursor, true) !== historyZipCentralSignature) {
+      throw archiveInspectionFailure("not_a_zip_archive");
+    }
+    const versionMade = view.getUint16(cursor + 4, true);
+    const versionNeeded = view.getUint16(cursor + 6, true);
+    const flags = view.getUint16(cursor + 8, true);
+    const compressionMethod = view.getUint16(cursor + 10, true);
+    const modifiedTime = view.getUint16(cursor + 12, true);
+    const modifiedDate = view.getUint16(cursor + 14, true);
+    const checksum = view.getUint32(cursor + 16, true);
+    const compressedSize = view.getUint32(cursor + 20, true);
+    const uncompressedSize = view.getUint32(cursor + 24, true);
+    const nameLength = view.getUint16(cursor + 28, true);
+    const extraLength = view.getUint16(cursor + 30, true);
+    const commentLength = view.getUint16(cursor + 32, true);
+    const diskStart = view.getUint16(cursor + 34, true);
+    const externalAttributes = view.getUint32(cursor + 38, true);
+    const localHeaderOffset = view.getUint32(cursor + 42, true);
+    const entryEnd = cursor + 46 + nameLength + extraLength + commentLength;
+    if (entryEnd > endOffset) {
+      throw archiveInspectionFailure("not_a_zip_archive");
+    }
+    if (
+      versionNeeded >= 45 ||
+      (versionMade & 0xff) >= 45 ||
+      diskStart !== 0 ||
+      compressedSize === historyZip64MarkerU32 ||
+      uncompressedSize === historyZip64MarkerU32 ||
+      localHeaderOffset === historyZip64MarkerU32
+    ) {
+      throw archiveInspectionFailure("unsupported_archive_feature");
+    }
+    if (compressionMethod !== 0 && compressionMethod !== 8) {
+      throw archiveInspectionFailure("unsupported_archive_feature");
+    }
+    const allowedFlags =
+      historyZipCommonFlags | (compressionMethod === 8 ? historyZipDeflateFlags : 0);
+    if ((flags & ~allowedFlags) !== 0) {
+      throw archiveInspectionFailure("unsupported_archive_feature");
+    }
+    const nameStart = cursor + 46;
+    const nameBytes = bytes.subarray(nameStart, nameStart + nameLength);
+    rejectHistoryZip64Extra(
+      bytes.subarray(nameStart + nameLength, nameStart + nameLength + extraLength),
+    );
+    if ((flags & 0x0800) === 0 && nameBytes.some((byte) => byte >= 0x80)) {
+      throw archiveInspectionFailure("not_a_zip_archive");
+    }
+    let path: string;
+    try {
+      path = utf8.decode(nameBytes);
+    } catch {
+      throw archiveInspectionFailure("not_a_zip_archive");
+    }
+    const unixType = (externalAttributes >>> 16) & 0xf000;
+    const isDirectory =
+      unixType === 0o040000 || path.endsWith("/") || (externalAttributes & 0x10) !== 0;
+    const pathForSafety = isDirectory && path.endsWith("/") ? path.slice(0, -1) : path;
+    if (
+      path.normalize("NFC") !== path ||
+      path.length > defaultArchiveSafetyLimits.maxPathLength ||
+      /[\p{Cc}\p{Cf}]/u.test(path) ||
+      !isSafeHistoryRelativePath(pathForSafety)
+    ) {
+      throw archiveInspectionFailure("invalid_path");
+    }
+    if (isDirectory && (compressedSize !== 0 || uncompressedSize !== 0)) {
+      throw archiveInspectionFailure("size_mismatch");
+    }
+    const folded = foldPrivatePath(pathForSafety);
+    if (foldedPaths.has(folded)) {
+      throw archiveInspectionFailure("duplicate_path");
+    }
+    foldedPaths.add(folded);
+    declaredUncompressedBytes += uncompressedSize;
+    entries.push({
+      path,
+      nameBytes: new Uint8Array(nameBytes),
+      versionMade,
+      versionNeeded,
+      flags,
+      compressionMethod,
+      modifiedTime,
+      modifiedDate,
+      crc32: checksum,
+      compressedSize,
+      uncompressedSize,
+      localHeaderOffset,
+      isDirectory,
+    });
+    cursor = entryEnd;
+  }
+  if (cursor !== endOffset) {
+    throw archiveInspectionFailure("not_a_zip_archive");
+  }
+
+  let expectedOffset = 0;
+  for (const entry of [...entries].sort(
+    (first, second) => first.localHeaderOffset - second.localHeaderOffset,
+  )) {
+    const localOffset = entry.localHeaderOffset;
+    if (
+      localOffset !== expectedOffset ||
+      localOffset + 30 > centralOffset ||
+      view.getUint32(localOffset, true) !== historyZipLocalSignature
+    ) {
+      throw archiveInspectionFailure("not_a_zip_archive");
+    }
+    const versionNeeded = view.getUint16(localOffset + 4, true);
+    const flags = view.getUint16(localOffset + 6, true);
+    const compressionMethod = view.getUint16(localOffset + 8, true);
+    const modifiedTime = view.getUint16(localOffset + 10, true);
+    const modifiedDate = view.getUint16(localOffset + 12, true);
+    const checksum = view.getUint32(localOffset + 14, true);
+    const compressedSize = view.getUint32(localOffset + 18, true);
+    const uncompressedSize = view.getUint32(localOffset + 22, true);
+    const nameLength = view.getUint16(localOffset + 26, true);
+    const extraLength = view.getUint16(localOffset + 28, true);
+    const nameStart = localOffset + 30;
+    const dataStart = nameStart + nameLength + extraLength;
+    const dataEnd = dataStart + entry.compressedSize;
+    if (dataStart > centralOffset || dataEnd > centralOffset) {
+      throw archiveInspectionFailure("not_a_zip_archive");
+    }
+    const localName = bytes.subarray(nameStart, nameStart + nameLength);
+    rejectHistoryZip64Extra(bytes.subarray(nameStart + nameLength, dataStart));
+    if (
+      versionNeeded !== entry.versionNeeded ||
+      flags !== entry.flags ||
+      compressionMethod !== entry.compressionMethod ||
+      modifiedTime !== entry.modifiedTime ||
+      modifiedDate !== entry.modifiedDate ||
+      !equalHistoryBytes(localName, entry.nameBytes)
+    ) {
+      throw archiveInspectionFailure("not_a_zip_archive");
+    }
+    const localValuesMatch =
+      checksum === entry.crc32 &&
+      compressedSize === entry.compressedSize &&
+      uncompressedSize === entry.uncompressedSize;
+    if ((entry.flags & 0x0008) !== 0) {
+      const localValuesEmpty = checksum === 0 && compressedSize === 0 && uncompressedSize === 0;
+      if (!localValuesEmpty && !localValuesMatch) {
+        throw archiveInspectionFailure("size_mismatch");
+      }
+      expectedOffset = strictHistoryDescriptorEnd(view, dataEnd, centralOffset, entry);
+    } else {
+      if (!localValuesMatch) {
+        throw archiveInspectionFailure("size_mismatch");
+      }
+      expectedOffset = dataEnd;
+    }
+  }
+  if (expectedOffset !== centralOffset) {
+    throw archiveInspectionFailure("not_a_zip_archive");
+  }
+  return {
+    entries,
+    declaredEntryCount: entryCount,
+    declaredUncompressedBytes,
+  };
+}
+
+function rejectHistoryZip64Extra(extra: Uint8Array): void {
+  const view = new DataView(extra.buffer, extra.byteOffset, extra.byteLength);
+  let cursor = 0;
+  while (cursor < extra.byteLength) {
+    if (cursor + 4 > extra.byteLength) {
+      throw archiveInspectionFailure("not_a_zip_archive");
+    }
+    const fieldId = view.getUint16(cursor, true);
+    const fieldLength = view.getUint16(cursor + 2, true);
+    cursor += 4;
+    if (fieldId === historyZip64ExtraId) {
+      throw archiveInspectionFailure("unsupported_archive_feature");
+    }
+    if (cursor + fieldLength > extra.byteLength) {
+      throw archiveInspectionFailure("not_a_zip_archive");
+    }
+    cursor += fieldLength;
+  }
+}
+
+function strictHistoryDescriptorEnd(
+  view: DataView,
+  descriptorOffset: number,
+  centralOffset: number,
+  entry: StrictHistoryZipEntry,
+): number {
+  if (
+    descriptorOffset + 16 <= centralOffset &&
+    view.getUint32(descriptorOffset, true) === historyZipDescriptorSignature &&
+    historyDescriptorValuesMatch(view, descriptorOffset + 4, entry)
+  ) {
+    return descriptorOffset + 16;
+  }
+  if (
+    descriptorOffset + 12 <= centralOffset &&
+    historyDescriptorValuesMatch(view, descriptorOffset, entry)
+  ) {
+    return descriptorOffset + 12;
+  }
+  throw archiveInspectionFailure("size_mismatch");
+}
+
+function historyDescriptorValuesMatch(
+  view: DataView,
+  offset: number,
+  entry: StrictHistoryZipEntry,
+): boolean {
+  return (
+    view.getUint32(offset, true) === entry.crc32 &&
+    view.getUint32(offset + 4, true) === entry.compressedSize &&
+    view.getUint32(offset + 8, true) === entry.uncompressedSize
+  );
+}
+
+function equalHistoryBytes(first: Uint8Array, second: Uint8Array): boolean {
+  return (
+    first.byteLength === second.byteLength && first.every((value, index) => value === second[index])
+  );
+}
+
+function archiveInspectionFailure(
+  reason: HistorySourceInspectionReason,
+): HistorySourceInspectionFailure {
+  return archiveInspectionFailures([reason]);
+}
+
+function archiveInspectionFailures(
+  reasons: readonly HistorySourceInspectionReason[],
+): HistorySourceInspectionFailure {
+  return new HistorySourceInspectionFailure(
+    "SOURCE_FILE_INVALID",
+    reasons,
+    "私有压缩包未通过嵌套深度、路径、类型、数量、大小或压缩比例安全检查。",
+  );
 }
 
 function decodeMaterializableText(bytes: Uint8Array): string {
@@ -2156,12 +2865,40 @@ function compareCodeUnits(first: string, second: string): number {
   return first < second ? -1 : first > second ? 1 : 0;
 }
 
+function isSafeHistoryRelativePath(path: string): boolean {
+  const segments = path.split("/");
+  return (
+    path.normalize("NFC") === path &&
+    path.length <= defaultArchiveSafetyLimits.maxPathLength &&
+    segments.length <= defaultArchiveSafetyLimits.maxPathDepth &&
+    segments.every((segment) => segment.length <= maximumHistoryArchivePathSegmentUnits) &&
+    !/[\p{Cc}\p{Cf}]/u.test(path) &&
+    isSafeArchivePath(path)
+  );
+}
+
 function foldPrivatePath(path: string): string {
-  return path.normalize("NFC").toLocaleLowerCase("en-US");
+  return path
+    .normalize("NFC")
+    .toLocaleUpperCase("en-US")
+    .toLocaleLowerCase("en-US")
+    .normalize("NFC");
+}
+
+function pathChainKey(pathChain: readonly string[]): string {
+  return JSON.stringify(pathChain);
+}
+
+function foldPrivatePathChain(pathChain: readonly string[]): string {
+  return pathChainKey(pathChain.map((path) => foldPrivatePath(path)));
 }
 
 function arraysEqual(first: readonly string[], second: readonly string[]): boolean {
   return first.length === second.length && first.every((value, index) => value === second[index]);
+}
+
+function serializedPrivateJsonBytes(value: unknown): number {
+  return new TextEncoder().encode(`${JSON.stringify(value, null, 2)}\n`).byteLength;
 }
 
 function parsePrivateInput<T>(

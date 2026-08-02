@@ -20,8 +20,6 @@ export const historyMetadataRecordSchema = z
   .object({
     number: z.string().trim().min(1).max(200),
     name: z.string().trim().min(1).max(500),
-    difficultyText: z.string().max(2_000).default(""),
-    difficultyGuess: z.number().int().min(800).max(3500).nullable().default(null),
     authorStudentId: z.string().trim().max(200).default(""),
     status: z.string().max(500).default(""),
     contest: z.string().max(500).default(""),
@@ -126,12 +124,6 @@ export const normalizedHistoryOutputSchema = z
   })
   .strict();
 
-const historyMigrationExtensionSchema = z
-  .object({
-    difficultyText: z.string().max(2_000)
-  })
-  .strict();
-
 export const historyCandidateProblemSchema = canonicalProblemSchema.superRefine(
   (problem, context) => {
     if (problem.files.length > 0) {
@@ -148,16 +140,18 @@ export const historyCandidateProblemSchema = canonicalProblemSchema.superRefine(
         message: "第一阶段候选内容不能直接加入评测配置。"
       });
     }
-    const extensionKeys = Object.keys(problem.extensions);
-    if (
-      extensionKeys.some((key) => key !== "migration") ||
-      (problem.extensions.migration !== undefined &&
-        !historyMigrationExtensionSchema.safeParse(problem.extensions.migration).success)
-    ) {
+    if (Object.keys(problem.difficulty).length > 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["difficulty"],
+        message: "历史迁移候选不能采用投题者自填或人工写入的难度。"
+      });
+    }
+    if (Object.keys(problem.extensions).length > 0) {
       context.addIssue({
         code: "custom",
         path: ["extensions"],
-        message: "历史迁移候选只能保留难度原始文本，不能写入身份或其他扩展字段。"
+        message: "历史迁移候选不能写入私有元数据或其他扩展字段。"
       });
     }
     if (

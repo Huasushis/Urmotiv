@@ -173,9 +173,6 @@ async function requestNormalizationOnce(
             {
               role: "user",
               content: [
-                `已由人工确认的参考题名：${input.expectedTitle}`,
-                `已由人工确认的 CF 难度参考：${input.difficultyGuess ?? "未知"}`,
-                "",
                 "原始文本：",
                 input.text,
               ].join("\n"),

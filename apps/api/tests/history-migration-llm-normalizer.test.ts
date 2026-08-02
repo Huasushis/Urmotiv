@@ -9,8 +9,6 @@ import {
 const sourceInput = {
   sourceId: "source-000001",
   text: "只用于测试流式读取的合成正文。",
-  expectedTitle: "合成题名",
-  difficultyGuess: null,
 } as const;
 
 const normalizedContent = JSON.stringify({
@@ -105,6 +103,9 @@ describe("历史题目模型整理流式请求", () => {
 
     const parsedRequest = JSON.parse(requestBody) as { stream?: unknown };
     expect(parsedRequest.stream).toBe(true);
+    expect(requestBody).not.toContain("参考题名");
+    expect(requestBody).not.toContain("CF 难度参考");
+    expect(requestBody).not.toContain("difficultyGuess");
   });
 
   it("SSE heartbeat 和空事件不冒充首段有效输出", async () => {

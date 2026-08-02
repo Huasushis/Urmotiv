@@ -49,8 +49,6 @@ const preparationCompleteSchema = z
 export interface HistoryNormalizerInput {
   readonly sourceId: string;
   readonly text: string;
-  readonly expectedTitle: string;
-  readonly difficultyGuess: number | null;
 }
 
 export interface HistoryNormalizer {
@@ -149,9 +147,7 @@ export async function prepareHistoryCandidates(
         normalized = normalizedHistoryOutputSchema.parse(
           await options.normalizer.normalize({
             sourceId: source.sourceId,
-            text: sourceContent.text,
-            expectedTitle: source.metadata.name,
-            difficultyGuess: source.metadata.difficultyGuess
+            text: sourceContent.text
           })
         );
       } catch {
@@ -164,7 +160,7 @@ export async function prepareHistoryCandidates(
       for (const normalizedProblem of normalized.problems) {
         candidateSequence += 1;
         const candidateId = makeSafeId("candidate", candidateSequence);
-        const problem = toCandidateProblem(normalizedProblem, source.metadata);
+        const problem = toCandidateProblem(normalizedProblem);
         const sourceMappingSha256 = source.sourceMappingSha256;
         assertPrivateIdentifiersNotPresent(
           {
@@ -564,17 +560,13 @@ async function loadCandidate(
 }
 
 function toCandidateProblem(
-  problem: NormalizedHistoryProblem,
-  metadata: HistoryMetadataRecord
+  problem: NormalizedHistoryProblem
 ): CanonicalProblem {
   return historyCandidateProblemSchema.parse({
     title: problem.title,
     type: problem.type,
     tags: problem.tags,
-    difficulty:
-      metadata.difficultyGuess === null
-        ? {}
-        : { codeforces: metadata.difficultyGuess },
+    difficulty: {},
     content: {
       basicStatement: problem.basicStatement,
       basicSolution: problem.basicSolution,
@@ -591,14 +583,7 @@ function toCandidateProblem(
     provenance: {
       sourceSystem: "ustc-history-private"
     },
-    extensions:
-      metadata.difficultyText.length === 0
-        ? {}
-        : {
-            migration: {
-              difficultyText: metadata.difficultyText
-            }
-          }
+    extensions: {}
   });
 }
 

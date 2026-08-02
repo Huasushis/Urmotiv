@@ -1,8 +1,14 @@
+import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeZipArchive } from "@urmotiv/problem-package";
+import { crc32, deflateRawSync } from "node:zlib";
+import { readZipArchive, writeZipArchive } from "@urmotiv/problem-package";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  assertSafeHistoryZipTreeForTest,
+  historyCatalogBatchSafetyForTest,
+} from "../src/history-migration/grouping-workflow";
 import {
   assertHistoryMaterializationComplete,
   type HistoryGroupingPlan,
@@ -153,6 +159,760 @@ describe("历史题目人工分组文件工作流", () => {
     expect(locationsText).toContain(archiveEntryName);
     await expectPrivateMode(fixture.catalogDirectory, 0o700);
     await expectPrivateMode(fixture.locationsFile, 0o600);
+  });
+
+  it("只有明确的 .zip 才按题目压缩包登记，XLSX 等 ZIP 容器保持不透明", async () => {
+    const privateRoot = await createPrivateRoot();
+    const sourceDirectory = join(privateRoot, "container-sources");
+    await mkdir(sourceDirectory, { mode: 0o700 });
+    const spreadsheetName = "synthetic-list.xlsx";
+    const internalSpreadsheetPath = "xl/worksheets/sheet1.xml";
+    await writeFile(
+      join(sourceDirectory, spreadsheetName),
+      writeZipArchive([
+        {
+          path: internalSpreadsheetPath,
+          content: new TextEncoder().encode("<synthetic-sheet />"),
+        },
+      ]),
+    );
+    const catalogDirectory = join(privateRoot, "container-catalog");
+
+    await expect(
+      inventoryHistorySources({
+        privateRootDirectory: privateRoot,
+        sourceDirectory,
+        outputDirectory: catalogDirectory,
+      }),
+    ).resolves.toMatchObject({
+      sourceCount: 1,
+      archiveSourceCount: 0,
+      archiveEntryCount: 0,
+      manualSourceCount: 1,
+    });
+    const inventoryText = await readFile(join(catalogDirectory, "inventory.json"), "utf8");
+    expect(inventoryText).not.toContain(spreadsheetName);
+    expect(inventoryText).not.toContain(internalSpreadsheetPath);
+    const manualReview = JSON.parse(
+      await readFile(join(catalogDirectory, "manual-review.json"), "utf8"),
+    ) as { sources: Array<{ reasons: string[] }> };
+    expect(manualReview.sources).toEqual([
+      { sourceId: "source-000001", reasons: ["manual_binary"] },
+    ]);
+  });
+
+  it("批次边界单包可完整写出 inventory 与 source-locations，最坏 JSON 证明低于读取上限", async () => {
+    expect(historyCatalogBatchSafetyForTest.maximumItems).toBe(5_000);
+    expect(historyCatalogBatchSafetyForTest.maximumInventoryCatalogBytes).toBeLessThanOrEqual(
+      historyCatalogBatchSafetyForTest.maximumPrivateJsonBytes,
+    );
+    expect(historyCatalogBatchSafetyForTest.maximumLocationCatalogBytes).toBeLessThanOrEqual(
+      historyCatalogBatchSafetyForTest.maximumPrivateJsonBytes,
+    );
+    const maximumPath = `${"\u0800".repeat(120)}/${"\u0800".repeat(119)}`;
+    const maximumEntryCount = historyCatalogBatchSafetyForTest.maximumItems - 1;
+    const maximumLocationValue = {
+      version: 2,
+      sources: [
+        {
+          sourceId: "source-999999",
+          sourcePath: maximumPath,
+          entries: Array.from({ length: maximumEntryCount }, () => ({
+            entryId: "entry-999999",
+            entryPathChain: [maximumPath, maximumPath],
+          })),
+        },
+      ],
+    };
+    const maximumInventoryValue = {
+      version: 1,
+      sources: [
+        {
+          sourceId: "source-999999",
+          kind: "zip",
+          contentSha256: "f".repeat(64),
+          byteLength: 128 * 1024 * 1024,
+          entries: Array.from({ length: maximumEntryCount }, () => ({
+            entryId: "entry-999999",
+            contentSha256: "f".repeat(64),
+            byteLength: 128 * 1024 * 1024,
+          })),
+        },
+      ],
+    };
+    const maximumTextInventoryValue = {
+      version: 1,
+      sources: Array.from({ length: historyCatalogBatchSafetyForTest.maximumItems }, () => ({
+        sourceId: "source-999999",
+        kind: "text",
+        contentSha256: "f".repeat(64),
+        byteLength: 128 * 1024 * 1024,
+        characterCount: 500_000,
+      })),
+    };
+    expect(privateJsonByteLength(maximumLocationValue)).toBeLessThanOrEqual(
+      historyCatalogBatchSafetyForTest.maximumLocationCatalogBytes,
+    );
+    expect(privateJsonByteLength(maximumInventoryValue)).toBeLessThanOrEqual(
+      historyCatalogBatchSafetyForTest.maximumInventoryCatalogBytes,
+    );
+    expect(privateJsonByteLength(maximumTextInventoryValue)).toBeLessThanOrEqual(
+      historyCatalogBatchSafetyForTest.maximumInventoryCatalogBytes,
+    );
+
+    const privateRoot = await createPrivateRoot();
+    const sourceDirectory = join(privateRoot, "batch-boundary-sources");
+    await mkdir(sourceDirectory, { mode: 0o700 });
+    const declaredEntries = maximumEntryCount;
+    await writeFile(
+      join(sourceDirectory, "boundary.zip"),
+      writeZipArchive(syntheticArchiveEntries(declaredEntries, "boundary")),
+    );
+    const catalogDirectory = join(privateRoot, "batch-boundary-catalog");
+
+    await expect(
+      inventoryHistorySources({
+        privateRootDirectory: privateRoot,
+        sourceDirectory,
+        outputDirectory: catalogDirectory,
+      }),
+    ).resolves.toMatchObject({
+      sourceCount: 1,
+      archiveSourceCount: 1,
+      archiveEntryCount: declaredEntries,
+    });
+
+    for (const name of ["inventory.json", "source-locations.private.json"]) {
+      const content = await readFile(join(catalogDirectory, name));
+      expect(content.byteLength).toBeLessThanOrEqual(
+        historyCatalogBatchSafetyForTest.maximumPrivateJsonBytes,
+      );
+      expect(() => JSON.parse(content.toString("utf8"))).not.toThrow();
+    }
+  }, 30_000);
+
+  it("多包声明记录按整批立即计数，合计越界时不建立输出目录", async () => {
+    const privateRoot = await createPrivateRoot();
+    const sourceDirectory = join(privateRoot, "batch-overflow-sources");
+    await mkdir(sourceDirectory, { mode: 0o700 });
+    const perArchive = historyCatalogBatchSafetyForTest.maximumItems / 2;
+    await writeFile(
+      join(sourceDirectory, "a.zip"),
+      corruptFirstZipCrc(writeZipArchive(syntheticArchiveEntries(perArchive, "first"))),
+    );
+    await writeFile(
+      join(sourceDirectory, "b.zip"),
+      writeZipArchive(syntheticArchiveEntries(perArchive, "second")),
+    );
+    const catalogDirectory = join(privateRoot, "batch-overflow-catalog");
+
+    await expect(
+      inventoryHistorySources({
+        privateRootDirectory: privateRoot,
+        sourceDirectory,
+        outputDirectory: catalogDirectory,
+      }),
+    ).rejects.toMatchObject({ code: "SOURCE_TOO_LARGE" });
+    await expect(lstat(catalogDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 30_000);
+
+  it("结构校验失败的多包仍按 EOCD 声明记录占用整批预算", async () => {
+    const corruptions = [
+      (archive: Uint8Array) => patchFirstLocalU16(archive, 6, (value) => value ^ 0x0008),
+      (archive: Uint8Array) => patchFirstLocalU32(archive, 22, (value) => (value + 1) >>> 0),
+    ];
+    const perArchive = historyCatalogBatchSafetyForTest.maximumItems / 2;
+
+    for (const [caseIndex, corrupt] of corruptions.entries()) {
+      const privateRoot = await createPrivateRoot();
+      const sourceDirectory = join(privateRoot, `structural-overflow-${caseIndex}`);
+      await mkdir(sourceDirectory, { mode: 0o700 });
+      for (const [archiveIndex, prefix] of ["first", "second"].entries()) {
+        const archive = writeZipArchive(syntheticArchiveEntries(perArchive, prefix));
+        await writeFile(join(sourceDirectory, `${archiveIndex}.zip`), corrupt(archive));
+      }
+      const catalogDirectory = join(privateRoot, `structural-overflow-catalog-${caseIndex}`);
+
+      await expect(
+        inventoryHistorySources({
+          privateRootDirectory: privateRoot,
+          sourceDirectory,
+          outputDirectory: catalogDirectory,
+        }),
+      ).rejects.toMatchObject({ code: "SOURCE_TOO_LARGE" });
+      await expect(lstat(catalogDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  }, 60_000);
+
+  it("受限展开一层内嵌单题 ZIP，路径链只写私有位置清单且不按数字名自动分组", async () => {
+    const privateRoot = await createPrivateRoot();
+    const sourceDirectory = join(privateRoot, "nested-sources");
+    await mkdir(sourceDirectory, { mode: 0o700 });
+    const nestedText = "SYNTHETIC NESTED PROBLEM TEXT";
+    const innerName = "101.zip";
+    const leafName = "101.md";
+    const spreadsheetAttachmentName = "attachment.xlsx";
+    const inner = writeZipArchive([
+      { path: leafName, content: new TextEncoder().encode(nestedText) },
+    ]);
+    const spreadsheetAttachment = writeZipArchive([
+      {
+        path: "xl/worksheets/sheet1.xml",
+        content: new TextEncoder().encode("<synthetic-attachment />"),
+      },
+    ]);
+    const outerName = "101~106.zip";
+    await writeFile(
+      join(sourceDirectory, outerName),
+      writeZipArchive(
+        [
+          { path: innerName, content: inner },
+          { path: spreadsheetAttachmentName, content: spreadsheetAttachment },
+        ],
+        { allowNestedArchives: true },
+      ),
+    );
+    const catalogDirectory = join(privateRoot, "nested-catalog");
+    const inventoryResult = await inventoryHistorySources({
+      privateRootDirectory: privateRoot,
+      sourceDirectory,
+      outputDirectory: catalogDirectory,
+    });
+    expect(inventoryResult).toMatchObject({
+      sourceCount: 1,
+      archiveSourceCount: 1,
+      archiveEntryCount: 2,
+      manualSourceCount: 0,
+    });
+
+    const inventoryFile = join(catalogDirectory, "inventory.json");
+    const locationsFile = join(catalogDirectory, "source-locations.private.json");
+    const inventoryText = await readFile(inventoryFile, "utf8");
+    expect(inventoryText).not.toContain(outerName);
+    expect(inventoryText).not.toContain(innerName);
+    expect(inventoryText).not.toContain(leafName);
+    expect(inventoryText).not.toContain(spreadsheetAttachmentName);
+    const locations = await readLocations(locationsFile);
+    expect(locations.version).toBe(2);
+    expect(locations.sources[0]?.entries).toEqual([
+      {
+        entryId: "entry-000001",
+        entryPathChain: [innerName, leafName],
+      },
+      {
+        entryId: "entry-000002",
+        entryPathChain: [spreadsheetAttachmentName],
+      },
+    ]);
+
+    const metadataFile = join(privateRoot, "nested-metadata.private.json");
+    await writeFile(
+      metadataFile,
+      `${JSON.stringify({
+        records: [{ number: "synthetic-101", name: "Synthetic nested metadata" }],
+      })}\n`,
+      "utf8",
+    );
+    const worksheetDirectory = join(privateRoot, "nested-worksheet");
+    await initializeHistoryGroupingWorksheet({
+      privateRootDirectory: privateRoot,
+      sourceInventoryFile: inventoryFile,
+      sourceLocationsFile: locationsFile,
+      metadataFile,
+      outputDirectory: worksheetDirectory,
+    });
+    const skeleton = JSON.parse(
+      await readFile(join(worksheetDirectory, "grouping-plan.skeleton.private.json"), "utf8"),
+    ) as { groups: unknown[]; fragments: unknown[] };
+    expect(skeleton.groups).toEqual([]);
+    expect(skeleton.fragments).toEqual([]);
+
+    const planFile = join(privateRoot, "nested-plan.private.json");
+    await writeFile(
+      planFile,
+      `${JSON.stringify({
+        version: 2,
+        fragments: [
+          {
+            fragmentId: "fragment-000001",
+            sourceId: "source-000001",
+            selection: { kind: "zip_entry", entryId: "entry-000001" },
+          },
+        ],
+        groups: [
+          {
+            groupId: "group-000001",
+            metadataId: "metadata-000001",
+            fragmentIds: ["fragment-000001"],
+          },
+        ],
+        sharingConfirmations: [],
+        metadataDispositions: [],
+        zipEntryDispositions: [
+          {
+            sourceId: "source-000001",
+            entryId: "entry-000002",
+            action: "attachment",
+            reason: "synthetic spreadsheet attachment",
+            confirmed: true,
+          },
+        ],
+        textRangeDispositions: [],
+        manualSourceDispositions: [],
+      })}\n`,
+      "utf8",
+    );
+    const groupingDirectory = join(privateRoot, "nested-grouping");
+    await sealHistoryGrouping({
+      privateRootDirectory: privateRoot,
+      sourceDirectory,
+      sourceInventoryFile: inventoryFile,
+      sourceLocationsFile: locationsFile,
+      metadataFile,
+      groupingPlanFile: planFile,
+      outputDirectory: groupingDirectory,
+    });
+    const confirmationFile = join(privateRoot, "nested-confirmation.private.json");
+    await writeHistoryGroupingConfirmation({
+      privateRootDirectory: privateRoot,
+      sourceInventoryFile: inventoryFile,
+      sourceLocationsFile: locationsFile,
+      metadataFile,
+      groupingDirectory,
+      outputFile: confirmationFile,
+      confirmed: true,
+    });
+    const materializedDirectory = join(privateRoot, "nested-materialized");
+    await materializeHistoryGrouping({
+      privateRootDirectory: privateRoot,
+      sourceDirectory,
+      sourceInventoryFile: inventoryFile,
+      sourceLocationsFile: locationsFile,
+      metadataFile,
+      groupingDirectory,
+      groupingConfirmationFile: confirmationFile,
+      outputDirectory: materializedDirectory,
+    });
+    expect(await readFile(join(materializedDirectory, "sources", "source-000001.md"), "utf8")).toBe(
+      nestedText,
+    );
+  });
+
+  it("内层 ZIP 仍执行路径、链接、重复、大小比例和深度检查", async () => {
+    const privateRoot = await createPrivateRoot();
+    const sourceDirectory = join(privateRoot, "unsafe-nested-sources");
+    await mkdir(sourceDirectory, { mode: 0o700 });
+    const encoder = new TextEncoder();
+    const safeInner = writeZipArchive([{ path: "safe.txt", content: encoder.encode("safe") }]);
+    const traversalInner = rewriteFirstZipPath(safeInner, "../x.txt");
+    const symlinkInner = markFirstZipEntryAsSymlink(safeInner);
+    const duplicateInner = rewriteZipPath(
+      writeZipArchive([
+        { path: "one.txt", content: encoder.encode("one") },
+        { path: "two.txt", content: encoder.encode("two") },
+      ]),
+      1,
+      "one.txt",
+    );
+    const oversizedInner = rewriteFirstZipUncompressedSize(safeInner, 128 * 1024 * 1024 + 1);
+    const secondLevel = writeZipArchive([{ path: "level-two.zip", content: safeInner }], {
+      allowNestedArchives: true,
+    });
+    const tooDeepInner = writeZipArchive([{ path: "level-one.zip", content: secondLevel }], {
+      allowNestedArchives: true,
+    });
+    const cases = [
+      ["a-traversal.zip", traversalInner],
+      ["b-symlink.zip", symlinkInner],
+      ["c-duplicate.zip", duplicateInner],
+      ["d-oversized.zip", oversizedInner],
+      ["e-too-deep.zip", tooDeepInner],
+      ["f-fake-inner.zip", encoder.encode("synthetic not a zip")],
+    ] as const;
+    for (const [name, inner] of cases) {
+      await writeFile(
+        join(sourceDirectory, name),
+        writeZipArchive([{ path: "inner.zip", content: inner }], {
+          allowNestedArchives: true,
+        }),
+      );
+    }
+    const emptyInnerSourceName = "g-empty-inner.zip";
+    await writeFile(
+      join(sourceDirectory, emptyInnerSourceName),
+      writeZipArchive(
+        [
+          { path: "empty.zip", content: writeZipArchive([]) },
+          { path: "kept.md", content: encoder.encode("must not survive partial inventory") },
+        ],
+        { allowNestedArchives: true },
+      ),
+    );
+
+    const catalogDirectory = join(privateRoot, "unsafe-nested-catalog");
+    await expect(
+      inventoryHistorySources({
+        privateRootDirectory: privateRoot,
+        sourceDirectory,
+        outputDirectory: catalogDirectory,
+      }),
+    ).resolves.toMatchObject({
+      sourceCount: cases.length + 1,
+      archiveSourceCount: 0,
+      manualSourceCount: cases.length + 1,
+    });
+    const manualReviewText = await readFile(join(catalogDirectory, "manual-review.json"), "utf8");
+    const manualReview = JSON.parse(manualReviewText) as {
+      sources: Array<{ reasons: string[] }>;
+    };
+    const reasons = new Set(manualReview.sources.flatMap((source) => source.reasons));
+    expect(reasons).toEqual(
+      new Set([
+        "archive_too_large",
+        "compression_ratio_too_high",
+        "duplicate_path",
+        "empty_file",
+        "file_too_large",
+        "invalid_path",
+        "nested_archive",
+        "not_a_zip_archive",
+        "unsupported_entry_type",
+      ]),
+    );
+    for (const [name] of cases) {
+      expect(manualReviewText).not.toContain(name);
+    }
+    expect(manualReviewText).not.toContain(emptyInnerSourceName);
+  });
+
+  it("以小上限实际触发跨层条目、展开量和根包压缩比限制", () => {
+    const encoder = new TextEncoder();
+    const firstLeaf = encoder.encode("first synthetic leaf has enough bytes");
+    const secondLeaf = encoder.encode("second synthetic leaf has enough bytes");
+    const firstInner = writeZipArchive([{ path: "first.md", content: firstLeaf }]);
+    const secondInner = writeZipArchive([{ path: "second.md", content: secondLeaf }]);
+    const outer = writeZipArchive(
+      [
+        { path: "first.zip", content: firstInner },
+        { path: "second.zip", content: secondInner },
+      ],
+      { allowNestedArchives: true },
+    );
+    const generous = {
+      maxArchiveBytes: 1024 * 1024,
+      maxEntries: 100,
+      maxSingleFileBytes: 1024 * 1024,
+      maxExpandedBytes: 1024 * 1024,
+      maxCompressionRatio: 100,
+      maxDepth: 2,
+    };
+
+    expectHistoryArchiveReason(
+      () => assertSafeHistoryZipTreeForTest(outer, { ...generous, maxEntries: 3 }),
+      "too_many_entries",
+    );
+    const aggregateExpanded =
+      firstInner.byteLength + secondInner.byteLength + firstLeaf.byteLength + secondLeaf.byteLength;
+    expectHistoryArchiveReason(
+      () =>
+        assertSafeHistoryZipTreeForTest(outer, {
+          ...generous,
+          maxSingleFileBytes: Math.max(
+            firstInner.byteLength,
+            secondInner.byteLength,
+            firstLeaf.byteLength,
+            secondLeaf.byteLength,
+          ),
+          maxExpandedBytes: aggregateExpanded - 1,
+        }),
+      "archive_too_large",
+    );
+
+    const incompressible = deterministicIncompressibleBytes(4096);
+    const ratioInner = writeZipArchive([{ path: "random.bin", content: incompressible }]);
+    const ratioOuter = writeZipArchive([{ path: "inner.zip", content: ratioInner }], {
+      allowNestedArchives: true,
+    });
+    const innerSummary = readZipArchive(ratioInner, {
+      allowNestedArchives: true,
+      maxCompressionRatio: generous.maxCompressionRatio,
+    }).summary;
+    const outerSummary = readZipArchive(ratioOuter, {
+      allowNestedArchives: true,
+      maxCompressionRatio: generous.maxCompressionRatio,
+    }).summary;
+    const maximumPerLayerRatio = Math.max(
+      innerSummary.uncompressedSize / Math.max(1, innerSummary.compressedSize),
+      outerSummary.uncompressedSize / Math.max(1, outerSummary.compressedSize),
+    );
+    const rootTreeRatio =
+      (ratioInner.byteLength + incompressible.byteLength) / ratioOuter.byteLength;
+    expect(rootTreeRatio).toBeGreaterThan(maximumPerLayerRatio);
+    const treeOnlyRatioLimit = (maximumPerLayerRatio + rootTreeRatio) / 2;
+    expect(() =>
+      readZipArchive(ratioInner, {
+        allowNestedArchives: true,
+        maxCompressionRatio: treeOnlyRatioLimit,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      readZipArchive(ratioOuter, {
+        allowNestedArchives: true,
+        maxCompressionRatio: treeOnlyRatioLimit,
+      }),
+    ).not.toThrow();
+    expectHistoryArchiveReason(
+      () =>
+        assertSafeHistoryZipTreeForTest(ratioOuter, {
+          ...generous,
+          maxCompressionRatio: treeOnlyRatioLimit,
+        }),
+      "compression_ratio_too_high",
+    );
+  });
+
+  it("测试钩子不能放大生产历史 ZIP 安全上限", () => {
+    const archive = writeZipArchive([
+      { path: "safe.md", content: new TextEncoder().encode("synthetic safe content") },
+    ]);
+    expect(() =>
+      assertSafeHistoryZipTreeForTest(archive, {
+        maxArchiveBytes: 128 * 1024 * 1024 + 1,
+        maxEntries: 100,
+        maxSingleFileBytes: 1024,
+        maxExpandedBytes: 1024,
+        maxCompressionRatio: 100,
+        maxDepth: 2,
+      }),
+    ).toThrow(TypeError);
+  });
+
+  it("内层 ZIP 的 CRC 损坏和 Zip64 标记同样安全失败", () => {
+    const inner = writeZipArchive([
+      { path: "safe.md", content: new TextEncoder().encode("synthetic inner content") },
+    ]);
+    const cases = [
+      [corruptFirstZipCrc(inner), "size_mismatch"],
+      [markFirstZipEntryAsZip64(inner), "unsupported_archive_feature"],
+    ] as const;
+    for (const [unsafeInner, reason] of cases) {
+      const outer = writeZipArchive([{ path: "inner.zip", content: unsafeInner }], {
+        allowNestedArchives: true,
+      });
+      expectHistoryArchiveReason(
+        () =>
+          assertSafeHistoryZipTreeForTest(outer, {
+            maxArchiveBytes: 1024 * 1024,
+            maxEntries: 100,
+            maxSingleFileBytes: 1024 * 1024,
+            maxExpandedBytes: 1024 * 1024,
+            maxCompressionRatio: 100,
+            maxDepth: 2,
+          }),
+        reason,
+      );
+    }
+  });
+
+  it("根包和内包都拒绝前缀、各区段缝隙、尾随数据与伪 EOCD", () => {
+    const encoder = new TextEncoder();
+    const base = writeZipArchive([
+      { path: "first.md", content: encoder.encode("synthetic first") },
+      { path: "second.md", content: encoder.encode("synthetic second") },
+    ]);
+    const centralOffsets = zipCentralEntryOffsets(base);
+    const secondCentral = centralOffsets[1];
+    if (secondCentral === undefined) {
+      throw new Error("合成 ZIP 缺少第二个中央目录项。");
+    }
+    const baseView = new DataView(base.buffer, base.byteOffset, base.byteLength);
+    const secondLocal = baseView.getUint32(secondCentral + 42, true);
+    const centralStart = zipCentralStart(base);
+    const endOffset = zipEndOffset(base);
+    const structuralCases = [
+      addAdjustedZipByte(base, 0),
+      addAdjustedZipByte(base, secondLocal),
+      addAdjustedZipByte(base, centralStart),
+      addAdjustedZipByte(base, endOffset),
+      appendZipByte(base),
+      appendDuplicateZipEnd(base),
+    ];
+    const limits = generousHistoryArchiveLimits();
+
+    for (const [index, unsafe] of structuralCases.entries()) {
+      expectHistoryArchiveReason(
+        () => assertSafeHistoryZipTreeForTest(unsafe, limits),
+        "not_a_zip_archive",
+      );
+      const outer = writeZipArchive([{ path: `inner-${index}.zip`, content: unsafe }], {
+        allowNestedArchives: true,
+      });
+      expectHistoryArchiveReason(
+        () => assertSafeHistoryZipTreeForTest(outer, limits),
+        "not_a_zip_archive",
+      );
+    }
+  });
+
+  it("严格绑定中央目录、本地头、Zip64 和有无签名的数据描述符", () => {
+    const base = writeZipArchive([
+      { path: "strict.md", content: new TextEncoder().encode("x".repeat(1024)) },
+    ]);
+    const mismatches = [
+      patchFirstLocalU16(base, 6, (value) => value ^ 0x0008),
+      patchFirstLocalU16(base, 8, (value) => (value === 0 ? 8 : 0)),
+      corruptFirstLocalZipName(base),
+      patchFirstLocalU32(base, 14, (value) => (value + 1) >>> 0),
+      patchFirstLocalU32(base, 22, (value) => (value + 1) >>> 0),
+      patchFirstCentralU32(base, 42, (value) => (value + 1) >>> 0),
+    ];
+    const limits = generousHistoryArchiveLimits();
+    for (const unsafe of mismatches) {
+      expect(() => assertSafeHistoryZipTreeForTest(unsafe, limits)).toThrow();
+    }
+
+    const signed = makeDataDescriptorZip(true);
+    const unsigned = makeDataDescriptorZip(false);
+    expect(() => assertSafeHistoryZipTreeForTest(signed, limits)).not.toThrow();
+    expect(() => assertSafeHistoryZipTreeForTest(unsigned, limits)).not.toThrow();
+    expectHistoryArchiveReason(
+      () => assertSafeHistoryZipTreeForTest(corruptZipDescriptor(signed, true), limits),
+      "size_mismatch",
+    );
+    expectHistoryArchiveReason(
+      () => assertSafeHistoryZipTreeForTest(corruptZipDescriptor(unsigned, false), limits),
+      "size_mismatch",
+    );
+
+    const archiveZip64 = addArchiveLevelZip64(base);
+    expectHistoryArchiveReason(
+      () => assertSafeHistoryZipTreeForTest(archiveZip64, limits),
+      "unsupported_archive_feature",
+    );
+    const outer = writeZipArchive([{ path: "zip64.zip", content: archiveZip64 }], {
+      allowNestedArchives: true,
+    });
+    expectHistoryArchiveReason(
+      () => assertSafeHistoryZipTreeForTest(outer, limits),
+      "unsupported_archive_feature",
+    );
+  });
+
+  it("历史源路径以及根包、内包路径都拒绝非 NFC、Cc 与 Cf 字符", async () => {
+    const unsafePaths = ["synthetic-\u0085.md", "synthetic-\u202e.md", "synthetic-e\u0301.md"];
+    const limits = generousHistoryArchiveLimits();
+    for (const unsafePath of unsafePaths) {
+      const rootArchive = writeZipArchive([
+        { path: unsafePath, content: new TextEncoder().encode("synthetic") },
+      ]);
+      expectHistoryArchiveReason(
+        () => assertSafeHistoryZipTreeForTest(rootArchive, limits),
+        "invalid_path",
+      );
+      const inner = writeZipArchive([
+        { path: unsafePath, content: new TextEncoder().encode("synthetic") },
+      ]);
+      const outer = writeZipArchive([{ path: "inner.zip", content: inner }], {
+        allowNestedArchives: true,
+      });
+      expectHistoryArchiveReason(
+        () => assertSafeHistoryZipTreeForTest(outer, limits),
+        "invalid_path",
+      );
+
+      const privateRoot = await createPrivateRoot();
+      const sourceDirectory = join(privateRoot, "unsafe-unicode-source");
+      await mkdir(sourceDirectory, { mode: 0o700 });
+      await writeFile(join(sourceDirectory, unsafePath), "synthetic source", "utf8");
+      const catalogDirectory = join(privateRoot, "unsafe-unicode-catalog");
+      await expect(
+        inventoryHistorySources({
+          privateRootDirectory: privateRoot,
+          sourceDirectory,
+          outputDirectory: catalogDirectory,
+        }),
+      ).rejects.toMatchObject({ code: "SOURCE_FILE_INVALID" });
+      await expect(lstat(catalogDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+
+    const casefoldCollision = writeZipArchive([
+      { path: "straße.md", content: new TextEncoder().encode("first") },
+      { path: "STRASSE.md", content: new TextEncoder().encode("second") },
+    ]);
+    expectHistoryArchiveReason(
+      () => assertSafeHistoryZipTreeForTest(casefoldCollision, limits),
+      "duplicate_path",
+    );
+    const collisionOuter = writeZipArchive(
+      [{ path: "collision.zip", content: casefoldCollision }],
+      { allowNestedArchives: true },
+    );
+    expectHistoryArchiveReason(
+      () => assertSafeHistoryZipTreeForTest(collisionOuter, limits),
+      "duplicate_path",
+    );
+  });
+
+  it("同层内包先整体预占条目和展开预算，CRC 坏包不会抢先解压且结果与兄弟顺序无关", () => {
+    const encoder = new TextEncoder();
+    const corruptInner = corruptFirstZipCrc(
+      writeZipArchive([{ path: "corrupt.md", content: encoder.encode("c".repeat(64)) }]),
+    );
+    const validInner = writeZipArchive([
+      { path: "valid.md", content: encoder.encode("v".repeat(64)) },
+    ]);
+    for (const children of [
+      [corruptInner, validInner],
+      [validInner, corruptInner],
+    ]) {
+      const outer = writeZipArchive(
+        children.map((content, index) => ({ path: `child-${index}.zip`, content })),
+        { allowNestedArchives: true },
+      );
+      const rootExpanded = corruptInner.byteLength + validInner.byteLength;
+      const expandedLimit = rootExpanded + 64 + 64 - 1;
+      expectHistoryArchiveReason(
+        () =>
+          assertSafeHistoryZipTreeForTest(outer, {
+            ...generousHistoryArchiveLimits(),
+            maxSingleFileBytes: Math.max(corruptInner.byteLength, validInner.byteLength),
+            maxExpandedBytes: expandedLimit,
+          }),
+        "archive_too_large",
+      );
+      expectHistoryArchiveReason(
+        () =>
+          assertSafeHistoryZipTreeForTest(outer, {
+            ...generousHistoryArchiveLimits(),
+            maxEntries: 3,
+          }),
+        "too_many_entries",
+      );
+    }
+  });
+
+  it("旧式非 UTF-8 文件名 ZIP 不放宽解码，固定进入人工转换队列", async () => {
+    const privateRoot = await createPrivateRoot();
+    const sourceDirectory = join(privateRoot, "legacy-zip-sources");
+    await mkdir(sourceDirectory, { mode: 0o700 });
+    const legacyName = "synthetic-legacy-name.zip";
+    await writeFile(join(sourceDirectory, legacyName), makeLegacyFilenameZip());
+    const catalogDirectory = join(privateRoot, "legacy-zip-catalog");
+
+    await expect(
+      inventoryHistorySources({
+        privateRootDirectory: privateRoot,
+        sourceDirectory,
+        outputDirectory: catalogDirectory,
+      }),
+    ).resolves.toMatchObject({
+      sourceCount: 1,
+      archiveSourceCount: 0,
+      manualSourceCount: 1,
+    });
+    const manualReviewText = await readFile(join(catalogDirectory, "manual-review.json"), "utf8");
+    expect(manualReviewText).toContain("not_a_zip_archive");
+    expect(manualReviewText).not.toContain(legacyName);
   });
 
   it("确认后源文件变化会停止物化且不留下半成品", async () => {
@@ -870,13 +1630,15 @@ async function writePlan(fixture: CatalogFixture): Promise<string> {
     throw new Error("合成压缩包来源不存在。");
   }
   const archiveEntry = archiveLocation.entries.find(
-    (entry) => entry.entryPath === archiveEntryName,
+    (entry) => entry.entryPathChain.length === 1 && entry.entryPathChain[0] === archiveEntryName,
   );
   if (archiveEntry === undefined) {
     throw new Error("合成压缩包条目不存在。");
   }
   const unusedArchiveEntry = archiveLocation.entries.find(
-    (entry) => entry.entryPath === "private/synthetic-unused.md",
+    (entry) =>
+      entry.entryPathChain.length === 1 &&
+      entry.entryPathChain[0] === "private/synthetic-unused.md",
   );
   if (unusedArchiveEntry === undefined) {
     throw new Error("合成未使用压缩包条目不存在。");
@@ -988,4 +1750,406 @@ function materializeOptions(fixture: ConfirmedFixture) {
 async function expectPrivateMode(path: string, mode: number): Promise<void> {
   const metadata = await lstat(path);
   expect(metadata.mode & 0o777).toBe(mode);
+}
+
+function syntheticArchiveEntries(
+  count: number,
+  prefix: string,
+): Array<{ path: string; content: Uint8Array }> {
+  return Array.from({ length: count }, (_, index) => ({
+    path: `${prefix}-${index.toString().padStart(4, "0")}.md`,
+    content: new Uint8Array([index & 0xff]),
+  }));
+}
+
+function privateJsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(`${JSON.stringify(value, null, 2)}\n`).byteLength;
+}
+
+function generousHistoryArchiveLimits() {
+  return {
+    maxArchiveBytes: 1024 * 1024,
+    maxEntries: 100,
+    maxSingleFileBytes: 1024 * 1024,
+    maxExpandedBytes: 1024 * 1024,
+    maxCompressionRatio: 100,
+    maxDepth: 2,
+  };
+}
+
+function zipEndOffset(bytes: Uint8Array): number {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const scanStart = Math.max(0, bytes.byteLength - (22 + 65_535));
+  for (let offset = bytes.byteLength - 22; offset >= scanStart; offset -= 1) {
+    if (
+      view.getUint32(offset, true) === 0x06054b50 &&
+      offset + 22 + view.getUint16(offset + 20, true) === bytes.byteLength
+    ) {
+      return offset;
+    }
+  }
+  throw new Error("合成 ZIP 缺少普通结束目录记录。");
+}
+
+function zipCentralStart(bytes: Uint8Array): number {
+  const endOffset = zipEndOffset(bytes);
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(
+    endOffset + 16,
+    true,
+  );
+}
+
+function addAdjustedZipByte(archive: Uint8Array, insertionOffset: number): Uint8Array {
+  const oldEndOffset = zipEndOffset(archive);
+  const oldView = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+  const oldCentralStart = oldView.getUint32(oldEndOffset + 16, true);
+  const oldCentralOffsets = zipCentralEntryOffsets(archive);
+  if (insertionOffset < 0 || insertionOffset > oldEndOffset) {
+    throw new Error("合成 ZIP 插入位置不正确。");
+  }
+  const changed = new Uint8Array(archive.byteLength + 1);
+  changed.set(archive.subarray(0, insertionOffset), 0);
+  changed[insertionOffset] = 0x5a;
+  changed.set(archive.subarray(insertionOffset), insertionOffset + 1);
+  const changedView = new DataView(changed.buffer);
+  const newEndOffset = oldEndOffset + 1;
+  const newCentralStart = oldCentralStart + (insertionOffset <= oldCentralStart ? 1 : 0);
+  changedView.setUint32(newEndOffset + 16, newCentralStart, true);
+  for (const oldCentralOffset of oldCentralOffsets) {
+    const oldLocalOffset = oldView.getUint32(oldCentralOffset + 42, true);
+    const newCentralOffset = oldCentralOffset + (insertionOffset <= oldCentralOffset ? 1 : 0);
+    const newLocalOffset = oldLocalOffset + (insertionOffset <= oldLocalOffset ? 1 : 0);
+    changedView.setUint32(newCentralOffset + 42, newLocalOffset, true);
+  }
+  return changed;
+}
+
+function appendZipByte(archive: Uint8Array): Uint8Array {
+  const changed = new Uint8Array(archive.byteLength + 1);
+  changed.set(archive);
+  changed[archive.byteLength] = 0x5a;
+  return changed;
+}
+
+function appendDuplicateZipEnd(archive: Uint8Array): Uint8Array {
+  const endOffset = zipEndOffset(archive);
+  const endRecord = archive.subarray(endOffset);
+  const changed = new Uint8Array(archive.byteLength + endRecord.byteLength);
+  changed.set(archive);
+  changed.set(endRecord, archive.byteLength);
+  return changed;
+}
+
+function patchFirstLocalU16(
+  archive: Uint8Array,
+  fieldOffset: number,
+  update: (value: number) => number,
+): Uint8Array {
+  const changed = new Uint8Array(archive);
+  const view = new DataView(changed.buffer, changed.byteOffset, changed.byteLength);
+  const centralOffset = zipCentralEntryOffsets(changed)[0];
+  if (centralOffset === undefined) throw new Error("合成 ZIP 缺少目录项。");
+  const localOffset = view.getUint32(centralOffset + 42, true);
+  view.setUint16(
+    localOffset + fieldOffset,
+    update(view.getUint16(localOffset + fieldOffset, true)),
+    true,
+  );
+  return changed;
+}
+
+function patchFirstLocalU32(
+  archive: Uint8Array,
+  fieldOffset: number,
+  update: (value: number) => number,
+): Uint8Array {
+  const changed = new Uint8Array(archive);
+  const view = new DataView(changed.buffer, changed.byteOffset, changed.byteLength);
+  const centralOffset = zipCentralEntryOffsets(changed)[0];
+  if (centralOffset === undefined) throw new Error("合成 ZIP 缺少目录项。");
+  const localOffset = view.getUint32(centralOffset + 42, true);
+  view.setUint32(
+    localOffset + fieldOffset,
+    update(view.getUint32(localOffset + fieldOffset, true)),
+    true,
+  );
+  return changed;
+}
+
+function patchFirstCentralU32(
+  archive: Uint8Array,
+  fieldOffset: number,
+  update: (value: number) => number,
+): Uint8Array {
+  const changed = new Uint8Array(archive);
+  const view = new DataView(changed.buffer, changed.byteOffset, changed.byteLength);
+  const centralOffset = zipCentralEntryOffsets(changed)[0];
+  if (centralOffset === undefined) throw new Error("合成 ZIP 缺少目录项。");
+  view.setUint32(
+    centralOffset + fieldOffset,
+    update(view.getUint32(centralOffset + fieldOffset, true)),
+    true,
+  );
+  return changed;
+}
+
+function corruptFirstLocalZipName(archive: Uint8Array): Uint8Array {
+  const changed = new Uint8Array(archive);
+  const view = new DataView(changed.buffer, changed.byteOffset, changed.byteLength);
+  const centralOffset = zipCentralEntryOffsets(changed)[0];
+  if (centralOffset === undefined) throw new Error("合成 ZIP 缺少目录项。");
+  const localOffset = view.getUint32(centralOffset + 42, true);
+  if (view.getUint16(localOffset + 26, true) === 0) {
+    throw new Error("合成 ZIP 缺少本地文件名。");
+  }
+  changed[localOffset + 30] = (changed[localOffset + 30] ?? 0) ^ 0x01;
+  return changed;
+}
+
+function makeDataDescriptorZip(signed: boolean): Uint8Array {
+  const name = new TextEncoder().encode("descriptor.md");
+  const content = new TextEncoder().encode("synthetic descriptor content".repeat(8));
+  const compressed = deflateRawSync(content);
+  const checksum = crc32(content) >>> 0;
+  const flags = 0x0808;
+  const descriptor = new Uint8Array(signed ? 16 : 12);
+  const descriptorView = new DataView(descriptor.buffer);
+  const valuesOffset = signed ? 4 : 0;
+  if (signed) descriptorView.setUint32(0, 0x08074b50, true);
+  descriptorView.setUint32(valuesOffset, checksum, true);
+  descriptorView.setUint32(valuesOffset + 4, compressed.byteLength, true);
+  descriptorView.setUint32(valuesOffset + 8, content.byteLength, true);
+
+  const local = new Uint8Array(30 + name.byteLength);
+  const localView = new DataView(local.buffer);
+  localView.setUint32(0, 0x04034b50, true);
+  localView.setUint16(4, 20, true);
+  localView.setUint16(6, flags, true);
+  localView.setUint16(8, 8, true);
+  localView.setUint16(26, name.byteLength, true);
+  local.set(name, 30);
+
+  const central = new Uint8Array(46 + name.byteLength);
+  const centralView = new DataView(central.buffer);
+  centralView.setUint32(0, 0x02014b50, true);
+  centralView.setUint16(4, 0x0314, true);
+  centralView.setUint16(6, 20, true);
+  centralView.setUint16(8, flags, true);
+  centralView.setUint16(10, 8, true);
+  centralView.setUint32(16, checksum, true);
+  centralView.setUint32(20, compressed.byteLength, true);
+  centralView.setUint32(24, content.byteLength, true);
+  centralView.setUint16(28, name.byteLength, true);
+  centralView.setUint32(38, (0o100600 << 16) >>> 0, true);
+  central.set(name, 46);
+
+  const centralOffset = local.byteLength + compressed.byteLength + descriptor.byteLength;
+  const end = new Uint8Array(22);
+  const endView = new DataView(end.buffer);
+  endView.setUint32(0, 0x06054b50, true);
+  endView.setUint16(8, 1, true);
+  endView.setUint16(10, 1, true);
+  endView.setUint32(12, central.byteLength, true);
+  endView.setUint32(16, centralOffset, true);
+  return concatenateBytes([local, compressed, descriptor, central, end]);
+}
+
+function corruptZipDescriptor(archive: Uint8Array, signed: boolean): Uint8Array {
+  const changed = new Uint8Array(archive);
+  const view = new DataView(changed.buffer, changed.byteOffset, changed.byteLength);
+  const centralOffset = zipCentralStart(changed);
+  const localOffset = view.getUint32(centralOffset + 42, true);
+  const nameLength = view.getUint16(localOffset + 26, true);
+  const extraLength = view.getUint16(localOffset + 28, true);
+  const compressedSize = view.getUint32(centralOffset + 20, true);
+  const descriptorOffset = localOffset + 30 + nameLength + extraLength + compressedSize;
+  const checksumOffset = descriptorOffset + (signed ? 4 : 0);
+  changed[checksumOffset] = (changed[checksumOffset] ?? 0) ^ 0x01;
+  return changed;
+}
+
+function addArchiveLevelZip64(archive: Uint8Array): Uint8Array {
+  const endOffset = zipEndOffset(archive);
+  const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+  const entryCount = view.getUint16(endOffset + 10, true);
+  const centralSize = view.getUint32(endOffset + 12, true);
+  const centralOffset = view.getUint32(endOffset + 16, true);
+  const zip64End = new Uint8Array(56);
+  const zip64EndView = new DataView(zip64End.buffer);
+  zip64EndView.setUint32(0, 0x06064b50, true);
+  zip64EndView.setBigUint64(4, 44n, true);
+  zip64EndView.setUint16(12, 45, true);
+  zip64EndView.setUint16(14, 45, true);
+  zip64EndView.setBigUint64(24, BigInt(entryCount), true);
+  zip64EndView.setBigUint64(32, BigInt(entryCount), true);
+  zip64EndView.setBigUint64(40, BigInt(centralSize), true);
+  zip64EndView.setBigUint64(48, BigInt(centralOffset), true);
+  const locator = new Uint8Array(20);
+  const locatorView = new DataView(locator.buffer);
+  locatorView.setUint32(0, 0x07064b50, true);
+  locatorView.setBigUint64(8, BigInt(endOffset), true);
+  locatorView.setUint32(16, 1, true);
+  const ordinaryEnd = new Uint8Array(archive.subarray(endOffset));
+  const ordinaryView = new DataView(ordinaryEnd.buffer);
+  ordinaryView.setUint16(8, 0xffff, true);
+  ordinaryView.setUint16(10, 0xffff, true);
+  ordinaryView.setUint32(12, 0xffffffff, true);
+  ordinaryView.setUint32(16, 0xffffffff, true);
+  return concatenateBytes([archive.subarray(0, endOffset), zip64End, locator, ordinaryEnd]);
+}
+
+function concatenateBytes(parts: readonly Uint8Array[]): Uint8Array {
+  const output = new Uint8Array(parts.reduce((total, part) => total + part.byteLength, 0));
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.byteLength;
+  }
+  return output;
+}
+
+function expectHistoryArchiveReason(callback: () => void, reason: string): void {
+  let caught: unknown;
+  try {
+    callback();
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toMatchObject({ reasons: [reason] });
+}
+
+function deterministicIncompressibleBytes(length: number): Uint8Array {
+  const output = new Uint8Array(length);
+  let offset = 0;
+  let block = 0;
+  while (offset < output.byteLength) {
+    const digest = createHash("sha256").update(`urmotiv-history-archive-test-${block}`).digest();
+    const remaining = output.byteLength - offset;
+    output.set(digest.subarray(0, Math.min(remaining, digest.byteLength)), offset);
+    offset += Math.min(remaining, digest.byteLength);
+    block += 1;
+  }
+  return output;
+}
+
+function rewriteFirstZipPath(archive: Uint8Array, replacement: string): Uint8Array {
+  return rewriteZipPath(archive, 0, replacement);
+}
+
+function rewriteZipPath(archive: Uint8Array, entryIndex: number, replacement: string): Uint8Array {
+  const bytes = new Uint8Array(archive);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const centralOffset = zipCentralEntryOffsets(bytes)[entryIndex];
+  if (centralOffset === undefined) {
+    throw new Error("合成 ZIP 缺少要改写的目录项。");
+  }
+  const replacementBytes = new TextEncoder().encode(replacement);
+  const nameLength = view.getUint16(centralOffset + 28, true);
+  const localOffset = view.getUint32(centralOffset + 42, true);
+  if (
+    replacementBytes.byteLength !== nameLength ||
+    view.getUint16(localOffset + 26, true) !== nameLength
+  ) {
+    throw new Error("合成 ZIP 路径改写必须保持相同字节长度。");
+  }
+  bytes.set(replacementBytes, centralOffset + 46);
+  bytes.set(replacementBytes, localOffset + 30);
+  return bytes;
+}
+
+function markFirstZipEntryAsSymlink(archive: Uint8Array): Uint8Array {
+  const bytes = new Uint8Array(archive);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const centralOffset = zipCentralEntryOffsets(bytes)[0];
+  if (centralOffset === undefined) {
+    throw new Error("合成 ZIP 缺少目录项。");
+  }
+  view.setUint32(centralOffset + 38, (0o120777 << 16) >>> 0, true);
+  return bytes;
+}
+
+function corruptFirstZipCrc(archive: Uint8Array): Uint8Array {
+  const bytes = new Uint8Array(archive);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const centralOffset = zipCentralEntryOffsets(bytes)[0];
+  if (centralOffset === undefined) {
+    throw new Error("合成 ZIP 缺少目录项。");
+  }
+  const localOffset = view.getUint32(centralOffset + 42, true);
+  const wrong = (view.getUint32(centralOffset + 16, true) + 1) >>> 0;
+  view.setUint32(centralOffset + 16, wrong, true);
+  view.setUint32(localOffset + 14, wrong, true);
+  return bytes;
+}
+
+function markFirstZipEntryAsZip64(archive: Uint8Array): Uint8Array {
+  const bytes = new Uint8Array(archive);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const centralOffset = zipCentralEntryOffsets(bytes)[0];
+  if (centralOffset === undefined) {
+    throw new Error("合成 ZIP 缺少目录项。");
+  }
+  view.setUint32(centralOffset + 24, 0xffffffff, true);
+  return bytes;
+}
+
+function rewriteFirstZipUncompressedSize(archive: Uint8Array, declaredSize: number): Uint8Array {
+  const bytes = new Uint8Array(archive);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const centralOffset = zipCentralEntryOffsets(bytes)[0];
+  if (centralOffset === undefined) {
+    throw new Error("合成 ZIP 缺少目录项。");
+  }
+  const localOffset = view.getUint32(centralOffset + 42, true);
+  view.setUint32(centralOffset + 24, declaredSize, true);
+  view.setUint32(localOffset + 22, declaredSize, true);
+  return bytes;
+}
+
+function makeLegacyFilenameZip(): Uint8Array {
+  const bytes = new Uint8Array(
+    writeZipArchive([
+      { path: "safe.txt", content: new TextEncoder().encode("synthetic legacy text") },
+    ]),
+  );
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const centralOffset = zipCentralEntryOffsets(bytes)[0];
+  if (centralOffset === undefined) {
+    throw new Error("合成 ZIP 缺少目录项。");
+  }
+  const localOffset = view.getUint32(centralOffset + 42, true);
+  bytes[centralOffset + 46] = 0x82;
+  bytes[localOffset + 30] = 0x82;
+  view.setUint16(centralOffset + 8, view.getUint16(centralOffset + 8, true) & ~0x0800, true);
+  view.setUint16(localOffset + 6, view.getUint16(localOffset + 6, true) & ~0x0800, true);
+  return bytes;
+}
+
+function zipCentralEntryOffsets(bytes: Uint8Array): number[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let endOffset = -1;
+  for (let offset = bytes.byteLength - 22; offset >= 0; offset -= 1) {
+    if (view.getUint32(offset, true) === 0x06054b50) {
+      endOffset = offset;
+      break;
+    }
+  }
+  if (endOffset < 0) {
+    throw new Error("合成 ZIP 缺少结束目录记录。");
+  }
+  const entryCount = view.getUint16(endOffset + 10, true);
+  let cursor = view.getUint32(endOffset + 16, true);
+  const offsets: number[] = [];
+  for (let index = 0; index < entryCount; index += 1) {
+    if (view.getUint32(cursor, true) !== 0x02014b50) {
+      throw new Error("合成 ZIP 中央目录格式不正确。");
+    }
+    offsets.push(cursor);
+    cursor +=
+      46 +
+      view.getUint16(cursor + 28, true) +
+      view.getUint16(cursor + 30, true) +
+      view.getUint16(cursor + 32, true);
+  }
+  return offsets;
 }

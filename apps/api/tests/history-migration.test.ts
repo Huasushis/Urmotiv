@@ -17,6 +17,7 @@ import {
 } from "@urmotiv/problem-package";
 import {
   createLlmHistoryNormalizer,
+  historyMetadataFileSchema,
   historySourceMappingSchema,
   packageApprovedCandidates,
   prepareHistoryCandidates,
@@ -39,6 +40,23 @@ afterEach(async () => {
 });
 
 describe("历史题目迁移安全核心", () => {
+  it.each(["difficultyGuess", "difficultyText", "untrustedSubmittedDifficultyText"])(
+    "拒绝仍含 %s 的元数据，避免任何自填难度进入下游",
+    (field) => {
+      expect(
+        historyMetadataFileSchema.safeParse({
+          records: [
+            {
+              number: "synthetic-1",
+              name: "Synthetic metadata title",
+              [field]: field === "difficultyGuess" ? 3200 : "synthetic self report",
+            },
+          ],
+        }).success,
+      ).toBe(false);
+    },
+  );
+
   it("只接受明确确认且没有重复分配的源文件映射", () => {
     const digest = "a".repeat(64);
     expect(
@@ -177,6 +195,7 @@ describe("历史题目迁移安全核心", () => {
 
     const candidate = await readCandidate(fixture.prepareOutput);
     expect(candidate.problem.extensions).toEqual({});
+    expect(candidate.problem.difficulty).toEqual({});
     expect(candidate.problem.provenance).toEqual({
       sourceSystem: "ustc-history-private"
     });
@@ -409,7 +428,7 @@ describe("历史题目迁移安全核心", () => {
     });
   });
 
-  it("已知学号或原文件名出现在模型结果或难度文字时拒绝生成候选", async () => {
+  it("已知学号出现在模型结果时拒绝生成候选", async () => {
     const modelLeakFixture = await createFixture("只用于合成测试的源正文。");
     await expect(
       prepareHistoryCandidates({
@@ -431,18 +450,28 @@ describe("历史题目迁移安全核心", () => {
       code: "CANDIDATE_INVALID"
     });
 
-    const metadataLeakFixture = await createFixture(
-      "另一份只用于合成测试的源正文。",
-      { difficultyText: `不应导出的原文件名：${syntheticSourceName}` }
-    );
-    await expect(
-      prepareHistoryCandidates({
-        ...metadataLeakFixture.prepareOptions,
-        normalizer: fixedNormalizer()
-      })
-    ).rejects.toMatchObject({
-      code: "CANDIDATE_INVALID"
+  });
+
+  it("元数据题名和难度都不进入整理器、候选难度或扩展字段", async () => {
+    const fixture = await createFixture("另一份只用于合成测试的源正文。");
+    let normalizerInput: unknown;
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize(input) {
+          normalizerInput = input;
+          return normalizedOutput();
+        }
+      }
     });
+
+    expect(normalizerInput).not.toHaveProperty("difficultyGuess");
+    expect(normalizerInput).not.toHaveProperty("expectedTitle");
+    expect(JSON.stringify(normalizerInput)).not.toContain(syntheticMetadataTitle);
+    const candidate = await readCandidate(fixture.prepareOutput);
+    expect(candidate.problem.difficulty).toEqual({});
+    expect(candidate.problem.extensions).toEqual({});
+    expect(JSON.stringify(candidate)).not.toContain(syntheticMetadataTitle);
   });
 
   it("拒绝写出超过后续读取上限的候选，不留下完成标记", async () => {
@@ -514,6 +543,35 @@ describe("历史题目迁移安全核心", () => {
       packageApprovedCandidates(fixture.packageOptions)
     ).rejects.toMatchObject({
       code: "CANDIDATE_INVALID"
+    });
+  });
+
+  it("人工写入难度并重算摘要、重新批准后仍拒绝候选", async () => {
+    const fixture = await createPreparedFixture();
+    const candidate = await readCandidate(fixture.prepareOutput);
+    const problem = {
+      ...candidate.problem,
+      difficulty: { codeforces: 3200 },
+    };
+    const contentSha256 = sha256Hex(
+      JSON.stringify({
+        sourceId: candidate.sourceId,
+        sourceContentSha256: candidate.sourceContentSha256,
+        sourceMappingSha256: candidate.sourceMappingSha256,
+        modelConfidence: candidate.modelConfidence,
+        normalizationNote: candidate.normalizationNote,
+        problem,
+      }),
+    );
+    await writeFile(
+      join(fixture.prepareOutput, "candidates", `${candidate.candidateId}.json`),
+      `${JSON.stringify({ ...candidate, contentSha256, problem }, null, 2)}\n`,
+      "utf8",
+    );
+    await writeApproval(fixture.approvalFile, candidate.candidateId, contentSha256);
+
+    await expect(packageApprovedCandidates(fixture.packageOptions)).rejects.toMatchObject({
+      code: "CANDIDATE_INVALID",
     });
   });
 
@@ -694,9 +752,7 @@ describe("历史题目模型整理响应限制", () => {
     await expect(
       normalizer.normalize({
         sourceId: "source-000001",
-        text: "合成正文",
-        expectedTitle: "合成题名",
-        difficultyGuess: null
+        text: "合成正文"
       })
     ).rejects.toMatchObject({
       code: "NORMALIZATION_FAILED",
@@ -724,9 +780,7 @@ describe("历史题目模型整理响应限制", () => {
     try {
       await normalizer.normalize({
         sourceId: "source-000001",
-        text: "合成正文",
-        expectedTitle: "合成题名",
-        difficultyGuess: null
+        text: "合成正文"
       });
     } catch (error) {
       caught = error;
@@ -739,12 +793,7 @@ describe("历史题目模型整理响应限制", () => {
   });
 });
 
-async function createFixture(
-  sourceText: string,
-  metadataOverrides: {
-    readonly difficultyText?: string;
-  } = {}
-): Promise<{
+async function createFixture(sourceText: string): Promise<{
   readonly root: string;
   readonly sourceDirectory: string;
   readonly prepareOutput: string;
@@ -780,8 +829,6 @@ async function createFixture(
   const metadataRecord = {
     number: "synthetic-1",
     name: syntheticMetadataTitle,
-    difficultyText: metadataOverrides.difficultyText ?? "",
-    difficultyGuess: 1200,
     authorStudentId: syntheticStudentId,
     status: "",
     contest: "",
