@@ -20,9 +20,14 @@ describe("权限计算", () => {
 
     const wronglyConfiguredRobot = {
       ...robot,
-      grants: [...robot.grants, { permission: "system.manage" as const, effect: "allow" as const, scope: "global" as const }]
+      grants: [
+        ...robot.grants,
+        { permission: "system.manage" as const, effect: "allow" as const, scope: "global" as const },
+        { permission: "tag.manage" as const, effect: "allow" as const, scope: "global" as const }
+      ]
     };
     expect(hasPermission(wronglyConfiguredRobot, "system.manage")).toBe(false);
+    expect(hasPermission(wronglyConfiguredRobot, "tag.manage")).toBe(false);
   });
 
   it("机器人令牌只缩小账号允许项并保留全部明确拒绝", () => {

@@ -43,6 +43,7 @@ export const robotHardDeniedPermissions = [
   "system.manage",
   "plugin.manage",
   "service_account.manage",
+  "tag.manage",
   "problem.delete.own",
   "problem.delete.all",
   "contest.delete",
