@@ -4,12 +4,14 @@ import importlib.util
 import io
 import json
 import os
+import re
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 import zipfile
 import zlib
 from pathlib import Path
@@ -92,6 +94,72 @@ class ParseMetadataTest(unittest.TestCase):
             self.assertNotIn("SYNTHETIC-QQ", serialized)
             self.assertNotIn("SYNTHETIC REVIEW OPINION", serialized)
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+
+    def test_additional_private_columns_and_blank_shared_cells_are_ignored(self) -> None:
+        extra_headers = [
+            "联系方式",
+            "电子邮箱",
+            "微信号",
+            "预估难度",
+            "出题者",
+            "审核人1(合成审题者)",
+            "第二轮审题意见",
+            "复审意见",
+            "后续审核备注",
+        ]
+        extra_values = [f"SYNTHETIC OMITTED {index}" for index in range(len(extra_headers))]
+        members = self._xlsx_members(
+            [*SAFE_HEADERS, *extra_headers],
+            [[*SAFE_ROW, *extra_values]],
+        )
+        members["xl/worksheets/sheet1.xml"] = self._add_empty_shared_cell(
+            members["xl/worksheets/sheet1.xml"]
+        )
+
+        records = PARSER._parse_records(self._members_bytes(members))
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(
+            set(records[0]),
+            {"number", "name", "authorStudentId", "status", "contest", "note"},
+        )
+        serialized = json.dumps(records, ensure_ascii=False)
+        for value in extra_values:
+            self.assertNotIn(value, serialized)
+
+    def test_unique_header_can_follow_titles_in_one_of_multiple_worksheets(self) -> None:
+        members = self._xlsx_members(SAFE_HEADERS, [[*SAFE_ROW]])
+        candidate = self._add_leading_title_rows(
+            members.pop("xl/worksheets/sheet1.xml")
+        )
+        members["xl/worksheets/sheet1.xml"] = self._title_only_worksheet()
+        members["xl/worksheets/sheet7.xml"] = candidate
+        content = self._members_bytes(members)
+
+        records = PARSER._parse_records(content)
+
+        self.assertEqual(len(records), 1)
+        with mock.patch.object(PARSER, "_MAX_HEADER_SCAN_ROWS", 2):
+            with self.assertRaises(PARSER._SafeFailure):
+                PARSER._parse_records(content)
+        with mock.patch.object(PARSER, "_MAX_WORKSHEETS", 1):
+            with self.assertRaises(PARSER._SafeFailure):
+                PARSER._parse_records(content)
+
+    def test_multiple_header_candidates_and_unknown_header_columns_are_rejected(self) -> None:
+        ambiguous_members = self._xlsx_members(SAFE_HEADERS, [[*SAFE_ROW]])
+        ambiguous_members["xl/worksheets/sheet2.xml"] = ambiguous_members[
+            "xl/worksheets/sheet1.xml"
+        ]
+        with self.assertRaises(PARSER._SafeFailure):
+            PARSER._parse_records(self._members_bytes(ambiguous_members))
+
+        unknown_members = self._xlsx_members(
+            [*SAFE_HEADERS, "合成未知列"],
+            [[*SAFE_ROW, "SYNTHETIC UNKNOWN"]],
+        )
+        with self.assertRaises(PARSER._SafeFailure):
+            PARSER._parse_records(self._members_bytes(unknown_members))
 
     def test_multiple_xlsx_inputs_merge_stably_and_reject_cross_file_duplicates(self) -> None:
         with tempfile.TemporaryDirectory(prefix="urmotiv-metadata-multiple-") as directory:
@@ -307,6 +375,88 @@ class ParseMetadataTest(unittest.TestCase):
                     self._assert_fixed_failure(completed, [case, str(source), "xl/"])
                     self.assertFalse(output.exists())
 
+    def test_explicit_directories_and_high_create_version_are_supported(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="urmotiv-metadata-directories-") as directory:
+            root = Path(directory)
+            source = root / "synthetic.xlsx"
+            output = root / "metadata.json"
+            content = self._xlsx_with_explicit_directories(directories_after_files=True)
+            source.write_bytes(content)
+
+            raw_entries, _ = PARSER._validate_raw_zip(content)
+            self.assertEqual(sum(entry.is_directory for entry in raw_entries), 2)
+            self.assertEqual({entry.version_made & 0xFF for entry in raw_entries}, {63})
+            self.assertEqual({entry.version_needed for entry in raw_entries}, {20})
+            self.assertEqual(
+                set(PARSER._safe_zip_members(content)),
+                {"xl/sharedStrings.xml", "xl/worksheets/sheet1.xml"},
+            )
+
+            completed = self._run(source, output)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(len(json.loads(output.read_text(encoding="utf-8"))["records"]), 1)
+
+    def test_unsafe_explicit_directories_are_rejected(self) -> None:
+        cases = {
+            "nonzero-directory": self._xlsx_with_explicit_entry(
+                "synthetic-directory/",
+                stat.S_IFDIR,
+                b"not-empty",
+            ),
+            "deflated-directory": self._xlsx_with_explicit_entry(
+                "synthetic-directory/",
+                stat.S_IFDIR,
+                b"",
+                compression=zipfile.ZIP_DEFLATED,
+            ),
+            "directory-without-slash": self._xlsx_with_explicit_entry(
+                "synthetic-directory",
+                stat.S_IFDIR,
+                b"",
+            ),
+            "file-with-directory-name": self._xlsx_with_explicit_entry(
+                "synthetic-file/",
+                stat.S_IFREG,
+                b"",
+            ),
+            "directory-traversal": self._xlsx_with_explicit_entry(
+                "../",
+                stat.S_IFDIR,
+                b"",
+            ),
+            "directory-absolute": self._xlsx_with_explicit_entry(
+                "/synthetic/",
+                stat.S_IFDIR,
+                b"",
+            ),
+            "directory-drive": self._xlsx_with_explicit_entry(
+                "C:/synthetic/",
+                stat.S_IFDIR,
+                b"",
+            ),
+            "directory-empty-segment": self._xlsx_with_explicit_entry(
+                "synthetic//private/",
+                stat.S_IFDIR,
+                b"",
+            ),
+            "directory-format-control": self._xlsx_with_explicit_entry(
+                "synthetic-\u202e/private/",
+                stat.S_IFDIR,
+                b"",
+            ),
+            "directory-file-conflict": self._xlsx_with_directory_file_conflict(),
+        }
+        with tempfile.TemporaryDirectory(prefix="urmotiv-metadata-unsafe-directories-") as directory:
+            root = Path(directory)
+            for case, content in cases.items():
+                with self.subTest(case=case):
+                    source = root / f"{case}.xlsx"
+                    output = root / f"{case}.json"
+                    source.write_bytes(content)
+                    completed = self._run(source, output)
+                    self._assert_fixed_failure(completed, [case, str(source), "synthetic"])
+                    self.assertFalse(output.exists())
+
     def test_raw_zip64_descriptor_and_local_header_mismatches_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="urmotiv-metadata-raw-zip-") as directory:
             root = Path(directory)
@@ -373,6 +523,9 @@ class ParseMetadataTest(unittest.TestCase):
                 ("_MAX_ZIP_ENTRIES", 1),
                 ("_MAX_ZIP_ENTRY_BYTES", 128),
                 ("_MAX_ZIP_EXPANDED_BYTES", 256),
+                ("_MAX_WORKSHEETS", 0),
+                ("_MAX_HEADER_SCAN_ROWS", 0),
+                ("_MAX_WORKSHEET_TOTAL_BYTES", 128),
                 ("_MAX_XML_ELEMENTS", 8),
                 ("_MAX_XML_DEPTH", 2),
                 ("_MAX_WORKSHEET_ROWS", 2),
@@ -501,6 +654,69 @@ class ParseMetadataTest(unittest.TestCase):
         }
 
     @staticmethod
+    def _add_empty_shared_cell(content: bytes) -> bytes:
+        root = ET.fromstring(content)
+        sheet_data = root.find(f"{{{SPREADSHEET_NS}}}sheetData")
+        if sheet_data is None:
+            raise AssertionError("synthetic worksheet missing sheetData")
+        rows = sheet_data.findall(f"{{{SPREADSHEET_NS}}}row")
+        if len(rows) < 2:
+            raise AssertionError("synthetic worksheet missing record row")
+        cell = ET.SubElement(
+            rows[1],
+            f"{{{SPREADSHEET_NS}}}c",
+            {"r": "T2", "t": "s"},
+        )
+        ET.SubElement(cell, f"{{{SPREADSHEET_NS}}}v")
+        return ET.tostring(root, encoding="utf-8")
+
+    @staticmethod
+    def _add_leading_title_rows(content: bytes) -> bytes:
+        root = ET.fromstring(content)
+        sheet_data = root.find(f"{{{SPREADSHEET_NS}}}sheetData")
+        if sheet_data is None:
+            raise AssertionError("synthetic worksheet missing sheetData")
+        for row in sheet_data.findall(f"{{{SPREADSHEET_NS}}}row"):
+            original_row = int(row.get("r", "0"))
+            shifted_row = original_row + 2
+            row.set("r", str(shifted_row))
+            for cell in row.findall(f"{{{SPREADSHEET_NS}}}c"):
+                reference = cell.get("r", "")
+                match = re.fullmatch(r"([A-Z]+)([1-9][0-9]*)", reference)
+                if match is None or int(match.group(2)) != original_row:
+                    raise AssertionError("synthetic cell has invalid reference")
+                cell.set("r", f"{match.group(1)}{shifted_row}")
+        empty = ET.Element(f"{{{SPREADSHEET_NS}}}row", {"r": "1"})
+        title = ET.Element(f"{{{SPREADSHEET_NS}}}row", {"r": "2"})
+        cell = ET.SubElement(
+            title,
+            f"{{{SPREADSHEET_NS}}}c",
+            {"r": "A2", "t": "inlineStr"},
+        )
+        inline = ET.SubElement(cell, f"{{{SPREADSHEET_NS}}}is")
+        text = ET.SubElement(inline, f"{{{SPREADSHEET_NS}}}t")
+        text.text = "Synthetic catalog title"
+        sheet_data.insert(0, empty)
+        sheet_data.insert(1, title)
+        return ET.tostring(root, encoding="utf-8")
+
+    @staticmethod
+    def _title_only_worksheet() -> bytes:
+        root = ET.Element(f"{{{SPREADSHEET_NS}}}worksheet")
+        sheet_data = ET.SubElement(root, f"{{{SPREADSHEET_NS}}}sheetData")
+        ET.SubElement(sheet_data, f"{{{SPREADSHEET_NS}}}row", {"r": "1"})
+        title = ET.SubElement(sheet_data, f"{{{SPREADSHEET_NS}}}row", {"r": "2"})
+        cell = ET.SubElement(
+            title,
+            f"{{{SPREADSHEET_NS}}}c",
+            {"r": "A2", "t": "inlineStr"},
+        )
+        inline = ET.SubElement(cell, f"{{{SPREADSHEET_NS}}}is")
+        text = ET.SubElement(inline, f"{{{SPREADSHEET_NS}}}t")
+        text.text = "Synthetic notes"
+        return ET.tostring(root, encoding="utf-8")
+
+    @staticmethod
     def _write_members(path: Path, members: dict[str, bytes], *, compression: int = zipfile.ZIP_DEFLATED) -> None:
         with zipfile.ZipFile(path, "w", compression=compression) as archive:
             for name, content in members.items():
@@ -525,6 +741,84 @@ class ParseMetadataTest(unittest.TestCase):
             cls._xlsx_members(SAFE_HEADERS, [SAFE_ROW]),
             unseekable=True,
         )
+
+    @classmethod
+    def _xlsx_with_explicit_directories(cls, *, directories_after_files: bool) -> bytes:
+        target = io.BytesIO()
+        members = cls._xlsx_members(SAFE_HEADERS, [SAFE_ROW])
+
+        def write_directory(archive: zipfile.ZipFile, name: str) -> None:
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.create_version = 63
+            info.extract_version = 20
+            info.external_attr = ((stat.S_IFDIR | 0o755) << 16) | 0x10
+            info.compress_type = zipfile.ZIP_STORED
+            archive.writestr(info, b"")
+
+        def write_file(archive: zipfile.ZipFile, name: str, content: bytes) -> None:
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.create_version = 63
+            info.extract_version = 20
+            info.external_attr = (stat.S_IFREG | 0o600) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, content)
+
+        with zipfile.ZipFile(target, "w") as archive:
+            if not directories_after_files:
+                write_directory(archive, "xl/")
+                write_directory(archive, "xl/worksheets/")
+            for name, content in members.items():
+                write_file(archive, name, content)
+            if directories_after_files:
+                write_directory(archive, "xl/worksheets/")
+                write_directory(archive, "xl/")
+        return target.getvalue()
+
+    @classmethod
+    def _xlsx_with_explicit_entry(
+        cls,
+        name: str,
+        mode_type: int,
+        payload: bytes,
+        *,
+        compression: int = zipfile.ZIP_STORED,
+    ) -> bytes:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "x.xlsx"
+            cls._write_xlsx(path, SAFE_HEADERS, SAFE_ROW)
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.create_version = 63
+            info.extract_version = 20
+            info.external_attr = ((mode_type | 0o755) << 16) | (
+                0x10 if mode_type == stat.S_IFDIR else 0
+            )
+            info.compress_type = compression
+            with zipfile.ZipFile(path, "a") as archive:
+                archive.writestr(info, payload)
+            return path.read_bytes()
+
+    @classmethod
+    def _xlsx_with_directory_file_conflict(cls) -> bytes:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "x.xlsx"
+            cls._write_xlsx(path, SAFE_HEADERS, SAFE_ROW)
+            directory_info = zipfile.ZipInfo("synthetic-conflict/")
+            directory_info.create_system = 3
+            directory_info.create_version = 63
+            directory_info.extract_version = 20
+            directory_info.external_attr = ((stat.S_IFDIR | 0o755) << 16) | 0x10
+            file_info = zipfile.ZipInfo("synthetic-conflict")
+            file_info.create_system = 3
+            file_info.create_version = 63
+            file_info.extract_version = 20
+            file_info.external_attr = (stat.S_IFREG | 0o600) << 16
+            with zipfile.ZipFile(path, "a") as archive:
+                archive.writestr(directory_info, b"")
+                archive.writestr(file_info, b"conflict")
+            return path.read_bytes()
 
     @classmethod
     def _xlsx_with_unsigned_descriptors(cls) -> bytes:

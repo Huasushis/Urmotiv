@@ -35,6 +35,9 @@ _MAX_ZIP_PATH_DEPTH = 16
 _MAX_ZIP_SEGMENT_LENGTH = 120
 _MAX_SHARED_STRINGS_BYTES = 16 * 1024 * 1024
 _MAX_WORKSHEET_BYTES = 32 * 1024 * 1024
+_MAX_WORKSHEET_TOTAL_BYTES = 48 * 1024 * 1024
+_MAX_WORKSHEETS = 32
+_MAX_HEADER_SCAN_ROWS = 20
 _MAX_XML_ELEMENTS = 500_000
 _MAX_XML_DEPTH = 64
 _MAX_SHARED_STRINGS = 100_000
@@ -69,21 +72,40 @@ _SAFE_HEADERS = {
     "name": {"名称", "题目名称", "题名"},
     "authorStudentId": {"学号", "出题人学号", "投题人学号"},
     "status": {"状态", "题目状态"},
-    "contest": {"比赛", "所属比赛", "使用比赛"},
+    "contest": {"比赛", "比赛场次", "所属比赛", "使用比赛"},
     "note": {"备注", "说明"},
 }
 _IGNORED_HEADERS = {
     "难度",
     "自填难度",
     "题目难度",
+    "预估难度",
+    "预计难度",
     "QQ",
     "QQ号",
+    "联系方式",
+    "联系电话",
+    "手机号",
+    "手机",
+    "邮箱",
+    "电子邮箱",
+    "微信",
+    "微信号",
     "出题人",
+    "出题者",
     "投题人",
     "作者",
 }
-_REVIEW_HEADER = re.compile(r"^(?:审核|审题)(?:人|意见|结果|备注)?(?:[一二三四五六七八九十0-9]+)?$")
+_REVIEW_SEQUENCE = r"[一二三四五六七八九十0-9]+"
+_REVIEW_HEADER = re.compile(
+    rf"^(?:(?:审核|审题)(?:意见|结果|备注)?(?:{_REVIEW_SEQUENCE})?"
+    rf"|(?:审核|审题)人(?:{_REVIEW_SEQUENCE})?(?:\([\w·-]{{1,32}}\))?"
+    rf"|第?{_REVIEW_SEQUENCE}(?:轮|次)?(?:审核|审题)(?:人|意见|结果|备注)?"
+    rf"|(?:初审|复审|终审)(?:人|意见|结果|备注)?"
+    rf"|后续(?:审核|审题)(?:意见|结果|备注)?)$"
+)
 _CANONICAL_SHARED_INDEX = re.compile(r"(?:0|[1-9][0-9]*)")
+_WORKSHEET_MEMBER = re.compile(r"xl/worksheets/[^/]+\.xml")
 _XML_ENCODING = re.compile(
     r"^\s*<\?xml\s+[^?]*\bencoding\s*=\s*(['\"])([^'\"]+)\1[^?]*\?>",
     re.IGNORECASE,
@@ -123,7 +145,15 @@ class _RawZipEntry:
     local_offset: int
     central_extra: bytes
     central_comment: bytes
+    is_directory: bool
     content: bytes = b""
+
+
+@dataclass
+class _ParseBudget:
+    xml_elements: int = 0
+    worksheet_rows: int = 0
+    worksheet_cells: int = 0
 
 
 def _normalize_header(value: str) -> str:
@@ -261,9 +291,21 @@ def _decode_zip_name(name_bytes: bytes, flags: int) -> str:
         raise _SafeFailure() from error
 
 
-def _validate_zip_path(name: str) -> tuple[str, tuple[str, ...]]:
-    normalized = unicodedata.normalize("NFC", name)
-    original_parts = tuple(name.split("/"))
+def _validate_zip_path(
+    name: str,
+    *,
+    is_directory: bool,
+) -> tuple[str, tuple[str, ...]]:
+    if is_directory:
+        if not name.endswith("/") or name.endswith("//"):
+            raise _SafeFailure()
+        path = name[:-1]
+    else:
+        if name.endswith("/"):
+            raise _SafeFailure()
+        path = name
+    normalized = unicodedata.normalize("NFC", path)
+    original_parts = tuple(path.split("/"))
     parts = tuple(normalized.split("/"))
     if (
         not normalized
@@ -281,7 +323,7 @@ def _validate_zip_path(name: str) -> tuple[str, tuple[str, ...]]:
             or part in {".", ".."}
             or len(part) > _MAX_ZIP_SEGMENT_LENGTH
             or len(part.encode("utf-8")) > _MAX_ZIP_SEGMENT_LENGTH
-            or any(unicodedata.category(char) == "Cc" for char in part)
+            or any(unicodedata.category(char) in {"Cc", "Cf"} for char in part)
             for part in parts
         )
         or any(
@@ -289,7 +331,7 @@ def _validate_zip_path(name: str) -> tuple[str, tuple[str, ...]]:
             or part in {".", ".."}
             or len(part) > _MAX_ZIP_SEGMENT_LENGTH
             or len(part.encode("utf-8")) > _MAX_ZIP_SEGMENT_LENGTH
-            or any(unicodedata.category(char) == "Cc" for char in part)
+            or any(unicodedata.category(char) in {"Cc", "Cf"} for char in part)
             for part in original_parts
         )
     ):
@@ -353,6 +395,7 @@ def _validate_raw_zip(data: bytes) -> tuple[list[_RawZipEntry], bytes]:
     entries: list[_RawZipEntry] = []
     seen_paths: set[str] = set()
     file_paths: set[str] = set()
+    directory_paths: set[str] = set()
     parent_paths: set[str] = set()
     cursor = central_offset
     expanded = 0
@@ -390,10 +433,11 @@ def _validate_raw_zip(data: bytes) -> tuple[list[_RawZipEntry], bytes]:
             _DEFLATE_OPTION_FLAGS if method == zipfile.ZIP_DEFLATED else 0
         )
         mode = (external_attr >> 16) & 0xFFFF
+        mode_type = stat.S_IFMT(mode)
+        is_directory = mode_type == stat.S_IFDIR
         if (
             signature != _CENTRAL_SIGNATURE
             or version_needed >= 45
-            or (version_made & 0xFF) >= 45
             or flags & ~allowed_flags
             or method not in _ALLOWED_COMPRESSION
             or disk_start != 0
@@ -407,19 +451,34 @@ def _validate_raw_zip(data: bytes) -> tuple[list[_RawZipEntry], bytes]:
                 and uncompressed_size / max(1, compressed_size) > _MAX_ZIP_RATIO
             )
             or (method == zipfile.ZIP_STORED and compressed_size != uncompressed_size)
-            or stat.S_IFMT(mode) not in {0, stat.S_IFREG}
+            or mode_type not in {0, stat.S_IFREG, stat.S_IFDIR}
+            or (
+                is_directory
+                and (
+                    method != zipfile.ZIP_STORED
+                    or flags & 0x0008
+                    or crc32 != 0
+                    or compressed_size != 0
+                    or uncompressed_size != 0
+                )
+            )
         ):
             raise _SafeFailure()
         _reject_zip64_extra(extra)
         name = _decode_zip_name(name_bytes, flags)
-        folded, parts = _validate_zip_path(name)
+        folded, parts = _validate_zip_path(name, is_directory=is_directory)
         if folded in seen_paths:
             raise _SafeFailure()
         parents = tuple("/".join(parts[:index]).casefold() for index in range(1, len(parts)))
-        if any(parent in file_paths for parent in parents) or folded in parent_paths:
+        if any(parent in file_paths for parent in parents):
             raise _SafeFailure()
+        if is_directory:
+            directory_paths.add(folded)
+        else:
+            if folded in directory_paths or folded in parent_paths:
+                raise _SafeFailure()
+            file_paths.add(folded)
         seen_paths.add(folded)
-        file_paths.add(folded)
         parent_paths.update(parents)
         expanded += uncompressed_size
         if (
@@ -446,6 +505,7 @@ def _validate_raw_zip(data: bytes) -> tuple[list[_RawZipEntry], bytes]:
                 local_offset=local_offset,
                 central_extra=extra,
                 central_comment=comment,
+                is_directory=is_directory,
             )
         )
         cursor = entry_end
@@ -528,8 +588,13 @@ def _safe_zip_members(data: bytes) -> dict[str, bytes]:
                     or info.volume != raw.disk_start
                     or info.extra != raw.central_extra
                     or info.comment != raw.central_comment
+                    or info.is_dir() != raw.is_directory
                 ):
                     raise _SafeFailure()
+                if raw.is_directory:
+                    if raw.content:
+                        raise _SafeFailure()
+                    continue
                 with archive.open(info, "r") as member:
                     content = member.read(_MAX_ZIP_ENTRY_BYTES + 1)
                     if member.read(1):
@@ -571,15 +636,18 @@ def _strict_utf8_xml(content: bytes, maximum: int) -> str:
     return text
 
 
-def _bounded_events(text: str):
+def _bounded_events(text: str, budget: _ParseBudget | None = None):
     depth = 0
-    elements = 0
+    active_budget = budget if budget is not None else _ParseBudget()
     try:
         for event, element in ET.iterparse(io.StringIO(text), events=("start", "end")):
             if event == "start":
                 depth += 1
-                elements += 1
-                if depth > _MAX_XML_DEPTH or elements > _MAX_XML_ELEMENTS:
+                active_budget.xml_elements += 1
+                if (
+                    depth > _MAX_XML_DEPTH
+                    or active_budget.xml_elements > _MAX_XML_ELEMENTS
+                ):
                     raise _SafeFailure()
             yield event, element, depth
             if event == "end":
@@ -592,7 +660,10 @@ def _bounded_events(text: str):
         raise _SafeFailure() from error
 
 
-def _parse_shared_strings(content: bytes) -> list[str]:
+def _parse_shared_strings(
+    content: bytes,
+    budget: _ParseBudget | None = None,
+) -> list[str]:
     text = _strict_utf8_xml(content, _MAX_SHARED_STRINGS_BYTES)
     shared: list[str] = []
     root_seen = False
@@ -600,7 +671,7 @@ def _parse_shared_strings(content: bytes) -> list[str]:
     current_depth = 0
     current_chars = 0
     total_chars = 0
-    for event, element, depth in _bounded_events(text):
+    for event, element, depth in _bounded_events(text, budget):
         if event == "start":
             if not root_seen:
                 if element.tag != f"{_NS}sst" or depth != 1:
@@ -642,6 +713,8 @@ def _cell_text(cell: ET.Element, shared: list[str]) -> str:
     value = cell.find(f"{_NS}v")
     text = value.text if value is not None else ""
     if cell_type == "s":
+        if not text:
+            return ""
         if _CANONICAL_SHARED_INDEX.fullmatch(text or "") is None:
             raise _SafeFailure()
         index = int(text)
@@ -665,8 +738,9 @@ def _row_cells(row: ET.Element, shared: list[str]) -> dict[int, str]:
     return result
 
 
-def _header_mapping(row: ET.Element, shared: list[str]) -> dict[str, int]:
-    cells = _row_cells(row, shared)
+def _inspect_header_cells(
+    cells: dict[int, str],
+) -> tuple[dict[str, int] | None, int, int]:
     aliases = {
         _normalize_header(alias): field
         for field, values in _SAFE_HEADERS.items()
@@ -674,40 +748,55 @@ def _header_mapping(row: ET.Element, shared: list[str]) -> dict[str, int]:
     }
     mapping: dict[str, int] = {}
     seen_headers: set[str] = set()
+    duplicate = False
+    unknown = 0
+    recognized = 0
+    nonempty = 0
     for column, raw_header in cells.items():
         header = _normalize_header(raw_header)
         if not header:
             continue
+        nonempty += 1
         if header in seen_headers:
-            raise _SafeFailure()
+            duplicate = True
+            continue
         seen_headers.add(header)
         field = aliases.get(header)
         if field is not None:
+            recognized += 1
             if field in mapping:
-                raise _SafeFailure()
+                duplicate = True
+                continue
             mapping[field] = column
             continue
         if header in _IGNORED_HEADERS or _REVIEW_HEADER.fullmatch(header):
+            recognized += 1
             continue
-        raise _SafeFailure()
-    if set(mapping) != set(_SAFE_HEADERS):
-        raise _SafeFailure()
-    return mapping
+        unknown += 1
+    if set(mapping) == set(_SAFE_HEADERS):
+        if duplicate or unknown:
+            raise _SafeFailure()
+        return mapping, nonempty, recognized
+    return None, nonempty, recognized
 
 
-def _parse_worksheet(content: bytes, shared: list[str]) -> list[dict[str, str]]:
+def _parse_worksheet(
+    content: bytes,
+    shared: list[str],
+    budget: _ParseBudget | None = None,
+) -> list[dict[str, str]] | None:
     text = _strict_utf8_xml(content, _MAX_WORKSHEET_BYTES)
+    active_budget = budget if budget is not None else _ParseBudget()
     root_seen = False
     sheet_data_depth: int | None = None
     sheet_data_count = 0
     row_depth: int | None = None
-    row_count = 0
-    total_cells = 0
+    worksheet_row_count = 0
     row_references: set[str] = set()
     mapping: dict[str, int] | None = None
     records: list[dict[str, str]] = []
     record_numbers: set[str] = set()
-    for event, element, depth in _bounded_events(text):
+    for event, element, depth in _bounded_events(text, active_budget):
         if event == "start":
             if not root_seen:
                 if element.tag != f"{_NS}worksheet" or depth != 1:
@@ -725,15 +814,16 @@ def _parse_worksheet(content: bytes, shared: list[str]) -> list[dict[str, str]]:
                     or row_depth is not None
                 ):
                     raise _SafeFailure()
-                row_count += 1
-                if row_count > _MAX_WORKSHEET_ROWS:
+                worksheet_row_count += 1
+                active_budget.worksheet_rows += 1
+                if active_budget.worksheet_rows > _MAX_WORKSHEET_ROWS:
                     raise _SafeFailure()
                 row_depth = depth
             elif element.tag == f"{_NS}c":
                 if row_depth is None or depth != row_depth + 1:
                     raise _SafeFailure()
-                total_cells += 1
-                if total_cells > _MAX_WORKSHEET_CELLS:
+                active_budget.worksheet_cells += 1
+                if active_budget.worksheet_cells > _MAX_WORKSHEET_CELLS:
                     raise _SafeFailure()
             continue
 
@@ -747,10 +837,18 @@ def _parse_worksheet(content: bytes, shared: list[str]) -> list[dict[str, str]]:
             if row_reference is None or row_reference in row_references:
                 raise _SafeFailure()
             row_references.add(row_reference)
+            values = _row_cells(element, shared)
             if mapping is None:
-                mapping = _header_mapping(element, shared)
+                if worksheet_row_count <= _MAX_HEADER_SCAN_ROWS:
+                    candidate, nonempty, recognized = _inspect_header_cells(values)
+                    if candidate is not None:
+                        mapping = candidate
+                    elif nonempty > 1 or recognized > 0:
+                        raise _SafeFailure()
             else:
-                values = _row_cells(element, shared)
+                candidate, _, _ = _inspect_header_cells(values)
+                if candidate is not None:
+                    raise _SafeFailure()
                 record = {
                     field: (
                         _javascript_trim(values.get(mapping[field], ""))
@@ -780,14 +878,11 @@ def _parse_worksheet(content: bytes, shared: list[str]) -> list[dict[str, str]]:
             element.clear()
         elif row_depth is None:
             element.clear()
-    if (
-        not root_seen
-        or sheet_data_count != 1
-        or sheet_data_depth is not None
-        or row_depth is not None
-        or mapping is None
-        or not records
-    ):
+    if not root_seen or sheet_data_count != 1 or sheet_data_depth is not None or row_depth is not None:
+        raise _SafeFailure()
+    if mapping is None:
+        return None
+    if not records:
         raise _SafeFailure()
     return records
 
@@ -804,12 +899,37 @@ def _javascript_trim(value: str) -> str:
 
 def _parse_records(data: bytes) -> list[dict[str, str]]:
     members = _safe_zip_members(data)
-    sheet_bytes = members.get("xl/worksheets/sheet1.xml")
-    if sheet_bytes is None:
+    worksheets = sorted(
+        (
+            (name, content)
+            for name, content in members.items()
+            if _WORKSHEET_MEMBER.fullmatch(name)
+        ),
+        key=lambda item: (unicodedata.normalize("NFC", item[0]).casefold(), item[0]),
+    )
+    if (
+        not worksheets
+        or len(worksheets) > _MAX_WORKSHEETS
+        or sum(len(content) for _, content in worksheets) > _MAX_WORKSHEET_TOTAL_BYTES
+    ):
         raise _SafeFailure()
+    budget = _ParseBudget()
     shared_bytes = members.get("xl/sharedStrings.xml")
-    shared = [] if shared_bytes is None else _parse_shared_strings(shared_bytes)
-    return _parse_worksheet(sheet_bytes, shared)
+    shared = (
+        []
+        if shared_bytes is None
+        else _parse_shared_strings(shared_bytes, budget)
+    )
+    candidates: list[list[dict[str, str]]] = []
+    for _, content in worksheets:
+        records = _parse_worksheet(content, shared, budget)
+        if records is not None:
+            candidates.append(records)
+            if len(candidates) > 1:
+                raise _SafeFailure()
+    if len(candidates) != 1:
+        raise _SafeFailure()
+    return candidates[0]
 
 
 def _merge_record_batches(
