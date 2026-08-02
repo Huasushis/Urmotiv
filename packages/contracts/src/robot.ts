@@ -57,7 +57,7 @@ export const claimRobotReviewTasksResponseSchema = z
 
 export const renewRobotReviewTaskInputSchema = z
   .object({
-    requestId: z.string().uuid().optional(),
+    requestId: z.string().uuid(),
     expectedLeaseExpiresAt: z.string().datetime(),
     leaseSeconds: z.number().int().min(30).max(1_800).default(300)
   })
@@ -69,7 +69,7 @@ export const renewRobotReviewTaskResponseSchema = z
 
 export const completeRobotReviewTaskInputSchema = z
   .object({
-    requestId: z.string().uuid().optional(),
+    requestId: z.string().uuid(),
     expectedLeaseExpiresAt: z.string().datetime(),
     expectedProblemRevision: z.number().int().positive(),
     experimentVersion: z.string().trim().min(1).max(120),

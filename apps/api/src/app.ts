@@ -1186,7 +1186,6 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       const identity = await requireRobot(request);
       const assignmentId = parseAssignmentId(request);
       const input = renewRobotReviewTaskInputSchema.parse(request.body ?? {});
-      const operationInput = { ...input, requestId: input.requestId ?? randomUUID() };
       const target = await robots.findAssignmentTarget(assignmentId, identity.userId);
       if (target === undefined) throw notFound();
       const payloadDigest = digestRobotOperationPayload({
@@ -1204,7 +1203,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
             identity,
             problem,
             assignmentId,
-            operationInput,
+            input,
             payloadDigest,
           );
         },
@@ -1220,7 +1219,6 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       const identity = await requireRobot(request);
       const assignmentId = parseAssignmentId(request);
       const input = completeRobotReviewTaskInputSchema.parse(request.body);
-      const operationInput = { ...input, requestId: input.requestId ?? randomUUID() };
       const target = await robots.findAssignmentTarget(assignmentId, identity.userId);
       if (target === undefined) throw notFound();
       const payloadDigest = digestRobotOperationPayload({
@@ -1247,7 +1245,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
             identity,
             problem,
             assignmentId,
-            operationInput,
+            input,
             payloadDigest,
           );
           if (prepared.kind !== "ready") return prepared;
@@ -1256,7 +1254,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
             prepared.prepared.user,
             problem.id,
             input.review,
-            operationInput.requestId,
+            input.requestId,
           );
           const result: RobotCompletionResult = {
             assignmentId,

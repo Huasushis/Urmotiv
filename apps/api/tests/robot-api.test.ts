@@ -1010,11 +1010,11 @@ describe("机器人审题接口", () => {
     }]);
   });
 
-  it("滚动升级期间兼容未带请求标识的旧 Fermata，且仍不重复写意见", async () => {
+  it("缺少请求标识的旧 Fermata 固定返回无效输入且不写操作或意见", async () => {
     const { app, database } = await makeRobotApp();
     await createPendingProblem(app);
     const task = await claimOne(app);
-    const renewed = await app.inject({
+    const renewal = await app.inject({
       method: "POST",
       url: `/api/v1/robot/review-tasks/${task.assignmentId}/renew`,
       headers: robotHeaders(),
@@ -1023,29 +1023,28 @@ describe("机器人审题接口", () => {
         leaseSeconds: 300,
       },
     });
-    expect(renewed.statusCode).toBe(200);
-    const renewedLease = (renewed.json() as { leaseExpiresAt: string }).leaseExpiresAt;
-    const legacyCompletion = completionPayload({ ...task, leaseExpiresAt: renewedLease });
+    expect(renewal.statusCode).toBe(422);
+    expect((renewal.json() as { error: { code: string } }).error.code).toBe("INVALID_INPUT");
+    const legacyCompletion = completionPayload(task);
     Reflect.deleteProperty(legacyCompletion, "requestId");
-    const completed = await app.inject({
+    const completion = await app.inject({
       method: "POST",
       url: `/api/v1/robot/review-tasks/${task.assignmentId}/complete`,
       headers: robotHeaders(),
       payload: legacyCompletion,
     });
-    expect(completed.statusCode).toBe(200);
+    expect(completion.statusCode).toBe(422);
+    expect((completion.json() as { error: { code: string } }).error.code).toBe("INVALID_INPUT");
     const effects = await database.query<{
       operations: number | string;
       opinions: number | string;
-      generated_ids: number | string;
     }>(sql`
       SELECT count(*)::integer AS operations,
-             (SELECT count(*)::integer FROM review_opinions) AS opinions,
-             count(request_id)::integer AS generated_ids
+             (SELECT count(*)::integer FROM review_opinions) AS opinions
       FROM review_assignment_operations
       WHERE assignment_id = ${task.assignmentId}::uuid
     `);
-    expect(effects).toEqual([{ operations: 2, opinions: 1, generated_ids: 2 }]);
+    expect(effects).toEqual([{ operations: 0, opinions: 0 }]);
   });
 
   it("领取后失去具体题目的审题或查看权限时，续租和完成都按不存在处理", async () => {
