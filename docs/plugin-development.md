@@ -400,13 +400,19 @@ interface ProblemFormatAdapter {
 registry.registerProblemFormatAdapter(myFormatAdapter);
 ```
 
+这段是注册接口的目标用法，不代表现有 Hydro 适配器已经这样接线。当前
+`packages/jobs/src/problem-package-handlers.ts` 仍直接导入 Hydro 适配器并放进固定映射，管理后台的启停状态
+不会改变题目包运行时；详见[插件规范](plugins.md)第 4.5 节和
+[OJ 题目包兼容性文档](oj-compatibility.md)第 3 节。
+
 `registerProblemFormatAdapter` 会校验 `id`/`displayName`/`version`/`inputKind`，并确认 `detect`/`inspect`/`import`/
 `validateExport`/`export` 都是函数。但格式适配器几乎不可能只靠 `@urmotiv/plugin-sdk` 写完——
 `ArchiveSummary`/`SafeArchive`/`CanonicalProblem`/`LossReport` 这些类型和构造它们要用到的运行时校验都在
 `@urmotiv/problem-package` 包里，你的插件需要直接依赖它（`plugins/hydro-format/package.json` 就同时依赖
 了 `@urmotiv/plugin-sdk` 和 `@urmotiv/problem-package`）。`plugins/hydro-format/` 是仓库里唯一一个完整
-实现（含 Markdown/YAML 解析、真实样例测试），写格式适配器请直接照着它抄，并遵守
-[problem-package.md](problem-package.md) 第 9 节的测试清单，不要凭空造字段。
+实现（含 Markdown/YAML 解析和人工合成夹具测试），可作为实现结构参考；它的夹具不是 Hydro 真实导出样例，
+也不证明外部互操作。写格式适配器还要遵守 [problem-package.md](problem-package.md) 第 9 节的测试清单和
+[OJ 题目包兼容性文档](oj-compatibility.md)的证据边界，不要凭空造字段。
 
 ### 6.4 后台任务类型与前端扩展位：现在能在哪声明
 

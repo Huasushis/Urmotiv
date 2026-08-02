@@ -1,8 +1,9 @@
 # OJ 题目包兼容性与证据边界
 
 本文记录 Urmotiv 原生题目包、Hydro 题目包、FPS XML 和 Polygon 题目包的上游依据、
-当前接入状态及已知损失。核对日期为 **2026-08-02（UTC）**。外部格式会变化；实现前应把上游
-提交固定下来，并以对应提交的代码和格式文件重新核对，不能只凭本文或产品版本号猜测。
+当前接入状态及已知损失。核对日期为 **2026-08-02（UTC）**。本文及其中矩阵只是该日期的
+证据快照，不是运行时配置、兼容承诺或后续范围清单。外部格式会变化；实现前应把上游提交固定下来，
+并以对应提交的代码和格式文件重新核对，不能只凭本文或产品版本号猜测。
 
 下文的“适配器”是把某种 OJ 题目包与系统统一格式互相转换的组件。
 
@@ -22,7 +23,7 @@
 | 格式 | 可确认的格式依据与版本 | 上游或本站代码许可证 | 容器与题目数 | Urmotiv 当前状态 |
 | --- | --- | --- | --- | --- |
 | Urmotiv 原生 | 本仓库 `format: urmotiv-problem`、`formatVersion: 1`；适配器 `1.0.0` | 本仓库 MIT | 单题 ZIP；多选时另包一层下载 ZIP，不是原生多题格式 | **现已实现**；导入、导出、完整往返 |
-| Hydro | [官方格式页](https://docs.hydro.ac/docs/Hydro/user/problem-format)没有单独的格式版本号；当前适配器 `0.1.0` 固定核对上游提交 [`591dbd31c00ac54aa0381a85eed375c25f6bd829`](https://github.com/hydro-dev/Hydro/tree/591dbd31c00ac54aa0381a85eed375c25f6bd829)，内部来源标记为 `hydro-591dbd31-2026-07-25` | 当前上游 [`LICENSE`](https://github.com/hydro-dev/Hydro/blob/master/LICENSE) 和根 [`package.json`](https://github.com/hydro-dev/Hydro/blob/master/package.json) 标为 AGPL-3.0-only；不据此推断题目内容许可证 | ZIP；官方目录图允许出现多个题目目录，当前适配器只接收其中恰好一题 | **现已实现但为受限子集**；有合成测试样例的往返测试，尚无获许可的上游真实导出样例证据 |
+| Hydro | [官方格式页](https://docs.hydro.ac/docs/Hydro/user/problem-format)没有单独的格式版本号；当前适配器 `0.1.0` 固定核对上游提交 [`591dbd31c00ac54aa0381a85eed375c25f6bd829`](https://github.com/hydro-dev/Hydro/tree/591dbd31c00ac54aa0381a85eed375c25f6bd829)，内部来源标记为 `hydro-591dbd31-2026-07-25` | 固定提交的根 [`LICENSE`](https://github.com/hydro-dev/Hydro/blob/591dbd31c00ac54aa0381a85eed375c25f6bd829/LICENSE) 和 [`package.json`](https://github.com/hydro-dev/Hydro/blob/591dbd31c00ac54aa0381a85eed375c25f6bd829/package.json) 标为 AGPL-3.0-only；不据此推断题目内容许可证 | ZIP；官方目录图允许出现多个题目目录，当前适配器只接收其中恰好一题 | **现已实现但为受限子集**；只有人工构造的合成夹具往返测试，尚无获许可的上游真实导出样例证据 |
 | FPS XML | 上游把 [`fps.current.dtd`](https://github.com/zhblue/freeproblemset/blob/master/fps.current.dtd)称为最新定义；DTD（XML 的结构约束文件）的 `fps@version` 只是可选文本，没有枚举或语义版本约束，也没有已确认的正式发布标签 | 上游仓库 LGPL-3.0；[README](https://github.com/zhblue/freeproblemset)另行说明“准确兼容”不限制实现软件许可证，修改或衍生格式则有 LGPL 和开源实现要求 | 单个 XML；根元素允许 `item*`，所以可含零到多题 | **仅传输基础**；严格 UTF-8 原始 `.xml` 可安全进入适配器层，但没有 FPS 语义适配器，不能导入、导出或往返 |
 | Polygon | 官方站当前显示 `Polygon 0.2-r3280`；这是平台修订号，不是题目包结构版本。官方 [API 文档](https://codeforces.github.io/polygon-misc/API)持续更新，但没有给题目包声明独立版本号 | 官方站声明版权；官方 [`Codeforces/polygon-misc`](https://github.com/Codeforces/polygon-misc)仓库未提供可确认的开源许可证，不能推定可复制样例或包内容 | 每道题下载一个 ZIP；另有单题 `problem.xml` 和比赛 `contest.xml` 描述文件 | **计划**；没有生产适配器、导入、导出或往返测试 |
 
@@ -35,12 +36,18 @@
 生产题目包运行时目前只内置 `urmotiv` 和 `hydro` 两个适配器。原始 XML 分支只是统一传输能力；测试中的
 假 FPS 适配器只证明字节能被送入和送出，不能证明 FPS 字段已被解析。
 
+这里的“内置”描述当前硬编码接线：`packages/jobs/src/problem-package-handlers.ts` 直接把 Hydro 适配器放入
+`builtinProblemPackageAdapters`。管理后台虽然登记了同名内置插件，但题目包运行时尚未读取它的启停状态；
+所以目前停用 `org.ustc.urmotiv.hydro-format` **不会**关闭 Hydro 的识别、导入或导出。该状态不是期望的
+插件开关语义，也不能把下表当作可执行配置。实现边界另见[插件规范](plugins.md)和
+[Hydro 适配器说明](../plugins/hydro-format/README.md)。
+
 | 能力 | Urmotiv 原生 | Hydro | FPS XML | Polygon |
 | --- | --- | --- | --- | --- |
 | 生产内置识别与预览 | 已实现 | 已实现，且明确拒绝多题包 | 未实现 | 未实现 |
 | 导入统一结构 | 已实现 | 已实现受限子集 | 未实现 | 未实现 |
 | 从统一结构导出 | 已实现 | 已实现受限子集，并先生成丢失报告 | 未实现 | 未实现 |
-| 自动化往返 | 完整统一结构合成测试样例 | 支持交集的合成测试样例 | 无；只有原始 XML 传输测试 | 无 |
+| 自动化往返 | 完整统一结构的人工合成夹具 | 支持交集的人工合成夹具 | 无；只有原始 XML 传输测试 | 无 |
 | 与外部实现互相导入的证据 | 本站自有格式，不适用 | 尚缺获明确许可的官方或上游真实导出样例 | 无 | 无 |
 | 单次导入多题 | 不支持 | 不支持 | 格式本身允许，但当前任务模型不支持 | 不支持 |
 | 多题导出 | 外层 ZIP 内放多个单题包 | 外层 ZIP 内放多个单题包 | 将来若实现，单题 XML 可直接放入外层 ZIP | 未实现 |
@@ -55,8 +62,8 @@
 
 ## 4. 上游格式字段矩阵
 
-本节只比较一手来源能确认的**格式表达能力**，不代表 Urmotiv 已实现相应转换。“未见”表示在所列规范或
-官方接口中没有得到足够证据，不等于上游产品绝对没有该能力。
+本节只比较核对日期时一手来源能确认的**格式表达能力**，不代表 Urmotiv 已实现相应转换，也不是产品路线图
+或验收结果。“未见”表示在所列规范或官方接口中没有得到足够证据，不等于上游产品绝对没有该能力。
 
 | 字段或能力 | Urmotiv 原生 v1 | Hydro 上游格式 | FPS `fps.current.dtd` | Polygon 官方包/API |
 | --- | --- | --- | --- | --- |
@@ -120,6 +127,10 @@ Urmotiv 适配器固定核对提交 `591dbd31c00ac54aa0381a85eed375c25f6bd829` �
 - [`packages/ui-default/components/zipDownloader/index.ts`](https://github.com/hydro-dev/Hydro/blob/591dbd31c00ac54aa0381a85eed375c25f6bd829/packages/ui-default/components/zipDownloader/index.ts)
 - [`packages/common/types.ts`](https://github.com/hydro-dev/Hydro/blob/591dbd31c00ac54aa0381a85eed375c25f6bd829/packages/common/types.ts)
 
+同一固定提交的根 `LICENSE` 与 `package.json` 都标为 **AGPL-3.0-only**。这项结论只针对所核对提交，
+不从后续分支、商业发行方式或题目包内容反推许可证；本仓库的详细说明见
+[`plugins/hydro-format/LICENSE-NOTICE.md`](../plugins/hydro-format/LICENSE-NOTICE.md)。
+
 ### 6.2 已实现的交集
 
 当前适配器识别一个题目目录中的 `problem.yaml`、一份选定的 Markdown 题面、至多一份 Markdown 题解、
@@ -163,7 +174,7 @@ Hydro 题号、0 到 10 难度、原始题面、题面文件名、根目录和�
   请求也不传适配器专用的 `values` 选择字段，所以缺少来源类型的题目目前会停在 `choice`，无法由公开流程补选。
 - 资源会进入 `additional_file/`；题面引用必须由用户确认改成 Hydro 的 `file://文件名` 形式。
 
-因此 Hydro 当前只能称为**受限往返**。合成测试样例证明已支持交集在本实现内可以往返，但没有证明它与某个
+因此 Hydro 当前只能称为**受限往返**。人工构造的合成夹具证明已支持交集在本实现内可以往返，但没有证明它与某个
 真实 Hydro 部署的所有导入、导出变体互操作。补这种证据时只能使用独立创作的合成包，或内容许可证明确
 允许保存和再分发的上游样例。
 
@@ -295,5 +306,5 @@ Polygon 包可能包含脚本和平台相关可执行文件。导入端只能把
 - Hydro 适配器说明：[`plugins/hydro-format/README.md`](../plugins/hydro-format/README.md)
 - Hydro 适配器和显式损失规则：[`plugins/hydro-format/src/adapter.ts`](../plugins/hydro-format/src/adapter.ts)
 - Hydro 上游修订与 schema：[`plugins/hydro-format/src/schema.ts`](../plugins/hydro-format/src/schema.ts)
-- Hydro 合成测试样例往返测试：[`plugins/hydro-format/test/adapter.test.ts`](../plugins/hydro-format/test/adapter.test.ts)
+- Hydro 人工合成夹具往返测试：[`plugins/hydro-format/test/adapter.test.ts`](../plugins/hydro-format/test/adapter.test.ts)
 - 本仓库许可证：[`LICENSE`](../LICENSE)

@@ -1,6 +1,6 @@
 # Hydro 题目包格式适配器
 
-这个内置插件在 Urmotiv 的统一题目结构与 Hydro 题目包之间转换。它只处理单道题：导入时读取一个题目目录，导出时生成一个题目目录中的文件清单，外层后台任务再负责创建 ZIP 文件。
+这个内置插件在 Urmotiv 的统一题目结构与 Hydro 题目包之间转换。它只处理单道题：导入时读取一个题目目录，导出时生成一个题目目录中的文件清单，外层后台任务再负责创建 ZIP 文件。当前支持范围和外部互操作证据边界见 [OJ 题目包兼容性文档](../../docs/oj-compatibility.md)。
 
 ## 支持的 Hydro 文件
 
@@ -45,7 +45,13 @@ Hydro 不能直接表达的本站难度会报告为警告，不会擅自换算�
 
 所有 ZIP 路径、重复名、大小写冲突、符号链接、嵌套压缩包、压缩比例和文件数量由核心题目包组件在读取内容前检查。适配器还会拒绝不安全的 Hydro 文件名、未知目录层级、缺失的配置引用和无法明确归类的多题压缩包。失败只返回文件位置和简短原因，不返回题面、题解或测试数据内容。
 
-禁用插件后，已经导入题目的核心字段仍可读；仅 Hydro 来源扩展信息不会再用于格式转换。插件没有设置项、没有密钥，也不声明任何权限。
+已经导入题目的核心字段不依赖插件状态，始终仍可读取。插件没有设置项、没有密钥，也不声明任何权限。
+
+当前还有一项必须明确的接线限制：`packages/jobs/src/problem-package-handlers.ts` 通过
+`builtinProblemPackageAdapters` 直接导入本适配器，没有读取管理后台中的插件启停状态。因此目前在后台停用
+`org.ustc.urmotiv.hydro-format` **不会**关闭 Hydro 识别、导入、导出，也不会停止使用 Hydro 来源扩展信息。
+这是当前实现缺口，不是插件开关应有的最终语义；接线修复前不能把“已停用”当作运行时隔离措施。通用插件设计
+与这项现状的区别见[插件规范](../../docs/plugins.md)。
 
 ## 格式依据与许可证
 
@@ -55,6 +61,6 @@ Hydro 不能直接表达的本站难度会报告为警告，不会擅自换算�
 - `packages/ui-default/components/zipDownloader/index.ts` 的网页下载文件布局；
 - `packages/common/types.ts` 的 `ProblemConfigFile` 字段。
 
-Hydro 仓库采用 **AGPL-3.0-or-later OR Proprietary**。本插件没有复制 Hydro 的源代码、题目、测试数据或资源文件；这里只根据公开格式行为编写独立实现。使用者如计划复制、修改或分发 Hydro 本身的代码，应自行遵守 Hydro 的许可证。
+在上述固定提交中，根 [`LICENSE`](https://github.com/hydro-dev/Hydro/blob/591dbd31c00ac54aa0381a85eed375c25f6bd829/LICENSE) 和 [`package.json`](https://github.com/hydro-dev/Hydro/blob/591dbd31c00ac54aa0381a85eed375c25f6bd829/package.json) 均把 Hydro 代码标为 **AGPL-3.0-only**。本插件没有复制 Hydro 的源代码、题目、测试数据或资源文件；这里只根据公开格式行为编写独立实现。使用者如计划复制、修改或分发 Hydro 本身的代码，应自行遵守 Hydro 的许可证。许可证与内容授权边界另见 [`LICENSE-NOTICE.md`](LICENSE-NOTICE.md)。
 
-`test/fixtures.ts` 中的题目、题面、数据点和程序文本均为人工构造的最小公开测试夹具，不来自任何 OJ 或协会资料。
+当前自动化测试证据只有 `test/fixtures.ts` 中人工构造的最小公开合成夹具；其中题目、题面、数据点和程序文本不来自任何 OJ 或协会资料，不能称为 Hydro 真实导出样例或外部互操作证据。

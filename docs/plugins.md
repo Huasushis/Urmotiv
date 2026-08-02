@@ -120,6 +120,12 @@ interface ReviewDecisionRule {
 格式适配器遵循 [problem-package.md](problem-package.md) 的统一接口。插件可注册自己的后台任务类型，
 但任务参数必须校验、可取消、可重复执行且不会重复产生数据。
 
+**当前实现例外（2026-08-02）：** Hydro 适配器尚未通过启用后的插件注册表进入题目包运行时；
+`packages/jobs/src/problem-package-handlers.ts` 直接把它放进固定适配器映射。因此管理后台停用
+`org.ustc.urmotiv.hydro-format` 目前不影响 Hydro 的识别、导入或导出。这里描述的是已知接线缺口，
+不能据此放宽上面的目标语义，也不能把停用状态当成隔离措施。当前格式矩阵和证据边界见
+[OJ 题目包兼容性文档](oj-compatibility.md)。
+
 ## 5. 数据库使用
 
 插件如需保存数据，必须声明独立数据库命名空间和迁移：
