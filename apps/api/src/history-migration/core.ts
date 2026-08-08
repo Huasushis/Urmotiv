@@ -1,9 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, rename, rm, rmdir } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { lstat, mkdir, rm } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { CanonicalProblem } from "@urmotiv/problem-package";
 import { urmotivNativeAdapter, writeZipArchive } from "@urmotiv/problem-package";
 import { z } from "zod";
+import {
+  type HistoryAttachmentMappingCapability,
+  revalidateHistoryAttachmentMappingCapability,
+} from "./attachment-mapping";
 import { candidateContentDigest, sha256Hex, sourceMappingDigest } from "./digests";
 import {
   HistoryMigrationError,
@@ -11,17 +15,19 @@ import {
   historyNormalizationFailureKinds,
   type HistoryNormalizationFailureKind,
 } from "./errors";
+import { assertHistoryMaterializationComplete } from "./grouping-workflow";
 import {
   assertPathsInsidePrivateRoot,
   assertPrivateDirectoryMode,
   assertPrivateFileMode,
   assertNewOutputPath,
   createNewPrivateDirectory,
+  openVerifiedPrivateOutputWriter,
+  type VerifiedPrivateOutputWriter,
   readConfirmedSource,
   readPrivateJson,
   readPrivateJsonWithDigest,
   movePrivateFileNoReplace,
-  writeNewPrivateFile,
   writeNewPrivateJson,
 } from "./private-files";
 import {
@@ -150,14 +156,25 @@ export interface PrepareHistoryCandidatesOptions {
 
 export interface PackageApprovedCandidatesOptions {
   readonly privateRootDirectory: string;
-  readonly sourceDirectory: string;
+  readonly materializedDirectory: string;
   readonly metadataFile: string;
-  readonly sourceConfirmationFile: string;
   readonly preparedDirectory: string;
   readonly approvalFile: string;
   readonly outputDirectory: string;
   readonly authorMappingOutput: string;
+  readonly attachmentMappingCapability: HistoryAttachmentMappingCapability;
   readonly exportedAt?: string;
+  /**
+   * 只供确定性测试注入的挂钩。真实调用方不要传这些函数。
+   */
+  readonly testingHooks?: {
+    /** 物化核对通过之后、发布任何最终输出之前的最终复核之前触发。 */
+    readonly afterMaterializationVerified?: () => Promise<void>;
+    /** 最终复核通过之后、创建输出目录之前触发。 */
+    readonly afterFinalOutputRecheck?: () => Promise<void>;
+    /** 全部最终输出（不含 PACKAGE_COMPLETE）发布之后、最终复核之前触发。 */
+    readonly afterFinalOutputsPublished?: () => Promise<void>;
+  };
 }
 
 export interface PrepareHistoryCandidatesResult {
@@ -215,7 +232,7 @@ export async function prepareHistoryCandidates(
   ]);
   const { confirmedSources } = await loadConfirmedInputs(
     options.metadataFile,
-    options.sourceConfirmationFile,
+    await readPrivateJson(options.sourceConfirmationFile),
   );
   const operationTagSha256 = sha256Hex(operationTag);
   const inputBatchSha256 = sha256Hex(
@@ -878,20 +895,43 @@ export async function packageApprovedCandidates(
   options: PackageApprovedCandidatesOptions,
 ): Promise<PackageApprovedCandidatesResult> {
   await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
-    { path: options.sourceDirectory, kind: "existing" },
+    { path: options.materializedDirectory, kind: "existing" },
     { path: options.metadataFile, kind: "existing" },
-    { path: options.sourceConfirmationFile, kind: "existing" },
     { path: options.preparedDirectory, kind: "existing" },
     { path: options.approvalFile, kind: "existing" },
     { path: options.outputDirectory, kind: "new" },
     { path: options.authorMappingOutput, kind: "new" },
   ]);
   assertSeparateAuthorMappingPath(options.outputDirectory, options.authorMappingOutput);
+
+  const materialization = await assertHistoryMaterializationComplete({
+    privateRootDirectory: options.privateRootDirectory,
+    materializedDirectory: options.materializedDirectory,
+  });
+  const attachmentCapability = await revalidateHistoryAttachmentMappingCapability(
+    options.attachmentMappingCapability,
+    {
+      privateRootDirectory: options.privateRootDirectory,
+      metadataFile: options.metadataFile,
+    },
+  );
+  if (attachmentCapability.groupingBatchSha256 !== materialization.groupingBatchSha256) {
+    throw new HistoryMigrationError(
+      "ATTACHMENT_MAPPING_CHANGED",
+      "附件映射与本次可信物化结果不属于同一个已确认题目分组批次。",
+    );
+  }
+  if (attachmentCapability.attachmentCount > 0) {
+    throw new HistoryMigrationError(
+      "ATTACHMENT_PACKAGING_UNAVAILABLE",
+      "本批次含已确认附件；附件字节物化和题面引用改写接线完成前不能生成题目包。",
+    );
+  }
   await assertNewOutputPath(options.authorMappingOutput);
 
   const { confirmedSources } = await loadConfirmedInputs(
     options.metadataFile,
-    options.sourceConfirmationFile,
+    await materialization.readSourceConfirmation(),
   );
   const sourcesById = new Map(confirmedSources.map((source) => [source.sourceId, source] as const));
   const approvals = parsePrivateInput(
@@ -939,8 +979,7 @@ export async function packageApprovedCandidates(
         `${approval.candidateId} 对应的源文件映射已经变化，必须重新准备候选。`,
       );
     }
-    await readConfirmedSource(
-      options.sourceDirectory,
+    await materialization.readConfirmedSource(
       source.mapping.sourcePath,
       source.mapping.sourceSha256,
       source.sourceId,
@@ -969,13 +1008,23 @@ export async function packageApprovedCandidates(
     confirmedSources,
   );
 
+  await options.testingHooks?.afterMaterializationVerified?.();
+  await materialization.assertUnchangedBeforePublish();
+  await options.testingHooks?.afterFinalOutputRecheck?.();
+
   await createNewPrivateDirectory(options.outputDirectory);
-  const stagingDirectory = join(options.outputDirectory, `.incomplete-${randomUUID()}`);
+  const packagesDirectory = join(options.outputDirectory, "packages");
   let authorMappingWritten = false;
+  let authorMappingWriter: VerifiedPrivateOutputWriter | undefined;
+  let packagesWriter: VerifiedPrivateOutputWriter | undefined;
+  let outputWriter: VerifiedPrivateOutputWriter | undefined;
   try {
-    await mkdir(stagingDirectory, { recursive: false, mode: 0o700 });
-    const packageDirectory = join(stagingDirectory, "packages");
-    await mkdir(packageDirectory, { recursive: false, mode: 0o700 });
+    await mkdir(packagesDirectory, { recursive: false, mode: 0o700 });
+    outputWriter = await openVerifiedPrivateOutputWriter(options.outputDirectory);
+    packagesWriter = await openVerifiedPrivateOutputWriter(packagesDirectory);
+    authorMappingWriter = await openVerifiedPrivateOutputWriter(
+      dirname(options.authorMappingOutput),
+    );
 
     const packageReport: Array<{
       readonly candidateId: string;
@@ -1000,10 +1049,7 @@ export async function packageApprovedCandidates(
       }
       const archive = writeZipArchive(generated.files);
       const packageSha256 = sha256Hex(archive);
-      await writeNewPrivateFile(
-        join(packageDirectory, `${approved.record.candidateId}.zip`),
-        archive,
-      );
+      await packagesWriter.writeNewFile(`${approved.record.candidateId}.zip`, archive);
       packageReport.push({
         candidateId: approved.record.candidateId,
         contentSha256: approved.record.contentSha256,
@@ -1027,35 +1073,46 @@ export async function packageApprovedCandidates(
         packages: packageReport,
       }),
     );
-    await writeNewPrivateJson(join(stagingDirectory, "report.json"), {
+    await outputWriter.writeNewJson("report.json", {
       version: 1,
       phase: "package",
       batchSha256,
       packageCount: packageReport.length,
       packages: packageReport,
     });
-    await writeNewPrivateJson(join(stagingDirectory, "PACKAGE_COMPLETE"), {
-      version: 1,
-      phase: "package",
-      batchSha256,
-      packageCount: packageReport.length,
-    });
-    await rename(join(stagingDirectory, "packages"), join(options.outputDirectory, "packages"));
-    await rename(
-      join(stagingDirectory, "report.json"),
-      join(options.outputDirectory, "report.json"),
-    );
-    await writeNewPrivateJson(options.authorMappingOutput, {
+    await authorMappingWriter.writeNewJson(basename(options.authorMappingOutput), {
       version: 1,
       batchSha256,
       records: authorMappings,
     });
     authorMappingWritten = true;
-    await rename(
-      join(stagingDirectory, "PACKAGE_COMPLETE"),
-      join(options.outputDirectory, "PACKAGE_COMPLETE"),
-    );
-    await rmdir(stagingDirectory);
+
+    await options.testingHooks?.afterFinalOutputsPublished?.();
+
+    // 最终复核 PASS 点：PACKAGE_COMPLETE 发布前复核全部已发布输出；任何文件
+    // 被替换、改写或 chmod 过（包括还原后，ctimeNs 仍会变化）都会失败，
+    // 由下方 catch 删除全部部分输出。
+    await packagesWriter.assertAllPublishedUnchanged();
+    await outputWriter.assertAllPublishedUnchanged();
+    await authorMappingWriter.assertAllPublishedUnchanged();
+    // 完成标记必须最后发布。
+    await outputWriter.writeNewJson("PACKAGE_COMPLETE", {
+      version: 1,
+      phase: "package",
+      batchSha256,
+      packageCount: packageReport.length,
+    });
+    // 返回前的最终 PASS 点：连同 PACKAGE_COMPLETE 一起复核，并复核输入的
+    // 物化目录公开路径身份（close 内部完成）。
+    await outputWriter.assertAllPublishedUnchanged();
+
+    await authorMappingWriter.close();
+    authorMappingWriter = undefined;
+    await packagesWriter.close();
+    packagesWriter = undefined;
+    await outputWriter.close();
+    outputWriter = undefined;
+    await materialization.close();
 
     return {
       packageCount: packageReport.length,
@@ -1067,12 +1124,17 @@ export async function packageApprovedCandidates(
       await rm(options.authorMappingOutput, { force: true }).catch(() => undefined);
     }
     throw error;
+  } finally {
+    await authorMappingWriter?.close().catch(() => undefined);
+    await packagesWriter?.close().catch(() => undefined);
+    await outputWriter?.close().catch(() => undefined);
+    await materialization.close().catch(() => undefined);
   }
 }
 
 async function loadConfirmedInputs(
   metadataFile: string,
-  sourceConfirmationFile: string,
+  sourceConfirmationInput: unknown,
 ): Promise<{
   readonly confirmedSources: readonly ConfirmedSource[];
 }> {
@@ -1085,7 +1147,7 @@ async function loadConfirmedInputs(
   );
   const sourceConfirmation = parsePrivateInput(
     historySourceMappingSchema,
-    await readPrivateJson(sourceConfirmationFile),
+    sourceConfirmationInput,
     "INVALID_SOURCE_CONFIRMATION",
     "源文件映射确认格式不正确或没有明确确认。",
   );

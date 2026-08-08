@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   copyFile,
   chmod,
+  chown,
   mkdtemp,
   mkdir,
   readFile,
@@ -17,14 +18,23 @@ import { tmpdir } from "node:os";
 import { readZipArchive, urmotivNativeAdapter } from "@urmotiv/problem-package";
 import {
   createLlmHistoryNormalizer,
+  assertHistoryAttachmentMappingComplete,
+  initializeHistoryAttachmentMappingWorksheet,
+  inventoryHistorySources,
   historyMetadataFileSchema,
   historySourceMappingSchema,
   HistoryNormalizationError,
   packageApprovedCandidates,
   prepareHistoryCandidates,
+  sealHistoryAttachmentMapping,
+  sealHistoryGrouping,
   sha256Hex,
+  writeHistoryGroupingConfirmation,
+  type HistoryAttachmentMappingCapability,
   type HistoryCandidateRecord,
+  type HistoryGroupingPlan,
   type HistoryNormalizer,
+  type HistorySourceLocations,
   type NormalizedHistoryOutput,
 } from "../src/history-migration/index";
 
@@ -931,6 +941,86 @@ describe("历史题目迁移安全核心", () => {
     expect(authorMap.records[0]?.packageSha256).toBe(report.packages[0]?.packageSha256);
   });
 
+  it("核心打包器重新验证附件能力，非零附件在第二阶段接线前固定硬失败", async () => {
+    const fixture = await createPreparedFixture();
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+    const attachmentMappingCapability = await createAttachmentMappingCapability({
+      root: fixture.root,
+      sourceDirectory: fixture.sourceDirectory,
+      metadataFile: fixture.prepareOptions.metadataFile,
+      includeAttachment: true,
+    });
+    await rewriteFixtureMaterializationBatch(fixture, attachmentMappingCapability);
+
+    await expect(
+      packageApprovedCandidates({
+        ...fixture.packageOptions,
+        attachmentMappingCapability,
+      }),
+    ).rejects.toMatchObject({ code: "ATTACHMENT_PACKAGING_UNAVAILABLE" });
+    await expect(stat(fixture.packageOutput)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(fixture.authorMappingOutput)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("核心打包器拒绝把同 metadata 的零附件能力跨 grouping 用于含附件物化批次", async () => {
+    const fixture = await createPreparedFixture();
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+    const zeroAttachmentCapability = fixture.packageOptions.attachmentMappingCapability;
+    const nonemptyOtherBatch = await createAttachmentMappingCapability({
+      root: fixture.root,
+      sourceDirectory: fixture.sourceDirectory,
+      metadataFile: fixture.prepareOptions.metadataFile,
+      includeAttachment: true,
+    });
+    await rewriteFixtureMaterializationBatch(fixture, nonemptyOtherBatch);
+
+    await expect(
+      packageApprovedCandidates({
+        ...fixture.packageOptions,
+        attachmentMappingCapability: zeroAttachmentCapability,
+      }),
+    ).rejects.toMatchObject({ code: "ATTACHMENT_MAPPING_CHANGED" });
+    await expect(stat(fixture.packageOutput)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(fixture.authorMappingOutput)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("核心打包器拒绝复制字段伪造的附件能力", async () => {
+    const fixture = await createPreparedFixture();
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+    const forgedCapability = {
+      ...fixture.packageOptions.attachmentMappingCapability,
+    } as HistoryAttachmentMappingCapability;
+
+    await expect(
+      packageApprovedCandidates({
+        ...fixture.packageOptions,
+        attachmentMappingCapability: forgedCapability,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_ATTACHMENT_MAPPING_CAPABILITY" });
+    await expect(stat(fixture.packageOutput)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(fixture.authorMappingOutput)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("附件能力签发后 grouping 确认变化时核心重新扫描并拒绝", async () => {
+    const fixture = await createPreparedFixture();
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+    await writeFile(
+      join(fixture.root, "attachment-gate-empty-grouping-confirmation.private.json"),
+      '{"changed":true}\n',
+      "utf8",
+    );
+
+    await expect(packageApprovedCandidates(fixture.packageOptions)).rejects.toMatchObject({
+      code: "INVALID_SOURCE_CONFIRMATION",
+    });
+    await expect(stat(fixture.packageOutput)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(fixture.authorMappingOutput)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("作者映射不能写进题目包输出目录", async () => {
     const fixture = await createPreparedFixture();
     const candidate = await readCandidate(fixture.prepareOutput);
@@ -1019,6 +1109,7 @@ describe("历史题目模型整理响应限制", () => {
 async function createFixture(sourceText: string): Promise<{
   readonly root: string;
   readonly sourceDirectory: string;
+  readonly materializedDirectory: string;
   readonly prepareOutput: string;
   readonly approvalFile: string;
   readonly packageOutput: string;
@@ -1040,21 +1131,24 @@ async function createFixture(sourceText: string): Promise<{
   };
   readonly packageOptions: {
     readonly privateRootDirectory: string;
-    readonly sourceDirectory: string;
+    readonly materializedDirectory: string;
     readonly metadataFile: string;
-    readonly sourceConfirmationFile: string;
     readonly preparedDirectory: string;
     readonly approvalFile: string;
     readonly outputDirectory: string;
     readonly authorMappingOutput: string;
+    readonly attachmentMappingCapability: HistoryAttachmentMappingCapability;
     readonly exportedAt: string;
   };
 }> {
   const root = await mkdtemp(join(tmpdir(), "urmotiv-history-migration-"));
   temporaryDirectories.push(root);
-  const sourceDirectory = join(root, "sources");
-  await mkdir(sourceDirectory);
+  const materializedDirectory = join(root, "materialized");
+  const sourceDirectory = join(materializedDirectory, "sources");
+  await mkdir(materializedDirectory, { mode: 0o700 });
+  await mkdir(sourceDirectory, { mode: 0o700 });
   await writeFile(join(sourceDirectory, syntheticSourceName), sourceText, "utf8");
+  await chmod(join(sourceDirectory, syntheticSourceName), 0o600);
 
   const metadataFile = join(root, "metadata.private.json");
   const metadataRecord = {
@@ -1073,35 +1167,27 @@ async function createFixture(sourceText: string): Promise<{
     2,
   )}\n`;
   await writeFile(metadataFile, metadataText, "utf8");
-  const sourceConfirmationFile = join(root, "source-confirmation.private.json");
-  await writeFile(
-    sourceConfirmationFile,
-    `${JSON.stringify(
-      {
-        version: 1,
-        confirmed: true,
-        metadataFileSha256: sha256Hex(metadataText),
-        mappings: [
-          {
-            sourcePath: syntheticSourceName,
-            sourceSha256: sha256Hex(sourceText),
-            metadataNumber: "synthetic-1",
-          },
-        ],
-      },
-      null,
-      2,
-    )}\n`,
-    "utf8",
-  );
+  const sourceConfirmationFile = join(materializedDirectory, "source-confirmation.private.json");
   const prepareOutput = join(root, "prepared");
   const approvalFile = join(root, "candidate-approval.private.json");
   const packageOutput = join(root, "packaged");
   const authorMappingOutput = join(root, "author-map.private.json");
+  const attachmentMappingCapability = await createAttachmentMappingCapability({
+    root,
+    sourceDirectory,
+    metadataFile,
+  });
+  await writeSyntheticMaterialization({
+    materializedDirectory,
+    sourceText,
+    metadataFileSha256: sha256Hex(metadataText),
+    groupingBatchSha256: attachmentMappingCapability.groupingBatchSha256,
+  });
 
   return {
     root,
     sourceDirectory,
+    materializedDirectory,
     prepareOutput,
     approvalFile,
     packageOutput,
@@ -1123,16 +1209,108 @@ async function createFixture(sourceText: string): Promise<{
     },
     packageOptions: {
       privateRootDirectory: root,
-      sourceDirectory,
+      materializedDirectory,
       metadataFile,
-      sourceConfirmationFile,
       preparedDirectory: prepareOutput,
       approvalFile,
       outputDirectory: packageOutput,
       authorMappingOutput,
+      attachmentMappingCapability,
       exportedAt: "2026-07-30T00:00:00.000Z",
     },
   };
+}
+
+async function writeSyntheticMaterialization(options: {
+  readonly materializedDirectory: string;
+  readonly sourceText: string;
+  readonly metadataFileSha256: string;
+  readonly groupingBatchSha256: string;
+}): Promise<void> {
+  const sourceSha256 = sha256Hex(options.sourceText);
+  const byteLength = new TextEncoder().encode(options.sourceText).byteLength;
+  const sourceConfirmation = {
+    version: 1,
+    confirmed: true,
+    metadataFileSha256: options.metadataFileSha256,
+    mappings: [
+      {
+        sourcePath: syntheticSourceName,
+        sourceSha256,
+        metadataNumber: "synthetic-1",
+      },
+    ],
+  };
+  const report = {
+    version: 2,
+    phase: "materialize",
+    sourceInventorySha256: "e".repeat(64),
+    groupingBatchSha256: options.groupingBatchSha256,
+    fragmentCount: 1,
+    sourceCount: 1,
+    unresolvedItemCount: 0,
+    sources: [
+      {
+        groupId: "group-000001",
+        sourceId: "source-000001",
+        sourceSha256,
+        fragmentCount: 1,
+        byteLength,
+        characterCount: options.sourceText.length,
+        status: "ready_for_prepare",
+      },
+    ],
+  };
+  const marker = {
+    version: 2,
+    phase: "materialize",
+    reportSha256: sha256Hex(JSON.stringify(report)),
+    sourceConfirmationSha256: sha256Hex(JSON.stringify(sourceConfirmation)),
+    sourceSetSha256: sha256Hex(
+      JSON.stringify({
+        version: 1,
+        sources: [{ sourceId: "source-000001", sourceSha256, byteLength }],
+      }),
+    ),
+    groupingBatchSha256: options.groupingBatchSha256,
+    sourceCount: 1,
+    fragmentCount: 1,
+    unresolvedItemCount: 0,
+  };
+  await writeFile(
+    join(options.materializedDirectory, "source-confirmation.private.json"),
+    `${JSON.stringify(sourceConfirmation, null, 2)}\n`,
+    "utf8",
+  );
+  await writeFile(
+    join(options.materializedDirectory, "report.json"),
+    `${JSON.stringify(report, null, 2)}\n`,
+    "utf8",
+  );
+  await writeFile(
+    join(options.materializedDirectory, "MATERIALIZE_COMPLETE"),
+    `${JSON.stringify(marker, null, 2)}\n`,
+    "utf8",
+  );
+  // 真实物化流程写出的私有文件都是 0600 且归当前用户；合成夹具必须一致，
+  // 否则稳定句柄读取会按不安全状态拒绝。
+  await chmod(join(options.materializedDirectory, "source-confirmation.private.json"), 0o600);
+  await chmod(join(options.materializedDirectory, "report.json"), 0o600);
+  await chmod(join(options.materializedDirectory, "MATERIALIZE_COMPLETE"), 0o600);
+}
+
+async function rewriteFixtureMaterializationBatch(
+  fixture: Awaited<ReturnType<typeof createFixture>>,
+  capability: HistoryAttachmentMappingCapability,
+): Promise<void> {
+  const sourceText = await readFile(join(fixture.sourceDirectory, syntheticSourceName), "utf8");
+  const metadataBytes = await readFile(fixture.prepareOptions.metadataFile);
+  await writeSyntheticMaterialization({
+    materializedDirectory: fixture.materializedDirectory,
+    sourceText,
+    metadataFileSha256: sha256Hex(metadataBytes),
+    groupingBatchSha256: capability.groupingBatchSha256,
+  });
 }
 
 async function createPreparedFixture(): Promise<Awaited<ReturnType<typeof createFixture>>> {
@@ -1142,6 +1320,180 @@ async function createPreparedFixture(): Promise<Awaited<ReturnType<typeof create
     normalizer: fixedNormalizer(),
   });
   return fixture;
+}
+
+async function createAttachmentMappingCapability(options: {
+  readonly root: string;
+  readonly sourceDirectory: string;
+  readonly metadataFile: string;
+  readonly includeAttachment?: boolean;
+}): Promise<HistoryAttachmentMappingCapability> {
+  const gatePrefix =
+    options.includeAttachment === true ? "attachment-gate-nonempty" : "attachment-gate-empty";
+  const gateSourceDirectory = join(options.root, `${gatePrefix}-sources`);
+  await mkdir(gateSourceDirectory, { mode: 0o700 });
+  const requestedGateText = await readFile(
+    join(options.sourceDirectory, syntheticSourceName),
+    "utf8",
+  );
+  await writeFile(
+    join(gateSourceDirectory, syntheticSourceName),
+    requestedGateText.length <= 500_000
+      ? requestedGateText
+      : "只用于超限反例的合成附件完成门短文本。",
+    "utf8",
+  );
+  if (options.includeAttachment === true) {
+    await writeFile(
+      join(gateSourceDirectory, "synthetic-preserved.bin"),
+      new Uint8Array([1, 2, 3, 4]),
+    );
+  }
+  const catalogDirectory = join(options.root, `${gatePrefix}-catalog`);
+  await inventoryHistorySources({
+    privateRootDirectory: options.root,
+    sourceDirectory: gateSourceDirectory,
+    outputDirectory: catalogDirectory,
+  });
+  const sourceInventoryFile = join(catalogDirectory, "inventory.json");
+  const sourceLocationsFile = join(catalogDirectory, "source-locations.private.json");
+  const locations = JSON.parse(
+    await readFile(sourceLocationsFile, "utf8"),
+  ) as HistorySourceLocations;
+  const source = locations.sources.find((item) => item.sourcePath === syntheticSourceName);
+  if (source === undefined) throw new Error("合成附件完成门缺少源文件。");
+  const manualSource = locations.sources.find(
+    (item) => item.sourcePath === "synthetic-preserved.bin",
+  );
+  const groupingPlan: HistoryGroupingPlan = {
+    version: 2,
+    fragments: [
+      {
+        fragmentId: "fragment-000001",
+        sourceId: source.sourceId,
+        selection: { kind: "whole_file" },
+      },
+    ],
+    groups: [
+      {
+        groupId: "group-000001",
+        metadataId: "metadata-000001",
+        fragmentIds: ["fragment-000001"],
+      },
+    ],
+    sharingConfirmations: [],
+    metadataDispositions: [],
+    zipEntryDispositions: [],
+    textRangeDispositions: [],
+    manualSourceDispositions:
+      manualSource === undefined
+        ? []
+        : [
+            {
+              sourceId: manualSource.sourceId,
+              action: "attachment",
+              reason: "人工确认合成二进制材料需要批次内部保全。",
+              confirmed: true,
+            },
+          ],
+  };
+  const groupingPlanFile = join(options.root, `${gatePrefix}-grouping-plan.private.json`);
+  await writeFile(groupingPlanFile, `${JSON.stringify(groupingPlan, null, 2)}\n`, "utf8");
+  await chmod(groupingPlanFile, 0o600);
+  const groupingDirectory = join(options.root, `${gatePrefix}-grouping`);
+  await sealHistoryGrouping({
+    privateRootDirectory: options.root,
+    sourceDirectory: gateSourceDirectory,
+    sourceInventoryFile,
+    sourceLocationsFile,
+    metadataFile: options.metadataFile,
+    groupingPlanFile,
+    outputDirectory: groupingDirectory,
+  });
+  const groupingConfirmationFile = join(
+    options.root,
+    `${gatePrefix}-grouping-confirmation.private.json`,
+  );
+  await writeHistoryGroupingConfirmation({
+    privateRootDirectory: options.root,
+    sourceInventoryFile,
+    sourceLocationsFile,
+    metadataFile: options.metadataFile,
+    groupingDirectory,
+    outputFile: groupingConfirmationFile,
+    confirmed: true,
+  });
+  const contextOptions = {
+    privateRootDirectory: options.root,
+    sourceDirectory: gateSourceDirectory,
+    sourceInventoryFile,
+    sourceLocationsFile,
+    metadataFile: options.metadataFile,
+    groupingDirectory,
+    groupingConfirmationFile,
+  };
+  const worksheetDirectory = join(options.root, `${gatePrefix}-worksheet`);
+  await initializeHistoryAttachmentMappingWorksheet({
+    ...contextOptions,
+    outputDirectory: worksheetDirectory,
+  });
+  const worksheet = JSON.parse(
+    await readFile(join(worksheetDirectory, "attachment-worksheet.json"), "utf8"),
+  ) as {
+    attachments: Array<{
+      attachmentId: string;
+      sourceBindingSha256: string;
+    }>;
+  };
+  const expectedAttachmentCount = options.includeAttachment === true ? 1 : 0;
+  if (worksheet.attachments.length !== expectedAttachmentCount) {
+    throw new Error("合成附件完成门的附件计数不正确。");
+  }
+  const mappingPlanFile = join(options.root, `${gatePrefix}-plan.private.json`);
+  const mappingItem = worksheet.attachments[0];
+  await writeFile(
+    mappingPlanFile,
+    `${JSON.stringify(
+      {
+        version: 1,
+        confirmed: true,
+        worksheetSha256: sha256Hex(JSON.stringify(worksheet)),
+        mappings:
+          mappingItem === undefined
+            ? []
+            : [
+                {
+                  attachmentId: mappingItem.attachmentId,
+                  sourceBindingSha256: mappingItem.sourceBindingSha256,
+                  status: "resolved",
+                  semanticRole: "authoring_material",
+                  visibility: "internal",
+                  scope: {
+                    kind: "batch_internal",
+                    targetName: `${mappingItem.attachmentId}.bin`,
+                  },
+                  reviewNote: "人工确认仅作合成批次内部保全。",
+                  confirmed: true,
+                },
+              ],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  await chmod(mappingPlanFile, 0o600);
+  const attachmentMappingDirectory = join(options.root, `${gatePrefix}-mapping`);
+  await sealHistoryAttachmentMapping({
+    ...contextOptions,
+    worksheetDirectory,
+    mappingPlanFile,
+    outputDirectory: attachmentMappingDirectory,
+  });
+  return assertHistoryAttachmentMappingComplete({
+    ...contextOptions,
+    attachmentMappingDirectory,
+  });
 }
 
 async function createMultiFixture(): Promise<Awaited<ReturnType<typeof createFixture>>> {
@@ -1279,3 +1631,147 @@ function deferred<T>(): {
   });
   return { promise, resolve };
 }
+
+/** 等待文件系统把 ctime 推进到同一时间刻度外，避免粗粒度文件系统合并两次操作。 */
+async function waitForCtimeTick(): Promise<void> {
+  await new Promise<void>((done) => setTimeout(done, 20));
+}
+
+describe("打包期目录与输出防替换（同用户负例）", () => {
+  const canTestForeignOwner = typeof process.geteuid === "function" && process.geteuid() === 0;
+
+  it("核对后、最终复核前替换整个物化目录时失败且不留下任何输出", async () => {
+    const fixture = await createPreparedFixture();
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+
+    await expect(
+      packageApprovedCandidates({
+        ...fixture.packageOptions,
+        testingHooks: {
+          async afterMaterializationVerified() {
+            await rename(fixture.materializedDirectory, `${fixture.materializedDirectory}-displaced`);
+            await mkdir(fixture.materializedDirectory, { mode: 0o700 });
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "GROUPING_CHANGED" });
+    await expect(stat(fixture.packageOutput)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(fixture.authorMappingOutput)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("核对后把已确认源文件换成同名同内容新文件时失败且不留下任何输出", async () => {
+    const fixture = await createPreparedFixture();
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+
+    await expect(
+      packageApprovedCandidates({
+        ...fixture.packageOptions,
+        testingHooks: {
+          async afterMaterializationVerified() {
+            const sourcePath = join(fixture.materializedDirectory, "sources", syntheticSourceName);
+            const text = await readFile(sourcePath, "utf8");
+            await rename(sourcePath, `${sourcePath}.displaced`);
+            await writeFile(sourcePath, text, "utf8");
+            await chmod(sourcePath, 0o600);
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "GROUPING_CHANGED" });
+    await expect(stat(fixture.packageOutput)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(fixture.authorMappingOutput)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("发布后、最终复核前把已发布题目包替换成同内容新文件时失败并清理全部输出", async () => {
+    const fixture = await createPreparedFixture();
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+
+    await expect(
+      packageApprovedCandidates({
+        ...fixture.packageOptions,
+        testingHooks: {
+          async afterFinalOutputsPublished() {
+            const packagePath = join(fixture.packageOutput, "packages", "candidate-000001.zip");
+            const bytes = await readFile(packagePath);
+            await rename(packagePath, `${packagePath}.displaced`);
+            await writeFile(packagePath, bytes);
+            await chmod(packagePath, 0o600);
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "GROUPING_CHANGED" });
+    await expect(stat(fixture.packageOutput)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(fixture.authorMappingOutput)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("发布后 chmod 再还原权限与内容的题目包仍因 ctime 变化被最终复核拒绝", async () => {
+    const fixture = await createPreparedFixture();
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+
+    await expect(
+      packageApprovedCandidates({
+        ...fixture.packageOptions,
+        testingHooks: {
+          async afterFinalOutputsPublished() {
+            const packagePath = join(fixture.packageOutput, "packages", "candidate-000001.zip");
+            await waitForCtimeTick();
+            await chmod(packagePath, 0o644);
+            await waitForCtimeTick();
+            await chmod(packagePath, 0o600);
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "GROUPING_CHANGED" });
+    await expect(stat(fixture.packageOutput)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(fixture.authorMappingOutput)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("最终复核后（打包中段）把物化目录换成伪造目录时失败且不留下任何输出", async () => {
+    const fixture = await createPreparedFixture();
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+
+    await expect(
+      packageApprovedCandidates({
+        ...fixture.packageOptions,
+        testingHooks: {
+          async afterFinalOutputRecheck() {
+            await rename(fixture.materializedDirectory, `${fixture.materializedDirectory}-displaced`);
+            await mkdir(fixture.materializedDirectory, { mode: 0o700 });
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "GROUPING_CHANGED" });
+    await expect(stat(fixture.packageOutput)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(fixture.authorMappingOutput)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.skipIf(!canTestForeignOwner)(
+    "root 下把已发布题目包 chown 给其他用户时最终复核失败并清理全部输出",
+    async () => {
+      const fixture = await createPreparedFixture();
+      const candidate = await readCandidate(fixture.prepareOutput);
+      await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+
+      await expect(
+        packageApprovedCandidates({
+          ...fixture.packageOptions,
+          testingHooks: {
+            async afterFinalOutputsPublished() {
+              await chown(
+                join(fixture.packageOutput, "packages", "candidate-000001.zip"),
+                65_534,
+                65_534,
+              );
+            },
+          },
+        }),
+      ).rejects.toMatchObject({ code: "GROUPING_CHANGED" });
+      await expect(stat(fixture.packageOutput)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(fixture.authorMappingOutput)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+});

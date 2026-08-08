@@ -28,10 +28,13 @@ import {
 import {
   assertNewOutputPath,
   assertPathsInsidePrivateRoot,
+  compareHeldSourcePaths,
   createNewPrivateDirectory,
   maximumHistorySourceBytes,
   maximumHistorySourceTextUnits,
   maximumPrivateJsonBytes,
+  openHeldVerifiedDirectoryAccess,
+  parseStablePrivateJson,
   readConfirmedSource,
   readPrivateJson,
   readPrivateJsonWithDigest,
@@ -528,6 +531,93 @@ export interface InitializeHistoryGroupingWorksheetOptions {
 export interface AssertHistoryMaterializationCompleteOptions {
   readonly privateRootDirectory: string;
   readonly materializedDirectory: string;
+}
+
+/** 只由完整 MATERIALIZE_COMPLETE 核对流程返回，供核心打包器固定输入路径和批次。 */
+export interface VerifiedHistoryMaterialization {
+  readonly materializedDirectory: string;
+  readonly sourceDirectory: string;
+  readonly sourceConfirmationFile: string;
+  readonly groupingBatchSha256: string;
+  /**
+   * 通过核对时持有的同一句柄重新读取源映射确认内容；不能重新解析公开路径。
+   * 内容或状态与核对时不一致会抛出 HistoryMigrationError。
+   */
+  readSourceConfirmation(): Promise<unknown>;
+  /**
+   * 通过核对时持有的同一句柄重新核对并读取源文件。内容摘要与安全编号不一致
+   * 时抛 SOURCE_DIGEST_MISMATCH；文件身份/权限/状态在核对后变化时抛
+   * GROUPING_CHANGED。
+   */
+  readConfirmedSource(
+    sourcePath: string,
+    expectedSha256: string,
+    sourceId: string,
+  ): Promise<{ readonly text: string; readonly sha256: string }>;
+  /**
+   * 发布任何最终输出之前的最终复核：通过公开路径重新检查物化目录身份，
+   * 并通过持有的句柄重新读取完成标记确认摘要未变。任何不一致都抛
+   * GROUPING_CHANGED。
+   */
+  assertUnchangedBeforePublish(): Promise<void>;
+  /** 关闭持有的目录句柄；关闭前再次比较公开路径身份。 */
+  close(): Promise<void>;
+}
+
+/**
+ * 附件映射阶段只通过这些安全定位符引用原资料。原路径仍留在
+ * source-locations.private.json，不能进入工作表、报告或命令行输出。
+ */
+export type HistoryAttachmentSourceLocator =
+  | {
+      readonly kind: "zip_entry";
+      readonly sourceId: string;
+      readonly entryId: string;
+    }
+  | {
+      readonly kind: "text_range";
+      readonly sourceId: string;
+      readonly start: number;
+      readonly end: number;
+    }
+  | {
+      readonly kind: "whole_file";
+      readonly sourceId: string;
+    };
+
+export interface VerifiedHistoryAttachmentCandidate {
+  readonly locator: HistoryAttachmentSourceLocator;
+  readonly sourceContentSha256: string;
+  readonly contentSha256: string;
+  readonly byteLength: number;
+  readonly sourceBindingSha256: string;
+}
+
+export interface VerifiedHistoryAttachmentContext {
+  readonly bindings: {
+    readonly sourceInventorySha256: string;
+    readonly sourceLocationsSha256: string;
+    readonly manualReviewSha256: string;
+    readonly metadataFileSha256: string;
+    readonly groupingSha256: string;
+    readonly groupingBatchSha256: string;
+    readonly groupingConfirmationSha256: string;
+  };
+  readonly groups: readonly {
+    readonly groupId: string;
+    readonly metadataId: string;
+  }[];
+  readonly attachments: readonly VerifiedHistoryAttachmentCandidate[];
+}
+
+export interface LoadVerifiedHistoryAttachmentContextOptions {
+  readonly privateRootDirectory: string;
+  readonly sourceDirectory: string;
+  readonly sourceInventoryFile: string;
+  readonly sourceLocationsFile: string;
+  readonly metadataFile: string;
+  readonly groupingDirectory: string;
+  readonly groupingConfirmationFile: string;
 }
 
 interface CatalogSourceLocation {
@@ -1233,95 +1323,335 @@ export async function initializeHistoryGroupingWorksheet(
 /** 在 prepare 发出任何模型请求前，重新核对物化标记、报告、映射和全部文本。 */
 export async function assertHistoryMaterializationComplete(
   options: AssertHistoryMaterializationCompleteOptions,
-): Promise<void> {
-  const sourceDirectory = join(options.materializedDirectory, "sources");
-  const reportFile = join(options.materializedDirectory, "report.json");
-  const sourceConfirmationFile = join(
-    options.materializedDirectory,
-    "source-confirmation.private.json",
-  );
-  const completeFile = join(options.materializedDirectory, "MATERIALIZE_COMPLETE");
+): Promise<VerifiedHistoryMaterialization> {
+  const materializedDirectory = resolve(options.materializedDirectory);
+  const sourceDirectory = join(materializedDirectory, "sources");
+  const sourceConfirmationFile = join(materializedDirectory, "source-confirmation.private.json");
   await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
-    { path: options.materializedDirectory, kind: "existing" },
+    { path: materializedDirectory, kind: "existing" },
     { path: sourceDirectory, kind: "existing" },
-    { path: reportFile, kind: "existing" },
     { path: sourceConfirmationFile, kind: "existing" },
-    { path: completeFile, kind: "existing" },
+    { path: join(materializedDirectory, "report.json"), kind: "existing" },
+    { path: join(materializedDirectory, "MATERIALIZE_COMPLETE"), kind: "existing" },
   ]);
-  const report = parsePrivateInput(
-    historyMaterializeReportSchema,
-    await readPrivateJson(reportFile),
-    "INVALID_GROUPING",
-    "物化目录的安全报告格式不正确。",
+
+  // 一次性取得稳定目录句柄：标记、报告、源映射确认和全部源文件都经同一组
+  // O_NOFOLLOW dirfd 读取，返回后调用方也继续通过这些句柄读取，不能重新按
+  // 公开路径解析输入。
+  const access = await openHeldVerifiedDirectoryAccess(materializedDirectory, "sources");
+  let closed = false;
+  const closeHandles = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await access.close().catch(() => undefined);
+  };
+  try {
+    const report = parsePrivateInput(
+      historyMaterializeReportSchema,
+      await access.readJson("report.json"),
+      "INVALID_GROUPING",
+      "物化目录的安全报告格式不正确。",
+    );
+    const sourceConfirmation = parsePrivateInput(
+      historySourceMappingSchema,
+      await access.readJson("source-confirmation.private.json"),
+      "INVALID_SOURCE_CONFIRMATION",
+      "物化目录的源映射确认格式不正确。",
+    );
+    const markerBytes = await access.readBytes("MATERIALIZE_COMPLETE", maximumPrivateJsonBytes);
+    const markerSha256 = sha256Hex(markerBytes);
+    const marker = parsePrivateInput(
+      historyMaterializeCompleteSchema,
+      parseStablePrivateJson(markerBytes),
+      "INVALID_GROUPING",
+      "物化目录没有可验证的完整完成标记。",
+    );
+    if (
+      report.sources.length !== sourceConfirmation.mappings.length ||
+      report.sourceCount !== report.sources.length ||
+      marker.sourceCount !== report.sourceCount ||
+      marker.fragmentCount !== report.fragmentCount ||
+      marker.groupingBatchSha256 !== report.groupingBatchSha256 ||
+      marker.reportSha256 !== sha256Hex(JSON.stringify(report)) ||
+      marker.sourceConfirmationSha256 !== sha256Hex(JSON.stringify(sourceConfirmation))
+    ) {
+      throw new HistoryMigrationError("GROUPING_CHANGED", "物化报告、源映射或完成标记已经不一致。");
+    }
+    const assertInputsUnchanged = async (): Promise<void> => {
+      try {
+        await access.assertPublicPathUnchanged();
+      } catch (error) {
+        if (error instanceof HistoryMigrationError) {
+          throw new HistoryMigrationError("GROUPING_CHANGED", "物化目录在打包前复核时身份或权限发生变化。");
+        }
+        throw error;
+      }
+      let latestMarker: Uint8Array;
+      try {
+        latestMarker = await access.readBytes("MATERIALIZE_COMPLETE", maximumPrivateJsonBytes);
+      } catch (error) {
+        if (error instanceof HistoryMigrationError) {
+          throw new HistoryMigrationError("GROUPING_CHANGED", "物化完成标记在打包前复核时无法读取或状态发生变化。");
+        }
+        throw error;
+      }
+      if (sha256Hex(latestMarker) !== markerSha256) {
+        throw new HistoryMigrationError("GROUPING_CHANGED", "物化完成标记在打包前复核时内容发生变化。");
+      }
+      // 核对后换成换掉任意已确认源文件（即使同名同内容）也必须在此暴露：通过持有
+      // 的同一句柄重新读取每个源，文件身份/状态与核对时不一致就抛 GROUPING_CHANGED。
+      for (const [index, mapping] of sourceConfirmation.mappings.entries()) {
+        try {
+          await access.readConfirmedSource(
+            mapping.sourcePath,
+            mapping.sourceSha256,
+            makeSafeId("source", index + 1),
+          );
+        } catch (error) {
+          if (error instanceof HistoryMigrationError) {
+            throw new HistoryMigrationError("GROUPING_CHANGED", "物化源文件在打包前复核时发生变化。");
+          }
+          throw error;
+        }
+      }
+    };
+
+    const actualSources: Array<{
+      readonly sourceId: string;
+      readonly sourceSha256: string;
+      readonly byteLength: number;
+    }> = [];
+    for (const [index, mapping] of sourceConfirmation.mappings.entries()) {
+      const sourceId = makeSafeId("source", index + 1);
+      const reportSource = report.sources[index];
+      if (
+        reportSource === undefined ||
+        reportSource.sourceId !== sourceId ||
+        reportSource.sourceSha256 !== mapping.sourceSha256
+      ) {
+        throw new HistoryMigrationError("GROUPING_CHANGED", "物化报告中的安全源编号已经变化。");
+      }
+      const loaded = await access.readConfirmedSource(
+        mapping.sourcePath,
+        mapping.sourceSha256,
+        sourceId,
+      );
+      const byteLength = new TextEncoder().encode(loaded.text).byteLength;
+      if (
+        reportSource.byteLength !== byteLength ||
+        reportSource.characterCount !== loaded.text.length
+      ) {
+        throw new HistoryMigrationError("GROUPING_CHANGED", "物化报告中的文本计数已经变化。");
+      }
+      actualSources.push({
+        sourceId,
+        sourceSha256: loaded.sha256,
+        byteLength,
+      });
+    }
+    const confirmedPaths = sourceConfirmation.mappings
+      .map((mapping) => mapping.sourcePath)
+      .sort(compareHeldSourcePaths);
+    if (!arraysEqual(confirmedPaths, await access.listSourcePaths())) {
+      throw new HistoryMigrationError("GROUPING_CHANGED", "物化源目录的文件集合已经变化。");
+    }
+    const sourceSetSha256 = sha256Hex(JSON.stringify({ version: 1, sources: actualSources }));
+    if (marker.sourceSetSha256 !== sourceSetSha256) {
+      throw new HistoryMigrationError("GROUPING_CHANGED", "物化文本集合与完成标记已经不一致。");
+    }
+    return Object.freeze({
+      materializedDirectory,
+      sourceDirectory,
+      sourceConfirmationFile,
+      groupingBatchSha256: marker.groupingBatchSha256,
+      readSourceConfirmation: async () => {
+        try {
+          return await access.readJson("source-confirmation.private.json");
+        } catch (error) {
+          if (error instanceof HistoryMigrationError) {
+            throw new HistoryMigrationError("GROUPING_CHANGED", "物化源映射确认在核对后发生变化。");
+          }
+          throw error;
+        }
+      },
+      readConfirmedSource: (sourcePath: string, expectedSha256: string, sourceId: string) =>
+        access.readConfirmedSource(sourcePath, expectedSha256, sourceId),
+      assertUnchangedBeforePublish: assertInputsUnchanged,
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        try {
+          await assertInputsUnchanged();
+        } catch (error) {
+          if (error instanceof HistoryMigrationError) {
+            throw new HistoryMigrationError("GROUPING_CHANGED", "物化目录在核对到打包结束期间被替换或变化。");
+          }
+          throw error;
+        } finally {
+          await access.close().catch(() => undefined);
+        }
+      },
+    });
+  } catch (error) {
+    await closeHandles();
+    throw error;
+  }
+}
+
+/**
+ * 附件映射和之后的附件物化共用这一道只读校验。它重新扫描源目录、验证
+ * inventory/grouping 的完成标记及人工确认，并为每个 action=attachment 的
+ * 项目计算独立源绑定；调用方不能只凭人工计划里抄写的摘要继续。
+ *
+ * 这个内部入口故意不从 history-migration/index.ts 导出。公开工作流只暴露
+ * init/seal/assert 三个附件阶段，避免其他调用方取得原附件字节。
+ */
+export async function loadVerifiedHistoryAttachmentContext(
+  options: LoadVerifiedHistoryAttachmentContextOptions,
+): Promise<VerifiedHistoryAttachmentContext> {
+  await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+    { path: options.sourceDirectory, kind: "existing" },
+    { path: options.sourceInventoryFile, kind: "existing" },
+    { path: options.sourceLocationsFile, kind: "existing" },
+    { path: options.metadataFile, kind: "existing" },
+    { path: options.groupingDirectory, kind: "existing" },
+    { path: join(options.groupingDirectory, "grouping.private.json"), kind: "existing" },
+    { path: join(options.groupingDirectory, "grouping-validation.json"), kind: "existing" },
+    { path: join(options.groupingDirectory, "GROUPING_COMPLETE"), kind: "existing" },
+    { path: options.groupingConfirmationFile, kind: "existing" },
+  ]);
+
+  const { inventory, sourcesById, catalog } = await loadCurrentCatalogSources(options);
+  const metadata = await loadMetadata(options.metadataFile);
+  const verifiedGrouping = await loadVerifiedGrouping(
+    options.groupingDirectory,
+    catalog,
+    metadata.value.records.length,
+    metadata.sha256,
   );
-  const sourceConfirmation = parsePrivateInput(
-    historySourceMappingSchema,
-    await readPrivateJson(sourceConfirmationFile),
-    "INVALID_SOURCE_CONFIRMATION",
-    "物化目录的源映射确认格式不正确。",
+  const groupingInput = {
+    sourceInventory: inventory,
+    sourceLocationsSha256: catalog.sourceLocationsSha256,
+    manualReviewSha256: catalog.manualReviewSha256,
+    metadataFileSha256: metadata.sha256,
+    metadataNumbers: metadata.value.records.map((record) => record.number),
+    grouping: verifiedGrouping.grouping,
+    completenessReportSha256: verifiedGrouping.validationReportSha256,
+  };
+  const checked = validateHistoryGrouping(groupingInput);
+  validateDispositionUnicodeBoundaries(checked.grouping, sourcesById);
+  const groupingConfirmationInput = await readPrivateJsonWithDigest(
+    options.groupingConfirmationFile,
   );
-  const marker = parsePrivateInput(
-    historyMaterializeCompleteSchema,
-    await readPrivateJson(completeFile),
-    "INVALID_GROUPING",
-    "物化目录没有可验证的完整完成标记。",
+  const groupingConfirmation = assertHistoryGroupingConfirmation(
+    groupingInput,
+    groupingConfirmationInput.value,
   );
-  if (
-    report.sources.length !== sourceConfirmation.mappings.length ||
-    report.sourceCount !== report.sources.length ||
-    marker.sourceCount !== report.sourceCount ||
-    marker.fragmentCount !== report.fragmentCount ||
-    marker.groupingBatchSha256 !== report.groupingBatchSha256 ||
-    marker.reportSha256 !== sha256Hex(JSON.stringify(report)) ||
-    marker.sourceConfirmationSha256 !== sha256Hex(JSON.stringify(sourceConfirmation))
-  ) {
-    throw new HistoryMigrationError("GROUPING_CHANGED", "物化报告、源映射或完成标记已经不一致。");
+
+  const attachments: VerifiedHistoryAttachmentCandidate[] = [];
+  for (const disposition of checked.grouping.zipEntryDispositions) {
+    if (disposition.action !== "attachment") continue;
+    const source = sourcesById.get(disposition.sourceId);
+    const entry =
+      source?.inventory.kind === "zip"
+        ? source.inventory.entries.find((candidate) => candidate.entryId === disposition.entryId)
+        : undefined;
+    if (source === undefined || source.inventory.kind !== "zip" || entry === undefined) {
+      throw new HistoryMigrationError("GROUPING_CHANGED", "已确认附件指向的压缩包条目已经变化。");
+    }
+    attachments.push(
+      verifiedAttachmentCandidate(
+        {
+          kind: "zip_entry",
+          sourceId: disposition.sourceId,
+          entryId: disposition.entryId,
+        },
+        source.inventory.contentSha256,
+        entry.contentSha256,
+        entry.byteLength,
+      ),
+    );
+  }
+  for (const disposition of checked.grouping.textRangeDispositions) {
+    if (disposition.action !== "attachment") continue;
+    const source = sourcesById.get(disposition.sourceId);
+    if (source?.inventory.kind !== "text" || source.text === undefined) {
+      throw new HistoryMigrationError("GROUPING_CHANGED", "已确认附件指向的文本源已经变化。");
+    }
+    const content = source.text.slice(disposition.start, disposition.end);
+    const contentBytes = new TextEncoder().encode(content);
+    attachments.push(
+      verifiedAttachmentCandidate(
+        {
+          kind: "text_range",
+          sourceId: disposition.sourceId,
+          start: disposition.start,
+          end: disposition.end,
+        },
+        source.inventory.contentSha256,
+        sha256Hex(contentBytes),
+        contentBytes.byteLength,
+      ),
+    );
+  }
+  for (const disposition of checked.grouping.manualSourceDispositions) {
+    if (disposition.action !== "attachment") continue;
+    const source = sourcesById.get(disposition.sourceId);
+    if (
+      source === undefined ||
+      (source.inventory.kind !== "file" && source.inventory.kind !== "pdf")
+    ) {
+      throw new HistoryMigrationError("GROUPING_CHANGED", "已确认附件指向的人工源文件已经变化。");
+    }
+    attachments.push(
+      verifiedAttachmentCandidate(
+        { kind: "whole_file", sourceId: disposition.sourceId },
+        source.inventory.contentSha256,
+        source.inventory.contentSha256,
+        source.inventory.byteLength,
+      ),
+    );
   }
 
-  const actualSources: Array<{
-    readonly sourceId: string;
-    readonly sourceSha256: string;
-    readonly byteLength: number;
-  }> = [];
-  for (const [index, mapping] of sourceConfirmation.mappings.entries()) {
-    const sourceId = makeSafeId("source", index + 1);
-    const reportSource = report.sources[index];
-    if (
-      reportSource === undefined ||
-      reportSource.sourceId !== sourceId ||
-      reportSource.sourceSha256 !== mapping.sourceSha256
-    ) {
-      throw new HistoryMigrationError("GROUPING_CHANGED", "物化报告中的安全源编号已经变化。");
-    }
-    const loaded = await readConfirmedSource(
-      sourceDirectory,
-      mapping.sourcePath,
-      mapping.sourceSha256,
-      sourceId,
-    );
-    const byteLength = new TextEncoder().encode(loaded.text).byteLength;
-    if (
-      reportSource.byteLength !== byteLength ||
-      reportSource.characterCount !== loaded.text.length
-    ) {
-      throw new HistoryMigrationError("GROUPING_CHANGED", "物化报告中的文本计数已经变化。");
-    }
-    actualSources.push({
-      sourceId,
-      sourceSha256: loaded.sha256,
-      byteLength,
-    });
-  }
-  const confirmedPaths = sourceConfirmation.mappings
-    .map((mapping) => mapping.sourcePath)
-    .sort(compareCodeUnits);
-  if (!arraysEqual(confirmedPaths, await listPrivateSourcePaths(sourceDirectory))) {
-    throw new HistoryMigrationError("GROUPING_CHANGED", "物化源目录的文件集合已经变化。");
-  }
-  const sourceSetSha256 = sha256Hex(JSON.stringify({ version: 1, sources: actualSources }));
-  if (marker.sourceSetSha256 !== sourceSetSha256) {
-    throw new HistoryMigrationError("GROUPING_CHANGED", "物化文本集合与完成标记已经不一致。");
-  }
+  return {
+    bindings: {
+      sourceInventorySha256: catalog.inventorySha256,
+      sourceLocationsSha256: catalog.sourceLocationsSha256,
+      manualReviewSha256: catalog.manualReviewSha256,
+      metadataFileSha256: metadata.sha256,
+      groupingSha256: groupingConfirmation.groupingSha256,
+      groupingBatchSha256: groupingConfirmation.batchSha256,
+      groupingConfirmationSha256: groupingConfirmationInput.sha256,
+    },
+    groups: checked.grouping.groups.map((group) => ({
+      groupId: group.groupId,
+      metadataId: group.metadataId,
+    })),
+    attachments,
+  };
+}
+
+function verifiedAttachmentCandidate(
+  locator: HistoryAttachmentSourceLocator,
+  sourceContentSha256: string,
+  contentSha256: string,
+  byteLength: number,
+): VerifiedHistoryAttachmentCandidate {
+  return {
+    locator,
+    sourceContentSha256,
+    contentSha256,
+    byteLength,
+    sourceBindingSha256: sha256Hex(
+      JSON.stringify({
+        version: 1,
+        locator,
+        sourceContentSha256,
+        contentSha256,
+        byteLength,
+      }),
+    ),
+  };
 }
 
 function createGroupingValidationReport(

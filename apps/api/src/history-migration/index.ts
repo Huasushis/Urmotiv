@@ -1,4 +1,22 @@
 export * from "./core";
+export {
+  assertHistoryAttachmentMappingComplete,
+  historyAttachmentMappingPlanSchema,
+  historyAttachmentMappingSchema,
+  historyAttachmentSemanticRoles,
+  historyAttachmentWorksheetSchema,
+  initializeHistoryAttachmentMappingWorksheet,
+  revalidateHistoryAttachmentMappingCapability,
+  sealHistoryAttachmentMapping,
+} from "./attachment-mapping";
+export type {
+  AssertHistoryAttachmentMappingCompleteOptions,
+  HistoryAttachmentMapping,
+  HistoryAttachmentMappingCapability,
+  HistoryAttachmentMappingResult,
+  InitializeHistoryAttachmentMappingWorksheetOptions,
+  SealHistoryAttachmentMappingOptions,
+} from "./attachment-mapping";
 export * from "./digests";
 export * from "./errors";
 export * from "./grouping";
@@ -14,6 +32,7 @@ export type {
   SealHistoryGroupingOptions,
   SealHistoryGroupingResult,
   WriteHistoryGroupingConfirmationOptions,
+  VerifiedHistoryMaterialization,
 } from "./grouping-workflow";
 export {
   assertHistoryMaterializationComplete,

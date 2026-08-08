@@ -6,16 +6,19 @@
  */
 import { join } from "node:path";
 import {
+  assertHistoryAttachmentMappingComplete,
   assertHistoryMaterializationComplete,
   createLlmHistoryNormalizer,
   HistoryMigrationError,
   initializeHistoryGroupingWorksheet,
+  initializeHistoryAttachmentMappingWorksheet,
   inventoryHistorySources,
   loadHistoryPreparationCodeSha256,
   materializeHistoryGrouping,
   packageApprovedCandidates,
   prepareHistoryCandidates,
   sealHistoryGrouping,
+  sealHistoryAttachmentMapping,
   writeHistoryGroupingConfirmation,
 } from "../src/history-migration/index";
 
@@ -66,6 +69,41 @@ type Command =
       readonly outputDirectory: string;
     }
   | {
+      readonly phase: "init-attachments";
+      readonly privateRootDirectory: string;
+      readonly sourceDirectory: string;
+      readonly sourceInventoryFile: string;
+      readonly sourceLocationsFile: string;
+      readonly metadataFile: string;
+      readonly groupingDirectory: string;
+      readonly groupingConfirmationFile: string;
+      readonly outputDirectory: string;
+    }
+  | {
+      readonly phase: "seal-attachments";
+      readonly privateRootDirectory: string;
+      readonly sourceDirectory: string;
+      readonly sourceInventoryFile: string;
+      readonly sourceLocationsFile: string;
+      readonly metadataFile: string;
+      readonly groupingDirectory: string;
+      readonly groupingConfirmationFile: string;
+      readonly worksheetDirectory: string;
+      readonly mappingPlanFile: string;
+      readonly outputDirectory: string;
+    }
+  | {
+      readonly phase: "assert-attachments";
+      readonly privateRootDirectory: string;
+      readonly sourceDirectory: string;
+      readonly sourceInventoryFile: string;
+      readonly sourceLocationsFile: string;
+      readonly metadataFile: string;
+      readonly groupingDirectory: string;
+      readonly groupingConfirmationFile: string;
+      readonly attachmentMappingDirectory: string;
+    }
+  | {
       readonly phase: "prepare";
       readonly privateRootDirectory: string;
       readonly materializedDirectory: string;
@@ -77,13 +115,18 @@ type Command =
   | {
       readonly phase: "package";
       readonly privateRootDirectory: string;
-      readonly sourceDirectory: string;
+      readonly materializedDirectory: string;
       readonly metadataFile: string;
-      readonly sourceConfirmationFile: string;
       readonly preparedDirectory: string;
       readonly approvalFile: string;
       readonly outputDirectory: string;
       readonly authorMappingOutput: string;
+      readonly attachmentSourceDirectory: string;
+      readonly sourceInventoryFile: string;
+      readonly sourceLocationsFile: string;
+      readonly groupingDirectory: string;
+      readonly groupingConfirmationFile: string;
+      readonly attachmentMappingDirectory: string;
     };
 
 async function main(): Promise<void> {
@@ -118,6 +161,27 @@ async function main(): Promise<void> {
     const result = await materializeHistoryGrouping(command);
     process.stdout.write(
       `已物化 ${result.sourceCount} 份一题一文件文本，共使用 ${result.fragmentCount} 个片段；完整性报告没有未处置项目。\n`,
+    );
+    return;
+  }
+  if (command.phase === "init-attachments") {
+    const result = await initializeHistoryAttachmentMappingWorksheet(command);
+    process.stdout.write(
+      `已登记 ${result.attachmentCount} 个待人工映射附件；全部保持 unresolved，未生成完成确认。\n`,
+    );
+    return;
+  }
+  if (command.phase === "seal-attachments") {
+    const result = await sealHistoryAttachmentMapping(command);
+    process.stdout.write(
+      `已逐项确认 ${result.resolvedItemCount} 个附件，完成标记绑定了当前清单、分组、目标和引用改写表。\n`,
+    );
+    return;
+  }
+  if (command.phase === "assert-attachments") {
+    const capability = await assertHistoryAttachmentMappingComplete(command);
+    process.stdout.write(
+      `附件映射完成门验证通过，共 ${capability.attachmentCount} 个附件且没有 unresolved 项。\n`,
     );
     return;
   }
@@ -164,15 +228,25 @@ async function main(): Promise<void> {
     return;
   }
 
+  const attachmentMappingCapability = await assertHistoryAttachmentMappingComplete({
+    privateRootDirectory: command.privateRootDirectory,
+    sourceDirectory: command.attachmentSourceDirectory,
+    sourceInventoryFile: command.sourceInventoryFile,
+    sourceLocationsFile: command.sourceLocationsFile,
+    metadataFile: command.metadataFile,
+    groupingDirectory: command.groupingDirectory,
+    groupingConfirmationFile: command.groupingConfirmationFile,
+    attachmentMappingDirectory: command.attachmentMappingDirectory,
+  });
   const result = await packageApprovedCandidates({
     privateRootDirectory: command.privateRootDirectory,
-    sourceDirectory: command.sourceDirectory,
+    materializedDirectory: command.materializedDirectory,
     metadataFile: command.metadataFile,
-    sourceConfirmationFile: command.sourceConfirmationFile,
     preparedDirectory: command.preparedDirectory,
     approvalFile: command.approvalFile,
     outputDirectory: command.outputDirectory,
     authorMappingOutput: command.authorMappingOutput,
+    attachmentMappingCapability,
   });
   process.stdout.write(
     `已生成 ${result.packageCount} 个题目包，另写出 ${result.authorMappingCount} 条私有作者映射。\n`,
@@ -237,6 +311,48 @@ function parseCommand(argv: readonly string[]): Command {
       outputDirectory: requiredOption(argv, "--out"),
     };
   }
+  if (phase === "init-attachments") {
+    return {
+      phase,
+      privateRootDirectory: requiredOption(argv, "--private-root"),
+      sourceDirectory: requiredOption(argv, "--source"),
+      sourceInventoryFile: requiredOption(argv, "--inventory"),
+      sourceLocationsFile: requiredOption(argv, "--source-locations"),
+      metadataFile: requiredOption(argv, "--metadata"),
+      groupingDirectory: requiredOption(argv, "--grouping"),
+      groupingConfirmationFile: requiredOption(argv, "--grouping-confirmation"),
+      outputDirectory: requiredOption(argv, "--out"),
+    };
+  }
+  if (phase === "seal-attachments") {
+    requiredFlag(argv, "--i-have-reviewed");
+    return {
+      phase,
+      privateRootDirectory: requiredOption(argv, "--private-root"),
+      sourceDirectory: requiredOption(argv, "--source"),
+      sourceInventoryFile: requiredOption(argv, "--inventory"),
+      sourceLocationsFile: requiredOption(argv, "--source-locations"),
+      metadataFile: requiredOption(argv, "--metadata"),
+      groupingDirectory: requiredOption(argv, "--grouping"),
+      groupingConfirmationFile: requiredOption(argv, "--grouping-confirmation"),
+      worksheetDirectory: requiredOption(argv, "--worksheet"),
+      mappingPlanFile: requiredOption(argv, "--plan"),
+      outputDirectory: requiredOption(argv, "--out"),
+    };
+  }
+  if (phase === "assert-attachments") {
+    return {
+      phase,
+      privateRootDirectory: requiredOption(argv, "--private-root"),
+      sourceDirectory: requiredOption(argv, "--source"),
+      sourceInventoryFile: requiredOption(argv, "--inventory"),
+      sourceLocationsFile: requiredOption(argv, "--source-locations"),
+      metadataFile: requiredOption(argv, "--metadata"),
+      groupingDirectory: requiredOption(argv, "--grouping"),
+      groupingConfirmationFile: requiredOption(argv, "--grouping-confirmation"),
+      attachmentMappingDirectory: requiredOption(argv, "--attachment-mapping"),
+    };
+  }
   if (phase === "prepare") {
     return {
       phase,
@@ -252,18 +368,23 @@ function parseCommand(argv: readonly string[]): Command {
     return {
       phase,
       privateRootDirectory: requiredOption(argv, "--private-root"),
-      sourceDirectory: requiredOption(argv, "--source"),
+      materializedDirectory: requiredOption(argv, "--materialized"),
       metadataFile: requiredOption(argv, "--metadata"),
-      sourceConfirmationFile: requiredOption(argv, "--source-confirmation"),
       preparedDirectory: requiredOption(argv, "--prepared"),
       approvalFile: requiredOption(argv, "--approval"),
       outputDirectory: requiredOption(argv, "--out"),
       authorMappingOutput: requiredOption(argv, "--author-map-out"),
+      attachmentSourceDirectory: requiredOption(argv, "--attachment-source"),
+      sourceInventoryFile: requiredOption(argv, "--inventory"),
+      sourceLocationsFile: requiredOption(argv, "--source-locations"),
+      groupingDirectory: requiredOption(argv, "--grouping"),
+      groupingConfirmationFile: requiredOption(argv, "--grouping-confirmation"),
+      attachmentMappingDirectory: requiredOption(argv, "--attachment-mapping"),
     };
   }
   throw new HistoryMigrationError(
     "INVALID_ARGUMENTS",
-    "必须明确选择 inventory、init-grouping、seal-grouping、confirm-grouping、materialize、prepare 或 package 阶段。",
+    "必须明确选择 inventory、init-grouping、seal-grouping、confirm-grouping、materialize、init-attachments、seal-attachments、assert-attachments、prepare 或 package 阶段。",
   );
 }
 

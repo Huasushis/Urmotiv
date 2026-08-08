@@ -240,6 +240,55 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts confirm-grouping
 人工队列、完整元数据文件、片段集合、分组、所有人工处置及完整性报告摘要一起写入确认。任一项变化都会
 使确认失效。
 
+### 5.1 附件映射完成门（第一阶段）
+
+分组中只要有 `action: "attachment"`，必须先运行 `init-attachments`，再逐附件人工填写计划并运行
+`seal-attachments`。每个附件都必须保留原来的源绑定摘要，并明确填写受控语义角色、`public`/`internal`
+可见性和作用范围。`scope.kind: "problem_groups"` 至少包含一个 target；每个 target 分别填写题目组、元数据
+安全编号和安全目标名，题面资源还要逐 target 填原 Markdown 引用。同一附件可以进入多个题目组，同一目标
+路径也可在不同题目组中复用，但同一组内不得冲突。`scope.kind: "batch_internal"` 只允许不直接进入题目包的
+内部命题/评测候选材料，并进入独立保全清单。无法判断的项目必须写成 `unresolved`；不能省略、默认公开
+或当作已忽略。`solution_original` 表示“题解原件”，只允许作为内部附件，不能冒充已经隔离验证的
+`standard_solution`。题面资源使用内容摘要命名，并在私有映射中保留原 Markdown 引用到新路径的改写表。
+目标扩展名只允许单段 ASCII 字母或数字，严格匹配原生包的 `[A-Za-z0-9]+` 约束；`c++`、`tar.gz` 等不能
+直接成为扩展名。人工计划本身必须是权限 `0600` 的普通文件，不能经符号链接读取。
+
+```bash
+apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts init-attachments \
+  --private-root <private-root> --source <private-root>/history/originals \
+  --inventory <private-root>/history/catalog-001/inventory.json \
+  --source-locations <private-root>/history/catalog-001/source-locations.private.json \
+  --metadata <private-root>/history/metadata.json \
+  --grouping <private-root>/history/grouping-001 \
+  --grouping-confirmation <private-root>/history/grouping-confirmation-001.private.json \
+  --out <private-root>/history/attachment-worksheet-001
+
+apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts seal-attachments \
+  --private-root <private-root> --source <private-root>/history/originals \
+  --inventory <private-root>/history/catalog-001/inventory.json \
+  --source-locations <private-root>/history/catalog-001/source-locations.private.json \
+  --metadata <private-root>/history/metadata.json \
+  --grouping <private-root>/history/grouping-001 \
+  --grouping-confirmation <private-root>/history/grouping-confirmation-001.private.json \
+  --worksheet <private-root>/history/attachment-worksheet-001 \
+  --plan <private-root>/history/attachment-mapping-plan.private.json \
+  --out <private-root>/history/attachment-mapping-001 --i-have-reviewed
+```
+
+有未知项时封存命令保留完整私有映射并最后写 `ATTACHMENT_MAPPING_BLOCKED`，随后返回失败；只有零未知项
+才最后写 `ATTACHMENT_MAPPING_COMPLETE`。后续阶段的必经门是 `assert-attachments`，它会重新验证当前源
+目录、inventory、grouping、人工确认、映射、目标集合、保全清单和引用改写摘要，并在结束时再次核对目录
+身份与唯一状态标记。worksheet 和 mapping 从 `mkdir` 成功起就持续使用同一个稳定目录句柄：目录必须是
+当前进程用户拥有的 `0700` 真目录；每个 payload/marker 都以 `O_NOFOLLOW` 打开，在同一个文件句柄的读取
+前后重复验证普通文件、当前用户、`0600`、大小和纳秒级状态时间。写入先用 `O_EXCL`、`0600` 创建新文件并
+`fsync`，再以不可覆盖的硬链接（让目标名指向已经完整写好的同一文件）发布并 `fsync` 目录，最终标记最后
+发布；不使用阶段目录或可能覆盖目标
+的 rename。发布后仍通过创建时持有的目录句柄逐文件复核，最后再按公开路径重开并比较类型、设备号、
+inode、所有者、权限和 `ctimeNs`，目录被替换或权限改坏后再恢复也会失败。当前第一阶段尚未把附件字节及
+引用改写接入题目包：核心
+`packageApprovedCandidates` 会再次验证完成门签发的能力，只有附件数为零才允许旧打包逻辑；非零附件固定
+返回 `ATTACHMENT_PACKAGING_UNAVAILABLE`，不能靠跳过 CLI 或只改 README 绕过。
+
 ## 6. materialize：生成一题一文件的确认文本
 
 ```bash
@@ -283,8 +332,8 @@ node ../Fermata/scripts/run-with-env.mjs <private-model-env> \
 `report.json`、`source-confirmation.private.json`、输出文件集合的摘要和计数完全一致。缺少标记、报告被
 改写、增加/删除文本或混用另一次物化结果都会停止。
 
-该阶段只产生候选 JSON、只含安全摘要的 `review.json` 和 `PREPARE_COMPLETE`，不会产生 ZIP。模型置信度
-只帮助安排复核顺序，不代表批准。等待首段有效输出的默认上限为 30 分钟；已经收到有效输出后，连续
+该阶段只产生候选 JSON、只含安全摘要的 `review.json` 和 `PREPARE_COMPLETE`，不会产生 ZIP，也不表示附件
+已具备打包条件。模型置信度只帮助安排复核顺序，不代表批准。等待首段有效输出的默认上限为 30 分钟；已经收到有效输出后，连续
 10 分钟没有新有效内容才判为停顿。只要仍在持续输出就没有总时限，并一直读取到服务端 HTTP 响应真正
 结束。只有明确的 429 限流响应会重试；499、主动取消、输出中断或缺少完整结束都直接判失败且不重试，
 不能拿不完整候选继续。响应和单个候选 JSON 超过 10,000,000 字节会拒绝，不截断。
@@ -344,16 +393,29 @@ node ../Fermata/scripts/run-with-env.mjs <private-model-env> \
 ```bash
 apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts package \
   --private-root <private-root> \
-  --source <private-root>/history/materialized-001/sources \
+  --materialized <private-root>/history/materialized-001 \
   --metadata <private-root>/history/metadata.json \
-  --source-confirmation <private-root>/history/materialized-001/source-confirmation.private.json \
   --prepared <private-root>/history/prepared-001 \
   --approval <private-root>/history/candidate-approval.private.json \
+  --attachment-source <private-root>/history/originals \
+  --inventory <private-root>/history/catalog-001/inventory.json \
+  --source-locations <private-root>/history/catalog-001/source-locations.private.json \
+  --grouping <private-root>/history/grouping-001 \
+  --grouping-confirmation <private-root>/history/grouping-confirmation-001.private.json \
+  --attachment-mapping <private-root>/history/attachment-mapping-001 \
   --out <private-root>/history/packages-001 \
   --author-map-out <private-root>/history/author-map-001.private.json
 ```
 
-打包前再次读取物化文本并核对摘要。题目包报告不含题名、原题号、作者或正文；作者映射在输出目录之外的
+打包前先根据上述原始清单、分组和附件目录签发一次能力。核心打包函数只接受整个 `--materialized` 目录，
+自行固定使用其中的 `sources/` 与 `source-confirmation.private.json`，重新验证 `MATERIALIZE_COMPLETE`，再把
+其中的 grouping 批次摘要与附件能力重新扫描得到的批次摘要严格比较；缺参数、跨批次能力、伪造能力、
+BLOCKED 与 COMPLETE 并存、非零附件或任一摘要变化都会在创建输出目录或作者映射前停止。之后才重新读取
+物化文本并核对摘要；这些读取全部经由同一组稳定目录句柄完成，发布任何输出前还会按公开路径复核物化
+目录身份，并通过同一句柄重读完成标记和全部源文件。输出文件先在输出目录内以 0600 临时写入并 fsync，
+再硬链接（不可覆盖）发布，发布后逐文件复核 inode、所有者、权限、大小、ctimeNs、mtimeNs 与内容摘要，
+`PACKAGE_COMPLETE` 标记最后发布；任何文件被替换、改写或 chmod 后再还原都会失败，并删除全部部分输出。
+题目包报告不含题名、原题号、作者或正文；作者映射在输出目录之外的
 独立私有文件中，并绑定候选摘要、题目包摘要和整批摘要。
 
 本工作流能安全处理 UTF-8 文本，以及最多两层历史 ZIP 路径链中明确选择的 UTF-8 文本条目。PDF、图片、

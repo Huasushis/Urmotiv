@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { crc32, deflateRawSync } from "node:zlib";
@@ -1483,11 +1483,20 @@ describe("历史题目人工分组文件工作流", () => {
         privateRootDirectory: fixture.privateRoot,
         materializedDirectory: fixture.materializedDirectory,
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toMatchObject({
+      materializedDirectory: fixture.materializedDirectory,
+      sourceDirectory: join(fixture.materializedDirectory, "sources"),
+      sourceConfirmationFile: join(
+        fixture.materializedDirectory,
+        "source-confirmation.private.json",
+      ),
+      groupingBatchSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
     const reportFile = join(fixture.materializedDirectory, "report.json");
     const report = JSON.parse(await readFile(reportFile, "utf8")) as { fragmentCount: number };
     report.fragmentCount += 1;
     await writeFile(reportFile, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    await chmod(reportFile, 0o600);
     await expect(
       assertHistoryMaterializationComplete({
         privateRootDirectory: fixture.privateRoot,
