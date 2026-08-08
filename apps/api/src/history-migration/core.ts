@@ -1032,6 +1032,7 @@ export async function packageApprovedCandidates(
   let authorMappingWriter: VerifiedPrivateOutputWriter | undefined;
   let packagesWriter: VerifiedPrivateOutputWriter | undefined;
   let outputWriter: VerifiedPrivateOutputWriter | undefined;
+  const preservedWriters: VerifiedPrivateOutputWriter[] = [];
   try {
     await mkdir(packagesDirectory, { recursive: false, mode: 0o700 });
     outputWriter = await openVerifiedPrivateOutputWriter(options.outputDirectory);
@@ -1105,8 +1106,11 @@ export async function packageApprovedCandidates(
           seenPaths.add(target.targetPath);
         }
       }
+      // 服务端导入路径同样以 allowNestedArchives=true 读取题目包，.xlsx/.docx
+      // 等 ZIP 容器格式的附件作为不透明叶子文件进入包内。
       const archive = writeZipArchive(
         repackagedWithAttachmentChecksums(generated.files, attachmentFiles),
+        { allowNestedArchives: true },
       );
       const packageSha256 = sha256Hex(archive);
       await packagesWriter.writeNewFile(`${approved.record.candidateId}.zip`, archive);
@@ -1139,11 +1143,13 @@ export async function packageApprovedCandidates(
       await mkdir(internalDirectory, { recursive: false, mode: 0o700 });
       for (const entry of attachmentPackagePlan.preservedEntries) {
         const bytes = readVerifiedAttachmentBytes(attachmentCapability, entry);
-        await writePreservedMaterialFile(
-          options.privateRootDirectory,
-          internalDirectory,
-          entry.preservationPath,
-          bytes,
+        preservedWriters.push(
+          await writePreservedMaterialFile(
+            options.privateRootDirectory,
+            internalDirectory,
+            entry.preservationPath,
+            bytes,
+          ),
         );
         preservedMaterialReport.push({
           attachmentId: entry.attachmentId,
@@ -1195,6 +1201,9 @@ export async function packageApprovedCandidates(
     await packagesWriter.assertAllPublishedUnchanged();
     await outputWriter.assertAllPublishedUnchanged();
     await authorMappingWriter.assertAllPublishedUnchanged();
+    for (const writer of preservedWriters) {
+      await writer.assertAllPublishedUnchanged();
+    }
     // 完成标记必须最后发布。
     await outputWriter.writeNewJson("PACKAGE_COMPLETE", {
       version: 1,
@@ -1216,6 +1225,10 @@ export async function packageApprovedCandidates(
     authorMappingWriter = undefined;
     await packagesWriter.close();
     packagesWriter = undefined;
+    for (const writer of preservedWriters) {
+      await writer.close();
+    }
+    preservedWriters.length = 0;
     await outputWriter.close();
     outputWriter = undefined;
     await materialization.close();
@@ -1239,6 +1252,9 @@ export async function packageApprovedCandidates(
   } finally {
     await authorMappingWriter?.close().catch(() => undefined);
     await packagesWriter?.close().catch(() => undefined);
+    for (const writer of preservedWriters) {
+      await writer.close().catch(() => undefined);
+    }
     await outputWriter?.close().catch(() => undefined);
     await materialization.close().catch(() => undefined);
   }
@@ -1279,6 +1295,25 @@ function buildAttachmentPackagePlan(
   const groupIdBySourceId = new Map(
     materializeReport.sources.map((source) => [source.sourceId, source.groupId] as const),
   );
+  // 物化报告的 source→groupId 只是由确认清单与批次摘要间接绑定，这里与附件
+  // 完成门的分组集合双向核对，防止物化报告被一致改写后把附件路由到别的分组。
+  const reportGroupIds = new Set(materializeReport.sources.map((source) => source.groupId));
+  for (const source of materializeReport.sources) {
+    if (!capability.groups.some((group) => group.groupId === source.groupId)) {
+      throw new HistoryMigrationError(
+        "GROUPING_CHANGED",
+        "物化报告的分组与附件完成门不一致。",
+      );
+    }
+  }
+  for (const group of capability.groups) {
+    if (!reportGroupIds.has(group.groupId)) {
+      throw new HistoryMigrationError(
+        "GROUPING_CHANGED",
+        "附件完成门分组缺少对应的物化源。",
+      );
+    }
+  }
   const rewritesByGroupId = new Map<
     string,
     Array<{ readonly from: string; readonly to: string }>
@@ -1364,18 +1399,41 @@ function applyStatementReferenceRewrites(
   problem: CanonicalProblem,
   rewrites: readonly { readonly from: string; readonly to: string }[],
 ): CanonicalProblem {
-  const rewritten = structuredClone(problem);
-  let statement = rewritten.content.basicStatement;
+  const original = problem.content.basicStatement;
+  // 先对未改写的原题面核对全部原引用，再按最长优先单遍替换：改写结果与
+  // 计划顺序无关，也不会把先替换引入的新文本再次当作原引用匹配。
   for (const rewrite of rewrites) {
-    if (!statement.includes(rewrite.from)) {
+    if (!original.includes(rewrite.from)) {
       throw new HistoryMigrationError(
         "INVALID_ATTACHMENT_MAPPING",
         "题面资源原引用在候选题面中不存在，不能改写。",
       );
     }
-    statement = statement.split(rewrite.from).join(rewrite.to);
   }
-  rewritten.content.basicStatement = statement;
+  if (rewrites.length === 0) {
+    return problem;
+  }
+  const ordered = [...rewrites].sort((left, right) => right.from.length - left.from.length);
+  let result = "";
+  let index = 0;
+  while (index < original.length) {
+    let matched: { readonly from: string; readonly to: string } | undefined;
+    for (const rewrite of ordered) {
+      if (original.startsWith(rewrite.from, index)) {
+        matched = rewrite;
+        break;
+      }
+    }
+    if (matched === undefined) {
+      result += original[index] ?? "";
+      index += 1;
+      continue;
+    }
+    result += matched.to;
+    index += matched.from.length;
+  }
+  const rewritten = structuredClone(problem);
+  rewritten.content.basicStatement = result;
   return rewritten;
 }
 
@@ -1434,7 +1492,7 @@ async function writePreservedMaterialFile(
   internalDirectory: string,
   preservationPath: string,
   content: Uint8Array,
-): Promise<void> {
+): Promise<VerifiedPrivateOutputWriter> {
   const segments = preservationPath.split("/");
   if (
     segments.length === 0 ||
@@ -1448,13 +1506,12 @@ async function writePreservedMaterialFile(
     await ensurePrivateSubdirectory(directory);
   }
   const leafName = segments.at(-1) as string;
+  // 写入后不立即关闭：调用方在最终复核 PASS 点与 PACKAGE_COMPLETE 之前一起
+  // 复核保全文件，并让 close() 的目录身份核对在正常路径上生效。
   const writer = await openVerifiedPrivateOutputWriter(directory);
-  try {
-    await writer.writeNewFile(leafName, content);
-    await writer.assertAllPublishedUnchanged();
-  } finally {
-    await writer.close().catch(() => undefined);
-  }
+  await writer.writeNewFile(leafName, content);
+  await writer.assertAllPublishedUnchanged();
+  return writer;
 }
 
 async function loadConfirmedInputs(

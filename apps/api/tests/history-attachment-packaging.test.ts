@@ -34,6 +34,10 @@ const solutionBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2d])
 const judgeBytes = new Uint8Array([10, 20, 30, 40, 50, 60]);
 const notesText = "内部批改要点。";
 const svgBytes = encoder.encode('<svg xmlns="http://www.w3.org/2000/svg"></svg>');
+// .xlsx 本身是 ZIP 容器：作为不透明附件叶子进入题目包，验证嵌套容器放行。
+const xlsxBytes = writeZipArchive([
+  { path: "sheet1.xml", content: encoder.encode("<worksheet/>") },
+]);
 
 afterEach(async () => {
   await Promise.all(
@@ -48,7 +52,7 @@ describe("历史附件第二阶段打包", () => {
     expect(result).toEqual({
       packageCount: 1,
       authorMappingCount: 1,
-      attachmentCount: 6,
+      attachmentCount: 7,
       preservedMaterialCount: 1,
     });
 
@@ -62,7 +66,9 @@ describe("历史附件第二阶段打包", () => {
     const judgeId = idOf(judgeBytes);
 
     const packagePath = join(fixture.packageOutput, "packages", "candidate-000001.zip");
-    const archive = readZipArchive(new Uint8Array(await readFile(packagePath)));
+    const archive = readZipArchive(new Uint8Array(await readFile(packagePath)), {
+      allowNestedArchives: true,
+    });
     const entries = new Map(archive.list().map((entry) => [entry.path, entry] as const));
     const statementBytes = archive.read("content/basic-statement.md");
     if (statementBytes === undefined) {
@@ -85,6 +91,9 @@ describe("历史附件第二阶段打包", () => {
       `attachments/public/${idOf(encoder.encode(notesText))}.txt`,
     );
     expect(textRangePublic).toEqual(encoder.encode(notesText));
+    // .xlsx 是 ZIP 容器，按不透明附件叶子原样进入包内。
+    const xlsxPublic = archive.read(`attachments/public/${idOf(xlsxBytes)}.xlsx`);
+    expect(xlsxPublic).toEqual(xlsxBytes);
     // 批次内部保全材料绝不进入题目包。
     for (const entry of entries.keys()) {
       expect(entry).not.toMatch(/^internal\//);
@@ -131,7 +140,7 @@ describe("历史附件第二阶段打包", () => {
         attachments: Array<{ attachmentId: string; targetPath: string }>;
       }>;
     };
-    expect(report.attachmentCount).toBe(6);
+    expect(report.attachmentCount).toBe(7);
     expect(report.preservedMaterialCount).toBe(1);
     expect(report.preservedMaterials[0]).toEqual({
       attachmentId: judgeId,
@@ -147,6 +156,7 @@ describe("历史附件第二阶段打包", () => {
         idOf(solutionBytes),
         idOf(svgBytes),
         idOf(encoder.encode(notesText)),
+        idOf(xlsxBytes),
       ]),
     );
     expect(packageAttachments.some((item) => item.targetPath === assetName)).toBe(true);
@@ -158,7 +168,7 @@ describe("历史附件第二阶段打包", () => {
 
     const markerText = await readFile(join(fixture.packageOutput, "PACKAGE_COMPLETE"), "utf8");
     const marker = JSON.parse(markerText) as { batchSha256: string; attachmentCount: number };
-    expect(marker.attachmentCount).toBe(6);
+    expect(marker.attachmentCount).toBe(7);
     expect(marker.batchSha256).toBe(report.batchSha256);
 
     const authorMapText = await readFile(fixture.authorMappingOutput, "utf8");
@@ -327,6 +337,7 @@ async function createBaseFixture(options?: {
   await writeFile(join(gateSourceDirectory, "original-solution.pdf"), solutionBytes);
   await writeFile(join(gateSourceDirectory, "judge-data.bin"), judgeBytes);
   await writeFile(join(gateSourceDirectory, "notes.txt"), notesText, "utf8");
+  await writeFile(join(gateSourceDirectory, "report.xlsx"), xlsxBytes);
   await writeFile(
     join(gateSourceDirectory, "diagrams.zip"),
     writeZipArchive([
@@ -418,6 +429,7 @@ async function createBaseFixture(options?: {
       "images/fig2.png",
       "original-solution.pdf",
       "judge-data.bin",
+      "report.xlsx",
     ].map((sourcePath) => {
       const source = findSource(sourcePath);
       if (source === undefined) {
@@ -480,7 +492,7 @@ async function createBaseFixture(options?: {
       contentSha256: string;
     }>;
   };
-  expect(worksheet.attachments.length).toBe(6);
+  expect(worksheet.attachments.length).toBe(7);
 
   // 按工作表逐项给出人工计划：内容摘要决定语义角色与目标，目标名按工作表
   // 实际分配的附件安全编号构造。
@@ -523,6 +535,11 @@ async function createBaseFixture(options?: {
     semanticRole: "contestant_attachment",
     visibility: "public",
     extension: "txt",
+  });
+  roleBySha.set(sha256Hex(xlsxBytes), {
+    semanticRole: "contestant_attachment",
+    visibility: "public",
+    extension: "xlsx",
   });
 
   const attachmentIdBySha = new Map<string, string>();
@@ -592,7 +609,7 @@ async function createBaseFixture(options?: {
     ...contextOptions,
     attachmentMappingDirectory,
   });
-  expect(attachmentMappingCapability.attachmentCount).toBe(6);
+  expect(attachmentMappingCapability.attachmentCount).toBe(7);
 
   // 合成物化报告：只含进入候选的确认源，分组批次摘要与附件能力一致。
   const sourceConfirmationFile = join(materializedDirectory, "source-confirmation.private.json");
