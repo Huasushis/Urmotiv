@@ -251,6 +251,11 @@ async function main(): Promise<void> {
   process.stdout.write(
     `已生成 ${result.packageCount} 个题目包，另写出 ${result.authorMappingCount} 条私有作者映射。\n`,
   );
+  if (result.attachmentCount !== undefined) {
+    process.stdout.write(
+      `本批次含 ${result.attachmentCount} 个已确认附件：${result.preservedMaterialCount} 个写入内部保全目录，其余按公开/内部用途进入题目包。\n`,
+    );
+  }
 }
 
 function parseCommand(argv: readonly string[]): Command {

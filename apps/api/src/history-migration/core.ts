@@ -2,7 +2,13 @@ import { randomUUID } from "node:crypto";
 import { lstat, mkdir, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { CanonicalProblem } from "@urmotiv/problem-package";
-import { urmotivNativeAdapter, writeZipArchive } from "@urmotiv/problem-package";
+import {
+  checksumFilePath,
+  checksumsForFiles,
+  renderChecksums,
+  urmotivNativeAdapter,
+  writeZipArchive,
+} from "@urmotiv/problem-package";
 import { z } from "zod";
 import {
   type HistoryAttachmentMappingCapability,
@@ -15,7 +21,10 @@ import {
   historyNormalizationFailureKinds,
   type HistoryNormalizationFailureKind,
 } from "./errors";
-import { assertHistoryMaterializationComplete } from "./grouping-workflow";
+import {
+  type HistoryAttachmentSourceLocator,
+  assertHistoryMaterializationComplete,
+} from "./grouping-workflow";
 import {
   assertPathsInsidePrivateRoot,
   assertPrivateDirectoryMode,
@@ -190,6 +199,10 @@ export interface PrepareHistoryCandidatesResult {
 export interface PackageApprovedCandidatesResult {
   readonly packageCount: number;
   readonly authorMappingCount: number;
+  /** 本批次已确认附件数；仅在附件能力非空时出现。 */
+  readonly attachmentCount?: number;
+  /** 写入内部保全目录的批次内部附件数；仅在附件能力非空时出现。 */
+  readonly preservedMaterialCount?: number;
 }
 
 interface ConfirmedSource {
@@ -921,10 +934,11 @@ export async function packageApprovedCandidates(
       "附件映射与本次可信物化结果不属于同一个已确认题目分组批次。",
     );
   }
+  let attachmentPackagePlan: AttachmentPackagePlan | undefined;
   if (attachmentCapability.attachmentCount > 0) {
-    throw new HistoryMigrationError(
-      "ATTACHMENT_PACKAGING_UNAVAILABLE",
-      "本批次含已确认附件；附件字节物化和题面引用改写接线完成前不能生成题目包。",
+    attachmentPackagePlan = buildAttachmentPackagePlan(
+      attachmentCapability,
+      await materialization.readReport(),
     );
   }
   await assertNewOutputPath(options.authorMappingOutput);
@@ -1032,6 +1046,13 @@ export async function packageApprovedCandidates(
       readonly packageSha256: string;
       readonly packageBytes: number;
       readonly status: "packaged";
+      readonly attachments?: readonly {
+        readonly attachmentId: string;
+        readonly contentSha256: string;
+        readonly semanticRole: string;
+        readonly visibility: string;
+        readonly targetPath: string;
+      }[];
     }> = [];
     const authorMappings: Array<{
       readonly candidateId: string;
@@ -1041,13 +1062,52 @@ export async function packageApprovedCandidates(
     }> = [];
 
     for (const approved of approvedCandidates) {
-      const generated = await urmotivNativeAdapter.export(approved.record.problem, {
+      const candidateAttachmentPlan =
+        attachmentPackagePlan === undefined
+          ? undefined
+          : attachmentPlanForCandidate(attachmentPackagePlan, approved.record.sourceId);
+      const problemForExport =
+        candidateAttachmentPlan === undefined || candidateAttachmentPlan.rewrites.length === 0
+          ? approved.record.problem
+          : applyStatementReferenceRewrites(approved.record.problem, candidateAttachmentPlan.rewrites);
+      const generated = await urmotivNativeAdapter.export(problemForExport, {
         exportedAt: options.exportedAt ?? new Date().toISOString(),
       });
       if (generated.kind !== "zip") {
         throw new Error("Urmotiv 原生题目包没有生成 ZIP。");
       }
-      const archive = writeZipArchive(generated.files);
+      const attachmentFiles: Array<{ readonly path: string; readonly content: Uint8Array }> = [];
+      const attachmentRecords: Array<{
+        readonly attachmentId: string;
+        readonly contentSha256: string;
+        readonly semanticRole: string;
+        readonly visibility: string;
+        readonly targetPath: string;
+      }> = [];
+      if (candidateAttachmentPlan !== undefined) {
+        const seenPaths = new Set(generated.files.map((file) => file.path));
+        for (const target of candidateAttachmentPlan.targets) {
+          if (seenPaths.has(target.targetPath)) {
+            throw new HistoryMigrationError(
+              "INVALID_ATTACHMENT_MAPPING",
+              "附件目标路径与题目包已有文件冲突。",
+            );
+          }
+          const bytes = readVerifiedAttachmentBytes(attachmentCapability, target);
+          attachmentFiles.push({ path: target.targetPath, content: bytes });
+          attachmentRecords.push({
+            attachmentId: target.attachmentId,
+            contentSha256: target.contentSha256,
+            semanticRole: target.semanticRole,
+            visibility: target.visibility,
+            targetPath: target.targetPath,
+          });
+          seenPaths.add(target.targetPath);
+        }
+      }
+      const archive = writeZipArchive(
+        repackagedWithAttachmentChecksums(generated.files, attachmentFiles),
+      );
       const packageSha256 = sha256Hex(archive);
       await packagesWriter.writeNewFile(`${approved.record.candidateId}.zip`, archive);
       packageReport.push({
@@ -1056,6 +1116,7 @@ export async function packageApprovedCandidates(
         packageSha256,
         packageBytes: archive.byteLength,
         status: "packaged",
+        ...(attachmentRecords.length > 0 ? { attachments: attachmentRecords } : {}),
       });
       if (approved.metadata.authorStudentId.length > 0) {
         authorMappings.push({
@@ -1067,18 +1128,57 @@ export async function packageApprovedCandidates(
       }
     }
 
-    const batchSha256 = sha256Hex(
-      JSON.stringify({
-        version: 1,
-        packages: packageReport,
-      }),
-    );
+    const preservedMaterialReport: Array<{
+      readonly attachmentId: string;
+      readonly contentSha256: string;
+      readonly semanticRole: string;
+      readonly preservationPath: string;
+    }> = [];
+    if (attachmentPackagePlan !== undefined) {
+      const internalDirectory = join(options.outputDirectory, "internal");
+      await mkdir(internalDirectory, { recursive: false, mode: 0o700 });
+      for (const entry of attachmentPackagePlan.preservedEntries) {
+        const bytes = readVerifiedAttachmentBytes(attachmentCapability, entry);
+        await writePreservedMaterialFile(
+          options.privateRootDirectory,
+          internalDirectory,
+          entry.preservationPath,
+          bytes,
+        );
+        preservedMaterialReport.push({
+          attachmentId: entry.attachmentId,
+          contentSha256: entry.contentSha256,
+          semanticRole: entry.semanticRole,
+          preservationPath: entry.preservationPath,
+        });
+      }
+    }
+
+    const batchPayload = {
+      version: 1,
+      packages: packageReport,
+      ...(attachmentPackagePlan === undefined
+        ? {}
+        : {
+            attachmentCount: attachmentCapability.attachmentCount,
+            preservedMaterialCount: preservedMaterialReport.length,
+            preservedMaterials: preservedMaterialReport,
+          }),
+    };
+    const batchSha256 = sha256Hex(JSON.stringify(batchPayload));
     await outputWriter.writeNewJson("report.json", {
       version: 1,
       phase: "package",
       batchSha256,
       packageCount: packageReport.length,
       packages: packageReport,
+      ...(attachmentPackagePlan === undefined
+        ? {}
+        : {
+            attachmentCount: attachmentCapability.attachmentCount,
+            preservedMaterialCount: preservedMaterialReport.length,
+            preservedMaterials: preservedMaterialReport,
+          }),
     });
     await authorMappingWriter.writeNewJson(basename(options.authorMappingOutput), {
       version: 1,
@@ -1101,6 +1201,12 @@ export async function packageApprovedCandidates(
       phase: "package",
       batchSha256,
       packageCount: packageReport.length,
+      ...(attachmentPackagePlan === undefined
+        ? {}
+        : {
+            attachmentCount: attachmentCapability.attachmentCount,
+            preservedMaterialCount: preservedMaterialReport.length,
+          }),
     });
     // 返回前的最终 PASS 点：连同 PACKAGE_COMPLETE 一起复核，并复核输入的
     // 物化目录公开路径身份（close 内部完成）。
@@ -1117,6 +1223,12 @@ export async function packageApprovedCandidates(
     return {
       packageCount: packageReport.length,
       authorMappingCount: authorMappings.length,
+      ...(attachmentPackagePlan === undefined
+        ? {}
+        : {
+            attachmentCount: attachmentCapability.attachmentCount,
+            preservedMaterialCount: preservedMaterialReport.length,
+          }),
     };
   } catch (error) {
     await rm(options.outputDirectory, { recursive: true, force: true }).catch(() => undefined);
@@ -1129,6 +1241,219 @@ export async function packageApprovedCandidates(
     await packagesWriter?.close().catch(() => undefined);
     await outputWriter?.close().catch(() => undefined);
     await materialization.close().catch(() => undefined);
+  }
+}
+
+interface AttachmentPackageTarget {
+  readonly attachmentId: string;
+  readonly locator: HistoryAttachmentSourceLocator;
+  readonly contentSha256: string;
+  readonly byteLength: number;
+  readonly semanticRole: string;
+  readonly visibility: string;
+  readonly targetPath: string;
+}
+
+interface AttachmentPackagePreservedEntry {
+  readonly attachmentId: string;
+  readonly locator: HistoryAttachmentSourceLocator;
+  readonly contentSha256: string;
+  readonly byteLength: number;
+  readonly semanticRole: string;
+  readonly preservationPath: string;
+}
+
+interface AttachmentPackagePlan {
+  readonly groupIdBySourceId: ReadonlyMap<string, string>;
+  readonly rewritesByGroupId: ReadonlyMap<string, readonly { readonly from: string; readonly to: string }[]>;
+  readonly targetsByGroupId: ReadonlyMap<string, readonly AttachmentPackageTarget[]>;
+  readonly preservedEntries: readonly AttachmentPackagePreservedEntry[];
+}
+
+function buildAttachmentPackagePlan(
+  capability: HistoryAttachmentMappingCapability,
+  materializeReport: {
+    readonly sources: readonly { readonly groupId: string; readonly sourceId: string }[];
+  },
+): AttachmentPackagePlan {
+  const groupIdBySourceId = new Map(
+    materializeReport.sources.map((source) => [source.sourceId, source.groupId] as const),
+  );
+  const rewritesByGroupId = new Map<
+    string,
+    Array<{ readonly from: string; readonly to: string }>
+  >();
+  for (const rewrite of capability.mapping.referenceRewrites) {
+    const list = rewritesByGroupId.get(rewrite.groupId) ?? [];
+    list.push({ from: rewrite.from, to: rewrite.to });
+    rewritesByGroupId.set(rewrite.groupId, list);
+  }
+  const targetsByGroupId = new Map<string, AttachmentPackageTarget[]>();
+  for (const mapping of capability.mapping.mappings) {
+    if (mapping.status !== "resolved" || mapping.scope.kind !== "problem_groups") {
+      continue;
+    }
+    for (const target of mapping.scope.targets) {
+      const list = targetsByGroupId.get(target.groupId) ?? [];
+      list.push({
+        attachmentId: mapping.attachmentId,
+        locator: mapping.locator,
+        contentSha256: mapping.contentSha256,
+        byteLength: mapping.byteLength,
+        semanticRole: mapping.semanticRole,
+        visibility: mapping.visibility,
+        targetPath: target.targetPath,
+      });
+      targetsByGroupId.set(target.groupId, list);
+    }
+  }
+  const preservedEntries = capability.mapping.preservationEntries.map((entry) => {
+    const mapping = capability.mapping.mappings.find(
+      (item) => item.attachmentId === entry.attachmentId,
+    );
+    if (
+      mapping === undefined ||
+      mapping.status !== "resolved" ||
+      mapping.scope.kind !== "batch_internal"
+    ) {
+      throw new HistoryMigrationError(
+        "INVALID_ATTACHMENT_MAPPING",
+        "内部保全条目与附件映射不一致。",
+      );
+    }
+    return {
+      attachmentId: entry.attachmentId,
+      locator: mapping.locator,
+      contentSha256: mapping.contentSha256,
+      byteLength: mapping.byteLength,
+      semanticRole: entry.semanticRole,
+      preservationPath: entry.preservationPath,
+    };
+  });
+  return {
+    groupIdBySourceId,
+    rewritesByGroupId,
+    targetsByGroupId,
+    preservedEntries,
+  };
+}
+
+function attachmentPlanForCandidate(
+  plan: AttachmentPackagePlan,
+  sourceId: string,
+): {
+  readonly rewrites: readonly { readonly from: string; readonly to: string }[];
+  readonly targets: readonly AttachmentPackageTarget[];
+} | undefined {
+  const groupId = plan.groupIdBySourceId.get(sourceId);
+  if (groupId === undefined) {
+    throw new HistoryMigrationError(
+      "SOURCE_MAPPING_MISSING",
+      "已批准候选没有对应的已确认物化源分组。",
+    );
+  }
+  const rewrites = plan.rewritesByGroupId.get(groupId) ?? [];
+  const targets = plan.targetsByGroupId.get(groupId) ?? [];
+  if (rewrites.length === 0 && targets.length === 0) {
+    return undefined;
+  }
+  return { rewrites, targets };
+}
+
+function applyStatementReferenceRewrites(
+  problem: CanonicalProblem,
+  rewrites: readonly { readonly from: string; readonly to: string }[],
+): CanonicalProblem {
+  const rewritten = structuredClone(problem);
+  let statement = rewritten.content.basicStatement;
+  for (const rewrite of rewrites) {
+    if (!statement.includes(rewrite.from)) {
+      throw new HistoryMigrationError(
+        "INVALID_ATTACHMENT_MAPPING",
+        "题面资源原引用在候选题面中不存在，不能改写。",
+      );
+    }
+    statement = statement.split(rewrite.from).join(rewrite.to);
+  }
+  rewritten.content.basicStatement = statement;
+  return rewritten;
+}
+
+function readVerifiedAttachmentBytes(
+  capability: HistoryAttachmentMappingCapability,
+  target: {
+    readonly locator: HistoryAttachmentSourceLocator;
+    readonly contentSha256: string;
+    readonly byteLength: number;
+  },
+): Uint8Array {
+  const bytes = capability.readAttachmentBytes(target.locator);
+  if (bytes.byteLength !== target.byteLength || sha256Hex(bytes) !== target.contentSha256) {
+    throw new HistoryMigrationError(
+      "SOURCE_DIGEST_MISMATCH",
+      "附件固定源字节与已确认映射不一致。",
+    );
+  }
+  return bytes;
+}
+
+/**
+ * 原生导出在生成 ZIP 前就写好了覆盖导出文件的 checksums.sha256；追加附件后
+ * 必须重新生成校验值文件，否则题目包无法按原生格式重新导入。
+ */
+function repackagedWithAttachmentChecksums(
+  generatedFiles: readonly { readonly path: string; readonly content: Uint8Array }[],
+  attachmentFiles: readonly { readonly path: string; readonly content: Uint8Array }[],
+): Array<{ readonly path: string; readonly content: Uint8Array }> {
+  const files = new Map<string, Uint8Array>();
+  for (const file of [...generatedFiles, ...attachmentFiles]) {
+    files.set(file.path, file.content);
+  }
+  files.delete(checksumFilePath);
+  files.set(
+    checksumFilePath,
+    new TextEncoder().encode(renderChecksums(checksumsForFiles(files))),
+  );
+  return [...files.entries()].map(([path, content]) => ({ path, content }));
+}
+
+async function ensurePrivateSubdirectory(path: string): Promise<void> {
+  try {
+    await createNewPrivateDirectory(path);
+  } catch (error) {
+    if (error instanceof HistoryMigrationError && error.code === "OUTPUT_ALREADY_EXISTS") {
+      await assertPrivateDirectoryMode(path);
+      return;
+    }
+    throw error;
+  }
+}
+
+async function writePreservedMaterialFile(
+  privateRootDirectory: string,
+  internalDirectory: string,
+  preservationPath: string,
+  content: Uint8Array,
+): Promise<void> {
+  const segments = preservationPath.split("/");
+  if (
+    segments.length === 0 ||
+    segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")
+  ) {
+    throw new HistoryMigrationError("OUTPUT_WRITE_FAILED", "内部保全路径不安全。");
+  }
+  let directory = internalDirectory;
+  for (const segment of segments.slice(0, -1)) {
+    directory = join(directory, segment);
+    await ensurePrivateSubdirectory(directory);
+  }
+  const leafName = segments.at(-1) as string;
+  const writer = await openVerifiedPrivateOutputWriter(directory);
+  try {
+    await writer.writeNewFile(leafName, content);
+    await writer.assertAllPublishedUnchanged();
+  } finally {
+    await writer.close().catch(() => undefined);
   }
 }
 

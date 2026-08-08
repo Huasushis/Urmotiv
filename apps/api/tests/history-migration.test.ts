@@ -941,7 +941,7 @@ describe("历史题目迁移安全核心", () => {
     expect(authorMap.records[0]?.packageSha256).toBe(report.packages[0]?.packageSha256);
   });
 
-  it("核心打包器重新验证附件能力，非零附件在第二阶段接线前固定硬失败", async () => {
+  it("核心打包器重新验证附件能力，批次内部保全附件进入独立保全目录", async () => {
     const fixture = await createPreparedFixture();
     const candidate = await readCandidate(fixture.prepareOutput);
     await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
@@ -953,14 +953,56 @@ describe("历史题目迁移安全核心", () => {
     });
     await rewriteFixtureMaterializationBatch(fixture, attachmentMappingCapability);
 
-    await expect(
-      packageApprovedCandidates({
-        ...fixture.packageOptions,
-        attachmentMappingCapability,
-      }),
-    ).rejects.toMatchObject({ code: "ATTACHMENT_PACKAGING_UNAVAILABLE" });
-    await expect(stat(fixture.packageOutput)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(stat(fixture.authorMappingOutput)).rejects.toMatchObject({ code: "ENOENT" });
+    const result = await packageApprovedCandidates({
+      ...fixture.packageOptions,
+      attachmentMappingCapability,
+    });
+    expect(result).toEqual({
+      packageCount: 1,
+      authorMappingCount: 1,
+      attachmentCount: 1,
+      preservedMaterialCount: 1,
+    });
+
+    // 批次内部保全材料只进入独立保全目录，不进入题目包 ZIP。
+    const preservedBytes = await readFile(
+      join(
+        fixture.packageOutput,
+        "internal",
+        "preservation",
+        "internal",
+        "attachment-000001.bin",
+      ),
+    );
+    expect(new Uint8Array(preservedBytes)).toEqual(new Uint8Array([1, 2, 3, 4]));
+
+    const packagePath = join(fixture.packageOutput, "packages", "candidate-000001.zip");
+    const archive = readZipArchive(new Uint8Array(await readFile(packagePath)));
+    for (const entry of archive.list()) {
+      expect(entry.path).not.toMatch(/^attachments\//);
+      expect(entry.path).not.toMatch(/^internal\//);
+      expect(entry.path).not.toContain("attachment-000001");
+    }
+
+    const reportText = await readFile(join(fixture.packageOutput, "report.json"), "utf8");
+    expect(reportText).not.toContain(syntheticStudentId);
+    expect(reportText).not.toContain(syntheticSourceName);
+    expect(reportText).not.toContain(syntheticMetadataTitle);
+    const report = JSON.parse(reportText) as {
+      attachmentCount: number;
+      preservedMaterialCount: number;
+      preservedMaterials: Array<{ attachmentId: string; preservationPath: string }>;
+    };
+    expect(report.attachmentCount).toBe(1);
+    expect(report.preservedMaterialCount).toBe(1);
+    expect(report.preservedMaterials[0]?.attachmentId).toBe("attachment-000001");
+    expect(report.preservedMaterials[0]?.preservationPath).toBe(
+      "preservation/internal/attachment-000001.bin",
+    );
+
+    const authorMapText = await readFile(fixture.authorMappingOutput, "utf8");
+    expect(authorMapText).toContain("candidate-000001");
+    expect(authorMapText).toContain(syntheticStudentId);
   });
 
   it("核心打包器拒绝把同 metadata 的零附件能力跨 grouping 用于含附件物化批次", async () => {

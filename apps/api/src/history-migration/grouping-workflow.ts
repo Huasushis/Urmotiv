@@ -545,6 +545,11 @@ export interface VerifiedHistoryMaterialization {
    */
   readSourceConfirmation(): Promise<unknown>;
   /**
+   * 通过核对时持有的同一句柄重新读取物化安全报告。内容或状态与核对时不一致
+   * 会抛出 HistoryMigrationError；报告只含安全编号、摘要和计数。
+   */
+  readReport(): Promise<z.infer<typeof historyMaterializeReportSchema>>;
+  /**
    * 通过核对时持有的同一句柄重新核对并读取源文件。内容摘要与安全编号不一致
    * 时抛 SOURCE_DIGEST_MISMATCH；文件身份/权限/状态在核对后变化时抛
    * GROUPING_CHANGED。
@@ -608,6 +613,12 @@ export interface VerifiedHistoryAttachmentContext {
     readonly metadataId: string;
   }[];
   readonly attachments: readonly VerifiedHistoryAttachmentCandidate[];
+  /**
+   * 打包阶段只读固定源字节的入口。字节在本上下文加载时已经逐字核对过清单
+   * 摘要，这里只从内存快照返回，不接受任何新路径，也不重新读盘，因此同一
+   * 次确认得到的字节在打包期间不可变。
+   */
+  readonly readAttachmentBytes: (locator: HistoryAttachmentSourceLocator) => Uint8Array;
 }
 
 export interface LoadVerifiedHistoryAttachmentContextOptions {
@@ -1474,6 +1485,21 @@ export async function assertHistoryMaterializationComplete(
           throw error;
         }
       },
+      readReport: async () => {
+        try {
+          return parsePrivateInput(
+            historyMaterializeReportSchema,
+            await access.readJson("report.json"),
+            "INVALID_GROUPING",
+            "物化目录的安全报告格式不正确。",
+          );
+        } catch (error) {
+          if (error instanceof HistoryMigrationError) {
+            throw new HistoryMigrationError("GROUPING_CHANGED", "物化报告在核对后发生变化。");
+          }
+          throw error;
+        }
+      },
       readConfirmedSource: (sourcePath: string, expectedSha256: string, sourceId: string) =>
         access.readConfirmedSource(sourcePath, expectedSha256, sourceId),
       assertUnchangedBeforePublish: assertInputsUnchanged,
@@ -1613,6 +1639,30 @@ export async function loadVerifiedHistoryAttachmentContext(
     );
   }
 
+  const readAttachmentBytes = (locator: HistoryAttachmentSourceLocator): Uint8Array => {
+    const source = sourcesById.get(locator.sourceId);
+    if (locator.kind === "zip_entry") {
+      if (source?.inventory.kind !== "zip" || source.zipEntriesById === undefined) {
+        throw new HistoryMigrationError("GROUPING_CHANGED", "已确认附件指向的压缩包源已经变化。");
+      }
+      const entry = source.zipEntriesById.get(locator.entryId);
+      if (entry === undefined) {
+        throw new HistoryMigrationError("GROUPING_CHANGED", "已确认附件指向的压缩包条目已经变化。");
+      }
+      return entry;
+    }
+    if (locator.kind === "text_range") {
+      if (source?.inventory.kind !== "text" || source.text === undefined) {
+        throw new HistoryMigrationError("GROUPING_CHANGED", "已确认附件指向的文本源已经变化。");
+      }
+      return new TextEncoder().encode(source.text.slice(locator.start, locator.end));
+    }
+    if (source === undefined || source.bytes === undefined) {
+      throw new HistoryMigrationError("GROUPING_CHANGED", "已确认附件指向的源文件已经变化。");
+    }
+    return source.bytes;
+  };
+
   return {
     bindings: {
       sourceInventorySha256: catalog.inventorySha256,
@@ -1628,6 +1678,7 @@ export async function loadVerifiedHistoryAttachmentContext(
       metadataId: group.metadataId,
     })),
     attachments,
+    readAttachmentBytes,
   };
 }
 

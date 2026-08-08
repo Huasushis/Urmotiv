@@ -240,7 +240,7 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts confirm-grouping
 人工队列、完整元数据文件、片段集合、分组、所有人工处置及完整性报告摘要一起写入确认。任一项变化都会
 使确认失效。
 
-### 5.1 附件映射完成门（第一阶段）
+### 5.1 附件映射完成门
 
 分组中只要有 `action: "attachment"`，必须先运行 `init-attachments`，再逐附件人工填写计划并运行
 `seal-attachments`。每个附件都必须保留原来的源绑定摘要，并明确填写受控语义角色、`public`/`internal`
@@ -284,10 +284,10 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts seal-attachments
 `fsync`，再以不可覆盖的硬链接（让目标名指向已经完整写好的同一文件）发布并 `fsync` 目录，最终标记最后
 发布；不使用阶段目录或可能覆盖目标
 的 rename。发布后仍通过创建时持有的目录句柄逐文件复核，最后再按公开路径重开并比较类型、设备号、
-inode、所有者、权限和 `ctimeNs`，目录被替换或权限改坏后再恢复也会失败。当前第一阶段尚未把附件字节及
-引用改写接入题目包：核心
-`packageApprovedCandidates` 会再次验证完成门签发的能力，只有附件数为零才允许旧打包逻辑；非零附件固定
-返回 `ATTACHMENT_PACKAGING_UNAVAILABLE`，不能靠跳过 CLI 或只改 README 绕过。
+*inode、所有者、权限和 `ctimeNs`，目录被替换或权限改坏后再恢复也会失败。打包时核心
+*`packageApprovedCandidates` 会再次验证完成门签发的能力；非零附件不再固定拒绝，而是进入附件第二阶段：
+*固定源字节物化、题面资源引用改写、公开/内部保存、包清单与失败回滚（见第 9 节）。能力缺失、伪造或任一
+*摘要变化仍然在任何输出创建前停止，不能靠跳过 CLI 或只改 README 绕过。
 
 ## 6. materialize：生成一题一文件的确认文本
 
@@ -410,13 +410,36 @@ apps/api/node_modules/.bin/tsx apps/api/scripts/migrate-hist.ts package \
 打包前先根据上述原始清单、分组和附件目录签发一次能力。核心打包函数只接受整个 `--materialized` 目录，
 自行固定使用其中的 `sources/` 与 `source-confirmation.private.json`，重新验证 `MATERIALIZE_COMPLETE`，再把
 其中的 grouping 批次摘要与附件能力重新扫描得到的批次摘要严格比较；缺参数、跨批次能力、伪造能力、
-BLOCKED 与 COMPLETE 并存、非零附件或任一摘要变化都会在创建输出目录或作者映射前停止。之后才重新读取
+BLOCKED 与 COMPLETE 并存或任一摘要变化都会在创建输出目录或作者映射前停止。之后才重新读取
 物化文本并核对摘要；这些读取全部经由同一组稳定目录句柄完成，发布任何输出前还会按公开路径复核物化
 目录身份，并通过同一句柄重读完成标记和全部源文件。输出文件先在输出目录内以 0600 临时写入并 fsync，
 再硬链接（不可覆盖）发布，发布后逐文件复核 inode、所有者、权限、大小、ctimeNs、mtimeNs 与内容摘要，
 `PACKAGE_COMPLETE` 标记最后发布；任何文件被替换、改写或 chmod 后再还原都会失败，并删除全部部分输出。
 题目包报告不含题名、原题号、作者或正文；作者映射在输出目录之外的
 独立私有文件中，并绑定候选摘要、题目包摘要和整批摘要。
+
+附件第二阶段在打包时按已封存映射执行，所有字节都来自打包前重新完整核对过的只读内存快照，不接受任何新
+路径：
+
+- 固定源字节物化：每个已解决附件按定位符（`zip_entry`/`text_range`/`whole_file`）取回本次核对时已验证的
+  字节，并再次核对字节长度和内容摘要与映射一致；不一致即失败。
+- 题面资源引用改写：`referenceRewrites` 里的人工改写表按题目组套用到对应候选的 `basicStatement`。原引用
+  必须真实出现在题面中，否则失败；改写后 `assets/<内容摘要>.<扩展名>` 与原生包的资产命名和摘要校验一致。
+- 公开/内部保存：题面资源（`statement_asset`）与竞赛附件（`contestant_attachment`）按
+  `assets/`、`attachments/public/` 进入题目包 ZIP；`solution_original`、`reference_implementation_candidate`
+  等内部角色按 `attachments/internal/` 进入同一 ZIP 的内部附件区，导入时与对外用途分开。
+  `batch_internal` 的评测/命题候选材料不进入任何题目包，按人工保全路径写入
+  `<out>/internal/<preservationPath>`，目录与文件都用 `0700`/`0600` 私有权限，保全路径禁止 `..`、绝对路径
+  和空段。
+- 包清单：`report.json` 在含附件时记录 `attachmentCount`、每个题目包的附件条目（安全编号、摘要、语义角色、
+  可见性、目标路径）以及 `preservedMaterials` 保全清单；整批摘要把这些记录一并纳入，`PACKAGE_COMPLETE`
+  同样带附件计数。
+- 失败回滚：任一附件字节核对、引用改写、目标路径冲突或保全写入失败都会删除整个输出目录（含内部保全目录）
+  和作者映射，不留下部分输出；错误信息不含附件原路径或原引用。
+
+目标路径冲突（附件目标路径与题目包已有文件或另一附件重复）、保全路径之间的目录/文件冲突都会直接失败，
+不做静默覆盖。附件源目录、清单、分组、确认或映射在封存后变化，会在重新验证时以与“不存在”一致的方式
+失败，不会泄露附件是否存在。
 
 本工作流能安全处理 UTF-8 文本，以及最多两层历史 ZIP 路径链中明确选择的 UTF-8 文本条目。PDF、图片、
 评测数据、附件、二进制文档和无法明确划分的混合资料仍需人工处理，不能因为已有安全清单就称为完成真实

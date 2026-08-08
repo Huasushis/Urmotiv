@@ -4,6 +4,7 @@ import { z } from "zod";
 import { sha256Hex } from "./digests";
 import { HistoryMigrationError } from "./errors";
 import {
+  type HistoryAttachmentSourceLocator,
   type LoadVerifiedHistoryAttachmentContextOptions,
   type VerifiedHistoryAttachmentContext,
   loadVerifiedHistoryAttachmentContext,
@@ -492,6 +493,16 @@ export interface HistoryAttachmentMappingCapability {
   readonly mapping: HistoryAttachmentMapping;
   readonly attachmentCount: number;
   readonly groupingBatchSha256: string;
+  /** 题目组到元数据安全编号的对应，只含安全编号，不含题名等私有内容。 */
+  readonly groups: readonly {
+    readonly groupId: string;
+    readonly metadataId: string;
+  }[];
+  /**
+   * 打包阶段只读附件固定源字节的入口。只接受本映射中已验证的定位符，从本次
+   * 完整核对时加载并逐字验证过的内存快照返回，不接受任何新路径。
+   */
+  readonly readAttachmentBytes: (locator: HistoryAttachmentSourceLocator) => Uint8Array;
 }
 
 const attachmentCapabilityOptions = new WeakMap<
@@ -779,6 +790,8 @@ export async function assertHistoryAttachmentMappingComplete(
         mapping,
         attachmentCount: mapping.mappings.length,
         groupingBatchSha256: mapping.bindings.groupingBatchSha256,
+        groups: context.groups,
+        readAttachmentBytes: context.readAttachmentBytes,
       });
     },
   );
