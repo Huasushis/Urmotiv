@@ -7,6 +7,13 @@
 secrets/
 /private/
 
+# Machine-local handoff and status docs (mirrored copies of root-level docs)
+/HANDOFF.md
+/PROMPT-FOR-NEXT-AI.md
+/QUICK-START.txt
+/docs/handoff-2026-07-27-fix.md
+/docs/handoff-2026-07-29-pause.md
+
 # Private problem material. These paths must never be committed.
 USTC题目列表.xlsx
 *.xlsx
