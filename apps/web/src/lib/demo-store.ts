@@ -2,6 +2,8 @@ import type {
   ApplyReviewSuggestionsInput,
   CreateProblemInput,
   Problem,
+  ProblemAccessListResponse,
+  ProblemAccessRecord,
   ProblemCapabilities,
   ProblemListQuery,
   ProblemListResponse,
@@ -133,6 +135,57 @@ const initialProblems: Problem[] = [
     capabilities: emptyCapabilities()
   }
 ];
+
+const initialAccessRecords: Record<string, ProblemAccessRecord[]> = {
+  "p-2026-004": [
+    {
+      user: demoUsers.author,
+      firstAccessedAt: "2026-07-24T09:30:00.000Z",
+      lastAccessedAt: "2026-07-25T01:35:00.000Z",
+      totalActiveSeconds: 214,
+      lastRevision: 3
+    },
+    {
+      user: demoUsers.reviewer,
+      firstAccessedAt: "2026-07-24T11:02:00.000Z",
+      lastAccessedAt: "2026-07-24T11:08:00.000Z",
+      totalActiveSeconds: 126,
+      lastRevision: 2
+    }
+  ],
+  "p-2026-003": [
+    {
+      user: demoUsers.reviewer,
+      firstAccessedAt: "2026-07-21T08:10:00.000Z",
+      lastAccessedAt: "2026-07-24T09:12:00.000Z",
+      totalActiveSeconds: 1560,
+      lastRevision: 7
+    },
+    {
+      user: demoUsers.leader,
+      firstAccessedAt: "2026-07-22T03:20:00.000Z",
+      lastAccessedAt: "2026-07-24T09:15:00.000Z",
+      totalActiveSeconds: 720,
+      lastRevision: 7
+    }
+  ],
+  "p-2026-001": [
+    {
+      user: demoUsers.member,
+      firstAccessedAt: "2026-07-19T06:40:00.000Z",
+      lastAccessedAt: "2026-07-23T03:44:00.000Z",
+      totalActiveSeconds: 830,
+      lastRevision: 12
+    },
+    {
+      user: demoUsers.leader,
+      firstAccessedAt: "2026-07-18T08:00:00.000Z",
+      lastAccessedAt: "2026-07-23T03:40:00.000Z",
+      totalActiveSeconds: 1240,
+      lastRevision: 12
+    }
+  ]
+};
 
 const tags: ProblemTag[] = [
   { id: "graph.shortest-path", name: "最短路", group: "图论" },
@@ -492,6 +545,15 @@ const reviewsByProblem: Record<string, ReviewRoundSummary> = {
     decisionSource: "rule"
   }
 };
+
+export async function listDemoProblemAccess(id: string): Promise<ProblemAccessListResponse> {
+  const { problem } = findProblem(id);
+  if (!decorate(problem).capabilities.canView) {
+    throw new ApiError("题目不存在或你没有查看权限。", 404);
+  }
+  const items = initialAccessRecords[id];
+  return { items: items === undefined ? [] : items.map((record) => ({ ...record })) };
+}
 
 export async function listDemoReviews(id: string): Promise<ReviewRoundSummary> {
   const { problem } = findProblem(id);

@@ -20,6 +20,7 @@ import {
   listContests,
   updateContest
 } from "../lib/api";
+import { duration } from "../lib/presentation";
 
 const stateText = {
   draft: "草稿",
@@ -52,15 +53,6 @@ function dateTime(value: string | null): string {
     : new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(
         new Date(value)
       );
-}
-
-function duration(seconds: number): string {
-  if (seconds < 60) {
-    return `${seconds} 秒`;
-  }
-  const minutes = Math.floor(seconds / 60);
-  const remainder = seconds % 60;
-  return remainder === 0 ? `${minutes} 分钟` : `${minutes} 分 ${remainder} 秒`;
 }
 
 export function ContestPage() {

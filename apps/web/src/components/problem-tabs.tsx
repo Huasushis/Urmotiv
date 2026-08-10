@@ -3,10 +3,12 @@ import {
   ChevronDown,
   ChevronUp,
   ExternalLink,
+  Eye,
   FileCode2,
   FileUp,
   LockKeyhole,
   Plus,
+  RefreshCw,
   Search,
   ShieldCheck,
   Trash2
@@ -28,11 +30,12 @@ import {
   createReview,
   getProblem,
   getReviewSuggestions,
+  listProblemAccess,
   listReviewItems,
   listReviews,
   listTags
 } from "../lib/api";
-import { dateTime, isFrozen, reviewVerdictText, statusText, typeText } from "../lib/presentation";
+import { dateTime, duration, isFrozen, reviewVerdictText, statusText, typeText } from "../lib/presentation";
 import { MarkdownEditor } from "./markdown-editor";
 import {
   JudgeProgramPanel,
@@ -180,7 +183,64 @@ export function OverviewTab({ problem, update }: ProblemTabProps) {
         <div><dt>题目类型</dt><dd>{typeText[problem.type]}</dd></div>
         <div><dt>最近更新</dt><dd>{dateTime(problem.updatedAt)}</dd></div>
       </dl>
+
+      {problem.capabilities.canViewAccessLog ? <ProblemAccessPanel problemId={problem.id} /> : null}
     </div>
+  );
+}
+
+/** 题目浏览记录：只有服务端确认有查看权限的账号才会渲染并加载。 */
+export function ProblemAccessPanel({ problemId }: { problemId: string }) {
+  const access = useQuery({
+    queryKey: ["problem-access", problemId],
+    queryFn: () => listProblemAccess(problemId)
+  });
+
+  return (
+    <section className="access-log-panel plain-panel" aria-labelledby="access-log-title">
+      <div className="section-title">
+        <div>
+          <p className="eyebrow">命题组可见</p>
+          <h3 id="access-log-title">浏览记录</h3>
+        </div>
+        <Eye size={19} aria-hidden="true" />
+      </div>
+      {access.isLoading ? <p className="access-log-empty">正在加载浏览记录…</p> : null}
+      {access.isError ? (
+        <div className="access-log-error">
+          <p className="form-error">{access.error.message}</p>
+          <button
+            className="secondary-button compact-button"
+            type="button"
+            onClick={() => void access.refetch()}
+          >
+            <RefreshCw size={14} aria-hidden="true" />
+            重试
+          </button>
+        </div>
+      ) : null}
+      {access.data && access.data.items.length === 0 ? (
+        <p className="access-log-empty">还没有人看过这道题。</p>
+      ) : null}
+      {access.data && access.data.items.length > 0 ? (
+        <ul className="access-log-list">
+          {access.data.items.map((record) => (
+            <li className="access-log-entry" key={record.user.id}>
+              <span className="access-log-user">
+                <strong>{record.user.nickname}</strong>
+                <small>{record.user.id}</small>
+              </span>
+              <span className="access-log-detail">
+                <span>
+                  首次访问 {dateTime(record.firstAccessedAt)} · 最近访问 {dateTime(record.lastAccessedAt)}
+                </span>
+                <small>总浏览时长 {duration(record.totalActiveSeconds)} · 最后修订第 {record.lastRevision} 版</small>
+              </span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </section>
   );
 }
 

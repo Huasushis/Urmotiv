@@ -44,6 +44,15 @@ export function difficultyText(value: number | null): string {
   return value === null ? "未填写" : String(value);
 }
 
+export function duration(seconds: number): string {
+  if (seconds < 60) {
+    return `${seconds} 秒`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder === 0 ? `${minutes} 分钟` : `${minutes} 分 ${remainder} 秒`;
+}
+
 export function reviewVerdictText(verdict: "approve" | "request_changes" | "reject"): string {
   if (verdict === "approve") {
     return "通过";

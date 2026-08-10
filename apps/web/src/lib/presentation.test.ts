@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isFrozen, reviewVerdictText, statusText } from "./presentation";
+import { duration, isFrozen, reviewVerdictText, statusText } from "./presentation";
 
 describe("题目展示规则", () => {
   it("只在待审核和通过时冻结三个稳定字段", () => {
@@ -12,5 +12,12 @@ describe("题目展示规则", () => {
   it("使用给用户看的中文状态和审核结论", () => {
     expect(statusText.rejected).toBe("审核不通过");
     expect(reviewVerdictText("request_changes")).toBe("需要修改");
+  });
+
+  it("浏览时长按秒、分秒展示给用户", () => {
+    expect(duration(0)).toBe("0 秒");
+    expect(duration(42)).toBe("42 秒");
+    expect(duration(120)).toBe("2 分钟");
+    expect(duration(3210)).toBe("53 分 30 秒");
   });
 });

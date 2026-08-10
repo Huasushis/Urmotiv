@@ -48,6 +48,7 @@ import {
   type ProblemFileSummary,
   type ProblemListQuery,
   type ProblemListResponse,
+  type ProblemAccessListResponse,
   type ReviewInput,
   type ApplyReviewSuggestionsInput,
   type ReviewPolicyView,
@@ -502,11 +503,10 @@ export function recordProblemActivity(id: string, activeSeconds: number): Promis
   );
 }
 
-export function listProblemAccess(id: string) {
-  return request(
-    `/problems/${encodeURIComponent(id)}/access`,
-    { method: "GET" },
-    problemAccessListResponseSchema
+export function listProblemAccess(id: string): Promise<ProblemAccessListResponse> {
+  return fallback(
+    () => request(`/problems/${encodeURIComponent(id)}/access`, { method: "GET" }, problemAccessListResponseSchema),
+    async () => (await import("./demo-store")).listDemoProblemAccess(id)
   );
 }
 

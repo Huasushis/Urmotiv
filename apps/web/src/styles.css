@@ -1323,6 +1323,77 @@ textarea:read-only {
   white-space: nowrap;
 }
 
+.access-log-panel {
+  margin-top: 24px;
+  max-width: 960px;
+}
+
+.access-log-empty {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 13px;
+}
+
+.access-log-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.access-log-error .form-error {
+  margin: 0;
+}
+
+.access-log-list {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.access-log-entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, auto);
+  align-items: baseline;
+  gap: 4px 20px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.access-log-entry:last-child {
+  border-bottom: 0;
+}
+
+.access-log-user {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.access-log-user small {
+  color: var(--text-faint);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.access-log-detail {
+  display: grid;
+  justify-items: end;
+  min-width: 0;
+  gap: 2px;
+  color: var(--text-soft);
+  font-size: 12px;
+  text-align: right;
+}
+
+.access-log-detail small {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
 .stacked-editors {
   max-width: 1260px;
 }
@@ -3542,6 +3613,16 @@ textarea:read-only {
   .workspace-tabs button {
     padding: 0 12px;
     font-size: 12px;
+  }
+
+  .access-log-entry {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+
+  .access-log-detail {
+    justify-items: start;
+    text-align: left;
   }
 
   .metadata-list,

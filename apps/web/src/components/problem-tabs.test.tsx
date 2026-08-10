@@ -14,6 +14,7 @@ const api = vi.hoisted(() => ({
   createReview: vi.fn(),
   getProblem: vi.fn(),
   getReviewSuggestions: vi.fn(),
+  listProblemAccess: vi.fn(),
   listReviewItems: vi.fn(),
   listReviews: vi.fn(),
   listTags: vi.fn()
@@ -25,7 +26,7 @@ vi.mock("../lib/api", async (importOriginal) => {
 });
 
 import { ApiError } from "../lib/api";
-import { ReviewTab } from "./problem-tabs";
+import { OverviewTab, ProblemAccessPanel, ReviewTab } from "./problem-tabs";
 
 const timestamp = "2026-07-31T08:00:00.000Z";
 
@@ -668,5 +669,78 @@ describe("题目审核标签页", () => {
     expect(view.textContent).not.toContain("不应显示的权限判断细节");
     expect(view.textContent).not.toContain("所选字段已经写回题目");
     expect(api.getProblem).not.toHaveBeenCalled();
+  });
+});
+
+describe("浏览记录面板", () => {
+  function accessProblem(): Problem {
+    return {
+      ...problem(false),
+      status: "approved",
+      capabilities: {
+        ...problem(false).capabilities,
+        canView: true,
+        canViewAccessLog: true
+      }
+    };
+  }
+
+  it("没有查看权限时不渲染也不请求浏览记录", () => {
+    const view = mount(<OverviewTab problem={problem(false)} update={() => undefined} />);
+    expect(view.querySelector(".access-log-panel")).toBeNull();
+    expect(api.listProblemAccess).not.toHaveBeenCalled();
+  });
+
+  it("有权限时按时间列出浏览者、时长和最后修订", async () => {
+    api.listProblemAccess.mockResolvedValue({
+      items: [
+        {
+          user: { id: "author", nickname: "投稿人", accountType: "human" },
+          firstAccessedAt: "2026-07-24T09:30:00.000Z",
+          lastAccessedAt: "2026-07-25T01:35:00.000Z",
+          totalActiveSeconds: 3210,
+          lastRevision: 3
+        },
+        {
+          user: { id: "reviewer", nickname: "审题人", accountType: "human" },
+          firstAccessedAt: "2026-07-24T11:02:00.000Z",
+          lastAccessedAt: "2026-07-24T11:08:00.000Z",
+          totalActiveSeconds: 42,
+          lastRevision: 2
+        }
+      ]
+    });
+
+    const view = mount(<ProblemAccessPanel problemId="problem-1" />);
+
+    await waitFor(() => expect(view.textContent).toContain("投稿人"));
+    expect(api.listProblemAccess).toHaveBeenCalledWith("problem-1");
+    expect(view.textContent).toContain("53 分 30 秒");
+    expect(view.textContent).toContain("42 秒");
+    expect(view.textContent).toContain("最后修订第 3 版");
+  });
+
+  it("没有任何访问时展示引导性空状态", async () => {
+    api.listProblemAccess.mockResolvedValue({ items: [] });
+
+    const view = mount(<ProblemAccessPanel problemId="problem-1" />);
+
+    await waitFor(() => expect(view.textContent).toContain("还没有人看过这道题。"));
+    expect(view.querySelectorAll(".access-log-entry")).toHaveLength(0);
+  });
+
+  it("加载失败时展示错误与重试入口", async () => {
+    api.listProblemAccess.mockRejectedValueOnce(new ApiError("无法读取浏览记录。", 500));
+    api.listProblemAccess.mockResolvedValue({ items: [] });
+
+    const view = mount(<ProblemAccessPanel problemId="problem-1" />);
+
+    await waitFor(() => expect(view.textContent).toContain("无法读取浏览记录。"));
+    const retry = [...view.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "重试"
+    );
+    expect(retry).toBeDefined();
+    await act(async () => retry?.click());
+    await waitFor(() => expect(api.listProblemAccess).toHaveBeenCalledTimes(2));
   });
 });
