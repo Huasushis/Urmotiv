@@ -74,6 +74,7 @@ export interface AtomicImportedProblemWriter {
     readonly choices: ProblemPackageImportChoices;
     readonly problem: CanonicalProblem;
     readonly signal: AbortSignal;
+    readonly leaseId?: string;
   }): Promise<{ readonly problemId: string }>;
 }
 

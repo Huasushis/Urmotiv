@@ -4,6 +4,7 @@ import {
   CopyObjectCommand,
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   type S3Client
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
@@ -45,7 +46,8 @@ export class S3FileStorage implements FileStorage {
 
   public async stage(input: StageFileInput): Promise<StagedFile> {
     const metadata = validateFileMetadata(input, this.#limits);
-    const id = randomUUID();
+    const id = input.id ?? randomUUID();
+    storageIdSchema.parse(id);
     const stagingKey = this.#stagingKey(id);
     const hash = createHash("sha256");
     const inspection = { byteSize: 0 };
@@ -88,6 +90,25 @@ export class S3FileStorage implements FileStorage {
     }
     const storageKey = this.#storageKey(staged.id);
 
+    // 检查正式对象是否已存在（上一次发布可能已完成）。
+    try {
+      await this.#client.send(
+        new HeadObjectCommand({ Bucket: this.#bucket, Key: storageKey })
+      );
+      // 正式对象已存在：幂等返回，清理可能残留的临时对象。
+      await this.#deleteKey(staged.stagingKey).catch(() => undefined);
+      return {
+        id: staged.id,
+        originalName: staged.originalName,
+        mediaType: staged.mediaType,
+        byteSize: staged.byteSize,
+        sha256: staged.sha256,
+        storageKey,
+      };
+    } catch {
+      // 正式对象不存在：继续正常发布。
+    }
+
     try {
       await this.#client.send(
         new CopyObjectCommand({
@@ -95,7 +116,7 @@ export class S3FileStorage implements FileStorage {
           Key: storageKey,
           CopySource: copySource(this.#bucket, staged.stagingKey),
           ContentType: staged.mediaType,
-          MetadataDirective: "REPLACE"
+          MetadataDirective: "REPLACE",
         })
       );
       await this.#deleteKey(staged.stagingKey);
@@ -105,17 +126,17 @@ export class S3FileStorage implements FileStorage {
         mediaType: staged.mediaType,
         byteSize: staged.byteSize,
         sha256: staged.sha256,
-        storageKey
+        storageKey,
       };
     } catch (error) {
       await Promise.allSettled([
         this.#deleteKey(storageKey),
-        this.#deleteKey(staged.stagingKey)
+        this.#deleteKey(staged.stagingKey),
       ]);
       throw new StorageError(
         "STORAGE_PUBLISH_FAILED",
         "文件从对象存储临时区发布到正式区失败。",
-        { cause: error }
+        { cause: error },
       );
     }
   }

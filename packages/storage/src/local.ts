@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
-import { link, mkdir, open, rm } from "node:fs/promises";
+import { link, mkdir, open, readdir, rm, rmdir, stat } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import {
   stagedFileSchema,
@@ -34,10 +34,17 @@ export class LocalFileStorage implements FileStorage {
 
   public async stage(input: StageFileInput): Promise<StagedFile> {
     const metadata = validateFileMetadata(input, this.#limits);
-    const id = randomUUID();
-    const stagingKey = `staging/${id}.part`;
-    const stagingPath = this.#pathForKey(stagingKey, "staging");
+    const id = input.id ?? randomUUID();
     await this.#ensureDirectories();
+    storageIdSchema.parse(id);
+    // 所有权安全：每个竞争者使用自己的 staging 路径 staging/<id>/<attempt>.part，
+    // 而非共享 staging/<id>.part。确定性对象键 objects/<id> 保持不变——
+    // 原子 publish 通过 link 选出一个完整对象。失败方只删除自己的 staging 文件。
+    const attemptId = randomUUID();
+    const stagingKey = `staging/${id}/${attemptId}.part`;
+    const stagingDir = resolve(this.#rootDirectory, "staging", id);
+    const stagingPath = resolve(stagingDir, `${attemptId}.part`);
+    await mkdir(stagingDir, { recursive: true });
 
     let handle: FileHandle | undefined;
     try {
@@ -65,7 +72,10 @@ export class LocalFileStorage implements FileStorage {
       };
     } catch (error) {
       await handle?.close().catch(() => undefined);
+      // 只清理自己拥有的 staging 文件——绝不触碰其他竞争者的文件。
       await rm(stagingPath, { force: true }).catch(() => undefined);
+      // 清理可能空的 staging 子目录（best-effort）。
+      await rmdir(stagingDir).catch(() => undefined);
       if (error instanceof StorageError) {
         throw error;
       }
@@ -79,50 +89,110 @@ export class LocalFileStorage implements FileStorage {
 
   public async publish(stagedFile: StagedFile): Promise<StoredFile> {
     const staged = stagedFileSchema.parse(stagedFile);
-    const expectedStagingKey = `staging/${staged.id}.part`;
-    if (staged.stagingKey !== expectedStagingKey) {
+    // 接受新的所有权安全 staging 键格式 staging/<id>/<attempt>.part。
+    const stagingKeyPrefix = `staging/${staged.id}/`;
+    if (!staged.stagingKey.startsWith(stagingKeyPrefix) || !staged.stagingKey.endsWith(".part")) {
       throw new StorageError("INVALID_STORAGE_KEY", "临时文件位置不正确。");
     }
 
     const storageKey = `objects/${staged.id}`;
     const stagingPath = this.#pathForKey(staged.stagingKey, "staging");
+    const stagingDir = resolve(this.#rootDirectory, "staging", staged.id);
     const storagePath = this.#pathForKey(storageKey, "objects");
     await this.#ensureDirectories();
-    let linked = false;
+    let objectExists = false;
     try {
-      await link(stagingPath, storagePath);
-      linked = true;
-      await rm(stagingPath);
+      const objStat = await stat(storagePath);
+      objectExists = objStat.isFile();
+    } catch {
+      // 正式区无对象，继续正常发布。
+    }
+
+    if (objectExists) {
+      const objStat = await stat(storagePath);
+      if (objStat.size !== staged.byteSize) {
+        // 清理自己的 staging 文件后失败。
+        await rm(stagingPath, { force: true }).catch(() => undefined);
+        await rmdir(stagingDir).catch(() => undefined);
+        throw new StorageError(
+          "STORAGE_PUBLISH_FAILED",
+          "已存在的正式对象大小与记录不符。",
+        );
+      }
+      await rm(stagingPath, { force: true }).catch(() => undefined);
+      await rmdir(stagingDir).catch(() => undefined);
       return {
         id: staged.id,
         originalName: staged.originalName,
         mediaType: staged.mediaType,
         byteSize: staged.byteSize,
         sha256: staged.sha256,
-        storageKey
+        storageKey,
+      };
+    }
+
+    // 正式区无对象：正常发布（link 临时文件到正式区）。
+    // 原子 link：第一个竞争者获胜，后续 link 得到 EEXIST。
+    try {
+      await link(stagingPath, storagePath);
+      await rm(stagingPath);
+      await rmdir(stagingDir).catch(() => undefined);
+      return {
+        id: staged.id,
+        originalName: staged.originalName,
+        mediaType: staged.mediaType,
+        byteSize: staged.byteSize,
+        sha256: staged.sha256,
+        storageKey,
       };
     } catch (error) {
-      await Promise.allSettled([
-        ...(linked ? [rm(storagePath, { force: true })] : []),
-        rm(stagingPath, { force: true })
-      ]);
+      // link 失败：可能是 EEXIST（另一竞争者已 link）或其他错误。
+      // 只清理自己的 staging 文件——绝不删除 objects 路径（可能属于获胜方）。
+      await rm(stagingPath, { force: true }).catch(() => undefined);
+      await rmdir(stagingDir).catch(() => undefined);
+      if (error instanceof Error && (error as NodeJS.ErrnoException).code === "EEXIST") {
+        try {
+          const objStat = await stat(storagePath);
+          if (objStat.isFile() && objStat.size === staged.byteSize) {
+            await rmdir(stagingDir).catch(() => undefined);
+            return {
+              id: staged.id,
+              originalName: staged.originalName,
+              mediaType: staged.mediaType,
+              byteSize: staged.byteSize,
+              sha256: staged.sha256,
+              storageKey,
+            };
+          }
+        } catch {
+          // 对象可能在竞争中被删除——继续抛出失败。
+        }
+        throw new StorageError(
+          "STORAGE_PUBLISH_FAILED",
+          "并发发布竞争失败；另一竞争者的对象大小不匹配。",
+          { cause: error },
+        );
+      }
       throw new StorageError(
         "STORAGE_PUBLISH_FAILED",
         "文件从临时区发布到正式区失败。",
-        { cause: error }
+        { cause: error },
       );
     }
   }
 
   public async discard(stagedFile: StagedFile): Promise<void> {
     const staged = stagedFileSchema.parse(stagedFile);
-    const expectedStagingKey = `staging/${staged.id}.part`;
-    if (staged.stagingKey !== expectedStagingKey) {
+    // 接受新的所有权安全 staging 键格式 staging/<id>/<attempt>.part。
+    const stagingKeyPrefix = `staging/${staged.id}/`;
+    if (!staged.stagingKey.startsWith(stagingKeyPrefix) || !staged.stagingKey.endsWith(".part")) {
       throw new StorageError("INVALID_STORAGE_KEY", "临时文件位置不正确。");
     }
     await rm(this.#pathForKey(staged.stagingKey, "staging"), { force: true }).catch((error) => {
       throw new StorageError("STORAGE_DELETE_FAILED", "清理临时文件失败。", { cause: error });
     });
+    // 清理可能空的 staging 子目录（best-effort）。
+    await rmdir(resolve(this.#rootDirectory, "staging", staged.id)).catch(() => undefined);
   }
 
   public async open(
@@ -164,7 +234,7 @@ export class LocalFileStorage implements FileStorage {
   #pathForKey(key: string, expectedArea: "staging" | "objects"): string {
     const pattern =
       expectedArea === "staging"
-        ? /^staging\/[0-9a-f-]{36}\.part$/
+        ? /^staging\/[0-9a-f-]{36}\/[0-9a-f-]{36}\.part$/
         : /^objects\/[0-9a-f-]{36}$/;
     if (!pattern.test(key)) {
       throw new StorageError("INVALID_STORAGE_KEY", "文件位置格式不正确。");

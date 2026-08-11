@@ -31,6 +31,11 @@ export interface StageFileInput {
   readonly originalName: string;
   readonly mediaType: string;
   readonly content: AsyncIterable<Uint8Array>;
+  /**
+   * 调用方提供的存储 UUID，用于可恢复的源意向日志。省略时由存储实现生成。
+   * 精确重放（同一 UUID + 同一内容）必须返回相同的 StagedFile。
+   */
+  readonly id?: string;
 }
 
 export interface FileStorage {

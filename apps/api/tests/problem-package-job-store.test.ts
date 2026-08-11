@@ -526,7 +526,7 @@ describe("题目包任务协调器", () => {
     });
     expect(replayedImport).toBeDefined();
     expect(await queue.leaseNext({ workerId: "import-retry", leaseMs: 1_000 })).toEqual(
-      expect.objectContaining({ id: replayedImport?.id, type: problemImportJobType })
+      expect.objectContaining({ id: replayedImport?.job.id, type: problemImportJobType })
     );
 
     enqueue.mockRejectedValueOnce(new Error("synthetic queue outage"));

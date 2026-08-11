@@ -16,9 +16,12 @@ import {
   type CreateProblemPackageExportJob,
   type CreateProblemPackageImportJob,
   type ImportItemOutcome,
+  type ImportJobReplayResult,
   type ProblemPackageExportJob,
   type ProblemPackageFailureCode,
   type ProblemPackageImportItem,
+  type HistoryImportJobClaim,
+  type HistoryImportRecoveryStore,
   type ProblemPackageImportJob,
   type ProblemPackageJobReplayStore,
   type ProblemPackageJobReport,
@@ -59,6 +62,9 @@ interface ImportJobRow extends Record<string, unknown> {
   idempotency_key: string;
   started_at: Date | string | null;
   finished_at: Date | string | null;
+  execution_attempt: number;
+  lease_id: string | null;
+  lease_expires_at: Date | string | null;
   created_at: Date | string;
 }
 
@@ -144,11 +150,11 @@ export class ProblemPackageJobCoordinator {
 
   public async replayImportJob(
     input: ProblemPackageJobReplayClaim
-  ): Promise<ProblemPackageImportJob | undefined> {
-    const task = await this.store.findImportJobForReplay(input);
-    if (task === undefined) return undefined;
-    await this.enqueueImportJob(task);
-    return task;
+  ): Promise<ImportJobReplayResult | undefined> {
+    const result = await this.store.findImportJobForReplay(input);
+    if (result === undefined) return undefined;
+    await this.enqueueImportJob(result.job);
+    return result;
   }
 
   private async enqueueImportJob(task: ProblemPackageImportJob): Promise<void> {
@@ -198,12 +204,13 @@ export class ProblemPackageJobCoordinator {
  * This is useful in API and worker tests. It stores only task snapshots and
  * summaries, never the archive bytes or converted problem content.
  */
-export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
+export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore, HistoryImportRecoveryStore {
   readonly #imports = new Map<string, ProblemPackageImportJob>();
   readonly #importItems = new Map<string, ProblemPackageImportItem[]>();
   readonly #exports = new Map<string, ProblemPackageExportJob>();
   readonly #importIdempotency = new Map<string, string>();
   readonly #exportIdempotency = new Map<string, string>();
+  readonly #importAuditRequestIds = new Map<string, string | undefined>();
   readonly #now: () => Date;
 
   public constructor(options: InMemoryProblemPackageJobStoreOptions = {}) {
@@ -247,6 +254,9 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
       idempotencyKey: parsed.idempotencyKey,
       startedAt: null,
       finishedAt: null,
+      executionAttempt: 0,
+      leaseId: null,
+      leaseExpiresAt: null,
       createdAt: now
     });
     this.#imports.set(job.id, job);
@@ -263,7 +273,7 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
         })
       )
     );
-    this.#importIdempotency.set(key, job.id);
+    this.#importAuditRequestIds.set(job.id, parsed.auditRequestId);
     return copy(job);
   }
 
@@ -319,7 +329,7 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
 
   public async findImportJobForReplay(
     input: ProblemPackageJobReplayClaim
-  ): Promise<ProblemPackageImportJob | undefined> {
+  ): Promise<ImportJobReplayResult | undefined> {
     const parsed = problemPackageJobReplayClaimSchema.parse(input);
     const existingId = this.#importIdempotency.get(
       idempotencyIndex(parsed.requestedByUserId, parsed.idempotencyKey)
@@ -330,7 +340,9 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
       throw new ProblemPackageJobStoreError("TASK_NOT_FOUND", "任务记录不存在。");
     }
     requireMatchingClientRequest(existing.clientRequestDigest, parsed.clientRequestDigest);
-    return copy(existing);
+    const items = (this.#importItems.get(existing.id) ?? []).map(copy);
+    // 返回创建时保存的审计请求 ID（保持精确审计绑定）。
+    return { job: copy(existing), auditRequestId: this.#importAuditRequestIds.get(existing.id), items };
   }
 
   public async getImportItems(jobId: string): Promise<readonly ProblemPackageImportItem[]> {
@@ -495,6 +507,123 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
     });
   }
 
+  public async claimOrRecoverImportJob(input: {
+    readonly jobId: string;
+    readonly leaseDurationMs: number;
+  }): Promise<HistoryImportJobClaim | undefined> {
+    const id = uuidSchema.parse(input.jobId);
+    const job = this.#imports.get(id);
+    if (job === undefined) return undefined;
+    const now = this.#now();
+
+    if (job.state === "succeeded") {
+      const items = this.#importItems.get(id) ?? [];
+      return { kind: "reconstruct", job: copy(job), items: items.map(copy) };
+    }
+    if (job.state === "cancelled") {
+      return { kind: "cancelled" };
+    }
+    if (job.state === "running" && job.leaseExpiresAt !== null && new Date(job.leaseExpiresAt) > now) {
+      return { kind: "busy" };
+    }
+
+    // queued, running-expired, or failed: claim/reclaim/reset.
+    const leaseId = randomUUID();
+    const leaseExpiresAt = new Date(now.getTime() + input.leaseDurationMs).toISOString();
+    const attemptIncrement = job.state === "running" || job.state === "failed" ? 1 : 0;
+    const started = problemPackageImportJobSchema.parse({
+      ...job,
+      state: "running",
+      startedAt: job.startedAt ?? now.toISOString(),
+      finishedAt: null,
+      failure: null,
+      executionAttempt: job.executionAttempt + attemptIncrement,
+      leaseId,
+      leaseExpiresAt,
+      report: { ...job.report, phase: "reading" }
+    });
+    this.#imports.set(id, started);
+    return { kind: "claimed", job: copy(started), leaseId };
+  }
+
+  public async renewImportJobLease(input: {
+    readonly jobId: string;
+    readonly leaseId: string;
+    readonly leaseDurationMs: number;
+  }): Promise<boolean> {
+    const id = uuidSchema.parse(input.jobId);
+    uuidSchema.parse(input.leaseId);
+    const job = this.#imports.get(id);
+    if (job === undefined) return false;
+    if (job.state !== "running" || job.leaseId !== input.leaseId) return false;
+    const now = this.#now();
+    this.#imports.set(id, {
+      ...job,
+      leaseExpiresAt: new Date(now.getTime() + input.leaseDurationMs).toISOString()
+    });
+    return true;
+  }
+
+  public async fencedCompleteImportJob(input: {
+    readonly jobId: string;
+    readonly leaseId: string;
+    readonly report: ProblemPackageJobReport;
+  }): Promise<boolean> {
+    const id = uuidSchema.parse(input.jobId);
+    const job = this.#imports.get(id);
+    if (job === undefined) return false;
+    if (job.state !== "running" || job.leaseId !== input.leaseId) return false;
+    const now = this.#now();
+    if (job.leaseExpiresAt === null || new Date(job.leaseExpiresAt) <= now) return false;
+    this.#imports.set(id, {
+      ...job,
+      state: "succeeded",
+      progressPercent: 100,
+      report: problemPackageJobReportSchema.parse(input.report),
+      failure: null,
+      finishedAt: now.toISOString(),
+    });
+    return true;
+  }
+
+  public async fencedFailImportJob(input: {
+    readonly jobId: string;
+    readonly leaseId: string;
+    readonly position: number;
+    readonly code: ProblemPackageFailureCode;
+    readonly report: ProblemPackageJobReport;
+  }): Promise<boolean> {
+    const id = uuidSchema.parse(input.jobId);
+    const job = this.#imports.get(id);
+    if (job === undefined) return false;
+    if (job.state !== "running" || job.leaseId !== input.leaseId) return false;
+    const now = this.#now();
+    if (job.leaseExpiresAt === null || new Date(job.leaseExpiresAt) <= now) return false;
+    const failure = safeProblemPackageFailure(input.code);
+    this.#imports.set(id, {
+      ...job,
+      state: "failed",
+      report: problemPackageJobReportSchema.parse(input.report),
+      failure: { code: failure.code, message: failure.message },
+      finishedAt: now.toISOString(),
+    });
+    const items = this.#importItems.get(id);
+    if (items !== undefined && Number.isInteger(input.position) && input.position >= 0 && input.position < items.length) {
+      const item = items[input.position]!;
+      if (item.state !== "succeeded") {
+        items[input.position] = problemPackageImportItemSchema.parse({
+          jobId: job.id,
+          position: input.position,
+          state: "failed",
+          failureCode: failure.code,
+          failureMessage: failure.message,
+          finishedAt: now.toISOString(),
+        });
+      }
+    }
+    return true;
+  }
+
   #startImport(jobId: string): ProblemPackageImportJob | undefined {
     const job = this.#imports.get(uuidSchema.parse(jobId));
     if (job === undefined) return undefined;
@@ -531,7 +660,7 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore {
  * must perform authorization before creation; this class additionally proves
  * that an import source and every fixed export revision exists.
  */
-export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
+export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore, HistoryImportRecoveryStore {
   public constructor(
     private readonly database: DatabaseHandle,
     private readonly audit: ProblemPackageAuditWriter =
@@ -729,7 +858,7 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
 
   public async findImportJobForReplay(
     input: ProblemPackageJobReplayClaim
-  ): Promise<ProblemPackageImportJob | undefined> {
+  ): Promise<ImportJobReplayResult | undefined> {
     const parsed = problemPackageJobReplayClaimSchema.parse(input);
     const existing = await findImportByIdempotency(
       this.database,
@@ -738,7 +867,16 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
     );
     if (existing === undefined) return undefined;
     requireMatchingClientRequest(existing.clientRequestDigest, parsed.clientRequestDigest);
-    return existing;
+    // 查询持久化审计请求 ID 和导入条目用于回查验证。
+    const auditRows = await this.database.query<{ request_id: string }>(sql`
+      SELECT request_id::text FROM audit_events
+      WHERE object_type = 'import_job' AND object_id = ${existing.id}::text
+        AND action = 'problem.package.import.create'
+      ORDER BY occurred_at ASC LIMIT 1
+    `);
+    const auditRequestId = auditRows.length > 0 ? auditRows[0]!.request_id : undefined;
+    const items = await this.getImportItems(existing.id);
+    return { job: existing, auditRequestId, items };
   }
 
   public async getImportItems(jobId: string): Promise<readonly ProblemPackageImportItem[]> {
@@ -790,6 +928,167 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore {
       WHERE id = ${id}::uuid AND state = 'queued'
     `);
     return this.getExportJob(id);
+  }
+
+  public async claimOrRecoverImportJob(input: {
+    readonly jobId: string;
+    readonly leaseDurationMs: number;
+  }): Promise<HistoryImportJobClaim | undefined> {
+    const id = uuidSchema.parse(input.jobId);
+    const leaseId = randomUUID();
+    const now = this.now();
+    const leaseExpiresAt = new Date(now.getTime() + input.leaseDurationMs);
+
+    return await this.database.transaction(async (tx) => {
+      // SELECT ... FOR UPDATE 锁定任务行，原子地检查状态并认领。
+      const rows = await tx.query<{ state: string; lease_id: string | null; lease_expires_at: Date | null }>(sql`
+        SELECT state::text, lease_id::text, lease_expires_at
+        FROM import_jobs WHERE id = ${id}::uuid FOR UPDATE
+      `);
+      if (rows.length === 0) return undefined;
+      const row = rows[0]!;
+      const state = row.state;
+
+      // succeeded 或有 committed item：重建结果，不重写。
+      if (state === "succeeded" || state === "cancelled") {
+        const job = await findImportById(tx, id);
+        if (job === undefined) return undefined;
+        if (state === "cancelled") return { kind: "cancelled" as const };
+        const items = await this.getImportItemsInTx(tx, id);
+        return { kind: "reconstruct" as const, job, items };
+      }
+
+      // running with active lease：繁忙。
+      // lease_expires_at 可能以字符串形式从驱动返回（drizzle execute 不做
+      // timestamptz 到 Date 的类型解析），统一转为 Date 再比较。
+      const rowLeaseExpiresAt =
+        row.lease_expires_at === null ? null : new Date(row.lease_expires_at);
+      if (state === "running" && rowLeaseExpiresAt !== null && rowLeaseExpiresAt > now) {
+        return { kind: "busy" as const };
+      }
+
+      // queued 或 running with expired lease 或 failed（无 committed item）：认领/收回/重置。
+      const attemptIncrement = state === "running" || state === "failed" ? 1 : 0;
+
+      await tx.execute(sql`
+        UPDATE import_jobs
+        SET state = 'running',
+            started_at = COALESCE(started_at, ${now.toISOString()}::timestamptz),
+            finished_at = NULL,
+            failure_code = NULL,
+            failure_message = NULL,
+            execution_attempt = execution_attempt + ${attemptIncrement},
+            lease_id = ${leaseId}::uuid,
+            lease_expires_at = ${leaseExpiresAt.toISOString()}::timestamptz,
+            report = ${json({ ...initialReport(), phase: "reading" })}::jsonb
+        WHERE id = ${id}::uuid
+      `);
+
+      const job = await findImportById(tx, id);
+      if (job === undefined) return undefined;
+      return { kind: "claimed" as const, job, leaseId };
+    });
+  }
+
+  public async renewImportJobLease(input: {
+    readonly jobId: string;
+    readonly leaseId: string;
+    readonly leaseDurationMs: number;
+  }): Promise<boolean> {
+    const id = uuidSchema.parse(input.jobId);
+    const leaseId = uuidSchema.parse(input.leaseId);
+    const now = this.now();
+    const newExpiry = new Date(now.getTime() + input.leaseDurationMs);
+
+    const updated = await this.database.transaction(async (tx) => {
+      const before = await tx.query<{ lease_id: string | null }>(sql`
+        SELECT lease_id::text FROM import_jobs
+        WHERE id = ${id}::uuid AND state = 'running' FOR UPDATE
+      `);
+      if (before.length === 0 || before[0]!.lease_id !== leaseId) return false;
+      await tx.execute(sql`
+        UPDATE import_jobs
+        SET lease_expires_at = ${newExpiry.toISOString()}::timestamptz
+        WHERE id = ${id}::uuid AND lease_id = ${leaseId}::uuid AND state = 'running'
+      `);
+      return true;
+    });
+    return updated;
+  }
+
+  public async fencedCompleteImportJob(input: {
+    readonly jobId: string;
+    readonly leaseId: string;
+    readonly report: ProblemPackageJobReport;
+  }): Promise<boolean> {
+    const id = uuidSchema.parse(input.jobId);
+    const leaseId = uuidSchema.parse(input.leaseId);
+    const parsedReport = problemPackageJobReportSchema.parse(input.report);
+    const updated = await this.database.query<{ id: string }>(sql`
+      UPDATE import_jobs
+      SET state = 'succeeded', progress_percent = 100,
+          report = ${json(completeReport(parsedReport))}::jsonb,
+          failure_code = NULL, failure_message = NULL,
+          finished_at = ${this.now().toISOString()}::timestamptz
+      WHERE id = ${id}::uuid
+        AND state = 'running'
+        AND lease_id = ${leaseId}::uuid
+        AND lease_expires_at > now()
+      RETURNING id::text AS id
+    `);
+    return updated.length === 1;
+  }
+
+  public async fencedFailImportJob(input: {
+    readonly jobId: string;
+    readonly leaseId: string;
+    readonly position: number;
+    readonly code: ProblemPackageFailureCode;
+    readonly report: ProblemPackageJobReport;
+  }): Promise<boolean> {
+    const id = uuidSchema.parse(input.jobId);
+    const leaseId = uuidSchema.parse(input.leaseId);
+    const failure = safeProblemPackageFailure(input.code);
+    const parsedReport = problemPackageJobReportSchema.parse(input.report);
+    const position = input.position;
+    const finishedAt = this.now().toISOString();
+    return await this.database.transaction(async (tx) => {
+      const updated = await tx.query<{ id: string }>(sql`
+        UPDATE import_jobs
+        SET state = 'failed', report = ${json(failedReport(parsedReport))}::jsonb,
+            failure_code = ${failure.code}, failure_message = ${failure.message},
+            finished_at = ${finishedAt}::timestamptz
+        WHERE id = ${id}::uuid
+          AND state = 'running'
+          AND lease_id = ${leaseId}::uuid
+          AND lease_expires_at > now()
+        RETURNING id::text AS id
+      `);
+      if (updated.length !== 1) return false;
+      // 在同一事务内围栏记录条目失败（不覆盖已成功的条目）。
+      await tx.query(sql`
+        UPDATE import_job_items
+        SET state = 'failed',
+            failure_code = ${failure.code},
+            failure_message = ${failure.message},
+            finished_at = ${finishedAt}::timestamptz
+        WHERE job_id = ${id}::uuid AND position = ${position}
+          AND state <> 'succeeded'
+      `);
+      return true;
+    });
+  }
+
+  private async getImportItemsInTx(
+    tx: DatabaseExecutor,
+    id: string
+  ): Promise<readonly ProblemPackageImportItem[]> {
+    const rows = await tx.query<ImportItemRow>(sql`
+      SELECT job_id::text, position, state::text, imported_problem_id::text,
+             failure_code, failure_message, finished_at
+      FROM import_job_items WHERE job_id = ${id}::uuid ORDER BY position ASC
+    `);
+    return rows.map(hydrateImportItem);
   }
 
   public async updateImportJob(
@@ -1140,7 +1439,8 @@ async function findImportById(
            source_file_id::text, input_digest,
            detected_format, selected_format, selected_format_version,
            choices, state::text, progress_percent,
-           report, failure_code, failure_message, idempotency_key, started_at, finished_at, created_at
+           report, failure_code, failure_message, idempotency_key,
+           started_at, finished_at, execution_attempt, lease_id, lease_expires_at, created_at
     FROM import_jobs WHERE id = ${id}::uuid
   `);
   if (rows.length === 0) return undefined;
@@ -1162,7 +1462,8 @@ async function findImportByIdempotency(
            source_file_id::text, input_digest,
            detected_format, selected_format, selected_format_version,
            choices, state::text, progress_percent,
-           report, failure_code, failure_message, idempotency_key, started_at, finished_at, created_at
+           report, failure_code, failure_message, idempotency_key,
+           started_at, finished_at, execution_attempt, lease_id, lease_expires_at, created_at
     FROM import_jobs
     WHERE requested_by_user_id = ${requesterId} AND idempotency_key = ${idempotencyKey}
   `);
@@ -1237,6 +1538,9 @@ function hydrateImport(row: ImportJobRow, itemCount: number): ProblemPackageImpo
     idempotencyKey: row.idempotency_key,
     startedAt: toIsoOrNull(row.started_at),
     finishedAt: toIsoOrNull(row.finished_at),
+    executionAttempt: Number(row.execution_attempt),
+    leaseId: row.lease_id,
+    leaseExpiresAt: toIsoOrNull(row.lease_expires_at),
     createdAt: toIso(row.created_at)
   });
 }

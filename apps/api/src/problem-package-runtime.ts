@@ -364,6 +364,7 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
     readonly choices: ProblemPackageImportChoices;
     readonly problem: CanonicalProblem;
     readonly signal: AbortSignal;
+    readonly leaseId?: string;
   }): Promise<{ readonly problemId: string }> {
     assertActive(input.signal);
     if (input.choices.conflictAction !== "create") {
@@ -477,6 +478,7 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
             WHERE id = ${input.importJobId}::uuid
               AND state = 'running'
               AND requested_by_user_id = ${BigInt(input.requestedByUserId)}
+              ${input.leaseId === undefined ? sql`` : sql`AND lease_id = ${input.leaseId}::uuid AND lease_expires_at > now()`}
             FOR UPDATE
           `);
           if (lockedJob.length !== 1) {
@@ -550,6 +552,7 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
                 WHERE id = ${input.importJobId}::uuid
                   AND state = 'running'
                   AND requested_by_user_id = ${BigInt(input.requestedByUserId)}
+                  ${input.leaseId === undefined ? sql`` : sql`AND lease_id = ${input.leaseId}::uuid AND lease_expires_at > now()`}
               )
             RETURNING position
           `);

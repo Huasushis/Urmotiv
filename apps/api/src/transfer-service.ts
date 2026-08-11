@@ -305,8 +305,8 @@ export class TransferService {
         clientRequestDigest
       });
       if (replayed !== undefined) {
-        const items = await this.#jobs.getImportItems(replayed.id);
-        return toImportJobView(replayed, items);
+        const items = replayed.items.length > 0 ? replayed.items : await this.#jobs.getImportItems(replayed.job.id);
+        return toImportJobView(replayed.job, items);
       }
     } catch (error) {
       throw translateJobStoreError(error);

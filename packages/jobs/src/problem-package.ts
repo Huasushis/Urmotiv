@@ -252,6 +252,9 @@ export const problemPackageImportJobSchema = z
     idempotencyKey: idempotencyKeySchema,
     startedAt: z.string().datetime().nullable(),
     finishedAt: z.string().datetime().nullable(),
+    executionAttempt: z.number().int().min(0),
+    leaseId: uuidSchema.nullable(),
+    leaseExpiresAt: z.string().datetime().nullable(),
     createdAt: z.string().datetime()
   })
   .strict();
@@ -382,15 +385,102 @@ export interface ProblemPackageJobStore {
   failExportJob(jobId: string, code: ProblemPackageFailureCode): Promise<void>;
 }
 
+/**
+ * 回查结果：已提交任务 + 持久化审计身份 + 持久化条目身份/位置。
+ * 用于在创建响应丢失后验证全部绑定身份（审计绑定、条目链接、位置）。
+ */
+export interface ImportJobReplayResult {
+  readonly job: ProblemPackageImportJob;
+  readonly auditRequestId: string | undefined;
+  readonly items: readonly ProblemPackageImportItem[];
+}
+
 /** API-side extension used only to recover a committed create request. */
 export interface ProblemPackageJobReplayStore {
   findImportJobForReplay(
     input: ProblemPackageJobReplayClaim
-  ): Promise<ProblemPackageImportJob | undefined>;
+  ): Promise<ImportJobReplayResult | undefined>;
   findExportJobForReplay(
     input: ProblemPackageJobReplayLookup
   ): Promise<ProblemPackageExportJob | undefined>;
 }
+
+/**
+ * 历史导入恢复/认领接口。
+ *
+ * 这是 ProblemPackageJobStore 的历史导入专用围栏扩展，不属于通用队列。
+ * 它原子地认领或恢复一个导入任务，根据当前状态返回不同的认领结果：
+ * - queued/never-started：认领并设为 running
+ * - running with active lease：繁忙（另一个进程正在执行）
+ * - running with expired lease：收回（递增 attempt，发新 lease token）
+ * - failed with no committed item：安全重置并认领
+ * - succeeded 或任何 item 有 imported_problem_id：重建结果
+ * - cancelled：失败关闭
+ */
+export interface HistoryImportRecoveryStore {
+  /**
+   * 原子地认领或恢复一个导入任务。返回认领结果或 undefined 表示任务不存在。
+   *
+   * 调用方提供 leaseDurationMs 决定租约过期时间。如果任务正在被另一个活跃
+   * 租约持有（lease_expires_at > now），返回 busy 而不修改任务。
+   */
+  claimOrRecoverImportJob(input: {
+    readonly jobId: string;
+    readonly leaseDurationMs: number;
+  }): Promise<HistoryImportJobClaim | undefined>;
+
+  /**
+   * 续租当前持有的租约。必须提供当前 leaseId。
+   * 如果租约已被收回（leaseId 不匹配），返回 false。
+   */
+  renewImportJobLease(input: {
+    readonly jobId: string;
+    readonly leaseId: string;
+    readonly leaseDurationMs: number;
+  }): Promise<boolean>;
+
+  /**
+   * 围栏完成导入任务：只有持有未过期租约者才能完成。
+   * 租约不匹配或已过期时返回 false。
+   */
+  fencedCompleteImportJob(input: {
+    readonly jobId: string;
+    readonly leaseId: string;
+    readonly report: ProblemPackageJobReport;
+  }): Promise<boolean>;
+
+  /**
+   * 围栏标记导入任务失败：只有持有未过期租约者才能标记失败。
+   * 租约不匹配或已过期时返回 false。
+   */
+  fencedFailImportJob(input: {
+    readonly jobId: string;
+    readonly leaseId: string;
+    readonly position: number;
+    readonly code: ProblemPackageFailureCode;
+    readonly report: ProblemPackageJobReport;
+  }): Promise<boolean>;
+}
+
+export type HistoryImportJobClaim =
+  | { readonly kind: "claimed"; readonly job: ProblemPackageImportJob; readonly leaseId: string }
+  | { readonly kind: "busy" }
+  | {
+      readonly kind: "reconstruct";
+      readonly job: ProblemPackageImportJob;
+      readonly items: readonly ProblemPackageImportItem[];
+    }
+  | { readonly kind: "cancelled" };
+
+/**
+ * 统一历史导入任务存储：job + replay + recovery 三接口的编译期安全交集。
+ * 历史导入流程要求同一个对象同时实现全部三个接口，杜绝 Partial 类型转换。
+ * DatabaseProblemPackageJobStore 与 InMemoryProblemPackageJobStore 均实现此接口。
+ */
+export interface HistoryImportJobStore
+  extends ProblemPackageJobStore,
+    ProblemPackageJobReplayStore,
+    HistoryImportRecoveryStore {}
 
 export interface ProblemPackageTaskInput {
   readonly jobId: string;

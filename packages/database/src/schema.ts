@@ -1432,6 +1432,9 @@ export const importJobs = pgTable(
     idempotencyKey: varchar("idempotency_key", { length: 160 }).notNull(),
     startedAt: timestamp("started_at", { withTimezone: true }),
     finishedAt: timestamp("finished_at", { withTimezone: true }),
+    executionAttempt: integer("execution_attempt").notNull().default(0),
+    leaseId: uuid("lease_id"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
   },
   (table) => [
@@ -1440,6 +1443,9 @@ export const importJobs = pgTable(
       table.idempotencyKey
     ),
     index("import_jobs_state_created_idx").on(table.state, table.createdAt),
+    index("import_jobs_lease_expiry_idx")
+      .on(table.leaseExpiresAt)
+      .where(sql`state = 'running' AND lease_expires_at IS NOT NULL`),
     check("import_jobs_digest_ck", sql`${table.inputDigest} ~ '^[0-9a-f]{64}$'`),
     check(
       "import_jobs_client_request_digest_ck",
@@ -1452,6 +1458,10 @@ export const importJobs = pgTable(
     check(
       "import_jobs_progress_ck",
       sql`${table.progressPercent} BETWEEN 0 AND 100`
+    ),
+    check(
+      "import_jobs_execution_attempt_ck",
+      sql`${table.executionAttempt} >= 0`
     )
   ]
 );

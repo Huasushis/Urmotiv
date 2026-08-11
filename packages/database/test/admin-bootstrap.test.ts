@@ -206,7 +206,7 @@ describe("one-time first administrator creation", () => {
       audits: 0,
     });
     expect((await readAdminBootstrapState(tampered)).status).toBe("open");
-  });
+  }, 30000); // Creates two databases with 15 migrations each; needs >5s on Docker PostgreSQL
 
   it("refuses a changed system administrator role", async () => {
     const database = await createOpenBootstrapDatabase();
