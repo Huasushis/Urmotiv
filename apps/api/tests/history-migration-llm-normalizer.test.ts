@@ -284,6 +284,100 @@ describe("历史题目模型整理流式请求", () => {
     });
   });
 
+  it("stop 之后的 usage 记录不得携带顶层 reasoning 字段", async () => {
+    const poisoned = {
+      ...strictUsageMetadataEvent(),
+      choices: [{ index: 0, delta: {} }],
+      reasoning: "synthetic-payload",
+    };
+    const fetch = vi.fn(async () =>
+      eventStreamResponse(
+        `${completionEvent(normalizedContent, "stop")}data: ${JSON.stringify(
+          poisoned,
+        )}\n\ndata: [DONE]\n\n`,
+      ),
+    );
+
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+    });
+  });
+
+  it("stop 之后的 usage 记录不得携带顶层 content 字段", async () => {
+    const poisoned = {
+      ...strictUsageMetadataEvent(),
+      choices: [{ index: 0, delta: {} }],
+      content: "synthetic-injected-content",
+    };
+    const fetch = vi.fn(async () =>
+      eventStreamResponse(
+        `${completionEvent(normalizedContent, "stop")}data: ${JSON.stringify(
+          poisoned,
+        )}\n\ndata: [DONE]\n\n`,
+      ),
+    );
+
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+    });
+  });
+
+  it("stop 之后的 usage 记录不得携带任意未知顶层字段", async () => {
+    const poisoned = {
+      ...strictUsageMetadataEvent(),
+      choices: [{ index: 0, delta: {} }],
+      arbitrary_content_like_key: "synthetic-extra-value",
+    };
+    const fetch = vi.fn(async () =>
+      eventStreamResponse(
+        `${completionEvent(normalizedContent, "stop")}data: ${JSON.stringify(
+          poisoned,
+        )}\n\ndata: [DONE]\n\n`,
+      ),
+    );
+
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+    });
+  });
+
+  it("stop 之后的 usage 记录不得携带超长顶层元数据字符串", async () => {
+    const poisoned = {
+      ...strictUsageMetadataEvent(),
+      choices: [{ index: 0, delta: {} }],
+      model: "x".repeat(2000),
+    };
+    const fetch = vi.fn(async () =>
+      eventStreamResponse(
+        `${completionEvent(normalizedContent, "stop")}data: ${JSON.stringify(
+          poisoned,
+        )}\n\ndata: [DONE]\n\n`,
+      ),
+    );
+
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+    });
+  });
+
+  it("stop 之后的 usage 记录中 delta 不得携带 reasoning_content", async () => {
+    const poisoned = {
+      ...strictUsageMetadataEvent(),
+      choices: [{ index: 0, delta: { reasoning_content: "synthetic-reasoning" } }],
+    };
+    const fetch = vi.fn(async () =>
+      eventStreamResponse(
+        `${completionEvent(normalizedContent, "stop")}data: ${JSON.stringify(
+          poisoned,
+        )}\n\ndata: [DONE]\n\n`,
+      ),
+    );
+
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+    });
+  });
+
   it("SSE heartbeat 和空事件不冒充首段有效输出", async () => {
     let heartbeat: ReturnType<typeof setInterval> | undefined;
     const fetch = vi.fn(async () => {

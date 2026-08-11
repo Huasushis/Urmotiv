@@ -826,6 +826,34 @@ function isBoundedStreamUsageCounter(value: unknown): boolean {
 function isPostStopStreamUsageRecord(record: Record<string, unknown>): boolean {
   if (!Object.hasOwn(record, "usage")) return false;
   if (!isBoundedStreamUsageCounter(record.usage)) return false;
+  // Reject any top-level key outside the provider-compatible envelope.  This
+  // prevents reasoning/content/arbitrary values from piggy-backing on a
+  // valid usage record and bypassing the bounded-metadata limits below.
+  for (const key of Object.keys(record)) {
+    if (!streamUsageMetadataKeys.has(key)) return false;
+  }
+  // Bound the metadata string/integer fields exactly as the strict path does.
+  for (const key of ["id", "object", "model"] as const) {
+    if (Object.hasOwn(record, key) && !isBoundedStreamMetadataString(record[key])) {
+      return false;
+    }
+  }
+  for (const key of ["system_fingerprint", "service_tier"] as const) {
+    if (
+      Object.hasOwn(record, key) &&
+      !isBoundedStreamMetadataString(record[key], true)
+    ) {
+      return false;
+    }
+  }
+  if (
+    Object.hasOwn(record, "created") &&
+    (typeof record.created !== "number" ||
+      !Number.isSafeInteger(record.created) ||
+      record.created < 0)
+  ) {
+    return false;
+  }
   const only = (record.choices as unknown[])[0];
   if (!isPlainJsonRecord(only)) return false;
   for (const key of Object.keys(only)) {
