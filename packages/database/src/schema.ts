@@ -640,7 +640,7 @@ export const problemRevisions = pgTable(
     thinkingLevel: smallint("thinking_level"),
     codingLevel: smallint("coding_level"),
     basicStatement: text("basic_statement").notNull(),
-    basicSolution: text("basic_solution").notNull(),
+    basicSolution: text("basic_solution"),
     background: text("background").notNull().default(""),
     statement: text("statement").notNull().default(""),
     inputFormat: text("input_format").notNull().default(""),

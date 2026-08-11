@@ -25,7 +25,6 @@ import {
   type HistoryAttachmentSourceLocator,
   assertHistoryMaterializationComplete,
 } from "./grouping-workflow";
-import { migrationMissingSolutionMarker } from "./llm-normalizer";
 import {
   assertPathsInsidePrivateRoot,
   assertPrivateDirectoryMode,
@@ -860,7 +859,7 @@ async function summarizePreparation(
         contentSha256: candidate.contentSha256,
         titleLength: candidate.problem.title.length,
         basicStatementLength: candidate.problem.content.basicStatement.length,
-        basicSolutionLength: candidate.problem.content.basicSolution.length,
+        basicSolutionLength: candidate.problem.content.basicSolution === null ? 0 : candidate.problem.content.basicSolution.length,
         totalContentLength: totalCandidateContentLength(candidate.problem),
         sampleCount: candidate.problem.samples.length,
         status: "awaiting_approval",
@@ -997,10 +996,9 @@ async function finalizePreparationIncompleteMarker(
  * 只声明"本地源文只读修复、未调用模型"，绝不写入名称、路径、正文或摘要。
  */
 /**
- * 规范题面（canonicalContentSchema）要求 basicSolution 至少一个字符，无法表达
- * “无题解”为空串。本地修复复用公共域既有的权威缺失标记 migrationMissingSolutionMarker
- * （与规范化指令要求模型在原文缺题解时写入的字符串完全一致），绝不另造占位内容；
- * solution 保持空串，缺失由同一标记在候选 → 打包 → 导入全程透传。
+ * 规范题面（canonicalContentSchema）允许 basicSolution 为 null，以结构性缺失
+ * 表达"无题解"。本地修复对原文缺题解的源写入 null（绝不写入任何占位或提示文字）；
+ * solution 保持空串，缺失由 null 在候选 → 打包 → 导入全程透传，幂等重放后仍为 null。
  */
 export const localSourceTextRepairNote = "local-source-text-only-repair:v1" as const;
 
@@ -1316,7 +1314,7 @@ function buildRepairedCandidate(input: {
     difficulty: {},
     content: {
       basicStatement: input.sourceText,
-      basicSolution: migrationMissingSolutionMarker,
+      basicSolution: null,
       background: "",
       statement: "",
       inputFormat: "",
@@ -2174,7 +2172,7 @@ function toCandidateProblem(problem: NormalizedHistoryProblem): CanonicalProblem
 
 function totalCandidateContentLength(problem: CanonicalProblem): number {
   const contentLength = Object.values(problem.content).reduce(
-    (total, value) => total + value.length,
+    (total, value) => total + (value === null ? 0 : value.length),
     0,
   );
   const sampleLength = problem.samples.reduce(

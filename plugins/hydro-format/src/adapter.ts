@@ -278,7 +278,7 @@ export const hydroProblemFormatAdapter: ProblemFormatAdapter = {
       encodeUtf8(renderHydroStatement(parsedProblem, extension?.sourceStatementMarkdown))
     );
 
-    const solution = parsedProblem.content.solution || parsedProblem.content.basicSolution;
+    const solution = (parsedProblem.content.solution || parsedProblem.content.basicSolution) ?? "";
     const shouldWriteSolution =
       solution.length > 0 &&
       !(extension?.hadSolution === false && parsedProblem.content.solution.length === 0);

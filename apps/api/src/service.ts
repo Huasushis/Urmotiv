@@ -508,7 +508,7 @@ export class ProblemService {
     if (current.content.basicStatement.trim().length === 0) {
       requiredFieldErrors["content.basicStatement"] = ["请填写基础题面。"];
     }
-    if (current.content.basicSolution.trim().length === 0) {
+    if ((current.content.basicSolution ?? "").trim().length === 0) {
       requiredFieldErrors["content.basicSolution"] = ["请填写基础题解。"];
     }
     const validation = problemDraftSchema.safeParse({

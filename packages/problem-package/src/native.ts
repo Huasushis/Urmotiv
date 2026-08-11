@@ -48,7 +48,7 @@ const judgePath = "judge/config.yaml";
 
 interface ContentReferences {
   readonly basicStatement: string;
-  readonly basicSolution: string;
+  basicSolution?: string;
   background?: string;
   statement?: string;
   inputFormat?: string;
@@ -293,7 +293,9 @@ function loadManifest(archive: SafeArchive): NativeManifest {
   }
 
   assertPathPrefix(manifest.problem.content.basicStatement, "content/", "基础题面");
-  assertPathPrefix(manifest.problem.content.basicSolution, "content/", "基础题解");
+  if (manifest.problem.content.basicSolution !== undefined) {
+    assertPathPrefix(manifest.problem.content.basicSolution, "content/", "基础题解");
+  }
   for (const path of optionalContentPaths(manifest)) {
     assertPathPrefix(path, "content/", "题面内容");
   }
@@ -319,7 +321,8 @@ function loadContent(archive: SafeArchive, manifest: NativeManifest): CanonicalC
   const content = manifest.problem.content;
   return {
     basicStatement: readTextFile(archive, content.basicStatement),
-    basicSolution: readTextFile(archive, content.basicSolution),
+    basicSolution:
+      content.basicSolution === undefined ? null : readTextFile(archive, content.basicSolution),
     background: readOptionalTextFile(archive, content.background),
     statement: readOptionalTextFile(archive, content.statement),
     inputFormat: readOptionalTextFile(archive, content.input),
@@ -398,7 +401,7 @@ function buildManifest(
       difficulty: problem.difficulty,
       content: {
         basicStatement: content.basicStatement,
-        basicSolution: content.basicSolution,
+        ...(content.basicSolution === undefined ? {} : { basicSolution: content.basicSolution }),
         ...(content.background === undefined ? {} : { background: content.background }),
         ...(content.statement === undefined ? {} : { statement: content.statement }),
         ...(content.inputFormat === undefined ? {} : { input: content.inputFormat }),
@@ -421,12 +424,14 @@ function addContentFiles(
   content: CanonicalContent
 ): ContentReferences {
   const refs: ContentReferences = {
-    basicStatement: "content/basic-statement.md",
-    basicSolution: "content/basic-solution.md"
+    basicStatement: "content/basic-statement.md"
   };
 
   addFile(files, refs.basicStatement, encodeUtf8(content.basicStatement));
-  addFile(files, refs.basicSolution, encodeUtf8(content.basicSolution));
+  if (content.basicSolution !== null) {
+    refs.basicSolution = "content/basic-solution.md";
+    addFile(files, refs.basicSolution, encodeUtf8(content.basicSolution));
+  }
 
   const optionalFiles: readonly [
     Exclude<keyof ContentReferences, "basicStatement" | "basicSolution">,

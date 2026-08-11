@@ -91,7 +91,7 @@ export const beforeSubmitInputSchema = z
         type: problemTypeSchema,
         tagIds: z.array(z.string().min(1).max(120)).min(1).max(30),
         basicStatement: z.string().min(1).max(500_000),
-        basicSolution: z.string().min(1).max(500_000)
+        basicSolution: z.string().min(1).max(500_000).nullable()
       })
       .strict()
   })

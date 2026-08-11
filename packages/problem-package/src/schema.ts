@@ -55,7 +55,7 @@ export const binaryDataSchema = z.custom<Uint8Array>((value) => value instanceof
 
 export const canonicalContentSchema = z.object({
   basicStatement: z.string().min(1).max(500_000),
-  basicSolution: z.string().min(1).max(500_000),
+  basicSolution: z.string().min(1).max(500_000).nullable(),
   background: z.string().max(500_000).default(""),
   statement: z.string().max(500_000).default(""),
   inputFormat: z.string().max(500_000).default(""),
@@ -175,7 +175,7 @@ export const nativeManifestSchema = z.object({
       .default({}),
     content: z.object({
       basicStatement: archivePathSchema,
-      basicSolution: archivePathSchema,
+      basicSolution: archivePathSchema.optional(),
       background: archivePathSchema.optional(),
       statement: archivePathSchema.optional(),
       input: archivePathSchema.optional(),

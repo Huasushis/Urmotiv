@@ -6,7 +6,7 @@ import { hasExactDefaultCoreSeed } from "./seed";
 
 const migrationLockKeyOne = 1_431_453_001;
 const migrationLockKeyTwo = 1_651_666_804;
-const expectedMigrationCount = 15;
+const expectedMigrationCount = 16;
 
 const seededPublicTables = new Set([
   "admin_bootstrap_state",
@@ -25,7 +25,7 @@ const formalPublicTableNames = Object.values(databaseSchema)
   .sort(compareText);
 
 const expectedSequenceStates = [
-  { schema: "drizzle", name: "__drizzle_migrations_id_seq", last_value: "15", is_called: true },
+  { schema: "drizzle", name: "__drizzle_migrations_id_seq", last_value: "16", is_called: true },
   { schema: "public", name: "audit_events_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "contests_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "problems_id_seq", last_value: "1", is_called: false },

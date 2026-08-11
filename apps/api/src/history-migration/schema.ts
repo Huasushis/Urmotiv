@@ -92,7 +92,7 @@ const normalizedHistoryProblemSchema = z
       .enum(["traditional", "interactive", "submit_answer"])
       .default("traditional"),
     basicStatement: z.string().trim().min(1).max(500_000),
-    basicSolution: z.string().trim().min(1).max(500_000),
+    basicSolution: z.string().trim().min(1).max(500_000).nullable(),
     background: z.string().max(500_000).default(""),
     statement: z.string().max(500_000).default(""),
     inputFormat: z.string().max(500_000).default(""),

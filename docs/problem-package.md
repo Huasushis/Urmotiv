@@ -26,7 +26,7 @@
 manifest.yaml
 content/
   basic-statement.md
-  basic-solution.md
+  basic-solution.md（可选；无基础题解时省略）
   background.md
   statement.md
   input.md
@@ -73,7 +73,7 @@ problem:
     codingLevel: 2
   content:
     basicStatement: content/basic-statement.md
-    basicSolution: content/basic-solution.md
+    basicSolution: content/basic-solution.md  # 可选；无基础题解时省略此项与文件
     statement: content/statement.md
   samples: samples/samples.yaml
   judge: judge/config.yaml

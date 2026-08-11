@@ -197,7 +197,7 @@ export type ProblemJudgeConfig = z.infer<typeof problemJudgeConfigSchema>;
 
 export const problemContentSchema = z.object({
   basicStatement: markdownSchema,
-  basicSolution: markdownSchema,
+  basicSolution: markdownSchema.nullable(),
   background: markdownSchema.default(""),
   statement: markdownSchema.default(""),
   inputFormat: markdownSchema.default(""),

@@ -69,7 +69,7 @@ interface ProblemRow extends Record<string, unknown> {
   thinking_level: number | null;
   coding_level: number | null;
   basic_statement: string;
-  basic_solution: string;
+  basic_solution: string | null;
   background: string;
   statement: string;
   input_format: string;

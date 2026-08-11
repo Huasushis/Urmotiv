@@ -261,7 +261,7 @@ export function StatementTab({
   const editor = (label: string, key: keyof Problem["content"], helper: string, frozen = false) => (
     <MarkdownEditor
       label={label}
-      value={problem.content[key]}
+      value={problem.content[key] ?? ""}
       onChange={(value) => update((current) => setContent(current, key, value))}
       problemId={problem.id}
       onUploadImage={uploadStatementImage}
@@ -822,7 +822,7 @@ export function SolutionTab({
     <div className="workspace-section stacked-editors">
       <MarkdownEditor
         label="基础题解"
-        value={problem.content.basicSolution}
+        value={problem.content.basicSolution ?? ""}
         onChange={(value) => update((current) => setContent(current, "basicSolution", value))}
         problemId={problem.id}
         onUploadImage={uploadStatementImage}

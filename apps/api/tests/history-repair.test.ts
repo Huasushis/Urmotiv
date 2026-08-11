@@ -11,9 +11,8 @@ import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { readZipArchive, urmotivNativeAdapter, writeZipArchive } from "@urmotiv/problem-package";
+import { canonicalProblemSchema, readZipArchive, urmotivNativeAdapter, writeZipArchive, type CanonicalProblem } from "@urmotiv/problem-package";
 import {
-  migrationMissingSolutionMarker,
   localSourceTextRepairNote,
   normalizeRepairTitle,
   prepareHistoryCandidates,
@@ -374,9 +373,9 @@ describe("受控本地源文修复端到端", () => {
       ) as HistoryCandidateRecord;
       // 精确源正文作为题面，不缩小、不生成。
       expect(candidate.problem.content.basicStatement).toBe(fixture.mappings[index]!.text);
-      // 解不伪造：basicSolution 复用公共域权威缺失标记（规范化指令为原文缺题解
-      // 规定的同一字符串），绝不另造占位内容；solution 保持空串。
-      expect(candidate.problem.content.basicSolution).toBe(migrationMissingSolutionMarker);
+      // 解不伪造：原文缺题解时 basicSolution 为结构性 null（绝不写入任何占位或
+      // 提示文字），solution 保持空串；缺失在候选层即为结构性缺失。
+      expect(candidate.problem.content.basicSolution).toBeNull();
       expect(candidate.problem.content.solution).toBe("");
       expect(candidate.problem.samples).toEqual([]);
       // 未解析附件保持未附加。
@@ -387,7 +386,7 @@ describe("受控本地源文修复端到端", () => {
     }
   });
 
-  it("题解缺失经候选 → 打包 → 导入全程透传（唯一占位即公共域既有标记）", async () => {
+  it("题解缺失经候选 → 打包 → 导入全程保持结构性缺失（无任何占位内容或文件）", async () => {
     const fixture = await createRepairFixture();
     const receipts = await buildReceipts(fixture.preparedDirectory, fixture.mappings);
     const repairManifestFile = await writeRepairManifest(fixture.root, receipts);
@@ -411,13 +410,11 @@ describe("受控本地源文修复端到端", () => {
       ),
     ) as HistoryCandidateRecord;
 
-    // 候选层：缺题解只以公共域既有标记表示，不再出现任何其他占位字符串。
-    expect(candidate.problem.content.basicSolution).toBe(migrationMissingSolutionMarker);
+    // 候选层：缺题解以结构性 null 表示。
+    expect(candidate.problem.content.basicSolution).toBeNull();
     expect(candidate.problem.content.solution).toBe("");
-    const markerOccurrences = JSON.stringify(candidate).split(migrationMissingSolutionMarker).length - 1;
-    expect(markerOccurrences).toBe(1);
 
-    // 打包层：同一原生适配器导出生成题目包，基础题解文件原样承载该标记；
+    // 打包层：同一原生适配器导出生成题目包，缺失不生成 basic-solution.md 文件；
     // 补充题解为空则不生成 solution.md（缺失不到处蔓延）。
     const generated = await urmotivNativeAdapter.export(candidate.problem, {
       exportedAt: "2026-08-11T00:00:00.000Z",
@@ -426,19 +423,17 @@ describe("受控本地源文修复端到端", () => {
       throw new Error("合成题目包导出应为 zip。");
     }
     const archive = readZipArchive(writeZipArchive(generated.files));
-    const solutionBytes = archive.read("content/basic-solution.md");
-    expect(solutionBytes).toBeDefined();
-    expect(new TextDecoder().decode(solutionBytes)).toBe(migrationMissingSolutionMarker);
+    expect(archive.read("content/basic-solution.md")).toBeUndefined();
     expect(archive.read("content/solution.md")).toBeUndefined();
 
-    // 导入层：包经原生适配器导入后，缺失依然保持缺失，题面精确。
+    // 导入层：包经原生适配器导入后，缺失依然保持结构性缺失，题面精确。
     const imported = await urmotivNativeAdapter.import(archive, { conflictAction: "create" });
     expect(imported.content.basicStatement).toBe(fixture.mappings[FAILING_FIRST_INDEX]!.text);
-    expect(imported.content.basicSolution).toBe(migrationMissingSolutionMarker);
+    expect(imported.content.basicSolution).toBeNull();
     expect(imported.content.solution).toBe("");
     expect(imported.samples).toEqual([]);
 
-    // 幂等重放后缺失不变：候选与包的字节保持不变。
+    // 幂等重放后缺失不变：候选与包的字节保持不变，缺失仍为 null。
     await repairFailedHistoryCandidates({
       privateRootDirectory: fixture.root,
       sourceDirectory: fixture.sourceDirectory,
@@ -457,8 +452,46 @@ describe("受控本地源文修复端到端", () => {
         "utf8",
       ),
     ) as HistoryCandidateRecord;
-    expect(replayCandidate.problem.content.basicSolution).toBe(migrationMissingSolutionMarker);
+    expect(replayCandidate.problem.content.basicSolution).toBeNull();
     expect(replayCandidate.problem.content.solution).toBe("");
+  });
+
+  it("非空基础题解经打包 → 导入完整往返且与缺失解互不影响", async () => {
+    const problemWithSolution = canonicalProblemSchema.parse({
+      title: "合成有解题",
+      type: "traditional",
+      tags: [],
+      difficulty: { thinkingLevel: 3, codingLevel: 2 },
+      content: {
+        basicStatement: "求 1+1 的值。",
+        basicSolution: "1+1=2，直接计算即可。",
+        background: "",
+        statement: "",
+        inputFormat: "",
+        outputFormat: "",
+        constraints: "",
+        solution: "",
+        hints: ""
+      },
+      samples: [{ input: "无输入", output: "2", explanation: "" }],
+      files: [],
+      provenance: { sourceSystem: "synthetic-test" },
+      extensions: {}
+    }) as CanonicalProblem;
+
+    const generated = await urmotivNativeAdapter.export(problemWithSolution, {
+      exportedAt: "2026-08-11T00:00:00.000Z"
+    });
+    if (generated.kind !== "zip") {
+      throw new Error("合成题目包导出应为 zip。");
+    }
+    const archive = readZipArchive(writeZipArchive(generated.files));
+    expect(archive.read("content/basic-solution.md")).toBeDefined();
+    expect(new TextDecoder().decode(archive.read("content/basic-solution.md"))).toBe("1+1=2，直接计算即可。");
+
+    const imported = await urmotivNativeAdapter.import(archive, { conflictAction: "create" });
+    expect(imported.content.basicSolution).toBe("1+1=2，直接计算即可。");
+    expect(imported.content.basicStatement).toBe("求 1+1 的值。");
   });
 
   it("修复候选的稳定绑定来自标题无关元组并与确定性结果一致", async () => {
