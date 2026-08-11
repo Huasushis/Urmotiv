@@ -226,6 +226,7 @@ const packageReportEntrySchema = z
   .object({
     candidateId: z.string().regex(/^candidate-[0-9]{6}$/),
     contentSha256: digestSchema,
+    sourceBindingSha256: digestSchema.optional(),
     packageSha256: digestSchema,
     packageBytes: z
       .number()
@@ -294,6 +295,14 @@ const importManifestPayloadSchema = z
   .strict();
 
 type PackageReportEntry = z.infer<typeof packageReportEntrySchema>;
+
+/**
+ * 来源绑定键：新包报告包含 sourceBindingSha256（与标题无关），用于幂等回放。
+ * 旧包报告没有此字段时回退到 packageSha256——保持已完成记录的原有行为。
+ */
+function entrySourceBindingKey(entry: PackageReportEntry): string {
+  return entry.sourceBindingSha256 ?? entry.packageSha256;
+}
 const importCompletePayloadSchema = z
   .object({
     version: z.literal(1),
@@ -623,15 +632,15 @@ async function importSinglePackage(input: {
   const journalDir = join(input.outputDirectory, "journal");
   const sourceIntentPath = join(journalDir, `${input.packageEntry.candidateId}.private.json`);
   await mkdir(journalDir, { mode: 0o700, recursive: true });
-  const idempotencyKey = input.packageEntry.packageSha256;
+  const sourceBindingKey = entrySourceBindingKey(input.packageEntry);
   const importChoices = { conflictAction: "create" as const };
   const canonicalChoicesDigest = choicesDigestOf(importChoices);
   const sourceIntentExpected: SourceIntentExpected = {
     selectedFormat: urmotivNativeAdapter.id,
     selectedFormatVersion: urmotivNativeAdapter.version,
-    idempotencyKey,
-    clientRequestDigest: input.packageEntry.packageSha256,
-    inputDigest: input.packageEntry.packageSha256,
+    idempotencyKey: sourceBindingKey,
+    clientRequestDigest: sourceBindingKey,
+    inputDigest: sourceBindingKey,
     choicesDigest: canonicalChoicesDigest,
     requestedByUserId: input.requestedByUserId,
   };
@@ -656,8 +665,8 @@ async function importSinglePackage(input: {
   // 是否匹配获胜方的 sourceFileId——不匹配则 fail-closed（零物理对象、零存储行）。
   const preExistingJob = await input.jobStore.findImportJobForReplay({
     requestedByUserId: input.requestedByUserId,
-    idempotencyKey: input.packageEntry.packageSha256,
-    clientRequestDigest: input.packageEntry.packageSha256,
+    idempotencyKey: sourceBindingKey,
+    clientRequestDigest: sourceBindingKey,
   });
   if (preExistingJob !== undefined) {
     // 已有规范 import job：验证 journal UUID 是否匹配获胜方 sourceFileId。
@@ -744,14 +753,14 @@ async function importSinglePackage(input: {
   try {
     job = await input.jobStore.createImportJob({
       requestedByUserId: input.requestedByUserId,
-      clientRequestDigest: input.packageEntry.packageSha256,
+      clientRequestDigest: sourceBindingKey,
       sourceFileId,
-      inputDigest: input.packageEntry.packageSha256,
+      inputDigest: sourceBindingKey,
       selectedFormat: urmotivNativeAdapter.id,
       selectedFormatVersion: urmotivNativeAdapter.version,
       choices: importChoices,
       itemCount: 1,
-      idempotencyKey: input.packageEntry.packageSha256,
+      idempotencyKey: sourceBindingKey,
       auditRequestId,
     });
     // 立即验证 createImportJob 返回值的身份字段（不含 audit/items）。
@@ -761,8 +770,8 @@ async function importSinglePackage(input: {
     // 审计/条目持久化是强制性要求，不可选跳过。
     const successReplay = await input.jobStore.findImportJobForReplay({
       requestedByUserId: input.requestedByUserId,
-      idempotencyKey: input.packageEntry.packageSha256,
-      clientRequestDigest: input.packageEntry.packageSha256,
+      idempotencyKey: sourceBindingKey,
+      clientRequestDigest: sourceBindingKey,
     });
     if (successReplay === undefined) {
       throw new HistoryMigrationError(
@@ -782,8 +791,8 @@ async function importSinglePackage(input: {
     // 如果任务已提交，绝不删除已提交的源状态——直接使用既有任务。
     const committed = await input.jobStore.findImportJobForReplay({
       requestedByUserId: input.requestedByUserId,
-      idempotencyKey: input.packageEntry.packageSha256,
-      clientRequestDigest: input.packageEntry.packageSha256,
+      idempotencyKey: sourceBindingKey,
+      clientRequestDigest: sourceBindingKey,
     });
     if (committed !== undefined) {
       // 任务已提交：响应丢失。验证全部绑定身份匹配（含审计/条目/位置）。
@@ -1592,16 +1601,17 @@ function validateCreatedJobIdentity(
   expected: SourceIntentExpected,
 ): void {
   const createdChoicesDigest = choicesDigestOf(job.choices);
+  const bindingKey = entrySourceBindingKey(entry);
   if (
     job.requestedByUserId !== expected.requestedByUserId ||
     job.sourceFileId !== sourceFileId ||
     job.sourceFileId !== journal.storageUuid ||
     job.inputDigest !== expected.inputDigest ||
-    job.inputDigest !== entry.packageSha256 ||
+    job.inputDigest !== bindingKey ||
     job.clientRequestDigest !== expected.clientRequestDigest ||
-    job.clientRequestDigest !== entry.packageSha256 ||
+    job.clientRequestDigest !== bindingKey ||
     job.idempotencyKey !== expected.idempotencyKey ||
-    job.idempotencyKey !== entry.packageSha256 ||
+    job.idempotencyKey !== bindingKey ||
     job.selectedFormat !== expected.selectedFormat ||
     job.selectedFormat !== journal.selectedFormat ||
     job.selectedFormatVersion !== expected.selectedFormatVersion ||
@@ -1662,16 +1672,17 @@ function validateReplayJobIdentity(
 ): void {
   const job = committed.job;
   const replayChoicesDigest = choicesDigestOf(job.choices);
+  const bindingKey = entrySourceBindingKey(entry);
   if (
     job.requestedByUserId !== expected.requestedByUserId ||
     job.sourceFileId !== sourceFileId ||
     job.sourceFileId !== journal.storageUuid ||
     job.inputDigest !== expected.inputDigest ||
-    job.inputDigest !== entry.packageSha256 ||
+    job.inputDigest !== bindingKey ||
     job.clientRequestDigest !== expected.clientRequestDigest ||
-    job.clientRequestDigest !== entry.packageSha256 ||
+    job.clientRequestDigest !== bindingKey ||
     job.idempotencyKey !== expected.idempotencyKey ||
-    job.idempotencyKey !== entry.packageSha256 ||
+    job.idempotencyKey !== bindingKey ||
     job.selectedFormat !== expected.selectedFormat ||
     job.selectedFormat !== journal.selectedFormat ||
     job.selectedFormatVersion !== expected.selectedFormatVersion ||

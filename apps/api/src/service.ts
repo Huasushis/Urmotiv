@@ -212,9 +212,6 @@ function frozenFieldErrors(
   }
 
   const errors: FieldErrors = {};
-  if (input.title !== undefined && input.title !== current.title) {
-    errors.title = ["待审核或已通过的题目不能直接修改题目名称。"];
-  }
 
   if (
     input.content !== undefined &&
@@ -442,7 +439,7 @@ export class ProblemService {
     this.assertExpectedRevision(current, input.expectedRevision);
     const frozenErrors = frozenFieldErrors(current, input);
     if (frozenErrors !== undefined) {
-      throw conflict("题目正在审核或已通过，三个审核字段已冻结。", frozenErrors);
+      throw conflict("题目正在审核或已通过，两个基础审核字段已冻结。", frozenErrors);
     }
 
     const nextTagIds = input.tagIds ?? current.tagIds;

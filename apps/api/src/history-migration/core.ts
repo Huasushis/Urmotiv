@@ -14,7 +14,7 @@ import {
   type HistoryAttachmentMappingCapability,
   revalidateHistoryAttachmentMappingCapability,
 } from "./attachment-mapping";
-import { candidateContentDigest, sha256Hex, sourceMappingDigest } from "./digests";
+import { candidateContentDigest, sha256Hex, sourceBindingDigest, sourceMappingDigest } from "./digests";
 import {
   HistoryMigrationError,
   HistoryNormalizationError,
@@ -415,6 +415,11 @@ export async function prepareHistoryCandidates(
           source.metadata.authorStudentId,
           source.mapping.sourcePath,
         );
+        const sourceBindingSha256 = sourceBindingDigest({
+          sourceId: source.sourceId,
+          sourceContentSha256: sourceContent.sha256,
+          sourceMappingSha256: source.sourceMappingSha256,
+        });
         const contentSha256 = candidateContentDigest({
           sourceId: source.sourceId,
           sourceContentSha256: sourceContent.sha256,
@@ -429,6 +434,7 @@ export async function prepareHistoryCandidates(
           sourceId: source.sourceId,
           sourceContentSha256: sourceContent.sha256,
           sourceMappingSha256: source.sourceMappingSha256,
+          sourceBindingSha256,
           contentSha256,
           modelConfidence: normalizedProblem.confidence,
           normalizationNote: normalizedProblem.migrationNote,
@@ -1044,6 +1050,7 @@ export async function packageApprovedCandidates(
     const packageReport: Array<{
       readonly candidateId: string;
       readonly contentSha256: string;
+      readonly sourceBindingSha256: string;
       readonly packageSha256: string;
       readonly packageBytes: number;
       readonly status: "packaged";
@@ -1117,6 +1124,12 @@ export async function packageApprovedCandidates(
       packageReport.push({
         candidateId: approved.record.candidateId,
         contentSha256: approved.record.contentSha256,
+        sourceBindingSha256:
+          approved.record.sourceBindingSha256 ?? sourceBindingDigest({
+            sourceId: approved.record.sourceId,
+            sourceContentSha256: approved.record.sourceContentSha256,
+            sourceMappingSha256: approved.record.sourceMappingSha256,
+          }),
         packageSha256,
         packageBytes: archive.byteLength,
         status: "packaged",

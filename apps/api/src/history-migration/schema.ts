@@ -177,6 +177,7 @@ export const historyCandidateRecordSchema = z
     sourceId: historySourceIdSchema,
     sourceContentSha256: historyContentDigestSchema,
     sourceMappingSha256: historyContentDigestSchema,
+    sourceBindingSha256: historyContentDigestSchema.optional(),
     contentSha256: historyContentDigestSchema,
     modelConfidence: z.number().min(0).max(1),
     normalizationNote: z.string().max(10_000),

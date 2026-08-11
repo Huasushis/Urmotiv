@@ -356,7 +356,7 @@ describe("题目 API", () => {
     expect(foreignUpdate.statusCode).toBe(404);
   });
 
-  it("提交后服务端冻结三个审核字段，其他内容仍可补充", async () => {
+  it("提交后只冻结基础题面和基础题解，题目名称可继续编辑", async () => {
     const app = await makeApp();
     const authorCookie = await login(app, "author");
     const problem = await createDraft(app, authorCookie);
@@ -383,38 +383,76 @@ describe("题目 API", () => {
       })
     );
 
-    const leaderFrozenUpdate = await app.inject({
+    // 题目名称在待审核状态可编辑（有编辑权限的用户）。
+    const leaderTitleUpdate = await app.inject({
       method: "PATCH",
       url: `/api/v1/problems/${problemId}`,
       headers: { cookie: leaderCookie, origin: localOrigin },
-      payload: { expectedRevision: 2, title: "组长也不能直接覆盖冻结名称" }
+      payload: { expectedRevision: 2, title: "组长可以修改名称" }
     });
-    expect(leaderFrozenUpdate.statusCode).toBe(409);
+    expect(leaderTitleUpdate.statusCode).toBe(200);
+    expect(leaderTitleUpdate.json()).toEqual(
+      expect.objectContaining({ title: "组长可以修改名称", revision: 3 })
+    );
 
-    const frozenUpdate = await app.inject({
+    // 作者也可以编辑名称。
+    const authorTitleUpdate = await app.inject({
       method: "PATCH",
       url: `/api/v1/problems/${problemId}`,
       headers: { cookie: authorCookie, origin: localOrigin },
-      payload: { expectedRevision: 2, title: "不能修改的名称" }
+      payload: { expectedRevision: 3, title: "作者也可以改名称" }
     });
-    expect(frozenUpdate.statusCode).toBe(409);
-    expect(frozenUpdate.json()).toEqual({
+    expect(authorTitleUpdate.statusCode).toBe(200);
+    expect(authorTitleUpdate.json()).toEqual(
+      expect.objectContaining({ title: "作者也可以改名称", revision: 4 })
+    );
+
+    // 基础题面和基础题解仍然冻结。
+    const frozenStatementUpdate = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: authorCookie, origin: localOrigin },
+      payload: {
+        expectedRevision: 4,
+        content: { ...fullContent, basicStatement: "不能修改的题面" }
+      }
+    });
+    expect(frozenStatementUpdate.statusCode).toBe(409);
+    expect(frozenStatementUpdate.json()).toEqual({
       error: expect.objectContaining({
         code: "CONFLICT",
-        fieldErrors: expect.objectContaining({ title: expect.any(Array) })
+        fieldErrors: expect.objectContaining({ "content.basicStatement": expect.any(Array) })
       })
     });
 
+    const frozenSolutionUpdate = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: authorCookie, origin: localOrigin },
+      payload: {
+        expectedRevision: 4,
+        content: { ...fullContent, basicSolution: "不能修改的题解" }
+      }
+    });
+    expect(frozenSolutionUpdate.statusCode).toBe(409);
+    expect(frozenSolutionUpdate.json()).toEqual({
+      error: expect.objectContaining({
+        code: "CONFLICT",
+        fieldErrors: expect.objectContaining({ "content.basicSolution": expect.any(Array) })
+      })
+    });
+
+    // 非冻结内容仍可补充。
     const editableContent = { ...fullContent, background: "这部分可在审核中继续完善。" };
     const normalUpdate = await app.inject({
       method: "PATCH",
       url: `/api/v1/problems/${problemId}`,
       headers: { cookie: authorCookie, origin: localOrigin },
-      payload: { expectedRevision: 2, content: editableContent }
+      payload: { expectedRevision: 4, content: editableContent }
     });
     expect(normalUpdate.statusCode).toBe(200);
     expect(normalUpdate.json()).toEqual(
-      expect.objectContaining({ status: "pending_review", revision: 3 })
+      expect.objectContaining({ status: "pending_review", revision: 5 })
     );
   });
 
