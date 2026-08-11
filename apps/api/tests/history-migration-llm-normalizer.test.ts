@@ -249,6 +249,41 @@ describe("历史题目模型整理流式请求", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("stop 之后的 usage 记录携带唯一空 delta choice 时视为元数据", async () => {
+    const postStopUsage = {
+      ...strictUsageMetadataEvent(),
+      choices: [{ index: 0, delta: {} }],
+    };
+    const fetch = vi.fn(async () =>
+      eventStreamResponse(
+        `${completionEvent(normalizedContent, "stop")}data: ${JSON.stringify(
+          postStopUsage,
+        )}\n\ndata: [DONE]\n\n`,
+      ),
+    );
+
+    const result = await createNormalizer({ fetch }).normalize(sourceInput);
+    expect(result.problems).toHaveLength(1);
+  });
+
+  it("stop 之后的 usage 记录不得携带任何正文或推理字段", async () => {
+    const poisoned = {
+      ...strictUsageMetadataEvent(),
+      choices: [{ index: 0, delta: { content: "stop 后混进来的合成正文" } }],
+    };
+    const fetch = vi.fn(async () =>
+      eventStreamResponse(
+        `${completionEvent(normalizedContent, "stop")}data: ${JSON.stringify(
+          poisoned,
+        )}\n\ndata: [DONE]\n\n`,
+      ),
+    );
+
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+    });
+  });
+
   it("SSE heartbeat 和空事件不冒充首段有效输出", async () => {
     let heartbeat: ReturnType<typeof setInterval> | undefined;
     const fetch = vi.fn(async () => {

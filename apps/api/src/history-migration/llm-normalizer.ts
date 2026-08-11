@@ -681,7 +681,13 @@ function consumeCompletionEvent(
     // 空 choices 只有通过上面的封闭元数据校验才可忽略。
     throw invalidResponseFormat();
   }
-  if (record.choices.length !== 1 || state.sawStop) {
+  if (record.choices.length !== 1) {
+    throw invalidResponseFormat();
+  }
+  if (state.sawStop) {
+    // 兼容在 stop 事件之后再发送 usage 的网关：唯一 choice 只能是
+    // 空 delta，不允许携带内容、reasoning 或 finish_reason。
+    if (isPostStopStreamUsageRecord(record)) return;
     throw invalidResponseFormat();
   }
   const choice = record.choices[0];
@@ -793,6 +799,7 @@ function isStrictStreamUsageMetadata(raw: unknown): boolean {
       return false;
     }
   }
+
   for (const key of ["system_fingerprint", "service_tier"] as const) {
     if (
       Object.hasOwn(raw, key) &&
@@ -810,6 +817,26 @@ function isStrictStreamUsageMetadata(raw: unknown): boolean {
     return false;
   }
   return true;
+}
+
+function isBoundedStreamUsageCounter(value: unknown): boolean {
+  return isBoundedStreamUsageCounterStructure(value);
+}
+
+function isPostStopStreamUsageRecord(record: Record<string, unknown>): boolean {
+  if (!Object.hasOwn(record, "usage")) return false;
+  if (!isBoundedStreamUsageCounter(record.usage)) return false;
+  const only = (record.choices as unknown[])[0];
+  if (!isPlainJsonRecord(only)) return false;
+  for (const key of Object.keys(only)) {
+    if (key !== "index" && key !== "delta" && key !== "logprobs") return false;
+  }
+  if (Object.hasOwn(only, "index") && only.index !== 0) return false;
+  if (Object.hasOwn(only, "logprobs") && only.logprobs !== null) return false;
+  if (!Object.hasOwn(only, "delta") || !isPlainJsonRecord(only.delta)) {
+    return false;
+  }
+  return Object.keys(only.delta).length === 0;
 }
 
 function isBoundedStreamMetadataString(value: unknown, nullable = false): boolean {
@@ -1024,12 +1051,11 @@ function readCompletedResponseContent(payload: unknown): string {
 }
 
 /**
- * 公共域对"原文没有题解"的权威缺失表示：规范化指令要求模型在原文缺题解时把
- * basicSolution 恰好写成此标记、solution 留空，并在 migrationNote 如实记录。
- * 本地修复必须复用同一标记（绝不另造占位字符串），候选 → 打包 → 导入全程按
- * 原文含义透传，缺失在幂等重放后依然保持缺失。
+ * 公共域对"原文没有题解"的权威缺失表示：结构性的 null。规范化指令要求模型
+ * 在原文缺题解时把 basicSolution 写成 null（而非任何占位字符串）、solution 留空，
+ * 并在 migrationNote 如实记录。本地修复同样写入 null，候选 → 打包 → 导入全程
+ * 按原文含义保持结构性缺失，缺失在幂等重放后依然保持缺失。
  */
-export const migrationMissingSolutionMarker = "（迁移时缺题解，待补充）" as const;
 
 const normalizationInstructions = [
   "你是算法竞赛题库历史资料整理助手。输入材料已经过人工分组，但你的结果仍只是待人工批准的候选，不能直接导入。",
@@ -1037,7 +1063,7 @@ const normalizationInstructions = [
   "1. 先辨认材料中实际包含几道题。一份源含多道题时必须逐题拆成 problems 数组的独立项目；不要把多题合并，也不要凭题名、编号或顺序补出材料中没有的题。",
   "2. 题面和题解是核心。逐题提取明确出现的题意、输入、输出、约束、样例和题解；不得臆造规则、数据范围、样例、算法、结论或缺失段落。材料不明确时保留空字段，并在 migrationNote 简短说明不确定项。",
   "3. basicStatement 写成完整、可读且自洽的 Markdown 核心题面；background、statement、inputFormat、outputFormat、constraints、hints 和 samples 只放各自对应且原文确有的内容。不要把同一整段题面原样复制到 basicStatement 与任一拆分字段，也不要在多个拆分字段间重复整段正文。",
-  `4. basicSolution 写原文已有的完整核心题解；solution 只放原文中可明确区分的补充题解内容，不能与 basicSolution 重复整段。原文没有题解时，basicSolution 必须恰好写“${migrationMissingSolutionMarker}”，solution 留空，并在 migrationNote 如实记录缺失。`,
+  `4. basicSolution 写原文已有的完整核心题解；solution 只放原文中可明确区分的补充题解内容，不能与 basicSolution 重复整段。原文没有题解时，basicSolution 必须写成 null（不得写任何占位或提示文字），solution 留空，并在 migrationNote 如实记录缺失。`,
   "5. title 只取材料中明确的题名；type 只能是 traditional、interactive 或 submit_answer。只有材料明确要求交互或提交答案时才使用后两种，否则使用 traditional。",
   "6. samples 只登记材料中明确成对出现的输入、输出及解释；不要把正文代码块猜成样例。保留原有公式、代码和 Markdown 含义，不要擅自改题或润色成不同规则。",
   "7. tags 必须始终是空数组 []。不要选择或创造知识点标签，不要读取、采信或推断投题者自报难度，也不要输出任何难度字段。",
