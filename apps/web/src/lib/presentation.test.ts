@@ -2,9 +2,10 @@ import { describe, expect, it } from "vitest";
 import { duration, isFrozen, reviewVerdictText, statusText } from "./presentation";
 
 describe("题目展示规则", () => {
-  it("只在待审核和通过时冻结三个稳定字段", () => {
-    expect(isFrozen("pending_review", "title")).toBe(true);
+  it("待审核和通过时只冻结题面和题解，标题保持可编辑", () => {
+    expect(isFrozen("pending_review", "title")).toBe(false);
     expect(isFrozen("approved", "content.basicSolution")).toBe(true);
+    expect(isFrozen("pending_review", "content.basicStatement")).toBe(true);
     expect(isFrozen("draft", "title")).toBe(false);
     expect(isFrozen("pending_review", "content.constraints")).toBe(false);
   });

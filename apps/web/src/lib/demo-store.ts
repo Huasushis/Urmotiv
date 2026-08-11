@@ -200,6 +200,7 @@ function emptyCapabilities(): ProblemCapabilities {
   return {
     canView: false,
     canEdit: false,
+    canEditTitle: false,
     canEditFrozen: false,
     canSubmit: false,
     canWithdraw: false,
@@ -233,6 +234,7 @@ function permissionsFor(userId: DemoUserId, problem: Problem): ProblemCapabiliti
     return {
       canView: true,
       canEdit: true,
+      canEditTitle: true,
       canEditFrozen: false,
       canSubmit: isDraftLike,
       canWithdraw: problem.status === "pending_review" || problem.status === "approved",
@@ -248,6 +250,7 @@ function permissionsFor(userId: DemoUserId, problem: Problem): ProblemCapabiliti
     return {
       canView: true,
       canEdit: true,
+      canEditTitle: true,
       canEditFrozen: false,
       canSubmit: isOwner && isDraftLike,
       canWithdraw: isOwner && (problem.status === "pending_review" || problem.status === "approved"),
@@ -272,6 +275,7 @@ function permissionsFor(userId: DemoUserId, problem: Problem): ProblemCapabiliti
       ...emptyCapabilities(),
       canView: true,
       canEdit: isDraftLike,
+      canEditTitle: true,
       canSubmit: isDraftLike,
       canWithdraw: problem.status === "pending_review" || problem.status === "approved",
       canExport: true
@@ -314,11 +318,6 @@ function findProblem(id: string): { problem: Problem; index: number; all: Proble
   return { problem, index, all };
 }
 
-function requireEdit(problem: Problem): void {
-  if (!decorate(problem).capabilities.canEdit) {
-    throw new ApiError("你没有修改这道题的权限。", 403);
-  }
-}
 
 function requireRevision(problem: Problem, expected: number): void {
   if (problem.revision !== expected) {
@@ -458,31 +457,53 @@ export async function createDemoProblem(input: CreateProblemInput): Promise<Prob
 
 export async function updateDemoProblem(id: string, input: UpdateProblemInput): Promise<Problem> {
   const { problem, index, all } = findProblem(id);
-  requireEdit(problem);
-  requireRevision(problem, input.expectedRevision);
-  const frozen = problem.status === "pending_review" || problem.status === "approved";
-  if (
-    frozen &&
-    ((input.title !== undefined && input.title !== problem.title) ||
-      (input.content?.basicStatement !== undefined &&
-        input.content.basicStatement !== problem.content.basicStatement) ||
-      (input.content?.basicSolution !== undefined &&
-        input.content.basicSolution !== problem.content.basicSolution))
-  ) {
-    throw new ApiError("待审核或审核通过后，名称、基础题面和基础题解不能修改。", 409);
+  const capabilities = decorate(problem).capabilities;
+  const canEdit = capabilities.canEdit;
+  const canEditTitle = capabilities.canEditTitle;
+
+  if (!canEdit && !canEditTitle) {
+    throw new ApiError("你没有修改这道题的权限。", 403);
   }
+  requireRevision(problem, input.expectedRevision);
+
+  const frozen = problem.status === "pending_review" || problem.status === "approved";
+
+  if (frozen) {
+    if (
+      input.content?.basicStatement !== undefined &&
+      input.content.basicStatement !== problem.content.basicStatement
+    ) {
+      throw new ApiError("待审核或审核通过后，基础题面不能修改。", 409);
+    }
+    if (
+      input.content?.basicSolution !== undefined &&
+      input.content.basicSolution !== problem.content.basicSolution
+    ) {
+      throw new ApiError("待审核或审核通过后，基础题解不能修改。", 409);
+    }
+  }
+
+  if (!canEdit && canEditTitle) {
+    const allowedKeys: (keyof UpdateProblemInput)[] = ["expectedRevision", "title"];
+    const inputKeys = Object.keys(input) as (keyof UpdateProblemInput)[];
+    if (inputKeys.some((key) => !allowedKeys.includes(key))) {
+      throw new ApiError("仅有编辑名称权限时不能修改其他字段。", 403);
+    }
+  }
+
   const next: Problem = {
     ...problem,
     ...(input.title !== undefined ? { title: input.title } : {}),
-    ...(input.type !== undefined ? { type: input.type } : {}),
-    ...(input.tagIds !== undefined ? { tagIds: input.tagIds } : {}),
-    ...(input.codeforcesDifficulty !== undefined
+    ...(canEdit && input.type !== undefined ? { type: input.type } : {}),
+    ...(canEdit && input.tagIds !== undefined ? { tagIds: input.tagIds } : {}),
+    ...(canEdit && input.codeforcesDifficulty !== undefined
       ? { codeforcesDifficulty: input.codeforcesDifficulty }
       : {}),
-    ...(input.thinkingLevel !== undefined ? { thinkingLevel: input.thinkingLevel } : {}),
-    ...(input.codingLevel !== undefined ? { codingLevel: input.codingLevel } : {}),
-    content: { ...problem.content, ...(input.content ?? {}) },
-    samples: input.samples ?? problem.samples,
+    ...(canEdit && input.thinkingLevel !== undefined ? { thinkingLevel: input.thinkingLevel } : {}),
+    ...(canEdit && input.codingLevel !== undefined ? { codingLevel: input.codingLevel } : {}),
+    content: canEdit ? { ...problem.content, ...(input.content ?? {}) } : problem.content,
+    samples: canEdit ? (input.samples ?? problem.samples) : problem.samples,
+    judgeConfig: canEdit ? (input.judgeConfig ?? problem.judgeConfig) : problem.judgeConfig,
     revision: problem.revision + 1,
     updatedAt: now(),
     capabilities: emptyCapabilities()

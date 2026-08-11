@@ -261,6 +261,7 @@ export const withdrawProblemInputSchema = z.object({
 export const problemCapabilitiesSchema = z.object({
   canView: z.boolean(),
   canEdit: z.boolean(),
+  canEditTitle: z.boolean(),
   canEditFrozen: z.boolean(),
   canSubmit: z.boolean(),
   canWithdraw: z.boolean(),

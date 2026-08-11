@@ -64,6 +64,9 @@ function legacyLocalDraftKey(problemId: string): string {
 }
 
 function updateInput(problem: Problem): UpdateProblemInput {
+  if (!problem.capabilities.canEdit && problem.capabilities.canEditTitle) {
+    return { expectedRevision: problem.revision, title: problem.title };
+  }
   return {
     expectedRevision: problem.revision,
     title: problem.title,
@@ -179,7 +182,10 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
   });
 
   const saveNow = useCallback(() => {
-    if (!working || !dirty || save.isPending || fileUploadPending || !working.capabilities.canEdit) {
+    if (!working || !dirty || save.isPending || fileUploadPending) {
+      return;
+    }
+    if (!working.capabilities.canEdit && !working.capabilities.canEditTitle) {
       return;
     }
     save.mutate({ problem: working, edit: editNumber.current });
@@ -191,13 +197,13 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
       save.isPending ||
       fileUploadPending ||
       saveState === "failed" ||
-      !working?.capabilities.canEdit
+      (!working?.capabilities.canEdit && !working?.capabilities.canEditTitle)
     ) {
       return;
     }
     const timer = window.setTimeout(saveNow, 1200);
     return () => window.clearTimeout(timer);
-  }, [dirty, fileUploadPending, save.isPending, saveNow, saveState, working?.capabilities.canEdit]);
+  }, [dirty, fileUploadPending, save.isPending, saveNow, saveState, working?.capabilities.canEdit, working?.capabilities.canEditTitle]);
 
   const update: ProblemUpdater = (updater) => {
     setWorking((current) => (current ? updater(current) : current));

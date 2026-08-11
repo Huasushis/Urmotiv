@@ -60,6 +60,7 @@ function problem(type: Problem["type"] = "traditional"): Problem {
     capabilities: {
       canView: true,
       canEdit: true,
+      canEditTitle: true,
       canEditFrozen: false,
       canSubmit: true,
       canWithdraw: false,

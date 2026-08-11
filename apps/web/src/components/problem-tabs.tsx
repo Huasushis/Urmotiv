@@ -78,7 +78,7 @@ function judgeConfigForType(
 export function OverviewTab({ problem, update }: ProblemTabProps) {
   const tags = useQuery({ queryKey: ["tags"], queryFn: listTags, staleTime: 5 * 60_000 });
   const canEdit = problem.capabilities.canEdit;
-  const titleFrozen = isFrozen(problem.status, "title") && !problem.capabilities.canEditFrozen;
+  const canEditTitle = problem.capabilities.canEditTitle;
 
   return (
     <div className="workspace-section overview-tab">
@@ -96,9 +96,8 @@ export function OverviewTab({ problem, update }: ProblemTabProps) {
           <input
             value={problem.title}
             onChange={(event) => update((current) => ({ ...current, title: event.target.value }))}
-            disabled={!canEdit || titleFrozen}
+            disabled={!canEditTitle}
           />
-          {titleFrozen ? <small>进入审核后名称已冻结；撤回或驳回后可继续修改。</small> : null}
         </label>
         <label className="field">
           <span>题目类型</span>

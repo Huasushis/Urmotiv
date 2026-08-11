@@ -65,6 +65,7 @@ function problem(canReview = true): Problem {
     capabilities: {
       canView: true,
       canEdit: false,
+      canEditTitle: false,
       canEditFrozen: false,
       canSubmit: false,
       canWithdraw: false,
@@ -87,6 +88,7 @@ function approvedProblem(): Problem {
     capabilities: {
       ...current.capabilities,
       canEdit: true,
+      canEditTitle: true,
       canChangeStatus: true
     }
   };

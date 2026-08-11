@@ -379,7 +379,7 @@ describe("题目 API", () => {
     expect(leaderView.statusCode).toBe(200);
     expect(leaderView.json()).toEqual(
       expect.objectContaining({
-        capabilities: expect.objectContaining({ canEditFrozen: false })
+        capabilities: expect.objectContaining({ canEditFrozen: false, canEditTitle: true })
       })
     );
 

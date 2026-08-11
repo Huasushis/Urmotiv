@@ -1541,6 +1541,7 @@ export class ProblemService {
     return {
       canView: true,
       canEdit,
+      canEditTitle: canEdit,
       canEditFrozen: false,
       canSubmit,
       canWithdraw,

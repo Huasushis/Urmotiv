@@ -20,10 +20,13 @@ export const statusTone: Record<ProblemStatus, "neutral" | "warning" | "success"
   rejected: "danger"
 };
 
-export const frozenFields = new Set(["title", "content.basicStatement", "content.basicSolution"]);
+export const frozenFields: Record<string, true> = {
+  "content.basicStatement": true,
+  "content.basicSolution": true
+};
 
 export function isFrozen(status: ProblemStatus, field: string): boolean {
-  return (status === "pending_review" || status === "approved") && frozenFields.has(field);
+  return (status === "pending_review" || status === "approved") && frozenFields[field] === true;
 }
 
 export function dateTime(value: string): string {
