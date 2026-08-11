@@ -17,6 +17,7 @@ import {
   materializeHistoryGrouping,
   packageApprovedCandidates,
   prepareHistoryCandidates,
+  repairFailedHistoryCandidates,
   sealHistoryGrouping,
   sealHistoryAttachmentMapping,
   writeHistoryGroupingConfirmation,
@@ -111,6 +112,14 @@ type Command =
       readonly outputDirectory: string;
       readonly operationTag: string;
       readonly resume: boolean;
+    }
+  | {
+      readonly phase: "repair-local";
+      readonly privateRootDirectory: string;
+      readonly materializedDirectory: string;
+      readonly metadataFile: string;
+      readonly preparedDirectory: string;
+      readonly repairManifestFile: string;
     }
   | {
       readonly phase: "package";
@@ -224,6 +233,33 @@ async function main(): Promise<void> {
     }
     process.stdout.write(
       `已读取 ${result.sourceCount} 个确认源文件，生成 ${result.candidateCount} 个待人工批准的候选。\n`,
+    );
+    return;
+  }
+  if (command.phase === "repair-local") {
+    await assertHistoryMaterializationComplete({
+      privateRootDirectory: command.privateRootDirectory,
+      materializedDirectory: command.materializedDirectory,
+    });
+    const result = await repairFailedHistoryCandidates({
+      privateRootDirectory: command.privateRootDirectory,
+      sourceDirectory: join(command.materializedDirectory, "sources"),
+      metadataFile: command.metadataFile,
+      sourceConfirmationFile: join(
+        command.materializedDirectory,
+        "source-confirmation.private.json",
+      ),
+      preparedDirectory: command.preparedDirectory,
+      repairManifestFile: command.repairManifestFile,
+    });
+    if (!result.complete) {
+      throw new HistoryMigrationError(
+        "PREPARE_INCOMPLETE",
+        "受控修复后 prepare 仍未完整结束；不发布任何完成标记。",
+      );
+    }
+    process.stdout.write(
+      `受控本地源文修复完成：本次修复 ${result.repairedCount} 份，另有 ${result.alreadyRepairedCount} 份此前已满足；当前候选共 ${result.candidateCount} 个。\n`,
     );
     return;
   }
@@ -369,6 +405,16 @@ function parseCommand(argv: readonly string[]): Command {
       resume: argv.includes("--resume"),
     };
   }
+  if (phase === "repair-local") {
+    return {
+      phase,
+      privateRootDirectory: requiredOption(argv, "--private-root"),
+      materializedDirectory: requiredOption(argv, "--materialized"),
+      metadataFile: requiredOption(argv, "--metadata"),
+      preparedDirectory: requiredOption(argv, "--prepared"),
+      repairManifestFile: requiredOption(argv, "--repair-manifest"),
+    };
+  }
   if (phase === "package") {
     return {
       phase,
@@ -389,7 +435,7 @@ function parseCommand(argv: readonly string[]): Command {
   }
   throw new HistoryMigrationError(
     "INVALID_ARGUMENTS",
-    "必须明确选择 inventory、init-grouping、seal-grouping、confirm-grouping、materialize、init-attachments、seal-attachments、assert-attachments、prepare 或 package 阶段。",
+    "必须明确选择 inventory、init-grouping、seal-grouping、confirm-grouping、materialize、init-attachments、seal-attachments、assert-attachments、prepare、repair-local 或 package 阶段。",
   );
 }
 

@@ -22,15 +22,22 @@ export type HistoryMigrationErrorCode =
   | "CANDIDATE_INVALID"
   | "CANDIDATE_CHANGED"
   | "CANDIDATE_NOT_FOUND"
+  | "REPAIR_MANIFEST_INVALID"
+  | "REPAIR_REJECTED"
   | "DUPLICATE_ASSIGNMENT"
   | "OUTPUT_ALREADY_EXISTS"
-  | "OUTPUT_WRITE_FAILED";
+  | "OUTPUT_WRITE_FAILED"
+  | "LEASE_BUSY"
+  | "SOURCE_INTENT_MISMATCH"
+  | "LEASE_LOST"
+  | "RECOVERY_PENDING"
+  | "INTERNAL_ERROR";
 
 export class HistoryMigrationError extends Error {
   public readonly code: HistoryMigrationErrorCode;
 
-  public constructor(code: HistoryMigrationErrorCode, message: string) {
-    super(message);
+  public constructor(code: HistoryMigrationErrorCode, message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "HistoryMigrationError";
     this.code = code;
   }

@@ -25,6 +25,7 @@ import {
   type HistoryAttachmentSourceLocator,
   assertHistoryMaterializationComplete,
 } from "./grouping-workflow";
+import { migrationMissingSolutionMarker } from "./llm-normalizer";
 import {
   assertPathsInsidePrivateRoot,
   assertPrivateDirectoryMode,
@@ -44,10 +45,12 @@ import {
   historyCandidateProblemSchema,
   historyCandidateRecordSchema,
   historyMetadataFileSchema,
+  historyRepairManifestSchema,
   historySourceMappingSchema,
   normalizedHistoryOutputSchema,
   type HistoryCandidateRecord,
   type HistoryMetadataRecord,
+  type HistoryRepairManifest,
   type HistorySourceMapping,
   type NormalizedHistoryOutput,
   type NormalizedHistoryProblem,
@@ -215,6 +218,7 @@ interface ConfirmedSource {
 interface ApprovedCandidate {
   readonly record: HistoryCandidateRecord;
   readonly metadata: HistoryMetadataRecord;
+  readonly mapping: HistorySourceMapping["mappings"][number];
 }
 
 export async function prepareHistoryCandidates(
@@ -418,7 +422,9 @@ export async function prepareHistoryCandidates(
         const sourceBindingSha256 = sourceBindingDigest({
           sourceId: source.sourceId,
           sourceContentSha256: sourceContent.sha256,
-          sourceMappingSha256: source.sourceMappingSha256,
+          sourcePath: source.mapping.sourcePath,
+          sourceSha256: source.mapping.sourceSha256,
+          metadataNumber: source.mapping.metadataNumber,
         });
         const contentSha256 = candidateContentDigest({
           sourceId: source.sourceId,
@@ -665,6 +671,43 @@ async function readOptionalPreparationRecord<T>(
   return parsed.data;
 }
 
+/**
+ * 受控修复专属的收敛步骤：当同一源同时存在完成检查点与失败回执、且完成检查点
+ * 的请求登记链自洽（completed.activeSha256 与 active.json 一致）时，该失败回执
+ * 已被更晚的完成检查点取代，删除它以让 loadPreparationSourceState 的成功分支
+ * 成立。这是修复"先写 completed 后删 failed"的崩溃窗口自愈机制；任何不一致
+ * （active 缺失或链不匹配）都保持原样，交由后续校验失败关闭。仅对受控清单源
+ * 调用；prepare 自身的成功路径不会产生该共存态。
+ */
+async function removeSupersededFailureReceipt(
+  privateRootDirectory: string,
+  outputDirectory: string,
+  sourceId: string,
+): Promise<void> {
+  const active = await readOptionalPreparationRecord(
+    privateRootDirectory,
+    preparationStatePath(outputDirectory, sourceId, "active"),
+    preparationActiveSchema,
+  );
+  const completed = await readOptionalPreparationRecord(
+    privateRootDirectory,
+    preparationStatePath(outputDirectory, sourceId, "completed"),
+    preparationCompletedSchema,
+  );
+  const failed = await readOptionalPreparationRecord(
+    privateRootDirectory,
+    preparationStatePath(outputDirectory, sourceId, "failed"),
+    preparationFailureSchema,
+  );
+  if (completed === null || failed === null || active === null) {
+    return;
+  }
+  if (completed.activeSha256 !== sha256Hex(JSON.stringify(active))) {
+    return;
+  }
+  await rm(preparationStatePath(outputDirectory, sourceId, "failed"), { force: true });
+}
+
 async function assertPreparationAttemptChain(
   privateRootDirectory: string,
   outputDirectory: string,
@@ -882,6 +925,45 @@ async function writeOrValidatePreparationJson(
   }
 }
 
+/**
+ * 受控修复的写输出：文件不存在则新建；已存在且内容与本次确定性结果完全
+ * 一致则视为已满足（幂等重跑/崩溃续跑）；已存在但内容不同则拒绝覆盖。
+ * 任何检查失败都关闭，绝不覆盖已完成候选、后来授权内容或完成检查点。
+ */
+async function writeOrRejectRepairOutput(
+  privateRootDirectory: string,
+  path: string,
+  value: unknown,
+  sourceId: string,
+): Promise<void> {
+  await assertPathsInsidePrivateRoot(privateRootDirectory, [
+    { path: dirname(path), kind: "existing" },
+  ]);
+  let exists = true;
+  try {
+    await lstat(path);
+  } catch (error) {
+    if (hasNodeErrorCode(error, "ENOENT")) {
+      exists = false;
+    } else {
+      throw new HistoryMigrationError("REPAIR_REJECTED", `${sourceId} 的修复输出无法安全检查。`);
+    }
+  }
+  if (!exists) {
+    await writeNewPrivateJson(path, value);
+    return;
+  }
+  await assertPathsInsidePrivateRoot(privateRootDirectory, [{ path, kind: "existing" }]);
+  await assertPrivateFileMode(path);
+  const existing = await readPrivateJson(path);
+  if (sha256Hex(JSON.stringify(existing)) !== sha256Hex(JSON.stringify(value))) {
+    throw new HistoryMigrationError(
+      "REPAIR_REJECTED",
+      `${sourceId} 已存在内容不同的修复输出（可能来自后来授权）；拒绝覆盖。`,
+    );
+  }
+}
+
 async function finalizePreparationIncompleteMarker(
   privateRootDirectory: string,
   outputDirectory: string,
@@ -908,6 +990,373 @@ async function finalizePreparationIncompleteMarker(
   ]);
   await assertPrivateFileMode(incompletePath);
   await movePrivateFileNoReplace(incompletePath, join(outputDirectory, "PREPARE_RUN"));
+}
+
+/**
+ * 受控本地源文修复的候选溯源说明。固定类别常量，不包含任何私有值：
+ * 只声明"本地源文只读修复、未调用模型"，绝不写入名称、路径、正文或摘要。
+ */
+/**
+ * 规范题面（canonicalContentSchema）要求 basicSolution 至少一个字符，无法表达
+ * “无题解”为空串。本地修复复用公共域既有的权威缺失标记 migrationMissingSolutionMarker
+ * （与规范化指令要求模型在原文缺题解时写入的字符串完全一致），绝不另造占位内容；
+ * solution 保持空串，缺失由同一标记在候选 → 打包 → 导入全程透传。
+ */
+export const localSourceTextRepairNote = "local-source-text-only-repair:v1" as const;
+
+/**
+ * 把已确认元数据记录中的源原生名称确定性地规范化为 1..200 字符的候选标题。
+ * 只做两步确定性变换：折叠所有空白为单个空格并去掉首尾空白；若仍超过
+ * 200 个码点则按码点截断（不拆代理对）。不猜测、不加工、不生成新文本。
+ * 名称来自 1..500 且 trim 后非空的已确认元数据，因此结果恒非空且长度受控。
+ */
+export function normalizeRepairTitle(name: string): string {
+  const collapsed = name.replace(/\s+/gu, " ").trim();
+  if (collapsed.length === 0) {
+    throw new HistoryMigrationError(
+      "REPAIR_REJECTED",
+      "受控修复的源原生名称规范化为空，不能生成标题。",
+    );
+  }
+  const characters = Array.from(collapsed);
+  return characters.slice(0, 200).join("");
+}
+
+export interface RepairFailedHistoryCandidatesOptions {
+  readonly privateRootDirectory: string;
+  readonly sourceDirectory: string;
+  readonly metadataFile: string;
+  readonly sourceConfirmationFile: string;
+  readonly preparedDirectory: string;
+  /** 恰好九条失败回执的受控修复清单（留在私有目录，绝不进入公开或报告上下文）。 */
+  readonly repairManifestFile: string;
+}
+
+export interface RepairFailedHistoryCandidatesResult {
+  /** 本次实际写出修复候选的源文件数。 */
+  readonly repairedCount: number;
+  /** 清单中此前已经满足、本次未再改动的源文件数。 */
+  readonly alreadyRepairedCount: number;
+  readonly candidateCount: number;
+  readonly sourceCount: number;
+  readonly complete: boolean;
+}
+
+/**
+ * 受控本地源文修复：只针对修复清单明确选择的九条失败回执，在私有目录内用
+ * 源正文与源原生名称本地重建候选。整个过程不调用模型、不重发任何请求、
+ * 不缩小范围、不加工或伪造正文；身份只来自标题无关的绑定元组。任何一条
+ * 校验不一致（数量、唯一性、回执类别与摘要、源映射与摘要、正文为空、名称
+ * 无法规范化）都会在任何输出写入之前失败关闭。
+ *
+ * 幂等与覆盖保护：已完成的源若其候选与本次确定性结果一致则跳过；若已存在
+ * 内容不同的候选（例如后来授权的新标题）则拒绝覆盖，绝不用修复结果覆盖
+ * 后来授权的内容。
+ */
+export async function repairFailedHistoryCandidates(
+  options: RepairFailedHistoryCandidatesOptions,
+): Promise<RepairFailedHistoryCandidatesResult> {
+  await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+    { path: options.sourceDirectory, kind: "existing" },
+    { path: options.metadataFile, kind: "existing" },
+    { path: options.sourceConfirmationFile, kind: "existing" },
+    { path: options.preparedDirectory, kind: "existing" },
+    { path: options.repairManifestFile, kind: "existing" },
+  ]);
+  const repairManifest = parsePrivateInput(
+    historyRepairManifestSchema,
+    await readPrivateJson(options.repairManifestFile),
+    "REPAIR_MANIFEST_INVALID",
+    "受控本地修复清单格式不正确，或没有恰好九条不重复的失败回执。",
+  );
+  const { confirmedSources } = await loadConfirmedInputs(
+    options.metadataFile,
+    await readPrivateJson(options.sourceConfirmationFile),
+  );
+  const sourcesById = new Map(confirmedSources.map((source) => [source.sourceId, source] as const));
+
+  // ── 阶段 1：逐条校验；任何不一致都在写入任何输出之前失败关闭 ────────
+  const repairs: Array<{
+    readonly source: ConfirmedSource;
+    readonly candidateId: string;
+    readonly candidate: HistoryCandidateRecord;
+    readonly reference: { readonly candidateId: string; readonly contentSha256: string };
+    readonly activeSha256: string;
+    readonly requestAttemptSha256s: readonly string[];
+  }> = [];
+  let alreadyRepairedCount = 0;
+  for (const receipt of repairManifest.receipts) {
+    const source = sourcesById.get(receipt.sourceId);
+    if (
+      source === undefined ||
+      source.mapping.sourcePath !== receipt.sourcePath ||
+      source.mapping.sourceSha256 !== receipt.sourceSha256 ||
+      source.mapping.metadataNumber !== receipt.metadataNumber
+    ) {
+      throw new HistoryMigrationError(
+        "REPAIR_REJECTED",
+        `${receipt.sourceId} 的源映射与受控修复清单不一致，不能修复。`,
+      );
+    }
+    await removeSupersededFailureReceipt(
+      options.privateRootDirectory,
+      options.preparedDirectory,
+      receipt.sourceId,
+    );
+    const state = await loadPreparationSourceState(
+      options.privateRootDirectory,
+      options.preparedDirectory,
+      receipt.sourceId,
+    );
+    let sourceContent: { readonly text: string; readonly sha256: string };
+    try {
+      sourceContent = await readConfirmedSource(
+        options.sourceDirectory,
+        source.mapping.sourcePath,
+        source.mapping.sourceSha256,
+        receipt.sourceId,
+      );
+    } catch {
+      throw new HistoryMigrationError(
+        "REPAIR_REJECTED",
+        `${receipt.sourceId} 的源正文无法安全读取或其摘要已变化，不能修复。`,
+      );
+    }
+    if (sourceContent.text.trim().length === 0) {
+      throw new HistoryMigrationError(
+        "REPAIR_REJECTED",
+        `${receipt.sourceId} 的源正文为空，不能修复。`,
+      );
+    }
+    const candidateId = makeSafeId("candidate", confirmedSources.indexOf(source) * 30 + 1);
+    const candidate = buildRepairedCandidate({
+      candidateId,
+      source,
+      sourceContentSha256: sourceContent.sha256,
+      title: normalizeRepairTitle(source.metadata.name),
+      sourceText: sourceContent.text,
+    });
+    const reference = { candidateId, contentSha256: candidate.contentSha256 };
+    if (state === "pending") {
+      throw new HistoryMigrationError(
+        "REPAIR_REJECTED",
+        `${receipt.sourceId} 尚未处理，没有可用的失败回执，不能修复。`,
+      );
+    }
+    if (state.kind === "completed") {
+      if (
+        !state.record.candidates.some(
+          (item) => item.candidateId === candidateId && item.contentSha256 === reference.contentSha256,
+        )
+      ) {
+        throw new HistoryMigrationError(
+          "REPAIR_REJECTED",
+          `${receipt.sourceId} 已有内容不同的完成候选（可能来自后来授权）；拒绝覆盖。`,
+        );
+      }
+      alreadyRepairedCount += 1;
+      continue;
+    }
+    if (state.kind === "active") {
+      throw new HistoryMigrationError(
+        "REPAIR_REJECTED",
+        `${receipt.sourceId} 的请求仍然活跃，不能修复。`,
+      );
+    }
+    if (state.record.failureKind !== "schema") {
+      throw new HistoryMigrationError(
+        "REPAIR_REJECTED",
+        `${receipt.sourceId} 的失败回执不是受控可修复的格式失败类别。`,
+      );
+    }
+    if (sha256Hex(JSON.stringify(state.record)) !== receipt.failedReceiptSha256) {
+      throw new HistoryMigrationError(
+        "REPAIR_REJECTED",
+        `${receipt.sourceId} 的失败回执与修复清单摘要不一致，不能修复。`,
+      );
+    }
+    if (state.record.activeSha256 === null) {
+      throw new HistoryMigrationError(
+        "REPAIR_REJECTED",
+        `${receipt.sourceId} 的失败回执缺少请求登记链，不能修复。`,
+      );
+    }
+    repairs.push({
+      source,
+      candidateId,
+      candidate,
+      reference,
+      activeSha256: state.record.activeSha256,
+      requestAttemptSha256s: state.record.requestAttemptSha256s,
+    });
+  }
+
+  // ── 阶段 1b：除修复清单外，目录其余源必须全部已完成（先于任何输出写入）──
+  const manifestSourceIds = new Set(repairManifest.receipts.map((receipt) => receipt.sourceId));
+  for (const source of confirmedSources) {
+    if (manifestSourceIds.has(source.sourceId)) {
+      continue;
+    }
+    const state = await loadPreparationSourceState(
+      options.privateRootDirectory,
+      options.preparedDirectory,
+      source.sourceId,
+    );
+    if (state !== "pending" && state.kind !== "completed") {
+      throw new HistoryMigrationError(
+        "REPAIR_REJECTED",
+        `${source.sourceId} 不在受控修复清单中但尚未完成，不能修复。`,
+      );
+    }
+  }
+
+  // ── 阶段 2：全部校验通过后才开始写输出（write-or-reject：绝不覆盖任何已有内容）──
+  for (const repair of repairs) {
+    await writeOrRejectRepairOutput(
+      options.privateRootDirectory,
+      join(options.preparedDirectory, "candidates", `${repair.candidateId}.json`),
+      repair.candidate,
+      repair.source.sourceId,
+    );
+    await writeOrRejectRepairOutput(
+      options.privateRootDirectory,
+      preparationStatePath(options.preparedDirectory, repair.source.sourceId, "completed"),
+      preparationCompletedSchema.parse({
+        version: 1,
+        status: "completed",
+        sourceId: repair.source.sourceId,
+        activeSha256: repair.activeSha256,
+        requestAttemptSha256s: repair.requestAttemptSha256s,
+        candidates: [repair.reference],
+      }),
+      repair.source.sourceId,
+    );
+    // 完成检查点已权威地取代失败回执：移除它，让状态与 prepare 成功路径一致。
+    // 若中途崩溃留下两者并存，重跑时由 removeSupersededFailureReceipt 自愈。
+    await rm(
+      preparationStatePath(options.preparedDirectory, repair.source.sourceId, "failed"),
+      { force: true },
+    );
+  }
+
+  // ── 阶段 3：汇总并发布完成标记（与 prepare 收尾一致，全部 write-or-validate）。
+  // 该阶段在"全部已满足"时同样执行，因此崩溃续跑/重跑可幂等恢复：已存在且
+  // 内容一致的标记原样保留，缺失的补写，绝不用不同内容覆盖已有标记。 ──────
+  const summary = await summarizePreparation(
+    options.privateRootDirectory,
+    options.preparedDirectory,
+    confirmedSources,
+  );
+  if (summary.complete) {
+    const batchSha256 = sha256Hex(
+      JSON.stringify({
+        version: 1,
+        candidates: summary.report.map((candidate) => ({
+          candidateId: candidate.candidateId,
+          sourceId: candidate.sourceId,
+          contentSha256: candidate.contentSha256,
+        })),
+      }),
+    );
+    const run = preparationRunSchema.parse(
+      await readPrivateJson(join(options.preparedDirectory, "run.json")),
+    );
+    const runSha256 = sha256Hex(JSON.stringify(run));
+    await writeOrValidatePreparationJson(
+      options.privateRootDirectory,
+      join(options.preparedDirectory, "review.json"),
+      {
+        version: 2,
+        phase: "prepare",
+        batchSha256,
+        runSha256,
+        sourceCount: confirmedSources.length,
+        candidateCount: summary.report.length,
+        candidates: summary.report,
+      },
+    );
+    await finalizePreparationIncompleteMarker(
+      options.privateRootDirectory,
+      options.preparedDirectory,
+    );
+    await writeOrValidatePreparationJson(
+      options.privateRootDirectory,
+      join(options.preparedDirectory, "PREPARE_COMPLETE"),
+      {
+        version: 2,
+        phase: "prepare",
+        batchSha256,
+        candidateCount: summary.report.length,
+        sourceCount: confirmedSources.length,
+        runSha256,
+      },
+    );
+  }
+
+  return {
+    repairedCount: repairs.length,
+    alreadyRepairedCount,
+    candidateCount: summary.report.length,
+    sourceCount: confirmedSources.length,
+    complete: summary.complete,
+  };
+}
+
+function buildRepairedCandidate(input: {
+  readonly candidateId: string;
+  readonly source: ConfirmedSource;
+  readonly sourceContentSha256: string;
+  readonly title: string;
+  readonly sourceText: string;
+}): HistoryCandidateRecord {
+  const problem = historyCandidateProblemSchema.parse({
+    title: input.title,
+    type: "traditional",
+    tags: [],
+    difficulty: {},
+    content: {
+      basicStatement: input.sourceText,
+      basicSolution: migrationMissingSolutionMarker,
+      background: "",
+      statement: "",
+      inputFormat: "",
+      outputFormat: "",
+      constraints: "",
+      solution: "",
+      hints: "",
+    },
+    samples: [],
+    files: [],
+    provenance: { sourceSystem: "ustc-history-private" },
+    extensions: {},
+  });
+  const sourceBindingSha256 = sourceBindingDigest({
+    sourceId: input.source.sourceId,
+    sourceContentSha256: input.sourceContentSha256,
+    sourcePath: input.source.mapping.sourcePath,
+    sourceSha256: input.source.mapping.sourceSha256,
+    metadataNumber: input.source.mapping.metadataNumber,
+  });
+  const contentSha256 = candidateContentDigest({
+    sourceId: input.source.sourceId,
+    sourceContentSha256: input.sourceContentSha256,
+    sourceMappingSha256: input.source.sourceMappingSha256,
+    modelConfidence: 0,
+    normalizationNote: localSourceTextRepairNote,
+    problem,
+  });
+  return historyCandidateRecordSchema.parse({
+    version: 1,
+    candidateId: input.candidateId,
+    sourceId: input.source.sourceId,
+    sourceContentSha256: input.sourceContentSha256,
+    sourceMappingSha256: input.source.sourceMappingSha256,
+    sourceBindingSha256,
+    contentSha256,
+    modelConfidence: 0,
+    normalizationNote: localSourceTextRepairNote,
+    problem,
+  });
 }
 
 export async function packageApprovedCandidates(
@@ -1019,7 +1468,7 @@ export async function packageApprovedCandidates(
       );
     }
     assignedSourceIds.add(candidate.sourceId);
-    approvedCandidates.push({ record: candidate, metadata: source.metadata });
+    approvedCandidates.push({ record: candidate, metadata: source.metadata, mapping: source.mapping });
   }
 
   await loadPreparationMarker(
@@ -1128,7 +1577,9 @@ export async function packageApprovedCandidates(
           approved.record.sourceBindingSha256 ?? sourceBindingDigest({
             sourceId: approved.record.sourceId,
             sourceContentSha256: approved.record.sourceContentSha256,
-            sourceMappingSha256: approved.record.sourceMappingSha256,
+            sourcePath: approved.mapping.sourcePath,
+            sourceSha256: approved.mapping.sourceSha256,
+            metadataNumber: approved.mapping.metadataNumber,
           }),
         packageSha256,
         packageBytes: archive.byteLength,
@@ -1748,7 +2199,8 @@ function parsePrivateInput<T>(
     | "INVALID_METADATA"
     | "INVALID_SOURCE_CONFIRMATION"
     | "INVALID_CANDIDATE_APPROVAL"
-    | "CANDIDATE_INVALID",
+    | "CANDIDATE_INVALID"
+    | "REPAIR_MANIFEST_INVALID",
   message: string,
 ): T {
   const parsed = schema.safeParse(input);

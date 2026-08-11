@@ -212,6 +212,35 @@ export const historyCandidateApprovalSchema = z
     );
   });
 
+export const historyRepairManifestSchema = z
+  .object({
+    version: z.literal(1),
+    receipts: z
+      .array(
+        z
+          .object({
+            sourceId: historySourceIdSchema,
+            sourcePath: confirmedSourcePathSchema,
+            sourceSha256: historyContentDigestSchema,
+            metadataNumber: z.string().trim().min(1).max(200),
+            /** 失败回执（requests/<sourceId>.failed.json 解析后）的整体内容摘要。 */
+            failedReceiptSha256: historyContentDigestSchema
+          })
+          .strict()
+      )
+      .length(9, "受控本地源文修复必须恰好选择九个失败回执。")
+      .superRefine((value, context) => {
+        addDuplicateIssues(
+          value.map((receipt) => receipt.sourceId),
+          context,
+          ["receipts"],
+          "同一份源文件的失败回执不能重复修复。"
+        );
+      })
+  })
+  .strict();
+
+export type HistoryRepairManifest = z.infer<typeof historyRepairManifestSchema>;
 export type HistoryMetadataRecord = z.infer<typeof historyMetadataRecordSchema>;
 export type HistoryMetadataFile = z.infer<typeof historyMetadataFileSchema>;
 export type HistorySourceMapping = z.infer<typeof historySourceMappingSchema>;

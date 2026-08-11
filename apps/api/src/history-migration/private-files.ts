@@ -5,8 +5,9 @@ import {
   lstat,
   mkdir,
   open,
-  realpath,
   readdir,
+  realpath,
+  rename,
   rm,
   unlink,
 } from "node:fs/promises";
@@ -224,6 +225,37 @@ export async function writeNewPrivateFile(
   const parent = await openStablePrivateDirectory(directory);
   try {
     await writeNewPrivateFileThroughDirectoryHandle(parent.handle, name, content);
+  } finally {
+    await parent.handle.close().catch(() => undefined);
+  }
+}
+
+/**
+ * 覆盖式原子写入（rename 语义）：用于重跑时更新既有清单。已 fsync 的临时
+ * 文件原地 rename，目录同步后返回；目标不存在时行为与新建一致。
+ */
+export async function writePrivateFile(path: string, content: string | Uint8Array): Promise<void> {
+  const directory = dirname(path);
+  const name = basename(path);
+  const parent = await openStablePrivateDirectory(directory);
+  try {
+    const targetPath = joinThroughDirectoryHandle(parent.handle.fd, name);
+    const temporaryName = `.history-replace-${randomUUID()}.tmp`;
+    const temporaryPath = joinThroughDirectoryHandle(parent.handle.fd, temporaryName);
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      handle = await open(temporaryPath, "wx", 0o600);
+      await handle.writeFile(content);
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await rename(temporaryPath, targetPath);
+      await parent.handle.sync();
+    } catch (error) {
+      await handle?.close().catch(() => undefined);
+      await rm(temporaryPath, { force: true }).catch(() => undefined);
+      throw new HistoryMigrationError("OUTPUT_WRITE_FAILED", "私有输出写入失败。");
+    }
   } finally {
     await parent.handle.close().catch(() => undefined);
   }
@@ -796,7 +828,10 @@ async function openHeldSourceFile(
     }
     const content = await handle.readFile();
     const bytes = new Uint8Array(content);
-    if (bytes.byteLength > maximumHistorySourceBytes || BigInt(bytes.byteLength) !== metadata.size) {
+    if (
+      bytes.byteLength > maximumHistorySourceBytes ||
+      BigInt(bytes.byteLength) !== metadata.size
+    ) {
       throw new HistoryMigrationError("SOURCE_FILE_INVALID", "源文件在读取期间发生变化。");
     }
     return {
@@ -848,7 +883,10 @@ async function readConfirmedSourceThroughHeldDirectoryHandle(
         assertSamePrivateFileState(previousState, state);
       } catch (error) {
         if (error instanceof HistoryMigrationError) {
-          throw new HistoryMigrationError("GROUPING_CHANGED", `${sourceId} 的源文件在核对后发生变化。`);
+          throw new HistoryMigrationError(
+            "GROUPING_CHANGED",
+            `${sourceId} 的源文件在核对后发生变化。`,
+          );
         }
         throw error;
       }
@@ -863,9 +901,7 @@ async function readConfirmedSourceThroughHeldDirectoryHandle(
     }
     return { text: decodeUtf8(bytes), sha256: digest };
   } finally {
-    await Promise.all(
-      openedDirectories.map((handle) => handle.close().catch(() => undefined)),
-    );
+    await Promise.all(openedDirectories.map((handle) => handle.close().catch(() => undefined)));
   }
 }
 
@@ -1125,10 +1161,7 @@ export async function openVerifiedPrivateOutputWriter(
       await temporaryHandle.sync();
       const creationState = await capturePublishedPrivateOutputState(temporaryHandle);
       try {
-        await link(
-          join(directoryPath, temporaryName),
-          join(directoryPath, name),
-        );
+        await link(join(directoryPath, temporaryName), join(directoryPath, name));
       } catch (error) {
         if (hasErrorCode(error, "EEXIST")) {
           throw new HistoryMigrationError("OUTPUT_WRITE_FAILED", "打包输出文件已经存在。");
@@ -1155,7 +1188,10 @@ export async function openVerifiedPrivateOutputWriter(
           publishedState.device !== creationState.device ||
           publishedState.inode !== creationState.inode
         ) {
-          throw new HistoryMigrationError("OUTPUT_WRITE_FAILED", "打包输出文件发布后 inode 不一致。");
+          throw new HistoryMigrationError(
+            "OUTPUT_WRITE_FAILED",
+            "打包输出文件发布后 inode 不一致。",
+          );
         }
         records.set(name, {
           contentSha256: sha256Hex(content),
@@ -1181,7 +1217,10 @@ export async function openVerifiedPrivateOutputWriter(
           constants.O_RDONLY | constants.O_NOFOLLOW,
         );
       } catch {
-        throw new HistoryMigrationError("GROUPING_CHANGED", "打包输出文件在最终复核时不存在或已被替换。");
+        throw new HistoryMigrationError(
+          "GROUPING_CHANGED",
+          "打包输出文件在最终复核时不存在或已被替换。",
+        );
       }
       try {
         let currentState: PublishedPrivateOutputState;
@@ -1189,14 +1228,20 @@ export async function openVerifiedPrivateOutputWriter(
           currentState = await capturePublishedPrivateOutputState(publishedHandle);
         } catch (error) {
           if (error instanceof HistoryMigrationError) {
-            throw new HistoryMigrationError("GROUPING_CHANGED", "打包输出文件在最终复核时状态发生变化。");
+            throw new HistoryMigrationError(
+              "GROUPING_CHANGED",
+              "打包输出文件在最终复核时状态发生变化。",
+            );
           }
           throw error;
         }
         assertSamePublishedPrivateOutputState(record.baseline, currentState);
         const content = new Uint8Array(await publishedHandle.readFile());
         if (sha256Hex(content) !== record.contentSha256) {
-          throw new HistoryMigrationError("GROUPING_CHANGED", "打包输出文件在最终复核时内容发生变化。");
+          throw new HistoryMigrationError(
+            "GROUPING_CHANGED",
+            "打包输出文件在最终复核时内容发生变化。",
+          );
         }
       } finally {
         await publishedHandle.close().catch(() => undefined);
@@ -1248,6 +1293,24 @@ export async function privateRegularFileExists(path: string): Promise<boolean> {
   const parent = await openStablePrivateDirectory(dirname(path));
   try {
     return await privateRegularFileExistsThroughDirectoryHandle(parent.handle, basename(path));
+  } finally {
+    await parent.handle.close().catch(() => undefined);
+  }
+}
+
+/**
+ * 相对于稳定父目录句柄安全删除一个普通文件。先通过目录句柄验证目标是
+ * 普通文件（非符号链接），再通过 /proc/self/fd 路径 unlink，最后 fsync
+ * 目录。文件不存在时静默返回（幂等）。
+ */
+export async function removePrivateRegularFile(path: string): Promise<void> {
+  const parent = await openStablePrivateDirectory(dirname(path));
+  try {
+    const name = basename(path);
+    const exists = await privateRegularFileExistsThroughDirectoryHandle(parent.handle, name);
+    if (!exists) return;
+    await unlink(joinThroughDirectoryHandle(parent.handle.fd, name));
+    await parent.handle.sync();
   } finally {
     await parent.handle.close().catch(() => undefined);
   }
@@ -1561,12 +1624,7 @@ async function readSecurePrivateFileHandle(
   let offset = 0;
   try {
     while (offset < bytes.byteLength) {
-      const { bytesRead } = await handle.read(
-        bytes,
-        offset,
-        bytes.byteLength - offset,
-        offset,
-      );
+      const { bytesRead } = await handle.read(bytes, offset, bytes.byteLength - offset, offset);
       if (bytesRead === 0) {
         throw new HistoryMigrationError(
           "ATTACHMENT_MAPPING_CHANGED",

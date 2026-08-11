@@ -20,6 +20,20 @@ export type {
 export * from "./digests";
 export * from "./errors";
 export * from "./grouping";
+export {
+  dropHistoryImportDatabase,
+  historyImportDatabaseConnectionString,
+  importHistoryPackages,
+  prepareHistoryImportDatabase,
+} from "./import-phase";
+export type {
+  HistoryImportPhaseDependencies,
+  HistoryImportPublisher,
+  HistoryImportStore,
+  ImportHistoryPackagesFailedCandidate,
+  ImportHistoryPackagesOptions,
+  ImportHistoryPackagesResult,
+} from "./import-phase";
 export type {
   AssertHistoryMaterializationCompleteOptions,
   HistoryGroupingPlan,
