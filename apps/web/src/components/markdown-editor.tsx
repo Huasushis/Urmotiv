@@ -10,7 +10,12 @@ import {
   Table2,
   Undo2
 } from "lucide-react";
-import { type ClipboardEvent as ReactClipboardEvent, useRef, useState } from "react";
+import {
+  type ClipboardEvent as ReactClipboardEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  useRef,
+  useState
+} from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -30,6 +35,12 @@ type MarkdownEditorProps = {
 };
 
 type EditorMode = "edit" | "preview";
+
+type EditorSnapshot = {
+  value: string;
+  selectionStart: number;
+  selectionEnd: number;
+};
 
 const supportedImageTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 const unsupportedImageMessage = "仅支持 PNG、JPEG、GIF 或 WebP 图片。";
@@ -80,6 +91,44 @@ export function MarkdownEditor({
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const imageUploadPendingRef = useRef(false);
+  const undoStackRef = useRef<EditorSnapshot[]>([]);
+  const redoStackRef = useRef<EditorSnapshot[]>([]);
+
+  const snapshotFromField = (field: HTMLTextAreaElement, currentValue: string): EditorSnapshot => ({
+    value: currentValue,
+    selectionStart: field.selectionStart,
+    selectionEnd: field.selectionEnd
+  });
+
+  const commitChange = (next: string) => {
+    const field = textAreaRef.current;
+    if (field !== null && value !== next) {
+      undoStackRef.current.push(snapshotFromField(field, value));
+      redoStackRef.current = [];
+    }
+    onChange(next);
+  };
+
+  const applyHistory = (command: "undo" | "redo") => {
+    const field = textAreaRef.current;
+    if (field === null || readOnly) {
+      return;
+    }
+    const undoStack = undoStackRef.current;
+    const redoStack = redoStackRef.current;
+    const target = command === "undo" ? undoStack : redoStack;
+    const restored = target.pop();
+    if (restored === undefined) {
+      return;
+    }
+    const opposite = command === "undo" ? redoStack : undoStack;
+    opposite.push(snapshotFromField(field, value));
+    onChange(restored.value);
+    requestAnimationFrame(() => {
+      field.focus();
+      field.setSelectionRange(restored.selectionStart, restored.selectionEnd);
+    });
+  };
 
   const insert = (prefix: string, suffix: string, placeholder: string) => {
     const field = textAreaRef.current;
@@ -90,17 +139,29 @@ export function MarkdownEditor({
     const end = field.selectionEnd;
     const selected = value.slice(start, end) || placeholder;
     const next = `${value.slice(0, start)}${prefix}${selected}${suffix}${value.slice(end)}`;
-    onChange(next);
+    commitChange(next);
     requestAnimationFrame(() => {
       field.focus();
       field.setSelectionRange(start + prefix.length, start + prefix.length + selected.length);
     });
   };
 
-  const applyHistory = (command: "undo" | "redo") => {
-    if (!readOnly) {
-      document.execCommand(command);
-      textAreaRef.current?.focus();
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (readOnly) {
+      return;
+    }
+    const modifier = event.ctrlKey || event.metaKey;
+    if (!modifier || event.altKey) {
+      return;
+    }
+    if (event.key.toLowerCase() === "z") {
+      event.preventDefault();
+      applyHistory(event.shiftKey ? "redo" : "undo");
+      return;
+    }
+    if (event.key.toLowerCase() === "y") {
+      event.preventDefault();
+      applyHistory("redo");
     }
   };
 
@@ -143,7 +204,7 @@ export function MarkdownEditor({
       const source = await onUploadImage(file);
       const markdown = `![${alt}](${source})`;
       const next = `${value.slice(0, start)}${markdown}${value.slice(end)}`;
-      onChange(next);
+      commitChange(next);
       requestAnimationFrame(() => {
         field.focus();
         field.setSelectionRange(start + markdown.length, start + markdown.length);
@@ -183,8 +244,18 @@ export function MarkdownEditor({
   };
 
   const toolButtons = [
-    { label: "撤销", icon: Undo2, onClick: () => applyHistory("undo") },
-    { label: "重做", icon: Redo2, onClick: () => applyHistory("redo") },
+    {
+      label: "撤销",
+      icon: Undo2,
+      onClick: () => applyHistory("undo"),
+      disabled: undoStackRef.current.length === 0
+    },
+    {
+      label: "重做",
+      icon: Redo2,
+      onClick: () => applyHistory("redo"),
+      disabled: redoStackRef.current.length === 0
+    },
     { label: "二级标题", icon: Heading2, onClick: () => insert("## ", "", "标题") },
     { label: "粗体", icon: Bold, onClick: () => insert("**", "**", "重点") },
     { label: "斜体", icon: Italic, onClick: () => insert("*", "*", "强调") },
@@ -265,7 +336,8 @@ export function MarkdownEditor({
           <textarea
             ref={textAreaRef}
             value={value}
-            onChange={(event) => onChange(event.target.value)}
+            onChange={(event) => commitChange(event.target.value)}
+            onKeyDown={handleKeyDown}
             onPaste={pasteImage}
             placeholder="使用 Markdown 编写内容"
             readOnly={readOnly || uploadingImage}

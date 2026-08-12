@@ -18,18 +18,43 @@ type AppShellProps = {
   children: ReactNode;
 };
 
+const contestPermissions = [
+  "contest.create",
+  "contest.edit.own",
+  "contest.edit.all",
+  "contest.delete",
+  "contest.export",
+  "contest.risk.read"
+] as const;
+
+const transferPermissions = [
+  "problem.import",
+  "problem.export.own",
+  "problem.export.all"
+] as const;
+
 const baseNavItems = [
   { to: "/problems", label: "题目", icon: BookOpen },
   { to: "/submissions", label: "我的投稿", icon: FilePenLine },
-  { to: "/reviews", label: "待审", icon: ClipboardCheck },
-  { to: "/contests", label: "组题", icon: ListChecks },
-  { to: "/transfer", label: "导入导出", icon: ArrowLeftRight }
+  { to: "/reviews", label: "待审", icon: ClipboardCheck }
 ];
 
+function buildNavItems(session: NonNullable<SessionResponse["user"]>) {
+  const items = [...baseNavItems];
+  if (contestPermissions.some((name) => session.permissions.includes(name))) {
+    items.push({ to: "/contests", label: "组题", icon: ListChecks });
+  }
+  if (transferPermissions.some((name) => session.permissions.includes(name))) {
+    items.push({ to: "/transfer", label: "导入导出", icon: ArrowLeftRight });
+  }
+  if (session.canManageReviewPolicy || session.canManagePlugins || session.canManageTags) {
+    items.push({ to: "/admin", label: "管理", icon: Settings });
+  }
+  return items;
+}
+
 export function AppShell({ session, demoEnabled, children }: AppShellProps) {
-  const navItems = session.canManageReviewPolicy || session.canManagePlugins || session.canManageTags
-    ? [...baseNavItems, { to: "/admin", label: "管理", icon: Settings }]
-    : baseNavItems;
+  const navItems = buildNavItems(session);
   const client = useQueryClient();
   const signOut = useMutation({
     mutationFn: logout,
@@ -43,6 +68,9 @@ export function AppShell({ session, demoEnabled, children }: AppShellProps) {
   });
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#main-content">
+        跳到主要内容
+      </a>
       <header className="global-header">
         <NavLink className="brand" to="/problems" aria-label="Urmotiv 题目">
           <span className="brand-mark">U</span>
@@ -71,7 +99,7 @@ export function AppShell({ session, demoEnabled, children }: AppShellProps) {
           </button>
         </div>
       </header>
-      <main className="main-content">{children}</main>
+      <main id="main-content" className="main-content" tabIndex={-1}>{children}</main>
     </div>
   );
 }

@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import type { Contest, CreateContestInput } from "@urmotiv/contracts";
 import {
   createContest,
@@ -74,11 +75,31 @@ export function ContestPage() {
     enabled: selectedId !== null && !creating
   });
   const canCreate = session.data?.user?.permissions.includes("contest.create") ?? false;
+  const canViewContests = session.data?.user?.permissions.some((permission) =>
+    permission === "contest.create" ||
+    permission === "contest.edit.own" ||
+    permission === "contest.edit.all" ||
+    permission === "contest.export" ||
+    permission === "contest.risk.read"
+  ) ?? false;
 
   const refreshContest = (contest: Contest) => {
     client.setQueryData(["contest", contest.id], contest);
     void client.invalidateQueries({ queryKey: ["contests"] });
   };
+
+  if (session.status !== "pending" && !canViewContests) {
+    return (
+      <section className="contest-page">
+        <div className="centered-message" role="alert">
+          <ListChecks size={28} aria-hidden="true" />
+          <h1>当前账号不能查看组题方案</h1>
+          <p>你没有比赛方案相关权限，只能访问有权限的题目。</p>
+          <Link to="/problems">返回题目列表</Link>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="contest-page">
@@ -348,26 +369,33 @@ function ContestDetail({ contest, onChanged }: { contest: Contest; onChanged: (c
         <div className="data-table-wrap">
           <table className="data-table contest-detail-table">
             <thead><tr><th>顺序</th><th>题目</th><th>固定修订</th><th>分值</th><th>风险</th></tr></thead>
-            <tbody>
-              {contest.problems.map((problem) => (
-                <tr key={problem.problemId}>
-                  <td data-label="顺序">{problem.position + 1}</td>
-                  <td data-label="题目">
-                    <span className="contest-problem-name">
-                      <strong>{problem.title}</strong>
-                      <small>{problem.problemId}</small>
-                    </span>
-                  </td>
-                  <td data-label="固定修订">第 {problem.revision} 版</td>
-                  <td data-label="分值">{problem.score}</td>
-                  <td data-label="风险">
-                    {contest.capabilities.canReadRisk ? (
-                      problem.leakRiskCount > 0 ? <span className="risk-count"><AlertTriangle size={14} />{problem.leakRiskCount} 人</span> : <span className="risk-clear">未发现</span>
-                    ) : <span className="text-faint">不可查看</span>}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
+<tbody>
+            {contest.problems.length === 0 ? (
+              <tr>
+                <td colSpan={5} className="table-message">
+                  方案里还没有题目。
+                </td>
+              </tr>
+            ) : null}
+            {contest.problems.map((problem) => (
+              <tr key={problem.problemId}>
+                <td data-label="顺序">{problem.position + 1}</td>
+                <td data-label="题目">
+                  <span className="contest-problem-name">
+                    <strong>{problem.title}</strong>
+                    <small>{problem.problemId}</small>
+                  </span>
+                </td>
+                <td data-label="固定修订">第 {problem.revision} 版</td>
+                <td data-label="分值">{problem.score}</td>
+                <td data-label="风险">
+                  {contest.capabilities.canReadRisk ? (
+                    problem.leakRiskCount > 0 ? <span className="risk-count"><AlertTriangle size={14} />{problem.leakRiskCount} 人</span> : <span className="risk-clear">未发现</span>
+                  ) : <span className="text-faint">不可查看</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
           </table>
         </div>
       </section>

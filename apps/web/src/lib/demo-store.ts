@@ -339,6 +339,90 @@ function contentWithDefaults(input: CreateProblemInput["content"]): Problem["con
   };
 }
 
+const contributorPermissions = [
+  "auth.login",
+  "problem.create",
+  "problem.view.own",
+  "problem.edit.own",
+  "problem.delete.own"
+] as const;
+
+const reviewerPermissions = [
+  ...contributorPermissions,
+  "problem.view.all",
+  "problem.review",
+  "problem.testdata.read"
+] as const;
+
+const memberPermissions = [
+  ...reviewerPermissions,
+  "problem.edit.all",
+  "problem.testdata.write",
+  "problem.viewers.read",
+  "contest.create",
+  "contest.edit.own",
+  "contest.risk.read"
+] as const;
+
+const leaderPermissions = [
+  ...memberPermissions,
+  "problem.status.change",
+  "problem.access.grant",
+  "problem.import",
+  "problem.export.all",
+  "contest.edit.all",
+  "contest.delete",
+  "contest.export",
+  "tag.manage",
+  "user.create"
+] as const;
+
+const administratorPermissions = [
+  "auth.login",
+  "user.create",
+  "user.delete",
+  "user.permission.manage",
+  "system.manage",
+  "plugin.manage",
+  "service_account.manage",
+  "tag.manage",
+  "audit.read"
+] as const;
+
+const robotHardDenied = new Set([
+  "user.delete",
+  "user.impersonate",
+  "user.permission.manage",
+  "system.manage",
+  "plugin.manage",
+  "service_account.manage",
+  "tag.manage",
+  "problem.delete.own",
+  "problem.delete.all",
+  "contest.delete",
+  "audit.read"
+]);
+
+function sessionPermissionsFor(saved: DemoUserId): string[] {
+  if (saved === "denied") {
+    return reviewerPermissions.filter((permission) => permission !== "problem.view.all");
+  }
+  if (saved === "administrator") {
+    return [...administratorPermissions];
+  }
+  const base = saved === "leader"
+    ? leaderPermissions
+    : saved === "member"
+      ? memberPermissions
+      : saved === "reviewer" || saved === "robot"
+        ? reviewerPermissions
+        : contributorPermissions;
+  if (saved === "robot") {
+    return base.filter((permission) => !robotHardDenied.has(permission));
+  }
+  return [...base];
+}
+
 export async function getDemoSession(): Promise<SessionResponse> {
   const saved = window.localStorage.getItem(sessionKey);
   if (!saved || !(saved in demoUsers)) {
@@ -348,9 +432,7 @@ export async function getDemoSession(): Promise<SessionResponse> {
     };
   }
   const user = demoUsers[saved as DemoUserId];
-  const canManageReviewPolicy = saved === "leader";
-  const canManagePlugins = saved === "administrator";
-  const canManageTags = saved === "leader" || saved === "administrator";
+  const permissions = sessionPermissionsFor(saved as DemoUserId);
   return {
     user: {
       id: user.id,
@@ -358,14 +440,10 @@ export async function getDemoSession(): Promise<SessionResponse> {
       accountType: user.accountType,
       roles: user.roles,
       isRoot: false,
-      permissions: [
-        ...(canManageReviewPolicy ? ["problem.status.change"] : []),
-        ...(canManagePlugins ? ["plugin.manage"] : []),
-        ...(canManageTags ? ["tag.manage"] : [])
-      ],
-      canManageReviewPolicy,
-      canManagePlugins,
-      canManageTags
+      permissions,
+      canManageReviewPolicy: user.accountType === "human" && permissions.includes("problem.status.change"),
+      canManagePlugins: user.accountType === "human" && permissions.includes("plugin.manage"),
+      canManageTags: user.accountType === "human" && permissions.includes("tag.manage")
     },
     auth: { emailEnabled: false, emailRegistrationEnabled: false, casEnabled: false, demoEnabled: true }
   };

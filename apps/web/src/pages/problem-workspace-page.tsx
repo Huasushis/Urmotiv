@@ -278,11 +278,22 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
   if (problemQuery.isLoading || !working) {
     if (problemQuery.isError) {
       return (
-        <div className="centered-message error-message">
+        <div className="centered-message error-message" role="alert">
           <TriangleAlert size={28} aria-hidden="true" />
           <h1>无法打开题目</h1>
           <p>{problemQuery.error.message}</p>
-          <Link to="/problems">返回题目列表</Link>
+          <div className="inline-actions">
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={problemQuery.isFetching}
+              onClick={() => void problemQuery.refetch()}
+            >
+              <RefreshCw size={15} aria-hidden="true" />
+              重试
+            </button>
+            <Link to="/problems">返回题目列表</Link>
+          </div>
         </div>
       );
     }
@@ -377,11 +388,46 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
         <SimilarityCheckPanel result={similarityCheck.data} onDismiss={() => similarityCheck.reset()} />
       ) : null}
 
-      <nav className="workspace-tabs" aria-label="题目工作区">
+      <nav
+        className="workspace-tabs"
+        aria-label="题目工作区"
+        role="tablist"
+        onKeyDown={(event) => {
+          const currentIndex = tabs.findIndex((tab) => tab.id === activeTab);
+          let nextIndex: number | null = null;
+          if (event.key === "ArrowRight") {
+            nextIndex = (currentIndex + 1) % tabs.length;
+          } else if (event.key === "ArrowLeft") {
+            nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+          } else if (event.key === "Home") {
+            nextIndex = 0;
+          } else if (event.key === "End") {
+            nextIndex = tabs.length - 1;
+          }
+          if (nextIndex === null) {
+            return;
+          }
+          event.preventDefault();
+          const next = tabs[nextIndex];
+          if (next === undefined) {
+            return;
+          }
+          setSearchParams(next.id === "overview" ? {} : { tab: next.id }, { replace: true });
+          const nextElement = document.getElementById(`workspace-tab-${next.id}`);
+          if (nextElement instanceof HTMLButtonElement) {
+            nextElement.focus();
+          }
+        }}
+      >
         {tabs.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
+            id={`workspace-tab-${id}`}
             type="button"
+            role="tab"
+            aria-selected={activeTab === id}
+            aria-controls="workspace-tabpanel"
+            tabIndex={activeTab === id ? 0 : -1}
             className={activeTab === id ? "active" : ""}
             onClick={() => setSearchParams(id === "overview" ? {} : { tab: id }, { replace: true })}
           >
@@ -391,7 +437,12 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
         ))}
       </nav>
 
-      <div className="workspace-body">
+      <div
+        className="workspace-body"
+        id="workspace-tabpanel"
+        role="tabpanel"
+        aria-labelledby={`workspace-tab-${activeTab}`}
+      >
         {activeTab === "overview" ? <OverviewTab problem={working} update={update} /> : null}
         {activeTab === "statement" ? (
           <StatementTab

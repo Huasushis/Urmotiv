@@ -1,9 +1,9 @@
-import { ChevronLeft, ChevronRight, Filter, Plus, Search } from "lucide-react";
+import { ChevronLeft, ChevronRight, Filter, Plus, RefreshCw, Search } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import type { ProblemListQuery, ProblemStatus, ProblemType } from "@urmotiv/contracts";
-import { listProblems, listTags } from "../lib/api";
+import { getSession, listProblems, listTags } from "../lib/api";
 import { dateTime, difficultyText, statusText, statusTone, typeText } from "../lib/presentation";
 
 type ProblemListPageProps = { ownOnly?: boolean; fixedStatus?: ProblemStatus };
@@ -31,6 +31,8 @@ export function ProblemListPage({ ownOnly = false, fixedStatus }: ProblemListPag
     placeholderData: (previous) => previous
   });
   const tags = useQuery({ queryKey: ["tags"], queryFn: listTags, staleTime: 5 * 60_000 });
+  const session = useQuery({ queryKey: ["session"], queryFn: getSession, staleTime: 60_000 });
+  const canCreateProblem = session.data?.user?.permissions.includes("problem.create") ?? false;
   const tagNames = new Map(tags.data?.items.map((tag) => [tag.id, tag.name]) ?? []);
   const pages = Math.max(1, Math.ceil((problems.data?.total ?? 0) / 20));
 
@@ -53,10 +55,12 @@ export function ProblemListPage({ ownOnly = false, fixedStatus }: ProblemListPag
                 : "只显示当前账号有权查看的题目。"}
           </p>
         </div>
-        <Link className="primary-button" to="/problems/new">
-          <Plus size={17} aria-hidden="true" />
-          新建题目
-        </Link>
+        {canCreateProblem ? (
+          <Link className="primary-button" to="/problems/new">
+            <Plus size={17} aria-hidden="true" />
+            新建题目
+          </Link>
+        ) : null}
       </div>
 
       <div className="filter-bar" aria-label="题目筛选">
@@ -116,6 +120,15 @@ export function ProblemListPage({ ownOnly = false, fixedStatus }: ProblemListPag
         <div className="inline-error" role="alert">
           <strong>题目列表加载失败</strong>
           <span>{problems.error.message}</span>
+          <button
+            className="secondary-button compact-button"
+            type="button"
+            disabled={problems.isRefetching}
+            onClick={() => void problems.refetch()}
+          >
+            <RefreshCw size={15} aria-hidden="true" />
+            重试
+          </button>
         </div>
       ) : null}
 

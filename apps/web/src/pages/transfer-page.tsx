@@ -9,6 +9,7 @@ import {
   exportDownloadUrl,
   getExportJob,
   getImportJob,
+  getSession,
   previewExport,
   previewImport,
   uploadProblemPackage
@@ -125,6 +126,13 @@ function isJobFinished(state: TransferJobState | undefined): boolean {
 
 export function TransferPage() {
   const [mode, setMode] = useState<TransferMode>("import");
+  const session = useQuery({ queryKey: ["session"], queryFn: getSession, staleTime: 60_000 });
+  const permissions = session.data?.user?.permissions ?? [];
+  const canTransfer = permissions.some((permission) =>
+    permission === "problem.import" ||
+    permission === "problem.export.own" ||
+    permission === "problem.export.all"
+  );
 
   return (
     <section className="transfer-page">
@@ -137,18 +145,28 @@ export function TransferPage() {
         <Archive className="page-heading-icon" size={32} aria-hidden="true" />
       </div>
 
-      <div className="segmented-control transfer-mode" role="group" aria-label="导入或导出">
-        <button type="button" className={mode === "import" ? "selected" : ""} onClick={() => setMode("import")}>
-          <ArrowUpFromLine size={16} aria-hidden="true" />
-          导入
-        </button>
-        <button type="button" className={mode === "export" ? "selected" : ""} onClick={() => setMode("export")}>
-          <ArrowDownToLine size={16} aria-hidden="true" />
-          导出
-        </button>
-      </div>
-
-      {mode === "import" ? <ImportSection /> : <ExportSection />}
+      {session.status === "pending" ? null : !canTransfer ? (
+        <div className="centered-message" role="alert">
+          <Archive size={28} aria-hidden="true" />
+          <h1>当前账号不能导入或导出</h1>
+          <p>你没有题目导入或导出权限，只能管理自己有权限的题目。</p>
+          <Link to="/problems">返回题目列表</Link>
+        </div>
+      ) : (
+        <>
+          <div className="segmented-control transfer-mode" role="group" aria-label="导入或导出">
+            <button type="button" className={mode === "import" ? "selected" : ""} onClick={() => setMode("import")}>
+              <ArrowUpFromLine size={16} aria-hidden="true" />
+              导入
+            </button>
+            <button type="button" className={mode === "export" ? "selected" : ""} onClick={() => setMode("export")}>
+              <ArrowDownToLine size={16} aria-hidden="true" />
+              导出
+            </button>
+          </div>
+          {mode === "import" ? <ImportSection /> : <ExportSection />}
+        </>
+      )}
     </section>
   );
 }
@@ -369,6 +387,9 @@ function ImportSection() {
                     <dd>{preview.data.files.length}</dd>
                   </div>
                 </dl>
+                {preview.data.files.length === 0 ? (
+                  <p className="table-message">预览中没有可展示的文件。</p>
+                ) : null}
                 <div className="file-list">
                   <ul>
                     {preview.data.files.slice(0, 50).map((path) => (
@@ -561,6 +582,9 @@ function ExportSection() {
 
           {preview.data ? (
             <div className="export-preview-list">
+              {preview.data.problems.length === 0 ? (
+                <p className="table-message">没有找到可导出的题目，请检查题目编号是否有导出权限。</p>
+              ) : null}
               {preview.data.problems.map((problem) => (
                 <div key={problem.problemId} className="export-preview-item">
                   <div className="export-preview-item-heading">

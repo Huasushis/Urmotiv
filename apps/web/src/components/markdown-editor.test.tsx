@@ -1,8 +1,13 @@
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MarkdownEditor, MarkdownPreview } from "./markdown-editor";
+
+function StatefulEditor({ value: initialValue }: { value: string }) {
+  const [value, setValue] = useState(initialValue);
+  return <MarkdownEditor label="题目描述" value={value} onChange={setValue} problemId="42" />;
+}
 
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
@@ -273,5 +278,121 @@ describe("Markdown 图片预览", () => {
     expect(onChange).not.toHaveBeenCalled();
     expect((view.querySelector("textarea") as HTMLTextAreaElement | null)?.value).toBe("原正文");
     expect(view.querySelector('[role="alert"]')?.textContent).toBe("图片上传失败，请稍后重试。");
+  });
+});
+
+function typeInto(view: HTMLElement, value: string): HTMLTextAreaElement {
+  const field = view.querySelector("textarea");
+  if (!(field instanceof HTMLTextAreaElement)) {
+    throw new Error("找不到 Markdown 编辑框。");
+  }
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+  setter?.call(field, value);
+  act(() => {
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  return field;
+}
+
+function toolbarButton(view: HTMLElement, label: string): HTMLButtonElement {
+  const button = view.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+  if (button === null) {
+    throw new Error(`找不到工具按钮：${label}`);
+  }
+  return button;
+}
+
+function clickToolbar(view: HTMLElement, label: string): void {
+  act(() => {
+    toolbarButton(view, label).click();
+  });
+}
+
+function pressKey(view: HTMLElement, key: string, shiftKey = false): void {
+  const field = view.querySelector("textarea");
+  if (!(field instanceof HTMLTextAreaElement)) {
+    throw new Error("找不到 Markdown 编辑框。");
+  }
+  act(() => {
+    field.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key,
+        ctrlKey: true,
+        shiftKey,
+        bubbles: true,
+        cancelable: true
+      })
+    );
+  });
+}
+
+function editorValue(view: HTMLElement): string {
+  const field = view.querySelector("textarea");
+  return field instanceof HTMLTextAreaElement ? field.value : "";
+}
+
+function mountStatefulEditor(initialValue = "") {
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+  act(() => {
+    root?.render(<StatefulEditor value={initialValue} />);
+  });
+  return container;
+}
+
+describe("撤销与重做", () => {
+  it("初始时撤销和重做按钮都不可用", () => {
+    const view = mountStatefulEditor();
+
+    expect(toolbarButton(view, "撤销").disabled).toBe(true);
+    expect(toolbarButton(view, "重做").disabled).toBe(true);
+  });
+
+  it("输入后撤销回到上一版，重做恢复，新输入清空重做栈", () => {
+    const view = mountStatefulEditor("原始正文");
+
+    typeInto(view, "第一版");
+    expect(toolbarButton(view, "撤销").disabled).toBe(false);
+
+    typeInto(view, "第二版");
+    clickToolbar(view, "撤销");
+    expect(editorValue(view)).toBe("第一版");
+
+    clickToolbar(view, "重做");
+    expect(editorValue(view)).toBe("第二版");
+
+    clickToolbar(view, "撤销");
+    typeInto(view, "新分支");
+    expect(toolbarButton(view, "重做").disabled).toBe(true);
+    clickToolbar(view, "撤销");
+    expect(editorValue(view)).toBe("第一版");
+  });
+
+  it("Ctrl+Z 撤销、Ctrl+Shift+Z 重做、Ctrl+Y 重做", () => {
+    const view = mountStatefulEditor("");
+
+    typeInto(view, "一步");
+    typeInto(view, "两步");
+
+    pressKey(view, "z");
+    expect(editorValue(view)).toBe("一步");
+    pressKey(view, "z", true);
+    expect(editorValue(view)).toBe("两步");
+    pressKey(view, "z");
+    pressKey(view, "y");
+    expect(editorValue(view)).toBe("两步");
+  });
+
+  it("只读时不响应撤销快捷键并且按钮保持不可用", () => {
+    const onChange = vi.fn();
+    const view = mountEditor({ onChange, readOnly: true, value: "已有正文" });
+
+    pressKey(view, "z");
+
+    expect(onChange).not.toHaveBeenCalled();
+    expect(editorValue(view)).toBe("已有正文");
+    expect(toolbarButton(view, "撤销").disabled).toBe(true);
+    expect(toolbarButton(view, "重做").disabled).toBe(true);
   });
 });

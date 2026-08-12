@@ -5,12 +5,15 @@ import { Link, useNavigate } from "react-router-dom";
 import type { ProblemType } from "@urmotiv/contracts";
 import { MarkdownEditor } from "../components/markdown-editor";
 import { TagPicker } from "../components/tag-picker";
-import { createProblem, listTags } from "../lib/api";
+import { createProblem, getSession, listTags } from "../lib/api";
 
 export function CreateProblemPage() {
   const navigate = useNavigate();
   const client = useQueryClient();
   const tags = useQuery({ queryKey: ["tags"], queryFn: listTags, staleTime: 5 * 60_000 });
+  const session = useQuery({ queryKey: ["session"], queryFn: getSession, staleTime: 60_000 });
+  const canCreateProblem = session.data?.user?.permissions.includes("problem.create") ?? false;
+  const sessionReady = session.status !== "pending";
   const [title, setTitle] = useState("");
   const [type, setType] = useState<ProblemType>("traditional");
   const [tagIds, setTagIds] = useState<string[]>([]);
@@ -49,6 +52,19 @@ export function CreateProblemPage() {
       judgeConfig: null
     });
   };
+
+  if (sessionReady && !canCreateProblem) {
+    return (
+      <section className="create-problem-page">
+        <div className="centered-message" role="alert">
+          <FilePlus2 size={28} aria-hidden="true" />
+          <h1>当前账号不能新建题目</h1>
+          <p>你没有问题目创建权限，只能查看自己和可访问的题目。</p>
+          <Link to="/problems">返回题目列表</Link>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="create-problem-page">

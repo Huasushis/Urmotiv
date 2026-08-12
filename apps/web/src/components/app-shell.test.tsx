@@ -141,3 +141,55 @@ describe("管理导航", () => {
     expect([...view.querySelectorAll("nav a")].some((link) => link.textContent === "管理")).toBe(false);
   });
 });
+
+describe("导航权限", () => {
+  it("有比赛或导入导出权限时才显示对应入口", () => {
+    const client = new QueryClient();
+    const view = mount(
+      client,
+      <AppShell
+        session={{
+          ...session,
+          permissions: ["problem.review", "contest.create", "problem.import"]
+        }}
+        demoEnabled={false}
+      >
+        <p>题目工作区</p>
+      </AppShell>
+    );
+
+    const labels = [...view.querySelectorAll("nav a")].map((link) => link.textContent);
+    expect(labels).toEqual(expect.arrayContaining(["组题", "导入导出"]));
+  });
+
+  it("只有审核权限时不显示组题和导入导出入口", () => {
+    const client = new QueryClient();
+    const view = mount(
+      client,
+      <AppShell session={session} demoEnabled={false}>
+        <p>题目工作区</p>
+      </AppShell>
+    );
+
+    const labels = [...view.querySelectorAll("nav a")].map((link) => link.textContent);
+    expect(labels).not.toContain("组题");
+    expect(labels).not.toContain("导入导出");
+  });
+});
+
+describe("跳过链接", () => {
+  it("出现指向主内容区的跳过链接", () => {
+    const client = new QueryClient();
+    const view = mount(
+      client,
+      <AppShell session={session} demoEnabled={false}>
+        <p>题目工作区</p>
+      </AppShell>
+    );
+
+    const skip = view.querySelector<HTMLAnchorElement>("a.skip-link");
+    expect(skip?.getAttribute("href")).toBe("#main-content");
+    const main = view.querySelector<HTMLElement>("#main-content");
+    expect(main?.tagName).toBe("MAIN");
+  });
+});

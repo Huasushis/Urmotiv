@@ -71,7 +71,7 @@ test("投稿人可以创建带 Markdown 内容的草稿并看到六个工作区�
 
   await expect(page.getByRole("heading", { name: "页面联调示例题" })).toBeVisible();
   for (const label of ["概要", "题面", "样例与约束", "数据与评测", "题解与资料", "审核记录"]) {
-    await expect(page.getByRole("button", { name: label })).toBeVisible();
+    await expect(page.getByRole("tab", { name: label })).toBeVisible();
   }
   await page.screenshot({ path: testInfo.outputPath("problem-workspace.png"), fullPage: true });
 });
