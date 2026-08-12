@@ -279,6 +279,11 @@ test("手机视口中的插件设置没有横向溢出", async ({ page }, testIn
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth
   );
   expect(overflow).toBeLessThanOrEqual(1);
+  const modes = page.getByRole("group", { name: "管理内容" }).getByRole("button");
+  for (let index = 0; index < await modes.count(); index += 1) {
+    const box = await modes.nth(index).boundingBox();
+    expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
+  }
   await page.screenshot({ path: testInfo.outputPath("admin-plugins-mobile.png"), fullPage: true });
 });
 

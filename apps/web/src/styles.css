@@ -13,7 +13,7 @@
   --border-strong: #becbc8;
   --text: #182321;
   --text-soft: #596764;
-  --text-faint: #7b8986;
+  --text-faint: #63706d;
   --teal: #0d766e;
   --teal-dark: #095e58;
   --teal-soft: #e5f3f1;
@@ -215,6 +215,10 @@ h3 {
 }
 
 .quiet-link {
+  display: inline-flex;
+  align-items: center;
+  min-width: 24px;
+  min-height: 24px;
   padding-left: 12px;
   border-left: 1px solid var(--border);
   white-space: nowrap;
@@ -948,6 +952,8 @@ textarea:read-only {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  min-width: 24px;
+  min-height: 24px;
   margin-bottom: 16px;
   font-size: 13px;
 }
@@ -3381,6 +3387,32 @@ textarea:read-only {
   to { transform: rotate(360deg); }
 }
 
+@media (pointer: coarse) {
+  .primary-button,
+  .secondary-button,
+  .compact-button,
+  .text-button,
+  .segmented-control button,
+  .mobile-editor-mode button {
+    min-height: 44px;
+  }
+
+  .icon-button {
+    width: 44px;
+    height: 44px;
+    flex: 0 0 44px;
+  }
+
+  .editor-toolbar {
+    min-height: 52px;
+  }
+
+  .back-link,
+  .quiet-link {
+    min-height: 44px;
+  }
+}
+
 @media (max-width: 1080px) {
   .global-header {
     grid-template-columns: auto 1fr;
@@ -3393,9 +3425,26 @@ textarea:read-only {
     justify-content: flex-start;
     height: 48px;
     margin: 0 -18px;
-    padding: 0 18px;
+    padding: 0 46px 0 18px;
     overflow-x: auto;
     border-top: 1px solid var(--border);
+    scrollbar-width: thin;
+  }
+
+  .global-header::after {
+    content: "";
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    z-index: 1;
+    width: 34px;
+    height: 47px;
+    background: linear-gradient(to right, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.97));
+    pointer-events: none;
+  }
+
+  .global-header:focus-within::after {
+    opacity: 0;
   }
 
   .global-nav a {
@@ -3455,13 +3504,13 @@ textarea:read-only {
   }
 
   .global-header {
-    position: static;
+    position: relative;
     padding: 0 12px;
   }
 
   .global-nav {
     margin: 0 -12px;
-    padding: 0 12px;
+    padding: 0 44px 0 12px;
   }
 
   .global-nav a {
@@ -3617,7 +3666,7 @@ textarea:read-only {
 
   .workspace-state .primary-button,
   .workspace-state .secondary-button {
-    min-height: 34px;
+    min-height: 44px;
     padding: 0 9px;
     font-size: 12px;
   }

@@ -88,6 +88,105 @@ test("手机视口中的 Markdown 编辑器在编辑和预览间切换", async (
   await page.screenshot({ path: testInfo.outputPath("mobile-markdown-preview.png"), fullPage: true });
 });
 
+test("关键文字、导航提示和编辑操作在桌面与 360px 触屏上可访问", async ({ page }, testInfo) => {
+  const mobile = testInfo.project.name === "mobile-chromium";
+  if (mobile) {
+    await page.setViewportSize({ width: 360, height: 800 });
+  }
+  await loginAs(page, /组长/);
+
+  const contrast = await page.evaluate(() => {
+    const parse = (color: string) => {
+      const value = color.replace("#", "");
+      return [0, 2, 4].map((offset) => Number.parseInt(value.slice(offset, offset + 2), 16));
+    };
+    const luminance = (color: string) => {
+      const [red = 0, green = 0, blue = 0] = parse(color).map((channel) => {
+        const value = channel / 255;
+        return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+      });
+      return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+    };
+    const ratio = (foreground: string, background: string) => {
+      const values = [luminance(foreground), luminance(background)].sort((left, right) => right - left);
+      return ((values[0] ?? 0) + 0.05) / ((values[1] ?? 0) + 0.05);
+    };
+    const faint = getComputedStyle(document.documentElement).getPropertyValue("--text-faint").trim();
+    return {
+      faint,
+      onWhite: ratio(faint, "#ffffff"),
+      onSubtle: ratio(faint, "#f7f9f8")
+    };
+  });
+  expect(contrast.faint).toBe("#63706d");
+  expect(contrast.onWhite).toBeGreaterThanOrEqual(4.5);
+  expect(contrast.onSubtle).toBeGreaterThanOrEqual(4.5);
+
+  const navigation = page.getByRole("navigation", { name: "主导航" });
+  await expect(navigation).toBeVisible();
+  if (mobile) {
+    const navigationSize = await navigation.evaluate((element) => ({
+      clientWidth: element.clientWidth,
+      scrollWidth: element.scrollWidth
+    }));
+    expect(navigationSize.scrollWidth).toBeGreaterThan(navigationSize.clientWidth);
+    const header = page.locator(".global-header");
+    const cue = await header.evaluate((element) => {
+      const style = getComputedStyle(element, "::after");
+      return {
+        content: style.content,
+        pointerEvents: style.pointerEvents,
+        animationName: style.animationName
+      };
+    });
+    expect(cue.content).not.toBe("none");
+    expect(cue.pointerEvents).toBe("none");
+    expect(cue.animationName).toBe("none");
+    await navigation.getByRole("link").last().focus();
+    await expect.poll(() =>
+      header.evaluate((element) => getComputedStyle(element, "::after").opacity)
+    ).toBe("0");
+  } else {
+    const quietLink = page.getByRole("link", { name: "切换演示账号" });
+    const quietBox = await quietLink.boundingBox();
+    expect(quietBox?.height ?? 0).toBeGreaterThanOrEqual(24);
+  }
+
+  await page.goto("/problems/new");
+  const backLink = page.getByRole("link", { name: "返回题目列表" });
+  const backBox = await backLink.boundingBox();
+  expect(backBox?.height ?? 0).toBeGreaterThanOrEqual(mobile ? 44 : 24);
+
+  const editor = page.locator('section[aria-label="基础题面"]');
+  const field = editor.locator("textarea");
+  await field.fill("第一版");
+  await field.fill("第二版");
+  const undo = editor.getByRole("button", { name: "撤销" });
+  const redo = editor.getByRole("button", { name: "重做" });
+  await undo.click();
+  await expect(field).toHaveValue("第一版");
+  await redo.click();
+  await expect(field).toHaveValue("第二版");
+  for (const control of [undo, redo]) {
+    const box = await control.boundingBox();
+    expect(box?.height ?? 0).toBeGreaterThanOrEqual(mobile ? 44 : 32);
+    expect(box?.width ?? 0).toBeGreaterThanOrEqual(mobile ? 44 : 32);
+  }
+
+  const primaryBox = await page.getByRole("button", { name: "创建草稿" }).boundingBox();
+  expect(primaryBox?.height ?? 0).toBeGreaterThanOrEqual(mobile ? 44 : 38);
+  if (mobile) {
+    for (const label of ["编辑", "预览"]) {
+      const box = await editor.getByRole("button", { name: label, exact: true }).boundingBox();
+      expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
+    }
+  }
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
+});
+
 test("题面图片与公开附件可以上传、预览和下载", async ({ page }, testInfo) => {
   await loginAsAuthor(page);
   const problem = await postJson(page, "/api/v1/problems", {

@@ -183,6 +183,26 @@ describe("导航权限", () => {
     expect(labels).not.toContain("组题");
     expect(labels).not.toContain("导入导出");
   });
+
+  it("主导航保留可访问名称并使用横向滚动提示类", () => {
+    const client = new QueryClient();
+    const view = mount(
+      client,
+      <AppShell
+        session={{ ...session, permissions: ["contest.create", "problem.import"] }}
+        demoEnabled
+      >
+        <p>题目工作区</p>
+      </AppShell>
+    );
+
+    const navigation = view.querySelector<HTMLElement>('nav[aria-label="主导航"]');
+    expect(navigation?.classList.contains("global-nav")).toBe(true);
+    expect(view.querySelector(".global-header")).not.toBeNull();
+    const quietLink = [...view.querySelectorAll<HTMLAnchorElement>("a")]
+      .find((link) => link.textContent === "切换演示账号");
+    expect(quietLink?.classList.contains("quiet-link")).toBe(true);
+  });
 });
 
 describe("跳过链接", () => {

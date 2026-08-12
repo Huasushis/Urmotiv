@@ -142,6 +142,10 @@ test("手机视口下导入导出页没有横向溢出", async ({ page }, testIn
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth
   );
   expect(overflow).toBeLessThanOrEqual(1);
+  for (const label of ["导入", "导出"]) {
+    const box = await page.getByRole("button", { name: label, exact: true }).boundingBox();
+    expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
+  }
 
   await page.getByRole("button", { name: "导出", exact: true }).click();
   const overflowAfterSwitch = await page.evaluate(
