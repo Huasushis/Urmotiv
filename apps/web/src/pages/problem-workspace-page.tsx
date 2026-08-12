@@ -32,6 +32,7 @@ import {
   withdrawProblem
 } from "../lib/api";
 import { statusText, statusTone } from "../lib/presentation";
+import { isAccessBoundaryError } from "../lib/client-security";
 import {
   DataAndJudgeTab,
   OverviewTab,
@@ -87,10 +88,14 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
   const requestedTab = searchParams.get("tab");
   const activeTab = tabs.some((tab) => tab.id === requestedTab) ? (requestedTab as TabId) : "overview";
   const client = useQueryClient();
+  const [accessRevoked, setAccessRevoked] = useState(false);
+  const accessRevokedRef = useRef(false);
+  const problemQueryKey = ["problem", problemId, currentUserId] as const;
   const problemQuery = useQuery({
-    queryKey: ["problem", problemId, currentUserId],
+    queryKey: problemQueryKey,
     queryFn: () => getProblem(problemId),
-    enabled: Boolean(problemId)
+    enabled: Boolean(problemId) && !accessRevoked,
+    retry: (failureCount, error) => !isAccessBoundaryError(error) && failureCount < 3
   });
   const [working, setWorking] = useState<Problem | null>(null);
   const [dirty, setDirty] = useState(false);
@@ -98,9 +103,34 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
   const [fileUploadsInFlight, setFileUploadsInFlight] = useState(0);
   const fileUploadPending = fileUploadsInFlight > 0;
   const editNumber = useRef(0);
+  const clearPrivateProblemState = useCallback((id: string) => {
+    const queryKey = ["problem", problemId, currentUserId] as const;
+    accessRevokedRef.current = true;
+    setAccessRevoked(true);
+    setWorking(null);
+    setDirty(false);
+    setSaveState("saved");
+    setFileUploadsInFlight(0);
+    window.sessionStorage.removeItem(localDraftKey(currentUserId, id));
+    window.sessionStorage.removeItem(legacyLocalDraftKey(id));
+    void client.cancelQueries({ queryKey, exact: true }).finally(() => {
+      client.removeQueries({ queryKey, exact: true });
+    });
+  }, [client, currentUserId, problemId]);
+  useEffect(() => {
+    accessRevokedRef.current = false;
+    setAccessRevoked(false);
+    setWorking(null);
+    setDirty(false);
+  }, [currentUserId, problemId]);
+  useEffect(() => {
+    if (problemQuery.isError && isAccessBoundaryError(problemQuery.error)) {
+      clearPrivateProblemState(problemId);
+    }
+  }, [clearPrivateProblemState, problemId, problemQuery.error, problemQuery.isError]);
 
   useEffect(() => {
-    if (!problemQuery.data?.id) {
+    if (accessRevoked || problemQuery.isError || !problemQuery.data?.id) {
       return;
     }
     const id = problemQuery.data.id;
@@ -130,10 +160,11 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [problemQuery.data?.id]);
+  }, [accessRevoked, problemQuery.data?.id, problemQuery.isError]);
 
   useEffect(() => {
-    if (problemQuery.data && !dirty) {
+    if (problemQuery.data && !problemQuery.isError && !dirty) {
+      setAccessRevoked(false);
       window.sessionStorage.removeItem(legacyLocalDraftKey(problemQuery.data.id));
       const rawDraft = window.sessionStorage.getItem(
         localDraftKey(currentUserId, problemQuery.data.id)
@@ -154,13 +185,16 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
       setWorking(problemQuery.data);
       setSaveState("saved");
     }
-  }, [currentUserId, problemQuery.data, dirty]);
+  }, [currentUserId, problemQuery.data, problemQuery.isError, dirty]);
 
   const save = useMutation({
     mutationFn: ({ problem }: { problem: Problem; edit: number }) =>
       updateProblem(problem.id, updateInput(problem)),
     onMutate: () => setSaveState("saving"),
     onSuccess: (saved, variables) => {
+      if (accessRevokedRef.current) {
+        return;
+      }
       client.setQueryData(["problem", saved.id, currentUserId], saved);
       window.sessionStorage.removeItem(localDraftKey(currentUserId, saved.id));
       if (variables.edit === editNumber.current) {
@@ -172,7 +206,11 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
         setSaveState("dirty");
       }
     },
-    onError: (_error, variables) => {
+    onError: (error, variables) => {
+      if (isAccessBoundaryError(error)) {
+        clearPrivateProblemState(variables.problem.id);
+        return;
+      }
       window.sessionStorage.setItem(
         localDraftKey(currentUserId, variables.problem.id),
         JSON.stringify(variables.problem)
@@ -213,6 +251,9 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
   };
 
   const synchronizeFileRevision = useCallback((revision: number) => {
+    if (accessRevokedRef.current) {
+      return;
+    }
     setWorking((current) => current === null ? current : { ...current, revision });
     client.setQueryData<Problem>(
       ["problem", problemId, currentUserId],
@@ -229,6 +270,9 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
     revision: number,
     judgeConfig: ProblemJudgeConfig
   ) => {
+    if (accessRevokedRef.current) {
+      return;
+    }
     setWorking((current) => current === null
       ? current
       : { ...current, revision, judgeConfig });
@@ -251,6 +295,9 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
         : withdrawProblem(working.id, working.revision);
     },
     onSuccess: (saved) => {
+      if (accessRevokedRef.current) {
+        return;
+      }
       client.setQueryData(["problem", saved.id, currentUserId], saved);
       window.sessionStorage.removeItem(localDraftKey(currentUserId, saved.id));
       client.invalidateQueries({ queryKey: ["problems"] });
@@ -258,6 +305,11 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
       setWorking(saved);
       setDirty(false);
       setSaveState("saved");
+    },
+    onError: (error) => {
+      if (isAccessBoundaryError(error)) {
+        clearPrivateProblemState(problemId);
+      }
     }
   });
 
@@ -272,16 +324,32 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
       if (working) {
         client.invalidateQueries({ queryKey: ["review-items", working.id] });
       }
+    },
+    onError: (error) => {
+      if (isAccessBoundaryError(error)) {
+        clearPrivateProblemState(problemId);
+      }
     }
   });
+
+  if (accessRevoked || (problemQuery.isError && isAccessBoundaryError(problemQuery.error))) {
+    return (
+      <div className="centered-message error-message" role="alert">
+        <TriangleAlert size={28} aria-hidden="true" />
+        <h1>题目不存在</h1>
+        <p>题目不存在或当前账号不能访问。</p>
+        <Link to="/problems">返回题目列表</Link>
+      </div>
+    );
+  }
 
   if (problemQuery.isLoading || !working) {
     if (problemQuery.isError) {
       return (
         <div className="centered-message error-message" role="alert">
           <TriangleAlert size={28} aria-hidden="true" />
-          <h1>无法打开题目</h1>
-          <p>{problemQuery.error.message}</p>
+          <h1>暂时无法打开题目</h1>
+          <p>请稍后重试。</p>
           <div className="inline-actions">
             <button
               className="secondary-button"

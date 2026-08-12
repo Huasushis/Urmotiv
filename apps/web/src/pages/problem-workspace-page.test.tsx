@@ -23,6 +23,7 @@ vi.mock("../lib/api", async (importOriginal) => {
 });
 
 import { ProblemWorkspacePage } from "./problem-workspace-page";
+import { ApiError } from "../lib/api";
 
 function renderResult(
   status: SimilarityCheckResponse["status"],
@@ -82,18 +83,19 @@ function titleOnlyProblem(): Problem {
 }
 
 let root: Root | undefined;
+let queryClient: QueryClient | undefined;
 let container: HTMLDivElement | undefined;
 
 function mount(element: ReactNode): HTMLDivElement {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
-  const client = new QueryClient({
+  queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } }
   });
   act(() => {
     root?.render(
-      <QueryClientProvider client={client}>
+      <QueryClientProvider client={queryClient}>
         <MemoryRouter initialEntries={["/problems/p-title-1"]}>
           <Routes>
             <Route path="/problems/:problemId" element={element} />
@@ -161,6 +163,8 @@ describe("ProblemWorkspacePage 名称专用权限自动保存", () => {
     container?.remove();
     root = undefined;
     container = undefined;
+    queryClient = undefined;
+    sessionStorage.clear();
     vi.clearAllMocks();
   });
 
@@ -202,5 +206,116 @@ describe("ProblemWorkspacePage 名称专用权限自动保存", () => {
 
     await waitFor(() => expect(container!.textContent).toContain("新标题"));
     await waitFor(() => expect(container!.textContent).toContain("已保存"));
+  });
+
+  it("自动保存再次被服务端拒绝时立即清除题目、缓存和草稿", async () => {
+    const base = titleOnlyProblem();
+    api.getProblem.mockResolvedValue(base);
+    api.recordProblemActivity.mockResolvedValue(undefined);
+    api.listTags.mockResolvedValue([]);
+    api.updateProblem.mockRejectedValue(new ApiError("不应回显的保存拒绝", 403));
+
+    mount(<ProblemWorkspacePage currentUserId="author" />);
+    await waitFor(() => expect(container!.textContent).toContain("原标题"));
+    sessionStorage.setItem(
+      "urmotiv.web.unsaved.author.p-title-1",
+      JSON.stringify({ ...base, title: "不应保留的草稿" })
+    );
+
+    const titleInput = container!.querySelector('input[value="原标题"]') as HTMLInputElement;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value"
+      )!.set;
+      setter!.call(titleInput, "触发撤权保存");
+      titleInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    await waitFor(() => expect(api.updateProblem).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(container!.textContent).toContain("题目不存在"));
+    expect(container!.textContent).not.toContain("原标题");
+    expect(container!.textContent).not.toContain("不应回显的保存拒绝");
+    expect(queryClient!.getQueryData(["problem", "p-title-1", "author"])).toBeUndefined();
+    expect(sessionStorage.getItem("urmotiv.web.unsaved.author.p-title-1")).toBeNull();
+  });
+
+  it("提交审核再次被服务端拒绝时不保留已打开题目", async () => {
+    const base = {
+      ...titleOnlyProblem(),
+      status: "draft" as const,
+      capabilities: {
+        ...titleOnlyProblem().capabilities,
+        canSubmit: true,
+        canWithdraw: false
+      }
+    };
+    api.getProblem.mockResolvedValue(base);
+    api.recordProblemActivity.mockResolvedValue(undefined);
+    api.listTags.mockResolvedValue([]);
+    api.submitProblem.mockRejectedValue(new ApiError("不应回显的提交拒绝", 404));
+
+    mount(<ProblemWorkspacePage currentUserId="author" />);
+    await waitFor(() => expect(container!.textContent).toContain("原标题"));
+    const submit = [...container!.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.includes("提交审核"));
+    expect(submit).not.toBeUndefined();
+    await act(async () => {
+      submit?.click();
+    });
+
+    await waitFor(() => expect(container!.textContent).toContain("题目不存在"));
+    expect(container!.textContent).not.toContain("原标题");
+    expect(container!.textContent).not.toContain("不应回显的提交拒绝");
+    expect(queryClient!.getQueryData(["problem", "p-title-1", "author"])).toBeUndefined();
+  });
+
+  it.each([401, 403, 404])(
+    "已加载题目在重新读取返回 %i 后清除 DOM、查询缓存和本地草稿",
+    async (status) => {
+      const base = titleOnlyProblem();
+      api.getProblem
+        .mockResolvedValueOnce(base)
+        .mockRejectedValueOnce(new ApiError(`虚构 ${status} 错误`, status));
+      api.recordProblemActivity.mockResolvedValue(undefined);
+      api.listTags.mockResolvedValue([]);
+
+      mount(<ProblemWorkspacePage currentUserId="author" />);
+      await waitFor(() => expect(container!.textContent).toContain("原标题"));
+      sessionStorage.setItem(
+        "urmotiv.web.unsaved.author.p-title-1",
+        JSON.stringify({ ...base, title: "不应保留的本地草稿" })
+      );
+
+      await act(async () => {
+        await queryClient!.invalidateQueries({
+          queryKey: ["problem", "p-title-1", "author"],
+          exact: true
+        });
+      });
+
+      await waitFor(() => expect(container!.textContent).toContain("题目不存在"));
+      expect(container!.textContent).not.toContain("原标题");
+      expect(container!.textContent).not.toContain("题面");
+      expect(container!.textContent).not.toContain(`虚构 ${status} 错误`);
+      expect(api.getProblem).toHaveBeenCalledTimes(2);
+      await waitFor(() => {
+        expect(queryClient!.getQueryData(["problem", "p-title-1", "author"])).toBeUndefined();
+      });
+      expect(sessionStorage.getItem("urmotiv.web.unsaved.author.p-title-1")).toBeNull();
+    }
+  );
+
+  it("真实不存在与撤权使用相同的安全页面且不回显后端消息", async () => {
+    api.getProblem.mockRejectedValue(new ApiError("虚构但不可回显的详情", 404));
+    api.recordProblemActivity.mockResolvedValue(undefined);
+    api.listTags.mockResolvedValue([]);
+
+    mount(<ProblemWorkspacePage currentUserId="author" />);
+
+    await waitFor(() => expect(container!.textContent).toContain("题目不存在"));
+    expect(container!.textContent).toContain("题目不存在或当前账号不能访问");
+    expect(container!.textContent).not.toContain("虚构但不可回显的详情");
+    expect(queryClient!.getQueryData(["problem", "p-title-1", "author"])).toBeUndefined();
   });
 });

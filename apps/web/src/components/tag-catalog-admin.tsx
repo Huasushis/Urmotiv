@@ -33,6 +33,7 @@ import {
   updateTagAlias,
   updateTagCatalogItem,
 } from "../lib/api";
+import { isAccessBoundaryError } from "../lib/client-security";
 
 type CatalogOperation =
   | { kind: "create"; input: CreateTagCatalogItemInput }
@@ -115,14 +116,8 @@ async function executeOperation(operation: CatalogOperation): Promise<OperationR
   }
 }
 
-export function TagCatalogAdmin() {
+export function TagCatalogAdmin({ currentUserId }: { currentUserId: string }) {
   const queryClient = useQueryClient();
-  const catalog = useQuery({
-    queryKey: ["admin-tag-catalog"],
-    queryFn: listManagedTagCatalog,
-    retry: false,
-  });
-  const operation = useMutation({ mutationFn: executeOperation });
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState("");
@@ -133,6 +128,15 @@ export function TagCatalogAdmin() {
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [editorDirty, setEditorDirty] = useState(false);
   const [editorResetEpoch, setEditorResetEpoch] = useState(0);
+  const [accessDenied, setAccessDenied] = useState(false);
+  const catalog = useQuery({
+    queryKey: ["admin-tag-catalog", currentUserId],
+    queryFn: listManagedTagCatalog,
+    retry: false,
+    enabled: !accessDenied,
+  });
+  const operation = useMutation({ mutationFn: executeOperation });
+  const queryAccessDenied = catalog.isError && isAccessBoundaryError(catalog.error);
 
   const categories = useMemo(
     () =>
@@ -148,6 +152,30 @@ export function TagCatalogAdmin() {
         .sort(compareCatalogItems),
     [catalog.data],
   );
+
+  useEffect(() => {
+    if (!queryAccessDenied) {
+      return;
+    }
+    setAccessDenied(true);
+    setSelectedId(null);
+    setExpandedIds(new Set());
+    setSearch("");
+    setCreateKind(null);
+    setEditorDirty(false);
+    operation.reset();
+    queryClient.removeQueries({ queryKey: ["admin-tag-catalog", currentUserId], exact: true });
+  }, [currentUserId, queryAccessDenied, queryClient]);
+
+  useEffect(() => {
+    setAccessDenied(false);
+    setSelectedId(null);
+    setExpandedIds(new Set());
+    setSearch("");
+    setCreateKind(null);
+    setEditorDirty(false);
+    operation.reset();
+  }, [currentUserId]);
 
   useEffect(() => {
     if (catalog.data === undefined) {
@@ -188,6 +216,17 @@ export function TagCatalogAdmin() {
       setSuccessMessage(result.message);
       return true;
     } catch (error) {
+      if (isAccessBoundaryError(error)) {
+        setAccessDenied(true);
+        setSelectedId(null);
+        setExpandedIds(new Set());
+        setSearch("");
+        setCreateKind(null);
+        setEditorDirty(false);
+        operation.reset();
+        queryClient.removeQueries({ queryKey: ["admin-tag-catalog", currentUserId], exact: true });
+        return false;
+      }
       if (error instanceof ApiError && error.status === 409) {
         setConflict(true);
       }
@@ -226,6 +265,18 @@ export function TagCatalogAdmin() {
     }
     return true;
   };
+
+  if (accessDenied || queryAccessDenied) {
+    return (
+      <div className="plain-panel admin-load-error" role="alert">
+        <AlertTriangle size={20} aria-hidden="true" />
+        <div>
+          <h2>知识点目录不存在</h2>
+          <p>目录不存在或当前账号不能访问。</p>
+        </div>
+      </div>
+    );
+  }
 
   if (catalog.isLoading) {
     return (

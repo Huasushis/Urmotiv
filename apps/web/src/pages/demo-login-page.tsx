@@ -10,6 +10,7 @@ import {
   emailRegister,
   resendEmailVerification
 } from "../lib/api";
+import { clearProblemDrafts } from "../lib/client-security";
 
 const demoAccounts = [
   { id: "author", title: "投稿人", description: "创建、编辑和提交自己的题目" },
@@ -31,6 +32,7 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
   const [verificationPending, setVerificationPending] = useState(false);
   const auth = existingSession?.auth;
   const complete = (session: SessionResponse) => {
+    clearProblemDrafts();
     client.clear();
     client.setQueryData(["session"], session);
     navigate("/problems");

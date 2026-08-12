@@ -1,6 +1,6 @@
 import { AlertTriangle, Archive, ArrowDownToLine, ArrowUpFromLine, Download, FileArchive, Loader2 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import type { ExportPreviewResponse, ImportJobView, PackageFileCategory } from "@urmotiv/contracts";
 import {
@@ -15,6 +15,7 @@ import {
   uploadProblemPackage
 } from "../lib/api";
 import { dateTime } from "../lib/presentation";
+import { isAccessBoundaryError } from "../lib/client-security";
 
 type TransferMode = "import" | "export";
 type SourceFormat = "urmotiv" | "hydro";
@@ -125,15 +126,29 @@ function isJobFinished(state: TransferJobState | undefined): boolean {
 }
 
 export function TransferPage() {
+  const client = useQueryClient();
   const [mode, setMode] = useState<TransferMode>("import");
   const session = useQuery({ queryKey: ["session"], queryFn: getSession, staleTime: 60_000 });
+  const currentUserId = session.data?.user?.id ?? "";
   const permissions = session.data?.user?.permissions ?? [];
-  const canTransfer = permissions.some((permission) =>
-    permission === "problem.import" ||
-    permission === "problem.export.own" ||
-    permission === "problem.export.all"
-  );
-
+  const canImport = permissions.includes("problem.import");
+  const canExport = permissions.includes("problem.export.own") ||
+    permissions.includes("problem.export.all");
+  const canTransfer = canImport || canExport;
+  useEffect(() => {
+    if (!canImport) {
+      client.removeQueries({ queryKey: ["transfer-import-job"] });
+      if (canExport) {
+        setMode("export");
+      }
+    }
+    if (!canExport) {
+      client.removeQueries({ queryKey: ["transfer-export-job"] });
+      if (canImport) {
+        setMode("import");
+      }
+    }
+  }, [canExport, canImport, client, currentUserId]);
   return (
     <section className="transfer-page">
       <div className="page-heading">
@@ -155,16 +170,24 @@ export function TransferPage() {
       ) : (
         <>
           <div className="segmented-control transfer-mode" role="group" aria-label="导入或导出">
-            <button type="button" className={mode === "import" ? "selected" : ""} onClick={() => setMode("import")}>
-              <ArrowUpFromLine size={16} aria-hidden="true" />
-              导入
-            </button>
-            <button type="button" className={mode === "export" ? "selected" : ""} onClick={() => setMode("export")}>
-              <ArrowDownToLine size={16} aria-hidden="true" />
-              导出
-            </button>
+            {canImport ? (
+              <button type="button" className={mode === "import" ? "selected" : ""} onClick={() => setMode("import")}>
+                <ArrowUpFromLine size={16} aria-hidden="true" />
+                导入
+              </button>
+            ) : null}
+            {canExport ? (
+              <button type="button" className={mode === "export" ? "selected" : ""} onClick={() => setMode("export")}>
+                <ArrowDownToLine size={16} aria-hidden="true" />
+                导出
+              </button>
+            ) : null}
           </div>
-          {mode === "import" ? <ImportSection /> : <ExportSection />}
+          {mode === "import" && canImport
+            ? <ImportSection currentUserId={currentUserId} />
+            : mode === "export" && canExport
+              ? <ExportSection currentUserId={currentUserId} />
+              : null}
         </>
       )}
     </section>
@@ -222,11 +245,12 @@ function ImportResultList({ items }: { items: ImportJobItem[] }) {
   );
 }
 
-function ImportSection() {
+function ImportSection({ currentUserId }: { currentUserId: string }) {
   const client = useQueryClient();
   const [fileName, setFileName] = useState("");
   const [formatId, setFormatId] = useState<SourceFormat>("urmotiv");
   const [importJobId, setImportJobId] = useState<string | null>(null);
+  const [accessDenied, setAccessDenied] = useState(false);
 
   const upload = useMutation({
     mutationFn: uploadProblemPackage,
@@ -244,11 +268,35 @@ function ImportSection() {
     }
   });
   const importJobQuery = useQuery({
-    queryKey: ["transfer-import-job", importJobId],
+    queryKey: ["transfer-import-job", currentUserId, importJobId],
     queryFn: () => getImportJob(importJobId as string),
     enabled: importJobId !== null,
+    retry: false,
     refetchInterval: (query) => (isJobFinished(query.state.data?.state) ? false : 1500)
   });
+  const denied = [upload.error, preview.error, createImport.error, importJobQuery.error]
+    .some(isAccessBoundaryError);
+  useEffect(() => {
+    if (!denied) {
+      return;
+    }
+    setAccessDenied(true);
+    setFileName("");
+    setImportJobId(null);
+    upload.reset();
+    preview.reset();
+    createImport.reset();
+    client.removeQueries({ queryKey: ["transfer-import-job", currentUserId] });
+  }, [client, currentUserId, denied]);
+  useEffect(() => {
+    setAccessDenied(false);
+    setFileName("");
+    setFormatId("urmotiv");
+    setImportJobId(null);
+    upload.reset();
+    preview.reset();
+    createImport.reset();
+  }, [currentUserId]);
 
   const resetProgress = () => {
     preview.reset();
@@ -259,6 +307,15 @@ function ImportSection() {
   const detected = [...(upload.data?.detected ?? [])].sort((a, b) => b.confidence - a.confidence);
   const hasBlockingIssue = preview.data?.issues.some((issue) => issue.severity === "error") ?? false;
   const job = importJobQuery.data;
+  if (accessDenied || denied) {
+    return (
+      <div className="centered-message" role="alert">
+        <Archive size={28} aria-hidden="true" />
+        <h2>导入任务不存在</h2>
+        <p>任务不存在或当前账号不能访问。</p>
+      </div>
+    );
+  }
 
   return (
     <div className="transfer-layout">
@@ -483,11 +540,13 @@ function ImportSection() {
   );
 }
 
-function ExportSection() {
+function ExportSection({ currentUserId }: { currentUserId: string }) {
+  const client = useQueryClient();
   const [problemIdsText, setProblemIdsText] = useState("");
   const [targetFormat, setTargetFormat] = useState<SourceFormat>("urmotiv");
   const [categoryChecks, setCategoryChecks] = useState<Record<CategoryGroupKey, boolean>>(defaultCategoryChecks());
   const [exportJobId, setExportJobId] = useState<string | null>(null);
+  const [accessDenied, setAccessDenied] = useState(false);
 
   const preview = useMutation({ mutationFn: previewExport });
   const createExport = useMutation({
@@ -495,11 +554,34 @@ function ExportSection() {
     onSuccess: (job) => setExportJobId(job.id)
   });
   const exportJobQuery = useQuery({
-    queryKey: ["transfer-export-job", exportJobId],
+    queryKey: ["transfer-export-job", currentUserId, exportJobId],
     queryFn: () => getExportJob(exportJobId as string),
     enabled: exportJobId !== null,
+    retry: false,
     refetchInterval: (query) => (isJobFinished(query.state.data?.state) ? false : 1500)
   });
+  const denied = [preview.error, createExport.error, exportJobQuery.error]
+    .some(isAccessBoundaryError);
+  useEffect(() => {
+    if (!denied) {
+      return;
+    }
+    setAccessDenied(true);
+    setProblemIdsText("");
+    setExportJobId(null);
+    preview.reset();
+    createExport.reset();
+    client.removeQueries({ queryKey: ["transfer-export-job", currentUserId] });
+  }, [client, currentUserId, denied]);
+  useEffect(() => {
+    setAccessDenied(false);
+    setProblemIdsText("");
+    setTargetFormat("urmotiv");
+    setCategoryChecks(defaultCategoryChecks());
+    setExportJobId(null);
+    preview.reset();
+    createExport.reset();
+  }, [currentUserId]);
 
   const resetProgress = () => {
     preview.reset();
@@ -512,6 +594,15 @@ function ExportSection() {
     .filter((group) => categoryChecks[group.key])
     .flatMap((group) => group.categories);
   const job = exportJobQuery.data;
+  if (accessDenied || denied) {
+    return (
+      <div className="centered-message" role="alert">
+        <Archive size={28} aria-hidden="true" />
+        <h2>导出任务不存在</h2>
+        <p>任务不存在或当前账号不能访问。</p>
+      </div>
+    );
+  }
 
   return (
     <div className="transfer-layout">

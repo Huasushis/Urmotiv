@@ -73,6 +73,7 @@ afterEach(() => {
   container?.remove();
   root = undefined;
   container = undefined;
+  sessionStorage.clear();
   vi.clearAllMocks();
 });
 
@@ -92,6 +93,10 @@ describe("切换登录账号", () => {
     client.setQueryData(["reviews", "private-problem", 1, "reviewer"], {
       privateNote: "不应保留的私密备注"
     });
+    sessionStorage.setItem(
+      "urmotiv.web.unsaved.reviewer.private-problem",
+      "不应跨账号保留的本地草稿"
+    );
 
     container = document.createElement("div");
     document.body.append(container);
@@ -118,5 +123,8 @@ describe("切换登录账号", () => {
     });
     expect(client.getQueryData(["problem", "private-problem", "reviewer"])).toBeUndefined();
     expect(client.getQueryData(["reviews", "private-problem", 1, "reviewer"])).toBeUndefined();
+    expect(
+      sessionStorage.getItem("urmotiv.web.unsaved.reviewer.private-problem")
+    ).toBeNull();
   });
 });

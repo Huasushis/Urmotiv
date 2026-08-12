@@ -11,6 +11,7 @@ import { NavLink } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type { SessionResponse } from "@urmotiv/contracts";
 import { logout } from "../lib/api";
+import { clearProblemDrafts } from "../lib/client-security";
 
 type AppShellProps = {
   session: NonNullable<SessionResponse["user"]>;
@@ -59,6 +60,7 @@ export function AppShell({ session, demoEnabled, children }: AppShellProps) {
   const signOut = useMutation({
     mutationFn: logout,
     onSuccess: () => {
+      clearProblemDrafts();
       client.removeQueries({
         predicate: (query) => query.queryKey[0] !== "session"
       });

@@ -83,6 +83,7 @@ const plugin: AdminPlugin = {
 };
 
 let root: Root | undefined;
+let queryClient: QueryClient | undefined;
 let container: HTMLDivElement | undefined;
 
 function session(overrides: Partial<SessionUser> = {}): SessionUser {
@@ -107,6 +108,7 @@ function mount(element: ReactNode): HTMLDivElement {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } }
   });
+  queryClient = client;
   act(() => {
     root?.render(<QueryClientProvider client={client}>{element}</QueryClientProvider>);
   });
@@ -170,6 +172,8 @@ afterEach(() => {
   }
   container?.remove();
   root = undefined;
+  queryClient?.clear();
+  queryClient = undefined;
   container = undefined;
   vi.clearAllMocks();
 });
@@ -316,5 +320,64 @@ describe("管理页面", () => {
     expect(view.textContent).toContain("AI 审题服务");
     expect(view.textContent).toContain("其他人已经修改了这个插件");
     expect(view.textContent).not.toContain("插件设置暂时无法读取");
+  });
+
+  it("插件保存被服务端拒绝时清除插件缓存和未保存密钥", async () => {
+    api.listAdminPlugins.mockResolvedValue({ items: [plugin] });
+    api.updateAdminPlugin.mockRejectedValue(
+      new ApiError("不应回显的插件拒绝详情", 403)
+    );
+    const view = mount(<AdminPage session={session({ canManagePlugins: true })} />);
+
+    await waitFor(() => expect(view.textContent).toContain("AI 审题服务"));
+    const secret = view.querySelector<HTMLInputElement>('input[type="password"]');
+    expect(secret).not.toBeNull();
+    await changeValue(secret!, "temporary-secret");
+    await click(buttonWithText(view, "保存插件设置"));
+
+    await waitFor(() => expect(view.textContent).toContain("插件设置不存在"));
+    expect(view.textContent).not.toContain("AI 审题服务");
+    expect(view.textContent).not.toContain("temporary-secret");
+    expect(view.textContent).not.toContain("不应回显的插件拒绝详情");
+    expect(queryClient!.getQueryData(["admin-plugins", "user-1"])).toBeUndefined();
+  });
+
+  it("机器人即使带有宽泛权限字符串也不能读取管理设置", () => {
+    const view = mount(
+      <AdminPage
+        session={session({
+          accountType: "robot",
+          roles: ["审核机器人", "管理员"],
+          permissions: ["plugin.manage", "system.manage"],
+          canManageReviewPolicy: false,
+          canManagePlugins: false,
+          canManageTags: false
+        })}
+      />
+    );
+
+    expect(view.textContent).toContain("当前账号没有可用的管理设置");
+    expect(api.getReviewPolicy).not.toHaveBeenCalled();
+    expect(api.listAdminPlugins).not.toHaveBeenCalled();
+    expect(api.listManagedTagCatalog).not.toHaveBeenCalled();
+  });
+
+  it("明确拒绝账号不因角色名称获得管理读取", () => {
+    const view = mount(
+      <AdminPage
+        session={session({
+          roles: ["系统管理员"],
+          permissions: ["plugin.manage", "system.manage"],
+          canManageReviewPolicy: false,
+          canManagePlugins: false,
+          canManageTags: false
+        })}
+      />
+    );
+
+    expect(view.textContent).toContain("当前账号没有可用的管理设置");
+    expect(api.getReviewPolicy).not.toHaveBeenCalled();
+    expect(api.listAdminPlugins).not.toHaveBeenCalled();
+    expect(api.listManagedTagCatalog).not.toHaveBeenCalled();
   });
 });

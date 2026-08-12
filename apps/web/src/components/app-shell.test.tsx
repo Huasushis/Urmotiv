@@ -68,6 +68,7 @@ afterEach(() => {
   container?.remove();
   root = undefined;
   container = undefined;
+  sessionStorage.clear();
   vi.clearAllMocks();
 });
 
@@ -87,6 +88,10 @@ describe("退出登录", () => {
     client.setQueryData(["reviews", "private-problem", 1, session.id], {
       privateNote: "不应保留的私密备注"
     });
+    sessionStorage.setItem(
+      "urmotiv.web.unsaved.reviewer.private-problem",
+      "不应保留的本地草稿"
+    );
 
     const view = mount(
       client,
@@ -110,6 +115,9 @@ describe("退出登录", () => {
         client.getQueryData(["reviews", "private-problem", 1, session.id])
       ).toBeUndefined();
       expect(client.getQueryData(["session"])).toBeUndefined();
+      expect(
+        sessionStorage.getItem("urmotiv.web.unsaved.reviewer.private-problem")
+      ).toBeNull();
     });
   });
 });

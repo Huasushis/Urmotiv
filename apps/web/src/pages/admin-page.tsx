@@ -29,6 +29,7 @@ import {
   updateAdminPlugin,
   updateReviewPolicy
 } from "../lib/api";
+import { isAccessBoundaryError } from "../lib/client-security";
 
 type AdminMode = "review" | "plugins" | "tags";
 
@@ -67,6 +68,7 @@ function errorMessage(error: unknown): string {
 }
 
 export function AdminPage({ session }: { session: SessionUser }) {
+  const client = useQueryClient();
   const canReview = session.canManageReviewPolicy;
   const canManagePlugins = session.canManagePlugins;
   const canManageTags = session.canManageTags;
@@ -76,7 +78,21 @@ export function AdminPage({ session }: { session: SessionUser }) {
     ...(canManageTags ? ["tags" as const] : [])
   ];
   const [mode, setMode] = useState<AdminMode>(allowedModes[0] ?? "review");
-
+  useEffect(() => {
+    if (!canReview) {
+      client.removeQueries({ queryKey: ["review-policy"] });
+    }
+    if (!canManagePlugins) {
+      client.removeQueries({ queryKey: ["admin-plugins"] });
+    }
+    if (!canManageTags) {
+      client.removeQueries({ queryKey: ["admin-tag-catalog"] });
+    }
+    const fallbackMode = canReview ? "review" : canManagePlugins ? "plugins" : canManageTags ? "tags" : null;
+    if (fallbackMode !== null && !allowedModes.includes(mode)) {
+      setMode(fallbackMode);
+    }
+  }, [canManagePlugins, canManageTags, canReview, client, mode, session.id]);
   if (!canReview && !canManagePlugins && !canManageTags) {
     return (
       <section className="admin-page admin-no-access">
@@ -145,11 +161,19 @@ export function AdminPage({ session }: { session: SessionUser }) {
         </div>
       ) : null}
 
-      {mode === "review" && canReview ? <ReviewPolicySection /> : null}
-      {mode === "plugins" && canManagePlugins ? (
-        <PluginSection onOpenReviewPolicy={canReview ? () => setMode("review") : undefined} />
+      {mode === "review" && canReview ? (
+        <ReviewPolicySection key={session.id} currentUserId={session.id} />
       ) : null}
-      {mode === "tags" && canManageTags ? <TagCatalogAdmin /> : null}
+      {mode === "plugins" && canManagePlugins ? (
+        <PluginSection
+          key={session.id}
+          currentUserId={session.id}
+          onOpenReviewPolicy={canReview ? () => setMode("review") : undefined}
+        />
+      ) : null}
+      {mode === "tags" && canManageTags ? (
+        <TagCatalogAdmin key={session.id} currentUserId={session.id} />
+      ) : null}
     </section>
   );
 }
@@ -170,16 +194,33 @@ function reviewDraftFrom(view: ReviewPolicyView): ReviewDraft {
   };
 }
 
-function ReviewPolicySection() {
+function ReviewPolicySection({ currentUserId }: { currentUserId: string }) {
   const client = useQueryClient();
-  const policy = useQuery({
-    queryKey: ["review-policy"],
-    queryFn: getReviewPolicy,
-    retry: false
-  });
   const [draft, setDraft] = useState<ReviewDraft | null>(null);
   const [conflict, setConflict] = useState(false);
   const [reloading, setReloading] = useState(false);
+  const [accessDenied, setAccessDenied] = useState(false);
+  const policy = useQuery({
+    queryKey: ["review-policy", currentUserId],
+    queryFn: getReviewPolicy,
+    retry: false,
+    enabled: !accessDenied
+  });
+  const queryAccessDenied = policy.isError && isAccessBoundaryError(policy.error);
+  useEffect(() => {
+    if (!queryAccessDenied) {
+      return;
+    }
+    setAccessDenied(true);
+    setDraft(null);
+    setConflict(false);
+    client.removeQueries({ queryKey: ["review-policy", currentUserId], exact: true });
+  }, [client, currentUserId, queryAccessDenied]);
+  useEffect(() => {
+    setAccessDenied(false);
+    setDraft(null);
+    setConflict(false);
+  }, [currentUserId]);
 
   useEffect(() => {
     if (policy.data !== undefined && draft === null) {
@@ -195,16 +236,34 @@ function ReviewPolicySection() {
         expectedRevision: value.revision
       }),
     onSuccess: (result) => {
-      client.setQueryData(["review-policy"], result);
+      client.setQueryData(["review-policy", currentUserId], result);
       setDraft(reviewDraftFrom(result));
       setConflict(false);
     },
     onError: (error) => {
+      if (isAccessBoundaryError(error)) {
+        setAccessDenied(true);
+        setDraft(null);
+        setConflict(false);
+        client.removeQueries({ queryKey: ["review-policy", currentUserId], exact: true });
+        return;
+      }
       if (error instanceof ApiError && error.status === 409) {
         setConflict(true);
       }
     }
   });
+  if (accessDenied || queryAccessDenied) {
+    return (
+      <div className="plain-panel admin-load-error" role="alert">
+        <ShieldAlert size={20} aria-hidden="true" />
+        <div>
+          <h2>审核规则不存在</h2>
+          <p>设置不存在或当前账号不能访问。</p>
+        </div>
+      </div>
+    );
+  }
 
   if (policy.isError && policy.data === undefined) {
     return (
@@ -385,14 +444,35 @@ function ReviewPolicySection() {
   );
 }
 
-function PluginSection({ onOpenReviewPolicy }: { onOpenReviewPolicy?: (() => void) | undefined }) {
+function PluginSection({
+  currentUserId,
+  onOpenReviewPolicy
+}: {
+  currentUserId: string;
+  onOpenReviewPolicy?: (() => void) | undefined;
+}) {
   const client = useQueryClient();
-  const plugins = useQuery({
-    queryKey: ["admin-plugins"],
-    queryFn: listAdminPlugins,
-    retry: false
-  });
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [accessDenied, setAccessDenied] = useState(false);
+  const plugins = useQuery({
+    queryKey: ["admin-plugins", currentUserId],
+    queryFn: listAdminPlugins,
+    retry: false,
+    enabled: !accessDenied
+  });
+  const queryAccessDenied = plugins.isError && isAccessBoundaryError(plugins.error);
+  useEffect(() => {
+    if (!queryAccessDenied) {
+      return;
+    }
+    setAccessDenied(true);
+    setSelectedId(null);
+    client.removeQueries({ queryKey: ["admin-plugins", currentUserId], exact: true });
+  }, [client, currentUserId, queryAccessDenied]);
+  useEffect(() => {
+    setAccessDenied(false);
+    setSelectedId(null);
+  }, [currentUserId]);
 
   useEffect(() => {
     const items = plugins.data?.items ?? [];
@@ -400,6 +480,17 @@ function PluginSection({ onOpenReviewPolicy }: { onOpenReviewPolicy?: (() => voi
       setSelectedId(items[0]?.id ?? null);
     }
   }, [plugins.data, selectedId]);
+  if (accessDenied || queryAccessDenied) {
+    return (
+      <div className="plain-panel admin-load-error" role="alert">
+        <ShieldAlert size={20} aria-hidden="true" />
+        <div>
+          <h2>插件设置不存在</h2>
+          <p>设置不存在或当前账号不能访问。</p>
+        </div>
+      </div>
+    );
+  }
 
   if (plugins.isLoading) {
     return (
@@ -437,9 +528,12 @@ function PluginSection({ onOpenReviewPolicy }: { onOpenReviewPolicy?: (() => voi
 
   const selected = plugins.data.items.find((plugin) => plugin.id === selectedId);
   const replacePlugin = (next: AdminPlugin) => {
-    client.setQueryData<AdminPluginListResponse>(["admin-plugins"], (current) => ({
-      items: (current?.items ?? []).map((plugin) => (plugin.id === next.id ? next : plugin))
-    }));
+    client.setQueryData<AdminPluginListResponse>(
+      ["admin-plugins", currentUserId],
+      (current) => ({
+        items: (current?.items ?? []).map((plugin) => (plugin.id === next.id ? next : plugin))
+      })
+    );
   };
   const reloadPlugin = async (pluginId: string): Promise<AdminPlugin | undefined> => {
     const result = await plugins.refetch();
@@ -479,6 +573,11 @@ function PluginSection({ onOpenReviewPolicy }: { onOpenReviewPolicy?: (() => voi
           plugin={selected}
           onSaved={replacePlugin}
           onReload={reloadPlugin}
+          onAccessDenied={() => {
+            setAccessDenied(true);
+            setSelectedId(null);
+            client.removeQueries({ queryKey: ["admin-plugins", currentUserId], exact: true });
+          }}
           onOpenReviewPolicy={onOpenReviewPolicy}
         />
       ) : null}
@@ -490,11 +589,13 @@ function PluginEditor({
   plugin,
   onSaved,
   onReload,
-  onOpenReviewPolicy
+  onAccessDenied,
+  onOpenReviewPolicy,
 }: {
   plugin: AdminPlugin;
   onSaved: (plugin: AdminPlugin) => void;
   onReload: (pluginId: string) => Promise<AdminPlugin | undefined>;
+  onAccessDenied: () => void;
   onOpenReviewPolicy?: (() => void) | undefined;
 }) {
   const [saved, setSaved] = useState(plugin);
@@ -523,6 +624,12 @@ function PluginEditor({
       resetFrom(result);
     },
     onError: (error) => {
+      if (isAccessBoundaryError(error)) {
+        setSecretValues({});
+        setClearSecrets([]);
+        onAccessDenied();
+        return;
+      }
       if (error instanceof ApiError && error.status === 409) {
         setConflict(true);
       }

@@ -156,7 +156,7 @@ describe("知识点目录后台", () => {
     };
     api.listManagedTagCatalog.mockResolvedValueOnce(catalog).mockResolvedValueOnce(movedCatalog);
     api.updateTagCatalogItem.mockResolvedValue({ version: 8 });
-    const view = mount(<TagCatalogAdmin />);
+    const view = mount(<TagCatalogAdmin currentUserId="user-1" />);
 
     await waitFor(() => expect(view.textContent).toContain("目录版本 7"));
     await click(button(view, "图论"));
@@ -187,7 +187,7 @@ describe("知识点目录后台", () => {
     const refreshed: ManagedTagCatalogResponse = { ...catalog, version: 9 };
     api.listManagedTagCatalog.mockResolvedValueOnce(catalog).mockResolvedValueOnce(refreshed);
     api.updateTagCatalogItem.mockRejectedValue(new ApiError("版本冲突", 409));
-    const view = mount(<TagCatalogAdmin />);
+    const view = mount(<TagCatalogAdmin currentUserId="user-1" />);
 
     await waitFor(() => expect(view.textContent).toContain("目录版本 7"));
     const name = view.querySelector<HTMLInputElement>(".tag-admin-editor .tag-admin-form-grid input:not([type=number])");
@@ -226,7 +226,7 @@ describe("知识点目录后台", () => {
       version: 8,
       aliasId: "88888888-8888-4888-8888-888888888888",
     });
-    const view = mount(<TagCatalogAdmin />);
+    const view = mount(<TagCatalogAdmin currentUserId="user-1" />);
 
     await waitFor(() => expect(view.textContent).toContain("目录版本 7"));
     await click(button(view, "图论"));
@@ -282,7 +282,7 @@ describe("知识点目录后台", () => {
       },
     });
     api.confirmTagDeactivation.mockResolvedValue({ version: 8 });
-    const view = mount(<TagCatalogAdmin />);
+    const view = mount(<TagCatalogAdmin currentUserId="user-1" />);
 
     await waitFor(() => expect(view.textContent).toContain("目录版本 7"));
     await click(button(view, "图论"));
@@ -325,7 +325,7 @@ describe("知识点目录后台", () => {
       .mockResolvedValueOnce(catalog)
       .mockImplementationOnce(async () => ({ ...catalog, version: 8, items: [...catalog.items, createdCategory] }));
     api.createTagCatalogItem.mockResolvedValue({ version: 8 });
-    const view = mount(<TagCatalogAdmin />);
+    const view = mount(<TagCatalogAdmin currentUserId="user-1" />);
 
     await waitFor(() => expect(view.textContent).toContain("目录版本 7"));
     await click(button(view, "新增分类"));
@@ -373,7 +373,7 @@ describe("知识点目录后台", () => {
     api.createTagAlias.mockResolvedValue({ version: 8, aliasId });
     api.updateTagAlias.mockResolvedValue({ version: 9 });
     api.deleteTagAlias.mockResolvedValue({ version: 10 });
-    const view = mount(<TagCatalogAdmin />);
+    const view = mount(<TagCatalogAdmin currentUserId="user-1" />);
 
     await waitFor(() => expect(view.textContent).toContain("目录版本 7"));
     await click(button(view, "图论"));
@@ -446,7 +446,7 @@ describe("知识点目录后台", () => {
       });
     api.confirmTagDeactivation.mockResolvedValue({ version: 8 });
     api.updateTagCatalogItem.mockResolvedValue({ version: 9 });
-    const view = mount(<TagCatalogAdmin />);
+    const view = mount(<TagCatalogAdmin currentUserId="user-1" />);
 
     await waitFor(() => expect(view.textContent).toContain("目录版本 7"));
     await click(button(view, "预览停用影响"));
