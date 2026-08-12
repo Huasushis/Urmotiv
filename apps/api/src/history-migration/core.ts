@@ -132,11 +132,60 @@ const preparationCompleteSchema = z
   })
   .strict();
 
+/**
+ * 传输层捕获的终止类别。只区分可在线/离线确定的终止原因：
+ * - clean_eof：读取器正常结束，全部字节已收到。
+ * - partial_eof：读取器提前结束（HTTP 连接中断），已收到部分字节。
+ * - aborted：请求被 AbortController 或父信号明确取消。
+ * - limit_exceeded：超过字节上限，只保留已收到的前缀。
+ */
+export type CapturedTransportTermination =
+  | "clean_eof"
+  | "partial_eof"
+  | "aborted"
+  | "limit_exceeded";
+
+/**
+ * 在线请求期间捕获的传输证据描述符。绑定到确切解析器版本、尝试编号、
+ * HTTP 状态码、仅解析器相关头部（content-type/content-length）、媒体类型、
+ * 精确捕获的响应体字节、字节计数、终止类别和已净化的失败类别。
+ * 绝不包含正文内容之外的私有值；失败类别只来自固定枚举。
+ * Stage A 不做文件系统持久化——只通过证据接收器传递不透明绑定。
+ */
+export interface CapturedTransport {
+  readonly attempt: number;
+  readonly parserVersion: string;
+  readonly status: number;
+  readonly contentType: string;
+  readonly contentLength: string | null;
+  readonly mediaKind: "event_stream" | "json" | "unknown";
+  readonly body: Uint8Array;
+  readonly byteCount: number;
+  readonly termination: CapturedTransportTermination;
+  readonly failureKind: HistoryNormalizationFailureKind | null;
+}
+
+/**
+ * 证据接收器返回的不透明绑定描述符。core 持久化层（未来阶段）用它绑定
+ * 传输证据到 prepare/repair 状态，不暴露正文。
+ */
+export interface EvidenceDescriptor {
+  readonly descriptorDigest: string;
+}
+
 export interface HistoryNormalizerInput {
   readonly sourceId: string;
   readonly text: string;
   /** 传输层每次真正发请求前调用并等待，用于同步登记唯一请求身份。 */
   readonly beforeRequest?: (attempt: number) => Promise<void>;
+  /**
+   * 在线请求终端失败时调用的证据接收器。在净化后的 HistoryNormalizationError
+   * 逃逸之前等待。接收器错误会取代原始终端失败，且不携带正文。成功时返回
+   * 不透明绑定描述符，供未来 core 持久化层使用。Stage A 不做文件系统持久化。
+   */
+  readonly captureTransportEvidence?: (
+    transport: CapturedTransport,
+  ) => Promise<EvidenceDescriptor>;
 }
 
 export interface HistoryNormalizer {

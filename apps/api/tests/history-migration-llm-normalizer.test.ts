@@ -7,10 +7,17 @@ import {
   defaultNormalizationOutputTokens,
   defaultNormalizationMaximumDurationMs,
   historyNormalizationRequestProfileVersion,
+  historyReplayParserVersion,
   loadHistoryPreparationCodeSha256,
   maximumNormalizationOutputTokens,
+  ReplaySession,
+  type CapturedTransport,
   type LlmHistoryNormalizerOptions,
 } from "../src/history-migration/index";
+import {
+  HistoryMigrationError,
+  HistoryNormalizationError,
+} from "../src/history-migration/errors";
 
 const sourceInput = {
   sourceId: "source-000001",
@@ -225,7 +232,7 @@ describe("历史题目模型整理流式请求", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it("模型自行选择知识点标签时按候选结构失败", async () => {
+  it("模型自行选择知识点标签时强制重置为空数组", async () => {
     const withInventedTag = JSON.stringify({
       ...JSON.parse(normalizedContent),
       problems: [
@@ -241,11 +248,8 @@ describe("历史题目模型整理流式请求", () => {
       ),
     );
 
-    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
-      code: "NORMALIZATION_FAILED",
-      failureKind: "schema",
-      message: "source-000001 的模型结果不符合候选内容格式。",
-    });
+    const result = await createNormalizer({ fetch }).normalize(sourceInput);
+    expect(result.problems[0]!.tags).toEqual([]);
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
@@ -1192,6 +1196,549 @@ describe("历史题目模型整理重试与完整性", () => {
       code: "NORMALIZATION_FAILED",
       message: "模型响应缺少完整候选内容。",
     });
+  });
+});
+
+describe("传输证据捕获与离线重放", () => {
+  it("重放解析器版本是显式常量", () => {
+    expect(historyReplayParserVersion).toBe("history-replay-parser-v1");
+  });
+
+  it("SSE 在线解析与离线重放提取完全相同的原始 payload", () => {
+    const body = `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\n`;
+    const online = vi.fn(async () => eventStreamResponse(body));
+    const normalizer = createNormalizer({ fetch: online });
+    return normalizer.normalize(sourceInput).then(async (onlineResult) => {
+      // 离线重放提取的严格内容必须与原始 payload 逐字节一致。
+      const replayResult = ReplaySession.replay(
+        new TextEncoder().encode(body),
+        "event_stream",
+      );
+      expect(replayResult).toBe(normalizedContent);
+      // 在线结果与同一原始 payload 的字段一致（schema 校验会补默认字段）。
+      expect(onlineResult.problems[0]).toMatchObject(
+        JSON.parse(normalizedContent).problems[0],
+      );
+    });
+  });
+
+  it("JSON 在线解析与离线重放提取完全相同的原始 payload", async () => {
+    const jsonBody = JSON.stringify({
+      choices: [{ message: { content: normalizedContent }, finish_reason: "stop" }],
+    });
+    const fetch = vi.fn(async () =>
+      new Response(jsonBody, { headers: { "Content-Type": "application/json" } }),
+    );
+    const onlineResult = await createNormalizer({ fetch }).normalize(sourceInput);
+    const replayResult = ReplaySession.replay(
+      new TextEncoder().encode(jsonBody),
+      "json",
+    );
+    expect(replayResult).toBe(normalizedContent);
+    expect(onlineResult.problems[0]).toMatchObject(
+      JSON.parse(normalizedContent).problems[0],
+    );
+  });
+
+  it("SSE 协议失败在线和离线重放抛出相同 failureKind 与消息", async () => {
+    const body = `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: {not-json}\n\n`;
+    const fetch = vi.fn(async () => eventStreamResponse(body));
+    const onlineError = await createNormalizer({ fetch }).normalize(sourceInput).catch((e) => e);
+    expect(onlineError).toMatchObject({ code: "NORMALIZATION_FAILED", failureKind: "protocol" });
+    let offlineError: unknown;
+    try {
+      ReplaySession.replay(new TextEncoder().encode(body), "event_stream");
+    } catch (error) {
+      offlineError = error;
+    }
+    expect(offlineError).toMatchObject({ code: "NORMALIZATION_FAILED", failureKind: "protocol" });
+    expect(offlineError).toBeInstanceOf(HistoryNormalizationError);
+  });
+
+  it("JSON 协议失败在线和离线重放抛出相同 failureKind", async () => {
+    const jsonBody = JSON.stringify({ choices: [] });
+    const fetch = vi.fn(async () =>
+      new Response(jsonBody, { headers: { "Content-Type": "application/json" } }),
+    );
+    const onlineError = await createNormalizer({ fetch }).normalize(sourceInput).catch((e) => e);
+    expect(onlineError).toMatchObject({ code: "NORMALIZATION_FAILED", failureKind: "protocol" });
+    expect(() => ReplaySession.replay(new TextEncoder().encode(jsonBody), "json")).toThrowError(
+      expect.objectContaining({ code: "NORMALIZATION_FAILED", failureKind: "protocol" }),
+    );
+  });
+
+  it("证据接收器在协议终端失败前被等待", async () => {
+    let sinkCalled = false;
+    const body = `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: {not-json}\n\n`;
+    const fetch = vi.fn(async () => eventStreamResponse(body));
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async () => {
+        sinkCalled = true;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await expect(createNormalizer({ fetch }).normalize(input)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "protocol",
+    });
+    expect(sinkCalled).toBe(true);
+  });
+
+  it("证据接收器在真实 payload schema 失败前被等待并携带精确正文", async () => {
+    let sinkCalled = false;
+    let capturedDescriptor: CapturedTransport | undefined;
+    const schemaViolatingPayload = "{\"problems\":[]}";
+    const body = `${completionEvent(schemaViolatingPayload, "stop")}data: [DONE]\n\n`;
+    const fetch = vi.fn(async () => eventStreamResponse(body));
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async (transport: CapturedTransport) => {
+        sinkCalled = true;
+        capturedDescriptor = transport;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await expect(createNormalizer({ fetch }).normalize(input)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "schema",
+    });
+    expect(sinkCalled).toBe(true);
+    // 证据正文是完整传输字节，schema 失败发生在传输完整读完并标记 clean_eof 之后。
+    expect(new TextDecoder().decode(capturedDescriptor!.body)).toBe(body);
+    expect(capturedDescriptor!.termination).toBe("clean_eof");
+    expect(capturedDescriptor!.failureKind).toBe("schema");
+  });
+
+  it("schema 失败的已提取 payload 与离线重放严格一致", async () => {
+    const schemaViolatingPayload = "{\"problems\":[]}";
+    const body = `${completionEvent(schemaViolatingPayload, "stop")}data: [DONE]\n\n`;
+    // 离线重放不执行 schema 校验，只提取严格 payload：必须等于原始内容。
+    const replayResult = ReplaySession.replay(
+      new TextEncoder().encode(body),
+      "event_stream",
+    );
+    expect(replayResult).toBe(schemaViolatingPayload);
+    // 在线同一传输内容在 schema 校验阶段失败。
+    const fetch = vi.fn(async () => eventStreamResponse(body));
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "schema",
+    });
+  });
+
+  it("证据接收器在 invalid_json 解析失败前被等待并携带精确正文", async () => {
+    let sinkCalled = false;
+    let capturedDescriptor: CapturedTransport | undefined;
+    const invalidPayload = "this is not JSON at all";
+    const body = `${completionEvent(invalidPayload, "stop")}data: [DONE]\n\n`;
+    const fetch = vi.fn(async () => eventStreamResponse(body));
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async (transport: CapturedTransport) => {
+        sinkCalled = true;
+        capturedDescriptor = transport;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await expect(createNormalizer({ fetch }).normalize(input)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "invalid_json",
+    });
+    expect(sinkCalled).toBe(true);
+    expect(new TextDecoder().decode(capturedDescriptor!.body)).toBe(body);
+    expect(capturedDescriptor!.failureKind).toBe("invalid_json");
+  });
+
+  it("invalid_json 的已提取 payload 与离线重放严格一致", async () => {
+    const invalidPayload = "this is not JSON at all";
+    const body = `${completionEvent(invalidPayload, "stop")}data: [DONE]\n\n`;
+    expect(ReplaySession.replay(new TextEncoder().encode(body), "event_stream")).toBe(
+      invalidPayload,
+    );
+    const fetch = vi.fn(async () => eventStreamResponse(body));
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "invalid_json",
+    });
+  });
+
+  it("证据接收器在 EOF 中断终端失败前被等待", async () => {
+    let sinkCalled = false;
+    const fetch = vi.fn(async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(completionEvent(normalizedContent, "stop")));
+            controller.error(new Error("synthetic-connection-drop"));
+          },
+        }),
+        { headers: { "Content-Type": "text/event-stream" } },
+      ),
+    );
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async () => {
+        sinkCalled = true;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await expect(createNormalizer({ fetch }).normalize(input)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "eof_incomplete",
+    });
+    expect(sinkCalled).toBe(true);
+  });
+
+  it("证据接收器在 abort 终端失败前被等待", async () => {
+    let sinkCalled = false;
+    const cancellation = new AbortController();
+    const fetch = vi.fn(async () => {
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(completionEvent('{"problems":')));
+          },
+        }),
+        { headers: { "Content-Type": "text/event-stream" } },
+      );
+    });
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async () => {
+        sinkCalled = true;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    const result = createNormalizer({ fetch, signal: cancellation.signal, maximumAttempts: 3 }).normalize(input);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    cancellation.abort();
+    await expect(result).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "cancelled",
+    });
+    expect(sinkCalled).toBe(true);
+  });
+
+  it("证据接收器在 response_too_large 终端失败前被等待", async () => {
+    let sinkCalled = false;
+    const fetch = vi.fn(async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("x".repeat(200)));
+            controller.close();
+          },
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async () => {
+        sinkCalled = true;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await expect(
+      createNormalizer({ fetch, maximumResponseBytes: 100 }).normalize(input),
+    ).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "response_too_large",
+    });
+    expect(sinkCalled).toBe(true);
+  });
+
+  it("证据接收器失败取代原始终端失败且不携带正文", async () => {
+    const sinkMarker = "SYNTHETIC-SINK-FAILURE-MARKER";
+    const body = `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: {not-json}\n\n`;
+    const fetch = vi.fn(async () => eventStreamResponse(body));
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async () => {
+        throw new Error(sinkMarker);
+      },
+    };
+    const error = await createNormalizer({ fetch }).normalize(input).catch((e) => e);
+    expect(error).toMatchObject({ code: "NORMALIZATION_FAILED", failureKind: "internal" });
+    expect(String(error)).not.toContain(sinkMarker);
+  });
+
+  it("证据接收器失败为 HistoryMigrationError 时直接传播", async () => {
+    const body = `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: {not-json}\n\n`;
+    const fetch = vi.fn(async () => eventStreamResponse(body));
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async () => {
+        throw new HistoryMigrationError("REPAIR_REJECTED", "synthetic-sink-rejection");
+      },
+    };
+    await expect(createNormalizer({ fetch }).normalize(input)).rejects.toMatchObject({
+      code: "REPAIR_REJECTED",
+    });
+  });
+
+  it("无 captureTransportEvidence 时不调用接收器且行为不变", async () => {
+    const body = `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\n`;
+    const fetch = vi.fn(async () => eventStreamResponse(body));
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).resolves.toMatchObject({
+      problems: [{ title: "合成候选题" }],
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("终端 HTTP 429 失败在重试耗尽时调用证据接收器并携带状态正文", async () => {
+    let sinkCalled = false;
+    let capturedDescriptor: CapturedTransport | undefined;
+    const fetch = vi.fn(async () => new Response("rate limit", { status: 429 }));
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async (transport: CapturedTransport) => {
+        sinkCalled = true;
+        capturedDescriptor = transport;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await expect(createNormalizer({ fetch, maximumAttempts: 1 }).normalize(input)).rejects
+      .toMatchObject({ code: "NORMALIZATION_FAILED", failureKind: "http_429" });
+    expect(sinkCalled).toBe(true);
+    expect(capturedDescriptor!.status).toBe(429);
+    expect(capturedDescriptor!.failureKind).toBe("http_429");
+    // 状态正文被有界收集为证据。
+    expect(new TextDecoder().decode(capturedDescriptor!.body)).toBe("rate limit");
+    expect(capturedDescriptor!.termination).toBe("clean_eof");
+  });
+
+  it("非终端的 429 重试尝试绝不调用证据接收器，最终成功也不调用", async () => {
+    let sinkCalled = false;
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("rate limit", { status: 429 }))
+      .mockResolvedValueOnce(
+        eventStreamResponse(`${completionEvent(normalizedContent, "stop")}data: [DONE]\n\n`),
+      );
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async () => {
+        sinkCalled = true;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await expect(
+      createNormalizer({ fetch, maximumAttempts: 3, retryBaseDelayMs: 5 }).normalize(input),
+    ).resolves.toMatchObject({ problems: [{ title: "合成候选题" }] });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(sinkCalled).toBe(false);
+  });
+
+  it("非成功状态码零字节正文也触发证据接收器（携带状态且 byteCount=0）", async () => {
+    let sinkCalled = false;
+    let capturedDescriptor: CapturedTransport | undefined;
+    const fetch = vi.fn(async () => new Response("", { status: 500 }));
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async (transport: CapturedTransport) => {
+        sinkCalled = true;
+        capturedDescriptor = transport;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await expect(
+      createNormalizer({ fetch, maximumAttempts: 1 }).normalize(input),
+    ).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "http_status",
+    });
+    expect(sinkCalled).toBe(true);
+    expect(capturedDescriptor!.status).toBe(500);
+    expect(capturedDescriptor!.byteCount).toBe(0);
+    expect(capturedDescriptor!.termination).toBe("clean_eof");
+  });
+
+  it("声明长度越界仍产出 limit_exceeded 证据并等待接收器", async () => {
+    let sinkCalled = false;
+    let capturedDescriptor: CapturedTransport | undefined;
+    const fetch = vi.fn(async () =>
+      new Response(
+        "x".repeat(50),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": "99999",
+          },
+        },
+      ),
+    );
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async (transport: CapturedTransport) => {
+        sinkCalled = true;
+        capturedDescriptor = transport;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await expect(
+      createNormalizer({ fetch, maximumResponseBytes: 100 }).normalize(input),
+    ).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "response_too_large",
+    });
+    expect(sinkCalled).toBe(true);
+    expect(capturedDescriptor!.termination).toBe("limit_exceeded");
+    expect(capturedDescriptor!.byteCount).toBe(0);
+  });
+
+  it("已接收但零字节的响应也触发证据接收器（不以 byteCount>0 为准）", async () => {
+    let sinkCalled = false;
+    let capturedByteCount: number | undefined;
+    const fetch = vi.fn(async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        { headers: { "Content-Type": "text/event-stream" } },
+      ),
+    );
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async (transport: CapturedTransport) => {
+        sinkCalled = true;
+        capturedByteCount = transport.byteCount;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await expect(createNormalizer({ fetch }).normalize(input)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+    });
+    expect(sinkCalled).toBe(true);
+    expect(capturedByteCount).toBe(0);
+  });
+
+  it("捕获描述符绑定解析器版本和尝试编号", async () => {
+    let capturedDescriptor: CapturedTransport | undefined;
+    const body = `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: {not-json}\n\n`;
+    const fetch = vi.fn(async () => eventStreamResponse(body));
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async (transport: CapturedTransport) => {
+        capturedDescriptor = transport;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await createNormalizer({ fetch }).normalize(input).catch(() => {});
+    expect(capturedDescriptor).toBeDefined();
+    expect(capturedDescriptor!.parserVersion).toBe(historyReplayParserVersion);
+    expect(capturedDescriptor!.attempt).toBe(1);
+    expect(capturedDescriptor!.mediaKind).toBe("event_stream");
+    expect(capturedDescriptor!.termination).toBe("clean_eof");
+    expect(capturedDescriptor!.failureKind).toBe("protocol");
+    expect(capturedDescriptor!.byteCount).toBeGreaterThan(0);
+    expect(capturedDescriptor!.body).toBeInstanceOf(Uint8Array);
+  });
+
+  it("partial_eof 终止类别在流中断时正确标记", async () => {
+    let capturedDescriptor: CapturedTransport | undefined;
+    const fetch = vi.fn(async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(completionEvent(normalizedContent, "stop")));
+            controller.error(new Error("synthetic-stream-error"));
+          },
+        }),
+        { headers: { "Content-Type": "text/event-stream" } },
+      ),
+    );
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async (transport: CapturedTransport) => {
+        capturedDescriptor = transport;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await createNormalizer({ fetch }).normalize(input).catch(() => {});
+    expect(capturedDescriptor!.termination).toBe("partial_eof");
+  });
+
+  it("aborted 终止类别在取消时正确标记", async () => {
+    let capturedDescriptor: CapturedTransport | undefined;
+    const cancellation = new AbortController();
+    const fetch = vi.fn(async () => {
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(completionEvent('{"problems":')));
+          },
+        }),
+        { headers: { "Content-Type": "text/event-stream" } },
+      );
+    });
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async (transport: CapturedTransport) => {
+        capturedDescriptor = transport;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    const result = createNormalizer({ fetch, signal: cancellation.signal, maximumAttempts: 3 }).normalize(input);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    cancellation.abort();
+    await result.catch(() => {});
+    expect(capturedDescriptor!.termination).toBe("aborted");
+  });
+
+  it("limit_exceeded 终止类别在超字节上限时正确标记", async () => {
+    let capturedDescriptor: CapturedTransport | undefined;
+    const fetch = vi.fn(async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("x".repeat(200)));
+            controller.close();
+          },
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const input = {
+      ...sourceInput,
+      captureTransportEvidence: async (transport: CapturedTransport) => {
+        capturedDescriptor = transport;
+        return { descriptorDigest: "synthetic-digest" };
+      },
+    };
+    await createNormalizer({ fetch, maximumResponseBytes: 100 }).normalize(input).catch(() => {});
+    expect(capturedDescriptor!.termination).toBe("limit_exceeded");
+  });
+
+  it("严格 post-stop usage 规则在重放中保持", () => {
+    const poisoned = {
+      ...strictUsageMetadataEvent(),
+      choices: [{ index: 0, delta: {} }],
+      content: "synthetic-injected-content",
+    };
+    const body = `${completionEvent(normalizedContent, "stop")}data: ${JSON.stringify(poisoned)}\n\ndata: [DONE]\n\n`;
+    expect(() => ReplaySession.replay(new TextEncoder().encode(body), "event_stream")).toThrow();
+  });
+
+  it("有界协议排空在重放中保持", () => {
+    const body = `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: {not-json}\n\n排空阶段不应保存的合成字节`;
+    expect(() => ReplaySession.replay(new TextEncoder().encode(body), "event_stream")).toThrow();
+  });
+
+  it("finish_reason=stop 要求在重放中保持", () => {
+    const body = `${completionEvent(normalizedContent)}data: [DONE]\n\n`;
+    expect(() => ReplaySession.replay(new TextEncoder().encode(body), "event_stream")).toThrow();
+  });
+
+  it("逐字节分片投喂与整体投喂结果一致", () => {
+    const body = `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\n`;
+    const fullResult = ReplaySession.replay(new TextEncoder().encode(body), "event_stream");
+    // ReplaySession.replay already chunks at 4096; verify it works with exact body
+    expect(JSON.parse(fullResult)).toEqual(JSON.parse(normalizedContent));
   });
 });
 

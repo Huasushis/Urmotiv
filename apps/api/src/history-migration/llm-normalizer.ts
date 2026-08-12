@@ -3,6 +3,9 @@ import { readFile } from "node:fs/promises";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
+  CapturedTransport,
+  CapturedTransportTermination,
+  EvidenceDescriptor,
   HistoryNormalizer,
   HistoryNormalizerInput,
   HistoryPreparationExecutionIdentity,
@@ -49,6 +52,7 @@ export const maximumNormalizationOutputTokens = 65_536;
 export const defaultNormalizationOutputTokens = maximumNormalizationOutputTokens;
 export const historyNormalizationRequestProfileVersion =
   "history-normalization-request-v2" as const;
+export const historyReplayParserVersion = "history-replay-parser-v1" as const;
 export const defaultNormalizationFirstOutputTimeoutMs = 30 * 60 * 1_000;
 export const defaultNormalizationOutputIdleTimeoutMs = 10 * 60 * 1_000;
 export const defaultNormalizationMaximumDurationMs = 4 * 60 * 60 * 1_000;
@@ -128,15 +132,23 @@ export function createLlmHistoryNormalizer(
       ),
     },
     async normalize(input: HistoryNormalizerInput): Promise<NormalizedHistoryOutput> {
-      const response = await requestNormalization(
+      const requestResult = await requestNormalization(
         endpoint,
         options.apiKey,
         model,
         input,
         runtime,
       );
-      const parsed = normalizedHistoryOutputSchema.safeParse(response);
+      const sanitized = coerceDisallowedTagsArray(requestResult.payload);
+      const parsed = normalizedHistoryOutputSchema.safeParse(sanitized);
       if (!parsed.success) {
+        // 真实 payload 的 schema 失败也在净化后的拒绝逃逸前等待证据接收器。
+        await sinkCapturedTransport(
+          input,
+          input.sourceId,
+          requestResult.capture,
+          "schema",
+        );
         throw normalizationFailure("schema", `${input.sourceId} 的模型结果不符合候选内容格式。`);
       }
       return parsed.data;
@@ -164,7 +176,7 @@ async function requestNormalization(
   model: string,
   input: HistoryNormalizerInput,
   runtime: NormalizationRuntime,
-): Promise<unknown> {
+): Promise<RequestNormalizationResult> {
   for (let attempt = 1; attempt <= runtime.maximumAttempts; attempt += 1) {
     const attemptResult = await requestNormalizationOnce(
       endpoint,
@@ -177,8 +189,16 @@ async function requestNormalization(
     );
     if (attemptResult.kind === "content") {
       try {
-        return JSON.parse(attemptResult.content.trim()) as unknown;
+        const payload = JSON.parse(attemptResult.content.trim()) as unknown;
+        return { payload, capture: attemptResult.capture };
       } catch {
+        // 成功传输但 JSON 解析失败：仍等待证据接收器后再抛出净化后的失败。
+        await sinkCapturedTransport(
+          input,
+          input.sourceId,
+          attemptResult.capture,
+          "invalid_json",
+        );
         throw normalizationFailure(
           "invalid_json",
           `${input.sourceId} 的模型响应不包含有效候选 JSON。`,
@@ -186,6 +206,13 @@ async function requestNormalization(
       }
     }
     if (attempt === runtime.maximumAttempts) {
+      // 重试耗尽时保留最后一次 429 尝试的证据并等待接收器。
+      await sinkCapturedTransport(
+        input,
+        input.sourceId,
+        attemptResult.capture,
+        "http_429",
+      );
       throw normalizationFailure("http_429", `${input.sourceId} 的模型服务持续返回 HTTP 429。`);
     }
     await waitBeforeRateLimitRetry(
@@ -197,9 +224,52 @@ async function requestNormalization(
   throw normalizationFailure("internal", `${input.sourceId} 的模型请求失败。`);
 }
 
+type CapturedAttempt = {
+  readonly collector: TransportCollector;
+  readonly attempt: number;
+  readonly status: number;
+  readonly contentType: string;
+  readonly contentLength: string | null;
+  readonly mediaKind: "event_stream" | "json" | "unknown";
+};
+
 type NormalizationAttemptResult =
-  | { readonly kind: "content"; readonly content: string }
-  | { readonly kind: "rate_limited" };
+  | { readonly kind: "content"; readonly content: string; readonly capture: CapturedAttempt }
+  | { readonly kind: "rate_limited"; readonly capture: CapturedAttempt };
+
+type RequestNormalizationResult = {
+  readonly payload: unknown;
+  readonly capture: CapturedAttempt;
+};
+
+/**
+ * 在净化后的终端失败逃逸之前等待证据接收器。接收器失败取代原始终端失败，
+ * 且不携带任何正文；HistoryMigrationError 直接传播，其余错误包装为 internal。
+ */
+async function sinkCapturedTransport(
+  input: HistoryNormalizerInput,
+  sourceId: string,
+  capture: CapturedAttempt,
+  failureKind: HistoryNormalizationFailureKind | null,
+): Promise<void> {
+  if (input.captureTransportEvidence === undefined) return;
+  const descriptor = capture.collector.buildDescriptor(
+    capture.attempt,
+    capture.status,
+    capture.contentType,
+    capture.contentLength,
+    capture.mediaKind,
+    failureKind,
+  );
+  try {
+    await input.captureTransportEvidence(descriptor);
+  } catch (sinkError) {
+    if (sinkError instanceof HistoryMigrationError) {
+      throw sinkError;
+    }
+    throw normalizationFailure("internal", `${sourceId} 的传输证据接收器失败。`);
+  }
+}
 
 async function requestNormalizationOnce(
   endpoint: URL,
@@ -227,6 +297,11 @@ async function requestNormalizationOnce(
   };
   runtime.signal?.addEventListener("abort", cancelFromParent, { once: true });
   let responseReceived = false;
+  let responseCollector: TransportCollector | undefined;
+  let responseStatus = 0;
+  let responseContentType = "";
+  let responseContentLength: string | null = null;
+  let responseMediaKind: "event_stream" | "json" | "unknown" = "unknown";
 
   try {
     const requestProfile = normalizationRequestProfile(runtime.maximumOutputTokens);
@@ -257,11 +332,36 @@ async function requestNormalizationOnce(
       controller.signal,
     );
     responseReceived = true;
+    responseStatus = response.status;
+    responseContentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+    responseContentLength = response.headers.get("content-length");
+    responseMediaKind = responseContentType.includes("text/event-stream")
+      ? "event_stream"
+      : "json";
+    // 只要收到响应就建立收集器：状态失败、声明长度越界、零字节响应都必须
+    // 能产出有界证据（可能为零字节），不以 byteCount > 0 为准。
+    responseCollector = new TransportCollector();
 
     if (!response.ok) {
-      cancelResponseBodyWithoutReading(response, controller);
+      // 有界收集状态正文作为证据，不解析也不无界读取。
+      await collectBoundedStatusBody(
+        response,
+        controller,
+        runtime.maximumResponseBytes,
+        responseCollector,
+      );
       if (response.status === 429) {
-        return { kind: "rate_limited" };
+        return {
+          kind: "rate_limited",
+          capture: {
+            collector: responseCollector,
+            attempt,
+            status: responseStatus,
+            contentType: responseContentType,
+            contentLength: responseContentLength,
+            mediaKind: responseMediaKind,
+          },
+        };
       }
       throw normalizationFailure(
         response.status === 499 ? "http_499" : "http_status",
@@ -269,42 +369,81 @@ async function requestNormalizationOnce(
       );
     }
 
-    const content = await readSuccessfulResponse(
+    assertDeclaredResponseSize(
+      response,
+      controller,
+      runtime.maximumResponseBytes,
+      responseCollector,
+    );
+    const content = await readResponseWithCollector(
       response,
       controller,
       watchdog,
       runtime.maximumResponseBytes,
+      responseMediaKind,
+      responseCollector,
     );
-    return { kind: "content", content };
+    return {
+      kind: "content",
+      content,
+      capture: {
+        collector: responseCollector,
+        attempt,
+        status: responseStatus,
+        contentType: responseContentType,
+        contentLength: responseContentLength,
+        mediaKind: responseMediaKind,
+      },
+    };
   } catch (error) {
     const timeoutKind = watchdog.timeoutKind();
+    let terminalError: HistoryNormalizationError;
     if (timeoutKind === "first_output") {
-      throw normalizationFailure(
+      terminalError = normalizationFailure(
         "first_output_timeout",
         `${sourceId} 的模型请求在首段有效输出前超时。`,
       );
-    }
-    if (timeoutKind === "output_idle") {
-      throw normalizationFailure("output_idle_timeout", `${sourceId} 的模型输出长时间没有继续。`);
-    }
-    if (timeoutKind === "maximum_duration") {
-      throw normalizationFailure(
+    } else if (timeoutKind === "output_idle") {
+      terminalError = normalizationFailure(
+        "output_idle_timeout",
+        `${sourceId} 的模型输出长时间没有继续。`,
+      );
+    } else if (timeoutKind === "maximum_duration") {
+      terminalError = normalizationFailure(
         "maximum_duration_timeout",
         `${sourceId} 的模型请求超过最终保护时长。`,
       );
+    } else if (isSignalAborted(runtime.signal)) {
+      terminalError = cancelledRequest(sourceId);
+    } else if (error instanceof HistoryNormalizationError) {
+      terminalError = error as HistoryNormalizationError;
+    } else {
+      terminalError = normalizationFailure(
+        responseReceived ? "eof_incomplete" : "connection",
+        responseReceived
+          ? `${sourceId} 的模型响应在完整结束前中断。`
+          : `${sourceId} 的模型连接失败。`,
+      );
     }
-    if (isSignalAborted(runtime.signal)) {
-      throw cancelledRequest(sourceId);
+
+    // 在净化后的终端失败逃逸之前，等待证据接收器。
+    if (responseCollector !== undefined) {
+      await sinkCapturedTransport(
+        input,
+        sourceId,
+        {
+          collector: responseCollector,
+          attempt,
+          status: responseStatus,
+          contentType: responseContentType,
+          contentLength: responseContentLength,
+          mediaKind: responseMediaKind,
+        },
+        terminalError.failureKind,
+      );
     }
-    if (error instanceof HistoryMigrationError) {
-      throw error;
-    }
-    throw normalizationFailure(
-      responseReceived ? "eof_incomplete" : "connection",
-      responseReceived
-        ? `${sourceId} 的模型响应在完整结束前中断。`
-        : `${sourceId} 的模型连接失败。`,
-    );
+
+    throw terminalError;
   } finally {
     runtime.signal?.removeEventListener("abort", cancelFromParent);
     watchdog.close();
@@ -415,80 +554,50 @@ class NormalizationOutputWatchdog {
   }
 }
 
-async function readSuccessfulResponse(
+/**
+ * 使用共享 ReplaySession 读取响应体，将原始字节同时投喂到外层 TransportCollector。
+ * 解析器/协议/EOF/abort/limit 失败时 collector 仍然可达（由调用方持有）。
+ * 不把字节附加到错误对象上。
+ */
+async function readResponseWithCollector(
   response: Response,
   requestController: AbortController,
   watchdog: NormalizationOutputWatchdog,
   maximumBytes: number,
-): Promise<string> {
-  assertDeclaredResponseSize(response, requestController, maximumBytes);
-  const mediaType = response.headers.get("content-type")?.toLowerCase() ?? "";
-  if (mediaType.includes("text/event-stream")) {
-    return readEventStream(response, requestController, watchdog, maximumBytes);
-  }
-  const responseText = await readBoundedJsonResponseText(
-    response,
-    requestController,
-    watchdog,
-    maximumBytes,
-  );
-  let payload: unknown;
-  try {
-    payload = JSON.parse(responseText) as unknown;
-  } catch {
-    throw normalizationFailure("protocol", "模型响应不是完整的 JSON。");
-  }
-  return readCompletedResponseContent(payload);
-}
-
-function assertDeclaredResponseSize(
-  response: Response,
-  requestController: AbortController,
-  maximumBytes: number,
-): void {
-  const declaredLength = response.headers.get("content-length");
-  if (
-    declaredLength !== null &&
-    /^[0-9]+$/.test(declaredLength) &&
-    Number(declaredLength) > maximumBytes
-  ) {
-    cancelResponseBodyWithoutReading(response, requestController);
-    throw responseTooLarge();
-  }
-}
-
-async function readBoundedJsonResponseText(
-  response: Response,
-  requestController: AbortController,
-  watchdog: NormalizationOutputWatchdog,
-  maximumBytes: number,
+  mediaKind: "event_stream" | "json",
+  collector: TransportCollector,
 ): Promise<string> {
   if (response.body === null) {
     throw interruptedResponse();
   }
   const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
+  const session = new ReplaySession(mediaKind);
   let readerFinished = false;
   try {
     for (;;) {
       const chunk = await waitForOrAbort(reader.read(), requestController.signal);
       if (chunk.done) {
         readerFinished = true;
+        collector.markCleanEof();
         break;
       }
-      totalBytes = addResponseChunkSize(
-        totalBytes,
-        chunk.value.byteLength,
-        maximumBytes,
-        reader,
-        requestController,
-      );
-      if (containsNonWhitespaceByte(chunk.value)) {
-        watchdog.receivedValidOutput();
+      if (!collector.addChunk(chunk.value, maximumBytes)) {
+        cancelReaderWithoutReplacingError(reader, requestController);
+        throw responseTooLarge();
       }
-      chunks.push(chunk.value);
+      session.push(chunk.value, watchdog);
     }
+  } catch (error) {
+    if (error instanceof HistoryNormalizationError) {
+      collector.markPartialEof();
+      throw error;
+    }
+    if (requestController.signal.aborted) {
+      collector.markAborted();
+    } else {
+      collector.markPartialEof();
+    }
+    throw error;
   } finally {
     if (!readerFinished) {
       cancelReaderWithoutReplacingError(reader, requestController);
@@ -499,19 +608,77 @@ async function readBoundedJsonResponseText(
       // 已经得到固定结果或固定错误，不再用清理错误替换它。
     }
   }
+  return session.finish(watchdog);
+}
 
-  const bytes = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch {
-    throw normalizationFailure("invalid_utf8", "模型响应不是有效的 UTF-8 文本。");
+function assertDeclaredResponseSize(
+  response: Response,
+  requestController: AbortController,
+  maximumBytes: number,
+  collector: TransportCollector,
+): void {
+  const declaredLength = response.headers.get("content-length");
+  if (
+    declaredLength !== null &&
+    /^[0-9]+$/.test(declaredLength) &&
+    Number(declaredLength) > maximumBytes
+  ) {
+    // 声明长度越界仍是已接收响应：保留有界证据（可能为零字节）并标记
+    // limit_exceeded，然后抛出净化后的失败。
+    collector.markLimitExceeded();
+    cancelResponseBodyWithoutReading(response, requestController);
+    throw responseTooLarge();
   }
 }
+
+/**
+ * 有界收集非成功状态正文作为传输证据，不解析也不无界读取。
+ * 在读取失败/取消时按请求控制器标记终止类别；到达上限即停止读取。
+ */
+async function collectBoundedStatusBody(
+  response: Response,
+  requestController: AbortController,
+  maximumBytes: number,
+  collector: TransportCollector,
+): Promise<void> {
+  if (response.body === null) {
+    collector.markCleanEof();
+    return;
+  }
+  const reader = response.body.getReader();
+  let readerFinished = false;
+  try {
+    for (;;) {
+      const chunk = await waitForOrAbort(reader.read(), requestController.signal);
+      if (chunk.done) {
+        readerFinished = true;
+        collector.markCleanEof();
+        return;
+      }
+      if (!collector.addChunk(chunk.value, maximumBytes)) {
+        cancelReaderWithoutReplacingError(reader, requestController);
+        return;
+      }
+    }
+  } catch (error) {
+    if (requestController.signal.aborted) {
+      collector.markAborted();
+    } else {
+      collector.markPartialEof();
+    }
+    throw error;
+  } finally {
+    if (!readerFinished) {
+      cancelReaderWithoutReplacingError(reader, requestController);
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      // 已经得到固定结果或固定错误，不再用清理错误替换它。
+    }
+  }
+}
+
 
 interface CompletionStreamState {
   content: string;
@@ -520,97 +687,217 @@ interface CompletionStreamState {
   sawDone: boolean;
 }
 
-async function readEventStream(
-  response: Response,
-  requestController: AbortController,
-  watchdog: NormalizationOutputWatchdog,
-  maximumBytes: number,
-): Promise<string> {
-  if (response.body === null) {
-    throw interruptedResponse();
+/**
+ * 传输层字节收集器。独立于解析器错误路径存在，确保即使解析器/协议/EOF
+ * 失败也不会丢失已捕获的原始字节。Stage A 不做文件系统持久化。
+ */
+export class TransportCollector {
+  private readonly chunks: Uint8Array[] = [];
+  private totalBytes = 0;
+  private _termination: CapturedTransportTermination = "partial_eof";
+
+  addChunk(bytes: Uint8Array, maximumBytes: number): boolean {
+    const remaining = maximumBytes - this.totalBytes;
+    if (remaining <= 0) {
+      this._termination = "limit_exceeded";
+      return false;
+    }
+    const slice = bytes.byteLength > remaining ? bytes.slice(0, remaining) : bytes;
+    this.chunks.push(slice);
+    this.totalBytes += slice.byteLength;
+    if (bytes.byteLength > remaining) {
+      this._termination = "limit_exceeded";
+      return false;
+    }
+    return true;
   }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  const state: CompletionStreamState = {
+
+  markCleanEof(): void {
+    if (this._termination !== "limit_exceeded" && this._termination !== "aborted") {
+      this._termination = "clean_eof";
+    }
+  }
+
+  markLimitExceeded(): void {
+    this._termination = "limit_exceeded";
+  }
+
+  markAborted(): void {
+    this._termination = "aborted";
+  }
+
+  markPartialEof(): void {
+    if (this._termination !== "limit_exceeded" && this._termination !== "aborted") {
+      this._termination = "partial_eof";
+    }
+  }
+
+  get termination(): CapturedTransportTermination {
+    return this._termination;
+  }
+
+  get byteCount(): number {
+    return this.totalBytes;
+  }
+
+  toBody(): Uint8Array {
+    const result = new Uint8Array(this.totalBytes);
+    let offset = 0;
+    for (const chunk of this.chunks) {
+      result.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return result;
+  }
+
+  buildDescriptor(
+    attempt: number,
+    status: number,
+    contentType: string,
+    contentLength: string | null,
+    mediaKind: "event_stream" | "json" | "unknown",
+    failureKind: HistoryNormalizationFailureKind | null,
+  ): CapturedTransport {
+    return {
+      attempt,
+      parserVersion: historyReplayParserVersion,
+      status,
+      contentType,
+      contentLength,
+      mediaKind,
+      body: this.toBody(),
+      byteCount: this.totalBytes,
+      termination: this._termination,
+      failureKind,
+    };
+  }
+}
+
+/**
+ * 纯在线/离线重放状态机。在线分块投喂和离线重放共享同一解析器。
+ * SSE 路径通过 push 逐块处理事件；JSON 路径在 finish 时整体解析。
+ * 保留所有现有规则：协议首错排空、stop/DONE 要求、严格 post-stop 规则。
+ */
+export class ReplaySession {
+  private readonly state: CompletionStreamState = {
     content: "",
     sawChoice: false,
     sawStop: false,
     sawDone: false,
   };
-  let pending = "";
-  let trailingCarriageReturn = false;
-  let totalBytes = 0;
-  let readerFinished = false;
-  let firstProtocolError: HistoryNormalizationError | undefined;
+  private readonly decoder = new TextDecoder("utf-8", { fatal: true });
+  private pending = "";
+  private trailingCarriageReturn = false;
+  private firstProtocolError: HistoryNormalizationError | undefined;
+  private readonly mediaKind: "event_stream" | "json";
+  private jsonContent: string | undefined;
 
-  try {
-    for (;;) {
-      const chunk = await waitForOrAbort(reader.read(), requestController.signal);
-      if (chunk.done) {
-        readerFinished = true;
-        if (firstProtocolError !== undefined) {
-          throw firstProtocolError;
-        }
-        try {
-          ({ pending, trailingCarriageReturn } = appendEventStreamText(
-            pending,
-            trailingCarriageReturn,
-            decodeEventStreamText(decoder),
-            true,
-          ));
-          pending = consumeCompleteEvents(pending, state, watchdog);
-          if (pending.trim().length > 0) {
-            consumeCompletionEvent(pending, state, watchdog);
-          }
-        } catch (error) {
-          if (!isDrainableNormalizationProtocolError(error)) throw error;
-          state.content = "";
-          throw error;
-        }
-        if (!state.sawChoice || !state.sawStop || state.content.trim().length === 0) {
-          throw interruptedResponse();
-        }
-        return state.content;
-      }
-      totalBytes = addResponseChunkSize(
-        totalBytes,
-        chunk.value.byteLength,
-        maximumBytes,
-        reader,
-        requestController,
-      );
-      if (chunk.value.byteLength === 0) continue;
-      if (firstProtocolError !== undefined) {
-        watchdog.receivedInvalidResponseDrainActivity();
-        continue;
-      }
+  constructor(mediaKind: "event_stream" | "json") {
+    this.mediaKind = mediaKind;
+  }
+
+  push(bytes: Uint8Array, watchdog: NormalizationOutputWatchdog): void {
+    if (this.mediaKind === "json") {
       try {
-        ({ pending, trailingCarriageReturn } = appendEventStreamText(
-          pending,
-          trailingCarriageReturn,
-          decodeEventStreamText(decoder, chunk.value),
-          false,
-        ));
-        pending = consumeCompleteEvents(pending, state, watchdog);
-      } catch (error) {
-        if (!isDrainableNormalizationProtocolError(error)) throw error;
-        firstProtocolError = error;
-        state.content = "";
-        pending = "";
-        watchdog.invalidResponseDrainStarted();
+        this.jsonContent = (this.jsonContent ?? "") + this.decoder.decode(bytes, { stream: true });
+      } catch {
+        throw normalizationFailure("invalid_utf8", "模型响应不是有效的 UTF-8 文本。");
       }
+      if (containsNonWhitespaceByte(bytes)) {
+        watchdog.receivedValidOutput();
+      }
+      return;
     }
-  } finally {
-    if (!readerFinished) {
-      cancelReaderWithoutReplacingError(reader, requestController);
+    if (bytes.byteLength === 0) return;
+    if (this.firstProtocolError !== undefined) {
+      watchdog.receivedInvalidResponseDrainActivity();
+      return;
     }
     try {
-      reader.releaseLock();
-    } catch {
-      // 已经得到固定结果或固定错误，不再用清理错误替换它。
+      ({ pending: this.pending, trailingCarriageReturn: this.trailingCarriageReturn } =
+        appendEventStreamText(
+          this.pending,
+          this.trailingCarriageReturn,
+          decodeEventStreamText(this.decoder, bytes),
+          false,
+        ));
+      this.pending = consumeCompleteEvents(this.pending, this.state, watchdog);
+    } catch (error) {
+      if (!isDrainableNormalizationProtocolError(error)) throw error;
+      this.firstProtocolError = error as HistoryNormalizationError;
+      this.state.content = "";
+      this.pending = "";
+      watchdog.invalidResponseDrainStarted();
+    }
+  }
+
+  finish(watchdog: NormalizationOutputWatchdog): string {
+    if (this.mediaKind === "json") {
+      try {
+        this.jsonContent = (this.jsonContent ?? "") + this.decoder.decode();
+      } catch {
+        throw normalizationFailure("invalid_utf8", "模型响应不是有效的 UTF-8 文本。");
+      }
+      const text = this.jsonContent ?? "";
+      let payload: unknown;
+      try {
+        payload = JSON.parse(text) as unknown;
+      } catch {
+        throw normalizationFailure("protocol", "模型响应不是完整的 JSON。");
+      }
+      return readCompletedResponseContent(payload);
+    }
+    if (this.firstProtocolError !== undefined) {
+      throw this.firstProtocolError;
+    }
+    try {
+      ({ pending: this.pending, trailingCarriageReturn: this.trailingCarriageReturn } =
+        appendEventStreamText(
+          this.pending,
+          this.trailingCarriageReturn,
+          decodeEventStreamText(this.decoder),
+          true,
+        ));
+      this.pending = consumeCompleteEvents(this.pending, this.state, watchdog);
+      if (this.pending.trim().length > 0) {
+        consumeCompletionEvent(this.pending, this.state, watchdog);
+      }
+    } catch (error) {
+      if (!isDrainableNormalizationProtocolError(error)) throw error;
+      this.state.content = "";
+      throw error;
+    }
+    if (!this.state.sawChoice || !this.state.sawStop || this.state.content.trim().length === 0) {
+      throw interruptedResponse();
+    }
+    return this.state.content;
+  }
+
+  get hasFirstProtocolError(): boolean {
+    return this.firstProtocolError !== undefined;
+  }
+
+  static replay(body: Uint8Array, mediaKind: "event_stream" | "json"): string {
+    const session = new ReplaySession(mediaKind);
+    const dummyWatchdog = new NormalizationOutputWatchdog(
+      new AbortController(),
+      2147483647,
+      2147483647,
+      2147483647,
+    );
+    try {
+      const chunkSize = 4096;
+      for (let offset = 0; offset < body.byteLength; offset += chunkSize) {
+        const end = Math.min(offset + chunkSize, body.byteLength);
+        session.push(body.slice(offset, end), dummyWatchdog);
+      }
+      return session.finish(dummyWatchdog);
+    } finally {
+      dummyWatchdog.close();
     }
   }
 }
+
 
 function isDrainableNormalizationProtocolError(
   error: unknown,
@@ -952,19 +1239,6 @@ function appendEventStreamText(
   return { pending, trailingCarriageReturn: carried };
 }
 
-function addResponseChunkSize(
-  totalBytes: number,
-  nextBytes: number,
-  maximumBytes: number,
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  requestController: AbortController,
-): number {
-  if (nextBytes > maximumBytes - totalBytes) {
-    cancelReaderWithoutReplacingError(reader, requestController);
-    throw responseTooLarge();
-  }
-  return totalBytes + nextBytes;
-}
 
 function containsNonWhitespaceByte(bytes: Uint8Array): boolean {
   return bytes.some((byte) => byte !== 0x09 && byte !== 0x0a && byte !== 0x0d && byte !== 0x20);
@@ -1079,6 +1353,41 @@ function readCompletedResponseContent(payload: unknown): string {
 }
 
 /**
+ * 规范化指令第 7 条明确要求 tags 必须是空数组 []。部分模型偶尔忽略此条
+ * 产出非空 tags，导致 schema 校验失败。此函数在 schema 校验前将 problems
+ * 数组中每个题目的 tags 强制重置为 []，不修改其它字段。这不会发明内容，
+ * 只执行指令已要求的约束。
+ */
+function coerceDisallowedTagsArray(response: unknown): unknown {
+  if (response !== null && typeof response === "object" && Array.isArray((response as Record<string, unknown>).problems)) {
+    const problems = (response as Record<string, unknown>).problems as unknown[];
+    const allowedFields = new Set([
+      "title","type","basicStatement","basicSolution","background","statement",
+      "inputFormat","outputFormat","constraints","solution","hints","samples",
+      "tags","confidence","migrationNote",
+    ]);
+    for (const problem of problems) {
+      if (problem !== null && typeof problem === "object") {
+        const record = problem as Record<string, unknown>;
+        // 指令第 7 条：tags 必须始终是空数组
+        record.tags = [];
+        // 指令第 4 条：basicSolution 为空字符串时视为缺失，写成 null
+        if (typeof record.basicSolution === "string" && record.basicSolution.trim().length === 0) {
+          record.basicSolution = null;
+        }
+        // 移除 schema 未声明的额外字段（.strict() 会拒绝它们）
+        for (const key of Object.keys(record)) {
+          if (!allowedFields.has(key)) {
+            delete record[key];
+          }
+        }
+      }
+    }
+  }
+  return response;
+}
+
+/**
  * 公共域对"原文没有题解"的权威缺失表示：结构性的 null。规范化指令要求模型
  * 在原文缺题解时把 basicSolution 写成 null（而非任何占位字符串）、solution 留空，
  * 并在 migrationNote 如实记录。本地修复同样写入 null，候选 → 打包 → 导入全程
@@ -1092,7 +1401,7 @@ const normalizationInstructions = [
   "2. 题面和题解是核心。逐题提取明确出现的题意、输入、输出、约束、样例和题解；不得臆造规则、数据范围、样例、算法、结论或缺失段落。材料不明确时保留空字段，并在 migrationNote 简短说明不确定项。",
   "3. basicStatement 写成完整、可读且自洽的 Markdown 核心题面；background、statement、inputFormat、outputFormat、constraints、hints 和 samples 只放各自对应且原文确有的内容。不要把同一整段题面原样复制到 basicStatement 与任一拆分字段，也不要在多个拆分字段间重复整段正文。",
   `4. basicSolution 写原文已有的完整核心题解；solution 只放原文中可明确区分的补充题解内容，不能与 basicSolution 重复整段。原文没有题解时，basicSolution 必须写成 null（不得写任何占位或提示文字），solution 留空，并在 migrationNote 如实记录缺失。`,
-  "5. title 只取材料中明确的题名；type 只能是 traditional、interactive 或 submit_answer。只有材料明确要求交互或提交答案时才使用后两种，否则使用 traditional。",
+  "5. title 优先取材料中明确出现的题名；材料没有明确题名时，从题意中归纳一个简短（不超过 20 字）的中文描述性标题，不得编造规则或结论。type 只能是 traditional、interactive 或 submit_answer。只有材料明确要求交互或提交答案时才使用后两种，否则使用 traditional。",
   "6. samples 只登记材料中明确成对出现的输入、输出及解释；不要把正文代码块猜成样例。保留原有公式、代码和 Markdown 含义，不要擅自改题或润色成不同规则。",
   "7. tags 必须始终是空数组 []。不要选择或创造知识点标签，不要读取、采信或推断投题者自报难度，也不要输出任何难度字段。",
   "8. confidence 只表示本次整理对材料边界和字段归属的把握，不表示题目质量、难度或审核结论。",
@@ -1135,7 +1444,7 @@ function normalizationRequestProfile(maximumOutputTokens: number): {
   };
 }
 
-function cancelledRequest(sourceId: string): HistoryMigrationError {
+function cancelledRequest(sourceId: string): HistoryNormalizationError {
   return normalizationFailure("cancelled", `${sourceId} 的模型请求已明确取消。`);
 }
 
