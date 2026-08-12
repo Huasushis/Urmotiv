@@ -12,8 +12,7 @@ import { sql } from "drizzle-orm";
 import { rm } from "node:fs/promises";
 
 const ADMIN_URL = "postgresql://urmotiv:testpassword@127.0.0.1:5433/urmotiv";
-const DB_NAME = "urmotiv_history_import_acceptance_001";
-
+const DB_NAME = "urmotiv_history_import_acceptance_002";
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const getOpt = (name: string): string => {
@@ -147,6 +146,12 @@ async function main(): Promise<void> {
     sql`SELECT COUNT(*)::int as count FROM stored_files WHERE purpose = 'import_input'`,
   );
   console.log(`Stored files (import_input): ${fileRows[0].count}`);
+  // === Verify attachments ===
+  // 38 embedded in problem_revision_files + 1 batch_internal preserved (XLSX/ZIP-based) = 39 total
+  const { rows: attachmentRows } = await database.execute(
+    sql`SELECT COUNT(*)::int as count FROM problem_revision_files WHERE category IN ('public_attachment', 'internal_attachment')`,
+  );
+  console.log(`Problem attachment files (embedded): ${attachmentRows[0].count}`);
 
   // === Summary ===
   console.log("\n=== SUMMARY ===");
@@ -158,6 +163,7 @@ async function main(): Promise<void> {
   console.log(`PASS tags-assigned: ${tagRows[0].count === 137} (count=${tagRows[0].count})`);
   console.log(`PASS import-jobs: ${jobRows[0].count === 137} (count=${jobRows[0].count})`);
   console.log(`PASS stored-files: ${fileRows[0].count === 137} (count=${fileRows[0].count})`);
+  console.log(`PASS attachments-embedded: ${attachmentRows[0].count === 38} (count=${attachmentRows[0].count}, expected=38 embedded + 1 preserved = 39 total)`);
   console.log(`INFO solution-present: ${solRows[0].count} (missing: ${nullSolRows[0].count})`);
 
   await database.close();

@@ -240,10 +240,10 @@ describe("插件管理 HTTP 接口", () => {
         url: "/api/v1/admin/plugins",
         headers: { cookie }
       });
-      expect(list.statusCode, user.id).toBe(403);
+      expect(list.statusCode, user.id).toBe(404);
       expect(list.headers["cache-control"], user.id).toBe("private, no-store");
       expect(list.json(), user.id).toMatchObject({
-        error: { code: "FORBIDDEN", message: "你没有执行此操作的权限。" }
+        error: { code: "NOT_FOUND", message: "未找到请求的资源。" }
       });
       expect(list.body, user.id).not.toContain(pluginId);
       expect(list.body, user.id).not.toContain(pluginName);
@@ -254,10 +254,10 @@ describe("插件管理 HTTP 接口", () => {
         headers: { cookie, origin },
         payload: { expectedRevision: 1, state: "enabled" }
       });
-      expect(update.statusCode, user.id).toBe(403);
+      expect(update.statusCode, user.id).toBe(404);
       expect(update.headers["cache-control"], user.id).toBe("private, no-store");
       expect(update.json(), user.id).toMatchObject({
-        error: { code: "FORBIDDEN", message: "你没有执行此操作的权限。" }
+        error: { code: "NOT_FOUND", message: "未找到请求的资源。" }
       });
       expect(update.body, user.id).not.toContain(pluginId);
       expect(update.body, user.id).not.toContain(pluginName);
@@ -420,5 +420,194 @@ describe("插件管理 HTTP 接口", () => {
     });
     expect(saved.statusCode).toBe(200);
     expect(pluginStore.appendAttempts).toBe(1);
+  });
+});
+
+describe("插件管理权限安全契约", () => {
+  const blockedUsers = [
+    createUser("security-explicit-deny", "human", [
+      grant("plugin.manage"),
+      grant("plugin.manage", "deny")
+    ]),
+    createUser("security-no-perm", "human", [grant("tag.manage")]),
+    createUser("security-robot", "robot", [
+      grant("plugin.manage"),
+      grant("system.manage")
+    ])
+  ];
+
+  async function setup(users: StoredUser[]): Promise<{
+    app: Awaited<ReturnType<typeof createApp>>;
+    cookie: (userId: string) => Promise<string>;
+  }> {
+    const app = await createApp({
+      store: new InMemoryDataStore([...users, ...blockedUsers], demoTags),
+      demoAuthEnabled: true,
+      demoUserIds: [...users, ...blockedUsers].map((u) => u.id),
+      pluginHost: createPluginHost()
+    });
+    openApps.push(app);
+    return {
+      app,
+      cookie: (userId: string) => login(app, userId)
+    };
+  }
+
+  it("无权访问（明确拒绝、无权限、机器人）统一返回 404，不泄露存在性", async () => {
+    const { app, cookie } = await setup([
+      createUser("security-manager", "human", [grant("plugin.manage"), grant("system.manage")])
+    ]);
+
+    for (const user of blockedUsers) {
+      const session = await cookie(user.id);
+
+      // GET list — 404
+      const list = await app.inject({
+        method: "GET",
+        url: "/api/v1/admin/plugins",
+        headers: { cookie: session }
+      });
+      expect(list.statusCode, user.id).toBe(404);
+      expect(list.json(), user.id).toMatchObject({
+        error: { code: "NOT_FOUND", message: "未找到请求的资源。" }
+      });
+      // 不泄露插件 ID 或名称
+      expect(list.body, user.id).not.toContain(pluginId);
+      expect(list.body, user.id).not.toContain(pluginName);
+
+      // PATCH — 404
+      const update = await app.inject({
+        method: "PATCH",
+        url: `/api/v1/admin/plugins/${pluginId}`,
+        headers: { cookie: session, origin },
+        payload: { expectedRevision: 1, state: "enabled" }
+      });
+      expect(update.statusCode, user.id).toBe(404);
+      expect(update.json(), user.id).toMatchObject({
+        error: { code: "NOT_FOUND", message: "未找到请求的资源。" }
+      });
+      expect(update.body, user.id).not.toContain(pluginId);
+      expect(update.body, user.id).not.toContain(pluginName);
+    }
+  });
+
+  it("真实不存在的插件 ID 与无权访问返回相同的 404 错误体", async () => {
+    const { app, cookie } = await setup([
+      createUser("security-manager", "human", [grant("plugin.manage"), grant("system.manage")])
+    ]);
+    const managerCookie = await cookie("security-manager");
+
+    // 有权管理者访问真实不存在的插件 — 404
+    const realNotFound = await app.inject({
+      method: "PATCH",
+      url: "/api/v1/admin/plugins/org.example.missing-plugin",
+      headers: { cookie: managerCookie, origin },
+      payload: { expectedRevision: 1, state: "enabled" }
+    });
+    expect(realNotFound.statusCode).toBe(404);
+
+    // 无权用户访问任意插件 — 404
+    const deniedCookie = await cookie("security-explicit-deny");
+    const denied = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/admin/plugins/${pluginId}`,
+      headers: { cookie: deniedCookie, origin },
+      payload: { expectedRevision: 1, state: "enabled" }
+    });
+    expect(denied.statusCode).toBe(404);
+
+    // 两种 404 的错误体结构一致（code + message 相同）
+    expect(denied.json().error.code).toBe(realNotFound.json().error.code);
+    expect(denied.json().error.message).toBe(realNotFound.json().error.message);
+  });
+
+  it("有权管理者可以成功列出和修改插件", async () => {
+    const { app, cookie } = await setup([
+      createUser("security-manager", "human", [grant("plugin.manage"), grant("system.manage")])
+    ]);
+    const session = await cookie("security-manager");
+
+    const list = await app.inject({
+      method: "GET",
+      url: "/api/v1/admin/plugins",
+      headers: { cookie: session }
+    });
+    expect(list.statusCode).toBe(200);
+    expect(list.json().items).toBeInstanceOf(Array);
+    expect(list.json().items.length).toBeGreaterThan(0);
+
+    const update = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/admin/plugins/${pluginId}`,
+      headers: { cookie: session, origin },
+      payload: { expectedRevision: 1, state: "enabled" }
+    });
+    expect(update.statusCode).toBe(200);
+  });
+
+  it("所有插件端点响应含 cache-control: no-store 或更强的缓存头", async () => {
+    const { app, cookie } = await setup([
+      createUser("security-manager", "human", [grant("plugin.manage"), grant("system.manage")])
+    ]);
+    const session = await cookie("security-manager");
+
+    // 有权 GET
+    const list = await app.inject({
+      method: "GET",
+      url: "/api/v1/admin/plugins",
+      headers: { cookie: session }
+    });
+    expect(list.headers["cache-control"]).toMatch(/no-store|no-cache/);
+
+    // 无权 GET — 404 也必须有缓存头
+    const deniedCookie = await cookie("security-no-perm");
+    const denied = await app.inject({
+      method: "GET",
+      url: "/api/v1/admin/plugins",
+      headers: { cookie: deniedCookie }
+    });
+    expect(denied.headers["cache-control"]).toMatch(/no-store|no-cache/);
+
+    // 未认证 — 401 也必须有缓存头
+    const unauth = await app.inject({
+      method: "GET",
+      url: "/api/v1/admin/plugins"
+    });
+    expect(unauth.statusCode).toBe(401);
+    expect(unauth.headers["cache-control"]).toMatch(/no-store|no-cache/);
+  });
+
+  it("认证/会话端点响应含 cache-control: no-store", async () => {
+    const { app, cookie } = await setup([
+      createUser("security-manager", "human", [grant("plugin.manage"), grant("system.manage")])
+    ]);
+
+    // session
+    const session = await app.inject({
+      method: "GET",
+      url: "/api/v1/session",
+      headers: { cookie: await cookie("security-manager") }
+    });
+    expect(session.statusCode).toBe(200);
+    expect(session.headers["cache-control"]).toMatch(/no-store|no-cache/);
+
+    // demo-login
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/demo-login",
+      headers: { origin },
+      payload: { userId: "security-manager" }
+    });
+    expect(login.statusCode).toBe(200);
+    expect(login.headers["cache-control"]).toMatch(/no-store|no-cache/);
+
+    // logout
+    const logout = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/logout",
+      headers: { cookie: await cookie("security-manager"), origin }
+    });
+    expect(logout.statusCode).toBe(200);
+    expect(logout.headers["cache-control"]).toMatch(/no-store|no-cache/);
   });
 });

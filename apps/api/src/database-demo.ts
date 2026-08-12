@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseHandle } from "@urmotiv/database";
 import { sql } from "drizzle-orm";
+import { demoTags } from "./demo-data";
 
 export const databaseDemoUserIds = {
   author: "9000000000000001",
@@ -70,6 +71,7 @@ function stableUuid(value: string): string {
 
 export async function seedDatabaseDemoData(handle: DatabaseHandle): Promise<void> {
   await handle.transaction(async (transaction) => {
+    // 1. 演示用户
     for (const user of demoUsers) {
       await transaction.execute(sql`
         INSERT INTO users (id, nickname, account_type)
@@ -116,5 +118,57 @@ export async function seedDatabaseDemoData(handle: DatabaseHandle): Promise<void
       )
       ON CONFLICT (id) DO NOTHING
     `);
+    // 2. 演示知识点目录：先插类别，再插标签。E2E/演示环境的标签 ID（如
+    // algorithm.implementation）不在正式迁移目录里，需要额外 seed 才能让
+    // hasTags 校验通过。演示类别名称加"演示"前缀，避免与正式迁移目录
+    // （0011_tag_catalog.sql）创建的 legacy.category.* / catalog.category.* 冲突。
+    // 仅在 tags 表已含 normalized_name / item_kind 列（迁移 0011 之后）时执行；
+    // 旧 schema 的并发测试只迁移到第 8 步，跳过即可。
+    const schemaColumns = await transaction.query<{ column_name: string }>(sql`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'tags' AND column_name IN ('normalized_name', 'item_kind')
+    `);
+    if (schemaColumns.length >= 2) {
+      const demoCategories = new Map<string, string>();
+      for (const tag of demoTags) {
+        if (tag.category !== undefined && !demoCategories.has(tag.category.id)) {
+          demoCategories.set(tag.category.id, `演示·${tag.category.name}`);
+        }
+      }
+      let categorySort = 0;
+      for (const [categoryId, categoryName] of demoCategories) {
+        await transaction.execute(sql`
+          INSERT INTO tags (
+            id, parent_id, name, normalized_name, item_kind, group_name,
+            description, sort_order, is_active, created_by_user_id
+          )
+          VALUES (
+            ${categoryId}, NULL, ${categoryName},
+            lower(regexp_replace(normalize(${categoryName}, NFKC), '^[[:space:]]+|[[:space:]]+$', '', 'g')),
+            'category', ${categoryName}, '演示种子数据', ${categorySort}, true, NULL
+          )
+          ON CONFLICT (id) DO NOTHING
+        `);
+        categorySort += 1;
+      }
+      let tagSort = 0;
+      for (const tag of demoTags) {
+        const categoryId = tag.category?.id ?? null;
+        await transaction.execute(sql`
+          INSERT INTO tags (
+            id, parent_id, name, normalized_name, item_kind, group_name,
+            description, sort_order, is_active, created_by_user_id
+          )
+          VALUES (
+            ${tag.id}, ${categoryId}, ${tag.name},
+            lower(regexp_replace(normalize(${tag.name}, NFKC), '^[[:space:]]+|[[:space:]]+$', '', 'g')),
+            'tag', ${tag.group}, '', ${tagSort}, ${tag.active ?? true}, NULL
+          )
+          ON CONFLICT (id) DO NOTHING
+        `);
+        tagSort += 1;
+      }
+    }
+
   });
 }

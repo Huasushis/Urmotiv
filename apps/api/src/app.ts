@@ -550,10 +550,19 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   await app.register(cors, {
     origin: dependencies.allowedOrigins,
-    credentials: true
   });
   await app.register(cookie);
-
+  // 全局缓存头：所有 API 响应默认不可缓存。端点如需更强的策略可自行覆盖，
+  // 此钩子只在未设置 cache-control 时回填 no-store，保证认证/错误/敏感 JSON 统一覆盖。
+  app.addHook("onSend", (request, reply, payload, done) => {
+    if (reply.getHeader("cache-control") === undefined) {
+      reply.header("cache-control", "no-store");
+    }
+    if (reply.getHeader("x-content-type-options") === undefined) {
+      reply.header("x-content-type-options", "nosniff");
+    }
+    done(null, payload);
+  });
   app.addHook("preHandler", async (request) => {
     if (!new Set(["POST", "PUT", "PATCH", "DELETE"]).has(request.method)) {
       return;
@@ -654,7 +663,9 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     const user = await requireUser(request);
     const now = dependencies.now();
     if (!hasPermission(user, "plugin.manage", {}, now)) {
-      throw forbidden();
+      // 无权访问插件管理与无权访问私有资源一致，统一按"不存在"返回 404，
+      // 不泄露插件端点存在性或权限差异。
+      throw notFound();
     }
     return user;
   }
@@ -766,7 +777,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
         result: "denied",
         reasonCode: "permission_denied"
       });
-      throw forbidden();
+      throw notFound();
     }
     if (!pluginId.success) {
       await recordPluginUpdateAttemptSafely({

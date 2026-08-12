@@ -479,7 +479,7 @@ describe("插件宿主", () => {
       expect(JSON.stringify(allowed.json())).not.toContain("very-secret-token");
       const deniedCookie = await login("denied");
       const blocked = await app.inject({ method: "GET", url: "/api/v1/admin/plugins", headers: { cookie: deniedCookie } });
-      expect(blocked.statusCode).toBe(403);
+      expect(blocked.statusCode).toBe(404);
       const write = await app.inject({
         method: "PATCH", url: `/api/v1/admin/plugins/${manifest.id}`,
         headers: { cookie: managerCookie, origin: "http://localhost:5173" },

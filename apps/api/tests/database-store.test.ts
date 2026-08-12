@@ -135,7 +135,7 @@ describe("数据库题目仓库", () => {
         count(*) FILTER (WHERE item_kind = 'tag')::integer AS tags,
         (SELECT version::integer FROM tag_catalog_state WHERE singleton = true) AS version
       FROM tags
-    `)).toEqual([{ categories: 22, tags: 243, version: 1 }]);
+    `)).toEqual([{ categories: 26, tags: 248, version: 1 }]);
 
     expect(await store.hasTags(["catalog.category.01"])).toBe(false);
     expect(await store.hasTags(["catalog.tag.02.09"])).toBe(true);
