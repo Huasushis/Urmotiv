@@ -155,7 +155,7 @@ test("题面图片与公开附件可以上传、预览和下载", async ({ page 
   await expect(previewImage).toBeVisible();
   await expect.poll(() => previewImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
 
-  await page.getByRole("button", { name: "题解与资料" }).click();
+  await page.getByRole("tab", { name: "题解与资料" }).click();
   const attachmentButton = page.getByRole("button", { name: "选择公开附件" });
   await expect(attachmentButton).toBeEnabled();
   const attachmentChooser = page.waitForEvent("filechooser");
