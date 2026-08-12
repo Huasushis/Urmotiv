@@ -640,7 +640,7 @@ async function importSinglePackage(input: {
     selectedFormatVersion: urmotivNativeAdapter.version,
     idempotencyKey: sourceBindingKey,
     clientRequestDigest: sourceBindingKey,
-    inputDigest: sourceBindingKey,
+    inputDigest: input.packageEntry.packageSha256,
     choicesDigest: canonicalChoicesDigest,
     requestedByUserId: input.requestedByUserId,
   };
@@ -755,7 +755,7 @@ async function importSinglePackage(input: {
       requestedByUserId: input.requestedByUserId,
       clientRequestDigest: sourceBindingKey,
       sourceFileId,
-      inputDigest: sourceBindingKey,
+      inputDigest: input.packageEntry.packageSha256,
       selectedFormat: urmotivNativeAdapter.id,
       selectedFormatVersion: urmotivNativeAdapter.version,
       choices: importChoices,
@@ -1607,7 +1607,7 @@ function validateCreatedJobIdentity(
     job.sourceFileId !== sourceFileId ||
     job.sourceFileId !== journal.storageUuid ||
     job.inputDigest !== expected.inputDigest ||
-    job.inputDigest !== bindingKey ||
+    job.inputDigest !== entry.packageSha256 ||
     job.clientRequestDigest !== expected.clientRequestDigest ||
     job.clientRequestDigest !== bindingKey ||
     job.idempotencyKey !== expected.idempotencyKey ||
@@ -1678,7 +1678,7 @@ function validateReplayJobIdentity(
     job.sourceFileId !== sourceFileId ||
     job.sourceFileId !== journal.storageUuid ||
     job.inputDigest !== expected.inputDigest ||
-    job.inputDigest !== bindingKey ||
+    job.inputDigest !== entry.packageSha256 ||
     job.clientRequestDigest !== expected.clientRequestDigest ||
     job.clientRequestDigest !== bindingKey ||
     job.idempotencyKey !== expected.idempotencyKey ||
