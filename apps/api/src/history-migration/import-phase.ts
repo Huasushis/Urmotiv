@@ -219,10 +219,10 @@ const defaultPublisher: HistoryImportPublisher = {
  * 防止私有目录被替换后读入超大文件。读取前先用 stat 核对实际文件大小，
  * 再与包报告声明的 packageBytes 比对，两者一致后才读入内存。
  */
-const maximumImportPackageBytes = 256 * 1024 * 1024;
+export const maximumImportPackageBytes = 256 * 1024 * 1024;
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/);
 
-const packageReportEntrySchema = z
+export const packageReportEntrySchema = z
   .object({
     candidateId: z.string().regex(/^candidate-[0-9]{6}$/),
     contentSha256: digestSchema,
@@ -250,7 +250,7 @@ const packageReportEntrySchema = z
   })
   .strict();
 
-const packageReportPayloadSchema = z
+export const packageReportPayloadSchema = z
   .object({
     version: z.literal(1),
     phase: z.literal("package"),
@@ -284,7 +284,7 @@ const importManifestEntrySchema = z
   })
   .strict();
 
-const importManifestPayloadSchema = z
+export const importManifestPayloadSchema = z
   .object({
     version: z.literal(1),
     phase: z.literal("import"),

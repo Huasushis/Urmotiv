@@ -24,6 +24,9 @@ export {
   dropHistoryImportDatabase,
   historyImportDatabaseConnectionString,
   importHistoryPackages,
+  importManifestPayloadSchema,
+  maximumImportPackageBytes,
+  packageReportPayloadSchema,
   prepareHistoryImportDatabase,
 } from "./import-phase";
 export type {
@@ -60,3 +63,4 @@ export {
 } from "./grouping-workflow";
 export * from "./llm-normalizer";
 export * from "./schema";
+export * from "./import-preflight";

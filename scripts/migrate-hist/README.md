@@ -681,3 +681,35 @@ SHA-256。Python 工具不自行运行 Git；可信调用方仍须在调用前�
 校验失败一律视为不完整。`inspect` 命令若失败，也必须丢弃该目标路径并换新文件。终端无论成功或失败都只
 打印计数或固定错误，不打印原内容、原路径或人员信息。这个工具只准备人工 Gold，不调用外部模型；真实私有
 数据不得在测试里运行 `seal`，应先用合成 XLSX/XML 完成测试，再由人按上述流程处理。
+
+## 历史导入零数据库变更预检（Phase 1）
+
+正式导入前先做确定性对账与只读数据库预检，工具是
+`apps/api/scripts/preflight-history-import.ts`：
+
+```bash
+pnpm exec tsx scripts/preflight-history-import.ts \
+  --private-root=<私有根> \
+  --list-metadata=<清单元数据 .private.json> \
+  --package-directory=<已打包目录（含 report.json 与 packages/）> \
+  --output-directory=<回执输出目录，必须在私有根内> \
+  --expected-record-count=<权威清单题目数> \
+  --database-url-env=<存放连接串的环境变量名> \
+  [--import-manifest=<既有导入清单 .private.json>]
+```
+
+连接串只能通过环境变量传入，脚本内不保留任何凭据。所有路径必须位于私有根之内；
+只接受目录形式的私有根（拒绝单文件冒充）。逐包以
+`apps/api/src/history-migration/import-preflight.ts` 的对账逻辑核对：清单元数据记录数、
+打包报告条目、来源绑定、批次摘要、规范 §2 包内布局、附件数（声明数应等于包内嵌入数
+加保全数）与已有导入清单。题目身份只由包清单五元组和来源绑定摘要确定，题名仍是可编辑
+的元数据；基础题解结构性缺失只计数，不判失败。
+
+数据库检查全部在显式只读事务内完成（`transaction_read_only`，确认开关生效后才继续），
+只验证必需表存在并列出行数，绝不写入或准备导入数据。成功输出聚合计数、回执
+`history-import-preflight.private.json` 与完成标记 `PREFLIGHT_PASS`；任何一项失败都会移除
+完成标记并以退出码 1 结束（参数错误为 2），不输出题名、题号、摘要或内容。
+
+预检 READY 后才能进入 Phase 2：对指定的验收 PostgreSQL 执行
+`importHistoryPackages`（现有 `apps/api/src/history-migration/import-phase.ts` 流程），
+Phase 2 另行起步，不共用 Phase 1 的只读连接。
