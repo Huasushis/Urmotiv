@@ -665,3 +665,60 @@ test("组长把审核通过的固定题目版本加入组题方案", async ({ pa
   expect(pageFitsViewport).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("contest-workbench.png"), fullPage: true });
 });
+
+test("新建题目页说明题目名称待审核后仍可修改，题面题解冻结", async ({ page }, testInfo) => {
+  await loginAsAuthor(page);
+  await page.getByRole("link", { name: "新建题目" }).click();
+
+  await expect(page.getByRole("heading", { name: "基础审核内容" })).toBeVisible();
+  const freezeNote = page.locator(".section-heading").filter({ hasText: "基础审核内容" }).locator("p");
+  await expect(freezeNote).toContainText("这两项会冻结");
+  await expect(freezeNote).toContainText("题目名称仍可修改");
+  await expect(freezeNote).not.toContainText("题目名称会冻结");
+  await page.screenshot({ path: testInfo.outputPath("create-page-title-contract.png"), fullPage: true });
+
+  await page.getByLabel("题目名称").fill(`标题契约题-${testInfo.project.name}-${Date.now()}`);
+  await page.locator(".tag-picker-group summary").first().click();
+  await page.locator(".tag-choice").first().click();
+  await page.locator('section[aria-label="基础题面"] textarea').fill("求 $2+2$ 的值。");
+  await page.locator('section[aria-label="基础题解"] textarea').fill("直接计算即可。");
+  await page.getByRole("button", { name: "创建草稿" }).click();
+
+  await expect(page.getByRole("tab", { name: "概要" })).toBeVisible();
+  const problemId = new URL(page.url()).pathname.split("/").pop() as string;
+
+  const problem = await page.request.get(`/api/v1/problems/${problemId}`).then((r) => r.json());
+  const submitted = await postJson(page, `/api/v1/problems/${problemId}/submit`, {
+    expectedRevision: problem.revision
+  });
+  expect(submitted.status).toBe("pending_review");
+  await page.reload();
+
+  await expect(page.getByRole("tab", { name: "概要" })).toBeVisible();
+  const titleInput = page.getByLabel("题目名称");
+  await expect(titleInput).toBeEnabled();
+  await titleInput.fill("标题契约题-已改标题");
+  if (testInfo.project.name === "desktop-chromium") {
+    await expect(page.getByText("已保存")).toBeVisible({ timeout: 10_000 });
+  } else {
+    await page.waitForTimeout(1500);
+    const saved = await page.request.get(`/api/v1/problems/${problemId}`).then((r) => r.json());
+    expect(saved.title).toBe("标题契约题-已改标题");
+  }
+
+  await page.getByRole("tab", { name: "题面" }).click();
+  const statementEditor = page.locator('section[aria-label="基础题面"]');
+  await expect(statementEditor).toContainText("审核期间已冻结");
+  await expect(statementEditor.locator("textarea")).toHaveAttribute("readonly", "");
+
+  await page.getByRole("tab", { name: "题解与资料" }).click();
+  const solutionEditor = page.locator('section[aria-label="基础题解"]');
+  await expect(solutionEditor).toContainText("审核期间已冻结");
+  await expect(solutionEditor.locator("textarea")).toHaveAttribute("readonly", "");
+
+  const pageFitsViewport = await page.evaluate(
+    () => document.documentElement.scrollWidth <= document.documentElement.clientWidth
+  );
+  expect(pageFitsViewport).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("title-contract-frozen.png"), fullPage: true });
+});

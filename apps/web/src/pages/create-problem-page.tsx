@@ -128,7 +128,7 @@ export function CreateProblemPage() {
           <span>02</span>
           <div>
             <h2>基础审核内容</h2>
-            <p>进入待审核后，这两项和题目名称会冻结；驳回后可以继续修改。</p>
+            <p>进入待审核后，这两项会冻结，题目名称仍可修改；驳回后可以继续修改。</p>
           </div>
         </div>
         <MarkdownEditor
