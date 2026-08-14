@@ -26,10 +26,17 @@ function page(title, body, status = 200) {
   return { status, html };
 }
 
+// Immutable security headers for every /profile response (success and denials alike).
+const PROFILE_HEADERS = {
+  'content-security-policy':
+    "default-src 'none'; script-src 'none'; img-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  'referrer-policy': 'no-referrer',
+  'x-content-type-options': 'nosniff',
+};
+
 // Authenticated self-profile page: shows the OWN session holder's USTC profile fields.
 // Only allowlisted fields carry values (kept in the in-memory session, never on disk or
 // in logs); all other returned fields appear as name/type with their value discarded.
-// Restrictive CSP/referrer protections; no scripts, images, forms, or frames.
 function profilePage(s) {
   const allowed = (s.retained || [])
     .map(
@@ -51,14 +58,7 @@ function profilePage(s) {
     `<h2>其他返回字段（仅字段名与类型，值未保留）</h2>` +
     `<table border="1" cellspacing="0" cellpadding="4"><tbody>${others || '<tr><td>（无）</td></tr>'}</tbody></table>` +
     `<p><a href="/">首页</a> | <a href="/logout">退出登录（立即丢弃本次资料）</a></p>`;
-  const p = page('我的 USTC 资料', body);
-  p.headers = {
-    'content-security-policy':
-      "default-src 'none'; script-src 'none'; img-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
-    'referrer-policy': 'no-referrer',
-    'x-content-type-options': 'nosniff',
-  };
-  return p;
+  return page('我的 USTC 资料', body);
 }
 
 export function createApp(cfg, { log = console } = {}) {
@@ -84,7 +84,15 @@ export function createApp(cfg, { log = console } = {}) {
     if (!raw) return out;
     for (const part of raw.split(';')) {
       const idx = part.indexOf('=');
-      if (idx > 0) out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+      if (idx > 0) {
+        let value = part.slice(idx + 1).trim();
+        try {
+          value = decodeURIComponent(value);
+        } catch {
+          value = ''; // tolerate malformed percent-encoding; never throw into the handler
+        }
+        out[part.slice(0, idx).trim()] = value;
+      }
     }
     return out;
   }
@@ -211,10 +219,10 @@ export function createApp(cfg, { log = console } = {}) {
   }
 
   const handler = async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host || 'unknown'}`);
-    const path = url.pathname;
     let result;
     try {
+      const url = new URL(req.url, `http://${req.headers.host || 'unknown'}`);
+      const path = url.pathname;
       if (path === '/health' && req.method === 'GET') {
         result = { status: 200, json: { ok: true, mode: cfg.mode } };
       } else if (path === '/' && req.method === 'GET') {
@@ -240,9 +248,8 @@ export function createApp(cfg, { log = console } = {}) {
         result = await callback(req, res, url);
         if (result === null) return;
       } else if (path === '/profile' && req.method === 'GET') {
-        if (!hostMatches(req, redirect)) {
-          result = page('拒绝', '<p>主机不符，拒绝展示。</p>', 403);
-        } else {
+        result = page('拒绝', '<p>主机不符，拒绝展示。</p>', 403);
+        if (hostMatches(req, redirect)) {
           const sid = readCookies(req)[SESSION_COOKIE];
           const s = sid ? sessions.get(sid) : undefined;
           result = s
@@ -251,6 +258,7 @@ export function createApp(cfg, { log = console } = {}) {
               : page('我的资料', '<p>本会话未保留资料，需要重新登录一次后才能查看。</p>')
             : page('我的资料', '<p>未登录，无法查看资料。</p>');
         }
+        result.headers = { ...PROFILE_HEADERS };
       } else if (path === '/me' && req.method === 'GET') {
         const sid = readCookies(req)[SESSION_COOKIE];
         const s = sid ? sessions.get(sid) : undefined;

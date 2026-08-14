@@ -821,6 +821,10 @@ describe('self profile page', () => {
       const res = await rawGet(app.port, '/profile', { host: 'evil.example.com', cookie: sidOf(cb) });
       assert.equal(res.status, 403);
       assert.ok(!res.body.includes(FIXTURE.attributes.name), 'no data on wrong host');
+      // Denials carry the same immutable security headers as the success page.
+      assert.match(String(res.headers['content-security-policy'] || ''), /default-src 'none'/);
+      assert.equal(String(res.headers['referrer-policy'] || ''), 'no-referrer');
+      assert.equal(String(res.headers['x-content-type-options'] || ''), 'nosniff');
     } finally {
       await app.close();
       await mock.close();
@@ -947,5 +951,59 @@ describe('self profile page', () => {
       await app.close();
       await mock.close();
     }
+  });
+
+  test('malformed cookie and malformed Host are contained; server stays healthy', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock));
+    try {
+      // Malformed percent-encoding in the session cookie must not crash the request path.
+      const badCookie = await rawGet(app.port, '/profile', { host: HOST, cookie: 'ustc_demo_sid=%zz; other=x' });
+      assert.equal(badCookie.status, 200);
+      assert.ok(badCookie.body.includes('未登录'));
+      // Malformed Host header must be contained by the handler's error boundary.
+      const badHost = await rawGet(app.port, '/profile', { host: 'x:99999' });
+      assert.ok([400, 403].includes(badHost.status), `contained status, got ${badHost.status}`);
+      // Both cases leave the server fully functional.
+      const health = await rawGet(app.port, '/health', { host: HOST });
+      assert.equal(health.status, 200);
+      assert.match(health.body, /"ok":true/);
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('X-Forwarded-Host never overrides the real Host on /profile', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock));
+    try {
+      const { cb } = await fullLogin(app);
+      const sid = sidOf(cb);
+      // Real Host correct + spoofed X-Forwarded-Host: session owner is still authorized.
+      const ok = await rawGet(app.port, '/profile', { host: HOST, cookie: sid, 'x-forwarded-host': 'evil.example.com' });
+      assert.equal(ok.status, 200);
+      assert.ok(ok.body.includes(FIXTURE.attributes.name));
+      // Real Host wrong even with a plausible X-Forwarded-Host: denied.
+      const denied = await rawGet(app.port, '/profile', { host: 'evil.example.com', cookie: sid, 'x-forwarded-host': HOST });
+      assert.equal(denied.status, 403);
+      assert.ok(!denied.body.includes(FIXTURE.attributes.name));
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+});
+
+describe('session store sweep', () => {
+  test('accessing a live session discards stale unrelated retained profiles', () => {
+    const now = { v: 1000 };
+    const st = new SessionStore({ ttlMs: 100, now: () => now.v });
+    const a = st.create('h1', { retained: [{ path: 'attributes.name', label: '姓名', type: 'string', value: 'secret-value' }] });
+    const b = st.create('h2');
+    now.v = 1200; // both expired
+    st.get(b); // access sweeps every expired record, not just the requested one
+    assert.equal(st.map.has(a), false, 'stale retained profile must be swept on any access');
+    assert.equal(st.map.size, 0);
   });
 });

@@ -27,13 +27,8 @@ export class SessionStore {
 
   get(id) {
     if (!id) return undefined;
-    const rec = this.map.get(id);
-    if (!rec) return undefined;
-    if (rec.exp <= this.now()) {
-      this.map.delete(id);
-      return undefined;
-    }
-    return rec;
+    this.sweep(); // drop every expired record (incl. unrelated sessions) on access
+    return this.map.get(id);
   }
 
   destroy(id) {
