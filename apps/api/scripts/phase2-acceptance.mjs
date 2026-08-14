@@ -19,7 +19,7 @@ import { join } from "node:path";
 const repositoryRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const apiDirectory = fileURLToPath(new URL("..", import.meta.url));
 const workspaceDirectory = join(repositoryRoot, "apps", "worker");
-const vitestBin = join(repositoryRoot, "node_modules", ".bin", "vitest");
+const vitestBin = join(repositoryRoot, "node_modules", "vitest", "vitest.mjs");
 const acceptanceTestFile = "tests/history-phase2-runner-postgres.test.ts";
 const shardFileName = "shard-runner.private.json";
 const evidenceFileName = "phase2-acceptance-evidence.private.json";
