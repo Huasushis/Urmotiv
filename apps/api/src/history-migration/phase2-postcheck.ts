@@ -91,8 +91,10 @@ export interface Phase2PostcheckInput {
   readonly expectedJobItemRows: number;
   readonly expectedStoredFilesDelta: number;
   readonly expectedAuditDelta: number;
-  readonly expectedMissingSolutionCount: number;
-  readonly afterMissingSolutionCount: number;
+  readonly expectedNullSolutionCount: number;
+  readonly afterNullSolutionCount: number;
+  readonly expectedEmptySolutionCount: number;
+  readonly afterEmptySolutionCount: number;
   readonly expectedStoredBytes: number;
   readonly expectedStoredContentSha256: string;
   readonly afterFirstStoredInventory: StoredFileInventory;
@@ -188,7 +190,10 @@ export function verifyPhase2Outcome(input: Phase2PostcheckInput): Phase2Postchec
     if (actualDelta !== expectation.delta) driftedTableCount += 1;
   }
   if (driftedTableCount > 0) reasonCodes.push("table_delta_drift");
-  if (input.afterMissingSolutionCount !== input.expectedMissingSolutionCount) {
+  if (
+    input.afterNullSolutionCount !== input.expectedNullSolutionCount ||
+    input.afterEmptySolutionCount !== input.expectedEmptySolutionCount
+  ) {
     reasonCodes.push("solution_state_drift");
   }
   const expectedStoredInventory: StoredFileInventory = {
@@ -216,23 +221,33 @@ function problemIdList(problemIds: readonly string[]) {
   return sql.join(problemIds.map((problemId) => sql`${problemId}::bigint`), sql`, `);
 }
 
-/** 只统计导入清单精确绑定的问题修订，不使用范围或时间猜测。 */
-export async function countMissingBasicSolutionsForProblems(
+export interface SolutionStateCounts {
+  readonly nullSolutionCount: number;
+  readonly emptySolutionCount: number;
+}
+
+/** 分别统计 NULL（缺失）与空字符串（明确为空）；两种状态不得合并。 */
+export async function countSolutionStatesForProblems(
   database: DatabaseHandle,
   problemIds: readonly string[],
-): Promise<number> {
+): Promise<SolutionStateCounts> {
   const ids = problemIdList(problemIds);
   const rows = await database.transaction(async (executor) => {
     await executor.execute(sql`set local transaction_read_only = on`);
-    return executor.query<{ total: bigint }>(
-      sql`select count(*)::bigint as total
+    return executor.query<{ null_total: bigint; empty_total: bigint }>(
+      sql`select
+            count(*) filter (where pr.basic_solution is null)::bigint as null_total,
+            count(*) filter (where pr.basic_solution = '')::bigint as empty_total
           from "public"."problems" p
           inner join "public"."problem_revisions" pr
             on pr.problem_id = p.id and pr.revision = p.current_revision
-          where p.id in (${ids}) and coalesce(pr.basic_solution, '') = ''`,
+          where p.id in (${ids})`,
     );
   });
-  return Number(rows[0]?.total ?? 0);
+  return {
+    nullSolutionCount: Number(rows[0]?.null_total ?? 0),
+    emptySolutionCount: Number(rows[0]?.empty_total ?? 0),
+  };
 }
 
 /** 精确统计导入清单问题当前修订关联的附件行数。 */

@@ -12,6 +12,9 @@ const validEnv: NodeJS.ProcessEnv = {
   PRIVATE_ROOT: "/tmp/private",
   PACKAGE_DIRECTORY: "/tmp/private/packages",
   LIST_METADATA: "/tmp/private/list.json",
+  MATERIALIZED_DIRECTORY: "/tmp/private/materialized",
+  PREPARED_DIRECTORY: "/tmp/private/prepared",
+  APPROVAL_FILE: "/tmp/private/approval.json",
   PREFLIGHT_OUTPUT: "/tmp/private/preflight",
   GROUPING_FILE: "/tmp/private/grouping.json",
   PREFLIGHT_RECEIPT: "/tmp/private/preflight/phase2-preflight-receipt.private.json",
@@ -36,6 +39,9 @@ const validArgv = [
   "--package-directory-env=PACKAGE_DIRECTORY",
   "--list-metadata-env=LIST_METADATA",
   "--grouping-file-env=GROUPING_FILE",
+  "--materialized-directory-env=MATERIALIZED_DIRECTORY",
+  "--prepared-directory-env=PREPARED_DIRECTORY",
+  "--approval-file-env=APPROVAL_FILE",
   "--preflight-receipt-env=PREFLIGHT_RECEIPT",
   "--receipt-directory-env=RECEIPT_DIRECTORY",
   "--storage-root-env=STORAGE_ROOT",
@@ -50,7 +56,6 @@ const validArgv = [
   "--preflight-receipt-sha256-env=PREFLIGHT_RECEIPT_SHA256",
   "--execution-id-env=EXECUTION_ID",
   "--target-class-env=TARGET_CLASS",
-  "--expected-count=3",
 ];
 
 const validPreflightArgv = [
@@ -58,7 +63,9 @@ const validPreflightArgv = [
   "--list-metadata-env=LIST_METADATA",
   "--package-directory-env=PACKAGE_DIRECTORY",
   "--output-directory-env=PREFLIGHT_OUTPUT",
-  "--expected-record-count=3",
+  "--materialized-directory-env=MATERIALIZED_DIRECTORY",
+  "--prepared-directory-env=PREPARED_DIRECTORY",
+  "--approval-file-env=APPROVAL_FILE",
   "--database-url-env=DATABASE_URL",
   "--grouping-file-env=GROUPING_FILE",
   "--tag-id-env=TAG_ID",
@@ -79,7 +86,7 @@ describe("resolveRunnerInputs", () => {
     expect(inputs.databaseName).toBe(validEnv.DATABASE_NAME);
     expect(inputs.principal).toBe(validEnv.PRINCIPAL);
     expect(inputs.targetClass).toBe("scratch-temporary");
-    expect(inputs.expectedCount).toBe(3);
+    expect(inputs.materializedDirectory).toBe(validEnv.MATERIALIZED_DIRECTORY);
   });
 
   it("designated-validation 目标分类被接受", () => {
@@ -97,7 +104,7 @@ describe("resolveRunnerInputs", () => {
   });
 
   it("任何必填环境变量名参数缺失时拒绝", () => {
-    for (let index = 0; index < validArgv.length - 1; index += 1) {
+    for (let index = 0; index < validArgv.length; index += 1) {
       expect(() =>
         resolveRunnerInputs(validArgv.filter((_, argumentIndex) => argumentIndex !== index), validEnv),
       ).toThrow(HistoryMigrationError);
@@ -113,8 +120,8 @@ describe("resolveRunnerInputs", () => {
     ).toThrow(HistoryMigrationError);
   });
 
-  it("非法数量、摘要、库名或目标分类均拒绝", () => {
-    expect(() => resolveRunnerInputs([...validArgv, "--expected-count=0"], validEnv)).toThrow(
+  it("旧数量参数、非法摘要、库名或目标分类均拒绝", () => {
+    expect(() => resolveRunnerInputs([...validArgv, "--expected-count=3"], validEnv)).toThrow(
       HistoryMigrationError,
     );
     expect(() =>
@@ -131,7 +138,7 @@ describe("resolveRunnerInputs", () => {
   it("旧的直传值参数不能替代环境变量名参数", () => {
     expect(() =>
       resolveRunnerInputs(
-        ["--private-root=/tmp/private", "--target-class=scratch-temporary", "--expected-count=3"],
+        ["--private-root=/tmp/private", "--target-class=scratch-temporary"],
         validEnv,
       ),
     ).toThrow(HistoryMigrationError);
@@ -150,7 +157,7 @@ describe("resolvePreflightInputs", () => {
     expect(inputs.privateRoot).toBe(validEnv.PRIVATE_ROOT);
     expect(inputs.databaseUrl).toBe(validEnv.DATABASE_URL);
     expect(inputs.expectedBatchSha256).toBe(digest);
-    expect(inputs.expectedRecordCount).toBe(3);
+    expect(inputs.approvalFile).toBe(validEnv.APPROVAL_FILE);
   });
 
   it("摘要非法、环境变量缺失或旧直传参数均拒绝", () => {

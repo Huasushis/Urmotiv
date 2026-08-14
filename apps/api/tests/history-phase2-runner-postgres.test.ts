@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { sql } from "drizzle-orm";
@@ -16,9 +15,15 @@ import {
   preflightPassMarkerName,
   preflightReceiptName,
   runHistoryImportPreflight,
+  type HistoryImportPreflightHooks,
 } from "../scripts/preflight-history-import";
-import { runPhase2Acceptance } from "../scripts/run-real-import";
+import { runPhase2Acceptance, type Phase2RunnerHooks } from "../scripts/run-real-import";
 import { databaseDemoUserIds } from "../src/database-demo";
+import {
+  prepareHistoryCandidates,
+  verifyApprovedPackageSourceIdentities,
+  type HistoryNormalizer,
+} from "../src/history-migration/core";
 import { sha256Hex } from "../src/history-migration/digests";
 import {
   dropHistoryImportDatabase,
@@ -27,13 +32,17 @@ import {
   prepareHistoryImportDatabase,
 } from "../src/history-migration/import-phase";
 import {
+  historyImportRequiredTables,
   recomputePackageBatchIdentity,
   recomputeSourceBindingsIdentity,
 } from "../src/history-migration/import-preflight";
 import {
+  permittedPhase2EvidenceRoot,
+  type ExecutionProvenance,
+} from "../src/history-migration/execution-provenance";
+import {
+  captureDatabaseContentInventory,
   captureStorageInventory,
-  restoreStorageDirectory,
-  snapshotStorageDirectory,
 } from "../src/history-migration/history-import-snapshot";
 import {
   captureHistoryImportTableCounts,
@@ -41,19 +50,24 @@ import {
   expectedTableDeltas,
   type HistoryImportCountRow,
 } from "../src/history-migration/phase2-postcheck";
-
 const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
-const describePostgres = adminUrl === undefined ? describe.skip : describe;
+const acceptanceMode = process.env.URMOTIV_PHASE2_RUNNER_ACCEPTANCE === "1";
+const acceptanceCommit = process.env.URMOTIV_PHASE2_ACCEPTANCE_COMMIT;
+const describePostgres = adminUrl === undefined && !acceptanceMode ? describe.skip : describe;
 const temporaryDirectories: string[] = [];
 const temporaryDatabaseNames: string[] = [];
 const encoder = new TextEncoder();
 const tagId = "catalog.tag.01.01";
+const evidenceRoot = permittedPhase2EvidenceRoot();
 
 interface SyntheticBatch {
   readonly root: string;
   readonly packageDirectory: string;
   readonly listMetadata: string;
   readonly groupingFile: string;
+  readonly materializedDirectory: string;
+  readonly preparedDirectory: string;
+  readonly approvalFile: string;
   readonly preflightOutput: string;
   readonly runnerReceiptDirectory: string;
   readonly storageRoot: string;
@@ -64,6 +78,10 @@ interface SyntheticBatch {
 function scratchName(label: string): string {
   const suffix = `${label}${process.pid}${randomUUID().replaceAll("-", "").slice(0, 8)}`.slice(0, 20);
   return `urmotiv_history_import_${suffix}`;
+}
+
+function candidateIdForSource(index: number): string {
+  return `candidate-${String((index - 1) * 30 + 1).padStart(6, "0")}`;
 }
 
 async function privateDirectory(path: string): Promise<void> {
@@ -85,6 +103,12 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+function assertNode24(): void {
+  if (process.versions.node.split(".")[0] !== "24") {
+    throw new Error("Phase-2 PostgreSQL 验收必须使用 Node 24。");
+  }
+}
+
 function canonicalProblem(index: number): CanonicalProblem {
   const hasAttachment = index <= 38;
   return {
@@ -94,7 +118,7 @@ function canonicalProblem(index: number): CanonicalProblem {
     difficulty: {},
     content: {
       basicStatement: `# 合成验收题目 ${index}\n\n仅用于自动化验证。`,
-      basicSolution: index <= 7 ? null : `合成题解 ${index}`,
+      basicSolution: index <= 7 ? null : index === 8 ? "" : `合成题解 ${index}`,
       background: "",
       statement: "",
       inputFormat: "",
@@ -113,14 +137,118 @@ function canonicalProblem(index: number): CanonicalProblem {
           content: encoder.encode(`synthetic-attachment-${index}`),
         }]
       : [],
+    provenance: { sourceSystem: "ustc-history-private" },
     extensions: {},
   };
 }
 
+function syntheticNormalizer(): HistoryNormalizer {
+  return {
+    async normalize({ sourceId }) {
+      const index = Number(sourceId.slice("source-".length));
+      const problem = canonicalProblem(index);
+      return {
+        problems: [{
+          title: problem.title,
+          type: problem.type,
+          basicStatement: problem.content.basicStatement,
+          basicSolution: problem.content.basicSolution,
+          background: problem.content.background,
+          statement: problem.content.statement,
+          inputFormat: problem.content.inputFormat,
+          outputFormat: problem.content.outputFormat,
+          constraints: problem.content.constraints,
+          solution: problem.content.solution,
+          hints: problem.content.hints,
+          samples: problem.samples,
+          tags: [],
+          confidence: 1,
+          migrationNote: "synthetic-phase2-acceptance",
+        }],
+      };
+    },
+  };
+}
+
+async function writeSyntheticMaterialization(
+  materializedDirectory: string,
+  metadataFileSha256: string,
+  count: number,
+): Promise<void> {
+  const sourceDirectory = join(materializedDirectory, "sources");
+  await privateDirectory(sourceDirectory);
+  const mappings = [];
+  const sources = [];
+  const sourceSet = [];
+  for (let index = 1; index <= count; index += 1) {
+    const sourceId = `source-${String(index).padStart(6, "0")}`;
+    const sourcePath = `synthetic-source-${String(index).padStart(6, "0")}.md`;
+    const sourceText = `synthetic source body ${index}`;
+    const sourceBytes = encoder.encode(sourceText);
+    const sourceSha256 = sha256Hex(sourceBytes);
+    await privateFile(join(sourceDirectory, sourcePath), sourceBytes);
+    mappings.push({
+      sourcePath,
+      sourceSha256,
+      metadataNumber: String(index),
+    });
+    sources.push({
+      groupId: `group-${String(index).padStart(6, "0")}`,
+      sourceId,
+      sourceSha256,
+      fragmentCount: 1,
+      byteLength: sourceBytes.byteLength,
+      characterCount: sourceText.length,
+      status: "ready_for_prepare",
+    });
+    sourceSet.push({ sourceId, sourceSha256, byteLength: sourceBytes.byteLength });
+  }
+  const sourceConfirmation = {
+    version: 1,
+    confirmed: true,
+    metadataFileSha256,
+    mappings,
+  };
+  const groupingBatchSha256 = sha256Hex("synthetic-phase2-grouping");
+  const report = {
+    version: 2,
+    phase: "materialize",
+    sourceInventorySha256: sha256Hex("synthetic-phase2-source-inventory"),
+    groupingBatchSha256,
+    fragmentCount: count,
+    sourceCount: count,
+    unresolvedItemCount: 0,
+    sources,
+  };
+  const marker = {
+    version: 2,
+    phase: "materialize",
+    reportSha256: sha256Hex(JSON.stringify(report)),
+    sourceConfirmationSha256: sha256Hex(JSON.stringify(sourceConfirmation)),
+    sourceSetSha256: sha256Hex(JSON.stringify({ version: 1, sources: sourceSet })),
+    groupingBatchSha256,
+    sourceCount: count,
+    fragmentCount: count,
+    unresolvedItemCount: 0,
+  };
+  await privateFile(
+    join(materializedDirectory, "source-confirmation.private.json"),
+    `${JSON.stringify(sourceConfirmation, null, 2)}\n`,
+  );
+  await privateFile(join(materializedDirectory, "report.json"), `${JSON.stringify(report, null, 2)}\n`);
+  await privateFile(
+    join(materializedDirectory, "MATERIALIZE_COMPLETE"),
+    `${JSON.stringify(marker, null, 2)}\n`,
+  );
+}
+
 async function createSyntheticBatch(count: number): Promise<SyntheticBatch> {
-  const root = await mkdtemp(join(tmpdir(), "urmotiv-phase2-runner-"));
+  await privateDirectory(evidenceRoot);
+  const root = join(evidenceRoot, `runner-${process.pid}-${randomUUID()}`);
   temporaryDirectories.push(root);
-  await chmod(root, 0o700);
+  await privateDirectory(root);
+  const materializedDirectory = join(root, "materialized");
+  const preparedDirectory = join(root, "prepared");
   const packageDirectory = join(root, "package-output");
   const packageFilesDirectory = join(packageDirectory, "packages");
   const preflightOutput = join(root, "preflight");
@@ -128,25 +256,83 @@ async function createSyntheticBatch(count: number): Promise<SyntheticBatch> {
   const storageRoot = join(root, "storage");
   const importOutputDirectory = join(root, "import-output");
   await Promise.all([
+    privateDirectory(materializedDirectory),
     privateDirectory(packageFilesDirectory),
     privateDirectory(preflightOutput),
     privateDirectory(runnerReceiptDirectory),
     privateDirectory(storageRoot),
   ]);
 
+  const listMetadata = join(root, "list-metadata.json");
+  const metadata = {
+    records: Array.from({ length: count }, (_unused, index) => ({
+      number: String(index + 1),
+      name: `合成元数据 ${index + 1}`,
+      authorStudentId: `SYNTHETIC-${String(index + 1).padStart(6, "0")}`,
+      status: "",
+      contest: "",
+      note: "",
+    })),
+  };
+  const metadataText = `${JSON.stringify(metadata, null, 2)}\n`;
+  await privateFile(listMetadata, metadataText);
+  await writeSyntheticMaterialization(
+    materializedDirectory,
+    sha256Hex(metadataText),
+    count,
+  );
+  await prepareHistoryCandidates({
+    privateRootDirectory: evidenceRoot,
+    sourceDirectory: join(materializedDirectory, "sources"),
+    metadataFile: listMetadata,
+    sourceConfirmationFile: join(materializedDirectory, "source-confirmation.private.json"),
+    outputDirectory: preparedDirectory,
+    normalizer: syntheticNormalizer(),
+    operationTag: `phase2-${randomUUID()}`,
+    executionIdentity: {
+      version: 1,
+      codeSha256: sha256Hex("synthetic-normalizer-code"),
+      promptSha256: sha256Hex("synthetic-normalizer-prompt"),
+      modelSha256: sha256Hex("synthetic-normalizer-model"),
+      configSha256: sha256Hex("synthetic-normalizer-config"),
+    },
+  });
+
+  const approvals = [];
+  for (let index = 1; index <= count; index += 1) {
+    const candidateId = candidateIdForSource(index);
+    const candidate = JSON.parse(
+      await readFile(join(preparedDirectory, "candidates", `${candidateId}.json`), "utf8"),
+    ) as { readonly contentSha256: string };
+    approvals.push({ candidateId, contentSha256: candidate.contentSha256, decision: "approved" });
+  }
+  const approvalFile = join(root, "candidate-approval.private.json");
+  await privateFile(
+    approvalFile,
+    `${JSON.stringify({ version: 1, confirmed: true, approvals }, null, 2)}\n`,
+  );
+  const authoritative = await verifyApprovedPackageSourceIdentities({
+    privateRootDirectory: evidenceRoot,
+    materializedDirectory,
+    metadataFile: listMetadata,
+    preparedDirectory,
+    approvalFile,
+  });
+
   const entries = [];
   for (let index = 1; index <= count; index += 1) {
-    const candidateId = `candidate-${String(index).padStart(6, "0")}`;
+    const identity = authoritative[index - 1];
+    if (identity === undefined) throw new Error("synthetic authoritative identity missing");
     const problem = canonicalProblem(index);
     const generated = await urmotivNativeAdapter.export(problem, {});
     if (generated.kind === "single_file") throw new Error("原生适配器必须生成 ZIP。");
     const packageBytes = writeZipArchive(generated.files, { allowNestedArchives: true });
-    await privateFile(join(packageFilesDirectory, `${candidateId}.zip`), packageBytes);
+    await privateFile(join(packageFilesDirectory, `${identity.candidateId}.zip`), packageBytes);
     const attachment = problem.files[0];
     entries.push({
-      candidateId,
-      contentSha256: sha256Hex(problem.content.basicStatement),
-      sourceBindingSha256: sha256Hex(`synthetic-source-binding-${index}`),
+      candidateId: identity.candidateId,
+      contentSha256: identity.contentSha256,
+      sourceBindingSha256: identity.sourceBindingSha256,
       packageSha256: sha256Hex(packageBytes),
       packageBytes: packageBytes.byteLength,
       status: "packaged" as const,
@@ -181,17 +367,7 @@ async function createSyntheticBatch(count: number): Promise<SyntheticBatch> {
     `${JSON.stringify({ version: 1, phase: "package", packageCount: count })}\n`,
   );
 
-  const listMetadata = join(root, "list-metadata.json");
   const groupingFile = join(root, "grouping.json");
-  await privateFile(
-    listMetadata,
-    `${JSON.stringify({
-      records: Array.from({ length: count }, (_unused, index) => ({
-        number: String(index + 1),
-        name: `合成元数据 ${index + 1}`,
-      })),
-    })}\n`,
-  );
   await privateFile(
     groupingFile,
     `${JSON.stringify({
@@ -205,6 +381,9 @@ async function createSyntheticBatch(count: number): Promise<SyntheticBatch> {
     packageDirectory,
     listMetadata,
     groupingFile,
+    materializedDirectory,
+    preparedDirectory,
+    approvalFile,
     preflightOutput,
     runnerReceiptDirectory,
     storageRoot,
@@ -219,7 +398,9 @@ function preflightArguments(): string[] {
     "--list-metadata-env=LIST_METADATA",
     "--package-directory-env=PACKAGE_DIRECTORY",
     "--output-directory-env=PREFLIGHT_OUTPUT",
-    "--expected-record-count=137",
+    "--materialized-directory-env=MATERIALIZED_DIRECTORY",
+    "--prepared-directory-env=PREPARED_DIRECTORY",
+    "--approval-file-env=APPROVAL_FILE",
     "--database-url-env=DATABASE_URL",
     "--grouping-file-env=GROUPING_FILE",
     "--tag-id-env=TAG_ID",
@@ -232,12 +413,15 @@ function preflightArguments(): string[] {
   ];
 }
 
-function runnerArguments(expectedCount: number): string[] {
+function runnerArguments(): string[] {
   return [
     "--private-root-env=PRIVATE_ROOT",
     "--package-directory-env=PACKAGE_DIRECTORY",
     "--list-metadata-env=LIST_METADATA",
     "--grouping-file-env=GROUPING_FILE",
+    "--materialized-directory-env=MATERIALIZED_DIRECTORY",
+    "--prepared-directory-env=PREPARED_DIRECTORY",
+    "--approval-file-env=APPROVAL_FILE",
     "--preflight-receipt-env=PREFLIGHT_RECEIPT",
     "--receipt-directory-env=RECEIPT_DIRECTORY",
     "--storage-root-env=STORAGE_ROOT",
@@ -252,8 +436,18 @@ function runnerArguments(expectedCount: number): string[] {
     "--preflight-receipt-sha256-env=PREFLIGHT_RECEIPT_SHA256",
     "--execution-id-env=EXECUTION_ID",
     "--target-class-env=TARGET_CLASS",
-    `--expected-count=${expectedCount}`,
   ];
+}
+
+function provenanceHooks(): HistoryImportPreflightHooks & Phase2RunnerHooks {
+  if (acceptanceMode) return {};
+  return {
+    verifyProvenance: async (commit): Promise<ExecutionProvenance> => ({
+      commit,
+      codeInventorySha256: sha256Hex("synthetic-code-inventory"),
+      codeInventoryEntryCount: 1,
+    }),
+  };
 }
 
 async function approvedEnvironment(
@@ -261,35 +455,36 @@ async function approvedEnvironment(
   sourceConnectionString: string,
   executionId: string,
 ): Promise<NodeJS.ProcessEnv> {
-  const sourceBindingsSha256 = recomputeSourceBindingsIdentity(batch.report);
+  if (acceptanceMode && !/^[a-f0-9]{40}$/.test(acceptanceCommit ?? "")) {
+    throw new Error("专用验收缺少完整批准提交摘要。");
+  }
   return {
-    PRIVATE_ROOT: batch.root,
+    PRIVATE_ROOT: evidenceRoot,
     LIST_METADATA: batch.listMetadata,
     PACKAGE_DIRECTORY: batch.packageDirectory,
+    MATERIALIZED_DIRECTORY: batch.materializedDirectory,
+    PREPARED_DIRECTORY: batch.preparedDirectory,
+    APPROVAL_FILE: batch.approvalFile,
     PREFLIGHT_OUTPUT: batch.preflightOutput,
     DATABASE_URL: sourceConnectionString,
     GROUPING_FILE: batch.groupingFile,
     TAG_ID: tagId,
-    GIT_COMMIT: "synthetic-phase2-commit",
+    GIT_COMMIT: acceptanceMode ? acceptanceCommit : "0".repeat(40),
     TARGET_CLASS: "scratch-temporary",
     PRINCIPAL: databaseDemoUserIds.leader,
     EXECUTION_ID: executionId,
     BATCH_SHA256: batch.report.batchSha256,
-    SOURCE_BINDINGS_SHA256: sourceBindingsSha256,
+    SOURCE_BINDINGS_SHA256: recomputeSourceBindingsIdentity(batch.report),
   };
 }
 
 async function runApprovedPreflight(
   batch: SyntheticBatch,
   sourceConnectionString: string,
-  count: number,
   executionId: string,
 ): Promise<NodeJS.ProcessEnv> {
   const env = await approvedEnvironment(batch, sourceConnectionString, executionId);
-  const args = preflightArguments().map((argument) =>
-    argument === "--expected-record-count=137" ? `--expected-record-count=${count}` : argument,
-  );
-  expect(await runHistoryImportPreflight(args, env)).toBe(0);
+  expect(await runHistoryImportPreflight(preflightArguments(), env, provenanceHooks())).toBe(0);
   const preflightReceipt = join(batch.preflightOutput, preflightReceiptName);
   const receiptBytes = await readFile(preflightReceipt);
   return {
@@ -313,6 +508,15 @@ async function databaseExists(database: DatabaseHandle, name: string): Promise<b
   return Number(rows[0]?.total ?? 0) === 1;
 }
 
+function trackDatabaseFamily(name: string): void {
+  temporaryDatabaseNames.push(
+    name,
+    `${name}__snapshot`,
+    `${name}__restore`,
+    `${name}__failed`,
+  );
+}
+
 afterEach(async () => {
   if (adminUrl !== undefined) {
     for (const name of temporaryDatabaseNames.splice(0).reverse()) {
@@ -324,58 +528,41 @@ afterEach(async () => {
   }
 });
 
-describe("Phase-2 storage snapshot lifecycle", () => {
-  it("按批准摘要恢复非空目录，并在快照被改动时保持目标不变", async () => {
-    const root = await mkdtemp(join(tmpdir(), "urmotiv-phase2-storage-"));
-    temporaryDirectories.push(root);
-    const target = join(root, "target");
-    const nested = join(target, "nested");
-    const snapshot = join(root, "snapshot");
-    await privateDirectory(nested);
-    await privateFile(join(target, "one.bin"), encoder.encode("baseline-one"));
-    await privateFile(join(nested, "two.bin"), encoder.encode("baseline-two"));
-    const approved = await snapshotStorageDirectory(target, snapshot);
-
-    await privateFile(join(target, "one.bin"), encoder.encode("mutated"));
-    expect(await restoreStorageDirectory(snapshot, target, approved)).toEqual(approved);
-    expect(await captureStorageInventory(target)).toEqual(approved);
-
-    await privateFile(join(target, "one.bin"), encoder.encode("second-mutation"));
-    const targetBeforeRejectedRestore = await captureStorageInventory(target);
-    await privateFile(join(snapshot, "one.bin"), encoder.encode("corrupt-snapshot"));
-    await expect(restoreStorageDirectory(snapshot, target, approved)).rejects.toThrow();
-    expect(await captureStorageInventory(target)).toEqual(targetBeforeRejectedRestore);
-  });
-});
-
 describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
-  it("137 个合成包精确导入并幂等重放，完整增量与冻结字段均通过", async () => {
+  it("137 个权威来源包精确导入并以 0/137 幂等重放", async () => {
+    assertNode24();
     if (adminUrl === undefined) throw new Error("缺少 PostgreSQL 管理连接配置。");
     const sourceName = scratchName("src");
     const targetName = scratchName("ok");
-    temporaryDatabaseNames.push(sourceName, `${targetName}__snapshot`, `${targetName}__restore`, targetName);
+    trackDatabaseFamily(sourceName);
+    trackDatabaseFamily(targetName);
     await prepareHistoryImportDatabase(adminUrl, sourceName);
     const sourceConnectionString = historyImportDatabaseConnectionString(adminUrl, sourceName);
-    const sourceDatabase = createPostgresDatabase({ connectionString: sourceConnectionString, maxConnections: 1 });
+    const sourceDatabase = createPostgresDatabase({
+      connectionString: sourceConnectionString,
+      maxConnections: 1,
+    });
     const before = await captureHistoryImportTableCounts(sourceDatabase);
     await sourceDatabase.close();
 
     const batch = await createSyntheticBatch(137);
-    const env = await runApprovedPreflight(batch, sourceConnectionString, 137, "synthetic-success");
+    const env = await runApprovedPreflight(batch, sourceConnectionString, "synthetic-success");
     env.ADMIN_URL = sourceConnectionString;
     env.DATABASE_NAME = targetName;
-    expect(await runPhase2Acceptance(runnerArguments(137), env)).toBe(0);
+    expect(await runPhase2Acceptance(runnerArguments(), env, provenanceHooks())).toBe(0);
 
-    const receipt = JSON.parse(
-      await readFile(join(batch.runnerReceiptDirectory, "phase2-run-receipt.private.json"), "utf8"),
-    ) as Record<string, unknown>;
+    const receiptBytes = await readFile(
+      join(batch.runnerReceiptDirectory, "phase2-run-receipt.private.json"),
+    );
+    const receipt = JSON.parse(receiptBytes.toString("utf8")) as Record<string, unknown>;
     expect(receipt).toMatchObject({
+      version: 3,
       packageCount: 137,
       firstPass: { imported: 137, skipped: 0, failed: 0 },
       replayPass: { imported: 0, skipped: 137, failed: 0 },
       postcheck: { verdict: "PASS", reasonCodes: [], driftedTableCount: 0 },
       titleProbePassed: true,
-      missingSolutionCount: 7,
+      solutionStates: { nullCount: 7, emptyCount: 1 },
       attachmentCount: 38,
       storedObjectCount: 175,
       verdict: "PASS",
@@ -383,6 +570,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
     expect(JSON.stringify(receipt)).not.toContain("合成验收题目");
     expect(await exists(join(batch.runnerReceiptDirectory, "PHASE2_RUN_PASS"))).toBe(true);
     expect(await exists(join(batch.runnerReceiptDirectory, "storage.snapshot"))).toBe(false);
+    expect(await exists(join(batch.runnerReceiptDirectory, "PHASE2_RECOVERY_IN_PROGRESS"))).toBe(false);
 
     const targetDatabase = createPostgresDatabase({
       connectionString: historyImportDatabaseConnectionString(adminUrl, targetName),
@@ -416,49 +604,155 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
     const adminDatabase = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
     expect(await databaseExists(adminDatabase, `${targetName}__snapshot`)).toBe(false);
     expect(await databaseExists(adminDatabase, `${targetName}__restore`)).toBe(false);
+    expect(await databaseExists(adminDatabase, `${targetName}__failed`)).toBe(false);
     await adminDatabase.close();
+    if (acceptanceMode) {
+      console.log(
+        `Phase-2 route receipt: phase2-run-receipt.private.json sha256=${sha256Hex(receiptBytes)}`,
+      );
+    }
   }, 300_000);
 
-  it("快照后故障恢复数据库与存储精确基线，不留下通过收据或快照", async () => {
+  it("故障恢复、数据库快照损坏与清理失败均关闭验收", async () => {
+    assertNode24();
     if (adminUrl === undefined) throw new Error("缺少 PostgreSQL 管理连接配置。");
     const sourceName = scratchName("fsrc");
-    const targetName = scratchName("fail");
-    temporaryDatabaseNames.push(sourceName, `${targetName}__snapshot`, `${targetName}__restore`, targetName);
+    trackDatabaseFamily(sourceName);
     await prepareHistoryImportDatabase(adminUrl, sourceName);
     const sourceConnectionString = historyImportDatabaseConnectionString(adminUrl, sourceName);
-    const sourceDatabase = createPostgresDatabase({ connectionString: sourceConnectionString, maxConnections: 1 });
+    const sourceDatabase = createPostgresDatabase({
+      connectionString: sourceConnectionString,
+      maxConnections: 1,
+    });
     const expectedCounts = await captureHistoryImportTableCounts(sourceDatabase);
     const expectedStored = await captureStoredFileInventory(sourceDatabase);
     await sourceDatabase.close();
 
-    const batch = await createSyntheticBatch(1);
-    const env = await runApprovedPreflight(batch, sourceConnectionString, 1, "synthetic-failure");
-    env.ADMIN_URL = sourceConnectionString;
-    env.DATABASE_NAME = targetName;
-    const code = await runPhase2Acceptance(runnerArguments(1), env, {
-      afterFirstPass: async () => {
-        throw new Error("synthetic fault after first pass");
-      },
-    });
-    expect(code).toBe(1);
-
+    const rollbackTarget = scratchName("roll");
+    trackDatabaseFamily(rollbackTarget);
+    const rollbackBatch = await createSyntheticBatch(1);
+    const rollbackEnv = await runApprovedPreflight(
+      rollbackBatch,
+      sourceConnectionString,
+      "synthetic-rollback",
+    );
+    rollbackEnv.ADMIN_URL = sourceConnectionString;
+    rollbackEnv.DATABASE_NAME = rollbackTarget;
+    expect(
+      await runPhase2Acceptance(runnerArguments(), rollbackEnv, {
+        ...provenanceHooks(),
+        afterFirstPass: async () => {
+          throw new Error("synthetic fault after first pass");
+        },
+      }),
+    ).toBe(1);
     const restoredDatabase = createPostgresDatabase({
-      connectionString: historyImportDatabaseConnectionString(adminUrl, targetName),
+      connectionString: historyImportDatabaseConnectionString(adminUrl, rollbackTarget),
       maxConnections: 1,
     });
     expect(await captureHistoryImportTableCounts(restoredDatabase)).toEqual(expectedCounts);
     expect(await captureStoredFileInventory(restoredDatabase)).toEqual(expectedStored);
     await restoredDatabase.close();
-    expect((await captureStorageInventory(batch.storageRoot)).fileCount).toBe(0);
-    expect(await exists(batch.importOutputDirectory)).toBe(false);
-    expect(await exists(join(batch.runnerReceiptDirectory, "phase2-run-receipt.private.json"))).toBe(false);
-    expect(await exists(join(batch.runnerReceiptDirectory, "PHASE2_RUN_PASS"))).toBe(false);
-    expect(await exists(join(batch.runnerReceiptDirectory, "storage.snapshot"))).toBe(false);
-    expect(await exists(join(batch.preflightOutput, preflightPassMarkerName))).toBe(true);
+    expect((await captureStorageInventory(rollbackBatch.storageRoot)).fileCount).toBe(0);
+    expect(await exists(join(rollbackBatch.runnerReceiptDirectory, "phase2-run-receipt.private.json"))).toBe(false);
+    expect(await exists(join(rollbackBatch.runnerReceiptDirectory, "PHASE2_RUN_PASS"))).toBe(false);
+    expect(await exists(join(rollbackBatch.runnerReceiptDirectory, "storage.snapshot"))).toBe(false);
+    expect(await exists(join(rollbackBatch.runnerReceiptDirectory, "PHASE2_RECOVERY_IN_PROGRESS"))).toBe(false);
 
+    const corruptTarget = scratchName("corrupt");
+    trackDatabaseFamily(corruptTarget);
+    const corruptBatch = await createSyntheticBatch(1);
+    const corruptEnv = await runApprovedPreflight(
+      corruptBatch,
+      sourceConnectionString,
+      "synthetic-corruption",
+    );
+    corruptEnv.ADMIN_URL = sourceConnectionString;
+    corruptEnv.DATABASE_NAME = corruptTarget;
+    let corruptionStage = "not-started";
+    expect(
+      await runPhase2Acceptance(runnerArguments(), corruptEnv, {
+        ...provenanceHooks(),
+        afterFirstPass: async () => {
+          const snapshotDatabase = createPostgresDatabase({
+            connectionString: historyImportDatabaseConnectionString(
+              adminUrl,
+              `${corruptTarget}__snapshot`,
+            ),
+            maxConnections: 1,
+          });
+          corruptionStage = "connected";
+          try {
+            const beforeCorruption = await captureDatabaseContentInventory(
+              snapshotDatabase,
+              historyImportRequiredTables,
+            );
+            corruptionStage = "captured-before";
+            const changedRows = await snapshotDatabase.query<{ readonly id: string }>(
+              sql`update "public"."users"
+                  set nickname = nickname || ' changed'
+                  where id = ${databaseDemoUserIds.leader}
+                  returning id::text as id`,
+            );
+            corruptionStage = `updated-${changedRows.length}`;
+            if (changedRows.length !== 1) {
+              throw new Error("snapshot corruption did not mutate a row");
+            }
+            const afterCorruption = await captureDatabaseContentInventory(
+              snapshotDatabase,
+              historyImportRequiredTables,
+            );
+            corruptionStage = "captured-after";
+            console.log(
+              `数据库快照损坏摘要变化: ${
+                beforeCorruption.contentSha256 !== afterCorruption.contentSha256 ? "是" : "否"
+              }`,
+            );
+            if (beforeCorruption.contentSha256 === afterCorruption.contentSha256) {
+              throw new Error("database inventory did not detect snapshot corruption");
+            }
+            corruptionStage = "digest-changed";
+          } finally {
+            await snapshotDatabase.close();
+          }
+          throw new Error("synthetic database snapshot corruption");
+        },
+      }),
+    ).toBe(1);
+    expect(corruptionStage).toBe("digest-changed");
+    expect(await exists(join(corruptBatch.runnerReceiptDirectory, "phase2-run-receipt.private.json"))).toBe(false);
+    expect(await exists(join(corruptBatch.runnerReceiptDirectory, "PHASE2_RUN_PASS"))).toBe(false);
+    expect(await exists(join(corruptBatch.runnerReceiptDirectory, "storage.snapshot"))).toBe(true);
+    expect(await exists(join(corruptBatch.runnerReceiptDirectory, "PHASE2_RECOVERY_IN_PROGRESS"))).toBe(true);
     const adminDatabase = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
-    expect(await databaseExists(adminDatabase, `${targetName}__snapshot`)).toBe(false);
-    expect(await databaseExists(adminDatabase, `${targetName}__restore`)).toBe(false);
+    expect(await databaseExists(adminDatabase, `${corruptTarget}__snapshot`)).toBe(true);
     await adminDatabase.close();
-  }, 180_000);
+
+    const cleanupTarget = scratchName("clean");
+    trackDatabaseFamily(cleanupTarget);
+    const cleanupBatch = await createSyntheticBatch(1);
+    const cleanupEnv = await runApprovedPreflight(
+      cleanupBatch,
+      sourceConnectionString,
+      "synthetic-cleanup-failure",
+    );
+    cleanupEnv.ADMIN_URL = sourceConnectionString;
+    cleanupEnv.DATABASE_NAME = cleanupTarget;
+    expect(
+      await runPhase2Acceptance(runnerArguments(), cleanupEnv, {
+        ...provenanceHooks(),
+        beforeSnapshotCleanup: async () => {
+          throw new Error("synthetic cleanup failure");
+        },
+      }),
+    ).toBe(1);
+    expect(await exists(join(cleanupBatch.runnerReceiptDirectory, "phase2-run-receipt.private.json"))).toBe(false);
+    expect(await exists(join(cleanupBatch.runnerReceiptDirectory, "PHASE2_RUN_PASS"))).toBe(false);
+    expect(await exists(join(cleanupBatch.runnerReceiptDirectory, "storage.snapshot"))).toBe(true);
+    expect(await exists(join(cleanupBatch.runnerReceiptDirectory, "PHASE2_RECOVERY_IN_PROGRESS"))).toBe(false);
+    expect(await exists(join(cleanupBatch.preflightOutput, preflightPassMarkerName))).toBe(true);
+    const cleanupAdmin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
+    expect(await databaseExists(cleanupAdmin, `${cleanupTarget}__snapshot`)).toBe(true);
+    await cleanupAdmin.close();
+  }, 300_000);
 });

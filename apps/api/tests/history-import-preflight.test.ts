@@ -13,6 +13,7 @@ import {
   seedCoreDatabase,
   type DatabaseHandle,
 } from "@urmotiv/database";
+import type { CanonicalProblem } from "@urmotiv/problem-package";
 
 import {
   dropHistoryImportDatabase,
@@ -24,12 +25,14 @@ import { sha256Hex } from "../src/history-migration/digests";
 import { HistoryMigrationError } from "../src/history-migration/errors";
 import {
   historyImportRequiredTables,
+  bindAuthoritativeRevisionContent,
   reconcileHistoryImportBatch,
   recomputePackageBatchIdentity,
   runZeroMutationDatabasePreflight,
   summarizePackageEntryNames,
   summarizePackageReport,
 } from "../src/history-migration/import-preflight";
+import { expectedRevisionContentInventory } from "../src/history-migration/revision-integrity";
 
 const openDatabases: DatabaseHandle[] = [];
 
@@ -261,6 +264,8 @@ describe("历史导入预检对账", () => {
       entries: Array.from({ length: 3 }, (_unused, index) => ({
         candidateId: candidateId(index + 1),
         packageSha256: packageDigest(index + 1),
+        contentSha256: digest("a"),
+        sourceBindingSha256: sha256Hex(`binding-${index + 1}`),
         importJobId: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
         problemId: String(index + 1),
         importedAt: "2026-01-01T00:00:00Z",
@@ -389,16 +394,49 @@ describe("历史导入预检对账", () => {
       batchSha256: reportBatchSha256,
       importedCount: 3,
       entries: [
-        { candidateId: candidateId(1), packageSha256: digest("9"), importJobId: "00000000-0000-4000-8000-000000000001", problemId: "1", importedAt: "2026-01-01T00:00:00Z" },
-        { candidateId: candidateId(2), packageSha256: packageDigest(2), importJobId: "00000000-0000-4000-8000-000000000002", problemId: "2", importedAt: "2026-01-01T00:00:00Z" },
-        { candidateId: candidateId(3), packageSha256: packageDigest(3), importJobId: "00000000-0000-4000-8000-000000000003", problemId: "3", importedAt: "2026-01-01T00:00:00Z" },
+        { candidateId: candidateId(1), packageSha256: digest("9"), contentSha256: digest("a"), sourceBindingSha256: sha256Hex("binding-1"), importJobId: "00000000-0000-4000-8000-000000000001", problemId: "1", importedAt: "2026-01-01T00:00:00Z" },
+        { candidateId: candidateId(2), packageSha256: packageDigest(2), contentSha256: digest("a"), sourceBindingSha256: sha256Hex("binding-2"), importJobId: "00000000-0000-4000-8000-000000000002", problemId: "2", importedAt: "2026-01-01T00:00:00Z" },
+        { candidateId: candidateId(3), packageSha256: packageDigest(3), contentSha256: digest("a"), sourceBindingSha256: sha256Hex("binding-3"), importJobId: "00000000-0000-4000-8000-000000000003", problemId: "3", importedAt: "2026-01-01T00:00:00Z" },
       ],
     };
     const result = reconcileHistoryImportBatch(makeReconcileInput({ packageReport: report, importManifest: manifest }));
     expect(result.verdict).toBe("NOT_READY");
     expect(result.reasonCodes).toContain("manifest_entry_mismatch");
   });
+  it("把 ZIP 将写入的全部修订字段绑定到权威候选并拒绝单字段漂移", () => {
+    const problem: CanonicalProblem = {
+      title: "合成绑定题",
+      type: "traditional",
+      tags: [],
+      difficulty: {},
+      content: {
+        basicStatement: "合成题面",
+        basicSolution: "",
+        background: "",
+        statement: "",
+        inputFormat: "",
+        outputFormat: "",
+        constraints: "",
+        solution: "",
+        hints: "",
+      },
+      samples: [],
+      files: [],
+      provenance: { sourceSystem: "synthetic" },
+      extensions: {},
+    };
+    const authoritative = [{ candidateId: candidateId(1), problem }];
+    const inventory = expectedRevisionContentInventory(authoritative);
+    expect(bindAuthoritativeRevisionContent(inventory, authoritative)).toMatch(/^[a-f0-9]{64}$/);
+    expect(() =>
+      bindAuthoritativeRevisionContent(
+        { ...inventory, fullContentSha256: sha256Hex("tampered-title") },
+        authoritative,
+      ),
+    ).toThrow(HistoryMigrationError);
+  });
 });
+
 
 describe("包条目结构统计", () => {
   it("只按路径前缀分类，不读取正文", () => {

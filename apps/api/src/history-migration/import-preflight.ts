@@ -11,7 +11,7 @@ import { readdir } from "node:fs/promises";
 import { sql } from "drizzle-orm";
 import { z } from "zod";
 import type { DatabaseHandle } from "@urmotiv/database";
-import { readZipArchive, urmotivNativeAdapter } from "@urmotiv/problem-package";
+import { readZipArchive, urmotivNativeAdapter, type CanonicalProblem } from "@urmotiv/problem-package";
 
 import { HistoryMigrationError } from "./errors";
 import { historyMetadataFileSchema } from "./schema";
@@ -22,6 +22,10 @@ import {
 } from "./import-phase";
 import { sha256Hex } from "./digests";
 import { readPrivateRegularBytes } from "./private-files";
+import {
+  expectedRevisionContentInventory,
+  type RevisionContentInventory,
+} from "./revision-integrity";
 
 /** 真实导入中经 DatabaseImportedProblemWriter 原子写入的全部表与对象。 */
 export const historyImportRequiredTables = [
@@ -56,6 +60,7 @@ export interface PackageScanResult {
   readonly expectedStoredBytes: number;
   /** 忽略随机存储路径，只绑定每个对象的摘要与字节数。 */
   readonly expectedStoredContentSha256: string;
+  readonly expectedRevisionInventory: RevisionContentInventory;
 }
 
 export async function scanPackageDirectory(
@@ -69,6 +74,10 @@ export async function scanPackageDirectory(
   let packageDigestMismatchCount = 0;
   let expectedSampleRows = 0;
   let expectedProblemFileRows = 0;
+  const revisionPackages: Array<{
+    readonly candidateId: string;
+    readonly problem: Awaited<ReturnType<typeof urmotivNativeAdapter.import>>;
+  }> = [];
   let expectedStoredFilesRows = 0;
   let expectedStoredBytes = 0;
   const expectedPackageFiles = new Set<string>();
@@ -87,6 +96,7 @@ export async function scanPackageDirectory(
       expectedStoredFilesRows += 1 + imported.files.length;
       expectedStoredBytes += bytes.byteLength;
       storedObjects.push({ sha256: packageSha256, bytes: bytes.byteLength });
+      revisionPackages.push({ candidateId: entry.candidateId, problem: imported });
       for (const file of imported.files) {
         const fileSha256 = sha256Hex(file.content);
         expectedStoredBytes += file.content.byteLength;
@@ -126,6 +136,7 @@ export async function scanPackageDirectory(
     expectedStoredFilesRows,
     expectedStoredBytes,
     expectedStoredContentSha256: sha256Hex(JSON.stringify(storedObjects)),
+    expectedRevisionInventory: expectedRevisionContentInventory(revisionPackages),
   };
 }
 
@@ -278,6 +289,106 @@ export function recomputeSourceBindingsIdentity(report: PackageReportPayload): s
       })),
     ),
   );
+}
+
+export interface AuthoritativeSourceIdentity {
+  readonly candidateId: string;
+  readonly contentSha256: string;
+  readonly sourceBindingSha256: string;
+}
+
+/**
+ * 把上游重新验证的源/候选身份按原批准顺序绑定到实际产出的包摘要。
+ * 任何报告自报字段都必须与上游候选文件、批准文件和物化源重新计算的结果一致。
+ */
+export function bindAuthoritativePackageIdentities(
+  report: PackageReportPayload,
+  authoritative: readonly AuthoritativeSourceIdentity[],
+): string {
+  if (report.packages.length !== authoritative.length) {
+    throw new HistoryMigrationError("INVALID_METADATA", "权威候选清单与产出包数量不一致。");
+  }
+  const bindings = report.packages.map((entry, index) => {
+    const expected = authoritative[index];
+    if (
+      expected === undefined ||
+      entry.candidateId !== expected.candidateId ||
+      entry.contentSha256 !== expected.contentSha256 ||
+      entry.sourceBindingSha256 !== expected.sourceBindingSha256
+    ) {
+      throw new HistoryMigrationError("INVALID_METADATA", "产出包没有绑定到权威源与候选身份。");
+    }
+    return {
+      candidateId: expected.candidateId,
+      contentSha256: expected.contentSha256,
+      sourceBindingSha256: expected.sourceBindingSha256,
+      packageSha256: entry.packageSha256,
+    };
+  });
+  return sha256Hex(JSON.stringify(bindings));
+}
+
+export function verifyProducedManifestIdentity(
+  report: PackageReportPayload,
+  manifestInput: unknown,
+): string {
+  const manifest = importManifestPayloadSchema.parse(manifestInput);
+  if (
+    manifest.batchSha256 !== report.batchSha256 ||
+    manifest.importedCount !== report.packages.length ||
+    manifest.entries.length !== report.packages.length
+  ) {
+    throw new HistoryMigrationError("INVALID_METADATA", "产出导入清单与批准批次不一致。");
+  }
+  const entriesByCandidate = new Map(manifest.entries.map((entry) => [entry.candidateId, entry]));
+  if (entriesByCandidate.size !== report.packages.length) {
+    throw new HistoryMigrationError("INVALID_METADATA", "产出导入清单包含重复或缺失候选。");
+  }
+  const boundEntries = report.packages.map((expected) => {
+    const entry = entriesByCandidate.get(expected.candidateId);
+    if (
+      entry === undefined ||
+      entry.packageSha256 !== expected.packageSha256 ||
+      entry.contentSha256 !== expected.contentSha256 ||
+      entry.sourceBindingSha256 !== expected.sourceBindingSha256
+    ) {
+      throw new HistoryMigrationError("INVALID_METADATA", "产出导入清单没有绑定权威源、候选与包身份。");
+    }
+    return {
+      candidateId: entry.candidateId,
+      contentSha256: entry.contentSha256,
+      sourceBindingSha256: entry.sourceBindingSha256,
+      packageSha256: entry.packageSha256,
+      problemIdSha256: sha256Hex(entry.problemId),
+    };
+  });
+  return sha256Hex(JSON.stringify(boundEntries));
+}
+
+export interface AuthoritativeRevisionIdentity {
+  readonly candidateId: string;
+  readonly problem: CanonicalProblem;
+}
+
+/** 把 ZIP 中将写入数据库的全部修订字段绑定到权威批准候选，而非仅信任报告摘要。 */
+export function bindAuthoritativeRevisionContent(
+  packageInventory: RevisionContentInventory,
+  authoritative: readonly AuthoritativeRevisionIdentity[],
+): string {
+  const expected = expectedRevisionContentInventory(authoritative);
+  if (
+    packageInventory.revisionCount !== expected.revisionCount ||
+    packageInventory.nullSolutionCount !== expected.nullSolutionCount ||
+    packageInventory.emptySolutionCount !== expected.emptySolutionCount ||
+    packageInventory.fullContentSha256 !== expected.fullContentSha256 ||
+    packageInventory.frozenContentSha256 !== expected.frozenContentSha256
+  ) {
+    throw new HistoryMigrationError(
+      "INVALID_METADATA",
+      "产出包的全部修订内容没有绑定到权威批准候选。",
+    );
+  }
+  return sha256Hex(JSON.stringify(expected));
 }
 
 /** 安全编号（如 M-0000123）与清单题号的规范化等价形式：仅比较数字后缀。 */
@@ -503,11 +614,17 @@ export function reconcileHistoryImportBatch(
     importedCount = manifest.data.importedCount;
     if (manifest.data.batchSha256 !== report.data.batchSha256) reasonCodes.push("manifest_batch_mismatch");
     if (manifest.data.importedCount !== reportSummary.packageCount) reasonCodes.push("manifest_incomplete");
-    // 逐条比对：manifest 的每个条目都必须在报告中出现且包摘要一致，反之亦然。
-    const reportDigestsByCandidate = new Map<string, string>();
-    for (const entry of report.data.packages) {
-      reportDigestsByCandidate.set(entry.candidateId, entry.packageSha256);
-    }
+    // 逐条比对候选、候选内容、来源绑定和实际包摘要，反向也必须完整覆盖。
+    const reportIdentityByCandidate = new Map(
+      report.data.packages.map((entry) => [
+        entry.candidateId,
+        {
+          packageSha256: entry.packageSha256,
+          contentSha256: entry.contentSha256,
+          sourceBindingSha256: entry.sourceBindingSha256,
+        },
+      ]),
+    );
     const manifestCandidates = new Set<string>();
     let duplicateManifestEntries = 0;
     let manifestEntryMismatches = 0;
@@ -515,7 +632,13 @@ export function reconcileHistoryImportBatch(
     for (const entry of manifest.data.entries) {
       if (manifestCandidates.has(entry.candidateId)) duplicateManifestEntries += 1;
       manifestCandidates.add(entry.candidateId);
-      if (reportDigestsByCandidate.get(entry.candidateId) !== entry.packageSha256) {
+      const expected = reportIdentityByCandidate.get(entry.candidateId);
+      if (
+        expected === undefined ||
+        expected.packageSha256 !== entry.packageSha256 ||
+        expected.contentSha256 !== entry.contentSha256 ||
+        expected.sourceBindingSha256 !== entry.sourceBindingSha256
+      ) {
         manifestEntryMismatches += 1;
       }
     }

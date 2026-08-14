@@ -138,6 +138,18 @@ describe("Urmotiv native problem package", () => {
       })
     ).rejects.toThrow("校验值不一致");
   });
+
+  it("round trips an explicitly empty basic solution without converting it to null", async () => {
+    const explicitEmpty = canonicalProblemSchema.parse({
+      ...completeProblem,
+      content: { ...completeProblem.content, basicSolution: "" }
+    });
+    const generated = await urmotivNativeAdapter.export(explicitEmpty, {});
+    const imported = await urmotivNativeAdapter.import(toSafeArchive(generated), {
+      conflictAction: "create"
+    });
+    expect(imported.content.basicSolution).toBe("");
+  });
 });
 
 function toSafeArchive(archive: GeneratedArchive) {

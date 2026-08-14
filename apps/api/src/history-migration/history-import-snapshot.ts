@@ -28,6 +28,78 @@ interface StorageInventoryEntry {
   readonly sha256: string;
 }
 
+export interface DatabaseContentInventory {
+  readonly tableCount: number;
+  readonly rowCount: number;
+  readonly contentSha256: string;
+}
+
+function databaseConnectionString(adminConnectionString: string, databaseName: string): string {
+  const parsed = new URL(adminConnectionString);
+  parsed.pathname = `/${databaseName}`;
+  return parsed.toString();
+}
+
+export async function captureDatabaseContentInventory(
+  database: DatabaseHandle,
+  tableNames: readonly string[],
+): Promise<DatabaseContentInventory> {
+  const tablePayloads: Array<{ readonly table: string; readonly payload: string }> = [];
+  let rowCount = 0;
+  for (const tableName of tableNames) {
+    if (!/^[a-z_]+$/.test(tableName)) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "数据库内容清单包含非法表名。");
+    }
+    const rows = await database.query<{ total: bigint; payload: string }>(
+      sql`select count(*)::bigint as total,
+                 coalesce(
+                   jsonb_agg(to_jsonb(content_row) order by to_jsonb(content_row)::text),
+                   '[]'::jsonb
+                 )::text as payload
+            from (select * from ${sql.identifier("public")}.${sql.identifier(tableName)}) content_row`,
+    );
+    const row = rows[0];
+    if (row === undefined) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "数据库内容清单查询没有结果。");
+    }
+    rowCount += Number(row.total);
+    tablePayloads.push({ table: tableName, payload: row.payload });
+  }
+  return {
+    tableCount: tableNames.length,
+    rowCount,
+    contentSha256: createHash("sha256").update(JSON.stringify(tablePayloads)).digest("hex"),
+  };
+}
+
+export function databaseContentInventoriesEqual(
+  left: DatabaseContentInventory,
+  right: DatabaseContentInventory,
+): boolean {
+  return (
+    left.tableCount === right.tableCount &&
+    left.rowCount === right.rowCount &&
+    left.contentSha256 === right.contentSha256
+  );
+}
+
+async function captureNamedDatabaseInventory(
+  adminConnectionString: string,
+  databaseName: string,
+  tableNames: readonly string[],
+): Promise<DatabaseContentInventory> {
+  const database = createPostgresDatabase({
+    connectionString: databaseConnectionString(adminConnectionString, databaseName),
+    maxConnections: 1,
+    applicationName: "urmotiv-history-import-snapshot-verify",
+  });
+  try {
+    return await captureDatabaseContentInventory(database, tableNames);
+  } finally {
+    await database.close();
+  }
+}
+
 function snapshotNameFor(name: string): string {
   assertScratchDatabaseName(name);
   return `${name}__snapshot`;
@@ -36,6 +108,11 @@ function snapshotNameFor(name: string): string {
 function restoreStagingNameFor(name: string): string {
   assertScratchDatabaseName(name);
   return `${name}__restore`;
+}
+
+function restoreBackupNameFor(name: string): string {
+  assertScratchDatabaseName(name);
+  return `${name}__failed`;
 }
 
 async function withAdminConnection<T>(
@@ -79,7 +156,9 @@ async function terminateConnections(admin: DatabaseHandle, name: string): Promis
 export async function snapshotScratchDatabase(
   adminConnectionString: string,
   scratchName: string,
-): Promise<void> {
+  tableNames: readonly string[],
+  expectedInventory: DatabaseContentInventory,
+): Promise<DatabaseContentInventory> {
   assertScratchDatabaseName(scratchName);
   const snapshotName = snapshotNameFor(scratchName);
   await withAdminConnection(adminConnectionString, async (admin) => {
@@ -94,35 +173,86 @@ export async function snapshotScratchDatabase(
       sql`create database ${sql.identifier(snapshotName)} template ${sql.identifier(scratchName)}`,
     );
   });
+  const snapshotInventory = await captureNamedDatabaseInventory(
+    adminConnectionString,
+    snapshotName,
+    tableNames,
+  );
+  if (!databaseContentInventoriesEqual(snapshotInventory, expectedInventory)) {
+    await dropScratchSnapshot(adminConnectionString, scratchName);
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "数据库快照内容摘要与批准基线不一致。");
+  }
+  return snapshotInventory;
 }
 
 /**
- * 分阶段恢复：先从快照创建独立 staging 库，再替换目标库；快照保留到调用者
- * 完成行数核对，避免恢复校验失败后失去最后一份可重试副本。
+ * 分阶段恢复：先验证快照内容，再创建并验证 staging 库，最后保留失败现场备份并
+ * 原子改名。快照和失败现场直到调用者完成内容复核后才由 dropScratchSnapshot 删除。
  */
 export async function restoreScratchDatabase(
   adminConnectionString: string,
   scratchName: string,
-): Promise<void> {
+  tableNames: readonly string[],
+  expectedInventory: DatabaseContentInventory,
+): Promise<DatabaseContentInventory> {
   assertScratchDatabaseName(scratchName);
   const snapshotName = snapshotNameFor(scratchName);
   const stagingName = restoreStagingNameFor(scratchName);
+  const backupName = restoreBackupNameFor(scratchName);
   await withAdminConnection(adminConnectionString, async (admin) => {
     if (!(await databaseExists(admin, snapshotName))) {
       throw new HistoryMigrationError("INVALID_ARGUMENTS", "数据库快照不存在，无法恢复。");
     }
-    if (await databaseExists(admin, stagingName)) {
-      throw new HistoryMigrationError("INVALID_ARGUMENTS", "恢复 staging 库已存在，拒绝覆盖。");
+    if (!(await databaseExists(admin, scratchName))) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "待恢复数据库不存在。");
     }
+    if ((await databaseExists(admin, stagingName)) || (await databaseExists(admin, backupName))) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "恢复 staging 或失败现场库已存在，拒绝覆盖。");
+    }
+  });
+  const snapshotInventory = await captureNamedDatabaseInventory(
+    adminConnectionString,
+    snapshotName,
+    tableNames,
+  );
+  if (!databaseContentInventoriesEqual(snapshotInventory, expectedInventory)) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "数据库快照内容摘要不再匹配批准基线。");
+  }
+  await withAdminConnection(adminConnectionString, async (admin) => {
+    await terminateConnections(admin, snapshotName);
     await admin.execute(
       sql`create database ${sql.identifier(stagingName)} template ${sql.identifier(snapshotName)}`,
     );
-    await terminateConnections(admin, scratchName);
-    await admin.execute(sql`drop database if exists ${sql.identifier(scratchName)}`);
-    await admin.execute(
-      sql`alter database ${sql.identifier(stagingName)} rename to ${sql.identifier(scratchName)}`,
-    );
   });
+  const stagingInventory = await captureNamedDatabaseInventory(
+    adminConnectionString,
+    stagingName,
+    tableNames,
+  );
+  if (!databaseContentInventoriesEqual(stagingInventory, expectedInventory)) {
+    await withAdminConnection(adminConnectionString, async (admin) => {
+      await terminateConnections(admin, stagingName);
+      await admin.execute(sql`drop database ${sql.identifier(stagingName)}`);
+    });
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "数据库恢复 staging 内容摘要不一致。");
+  }
+  await withAdminConnection(adminConnectionString, async (admin) => {
+    await terminateConnections(admin, scratchName);
+    await admin.execute(
+      sql`alter database ${sql.identifier(scratchName)} rename to ${sql.identifier(backupName)}`,
+    );
+    try {
+      await admin.execute(
+        sql`alter database ${sql.identifier(stagingName)} rename to ${sql.identifier(scratchName)}`,
+      );
+    } catch (error) {
+      await admin.execute(
+        sql`alter database ${sql.identifier(backupName)} rename to ${sql.identifier(scratchName)}`,
+      );
+      throw error;
+    }
+  });
+  return stagingInventory;
 }
 
 /** 删除已验证恢复或成功导入后的数据库快照；清理错误直接向上传播。 */
@@ -130,11 +260,23 @@ export async function dropScratchSnapshot(
   adminConnectionString: string,
   scratchName: string,
 ): Promise<void> {
-  const snapshotName = snapshotNameFor(scratchName);
+  const names = [
+    snapshotNameFor(scratchName),
+    restoreStagingNameFor(scratchName),
+    restoreBackupNameFor(scratchName),
+  ];
+  const failures: unknown[] = [];
   await withAdminConnection(adminConnectionString, async (admin) => {
-    await terminateConnections(admin, snapshotName);
-    await admin.execute(sql`drop database if exists ${sql.identifier(snapshotName)}`);
+    for (const name of names) {
+      try {
+        await terminateConnections(admin, name);
+        await admin.execute(sql`drop database if exists ${sql.identifier(name)}`);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
   });
+  if (failures.length > 0) throw failures[0];
 }
 
 async function collectStorageEntries(

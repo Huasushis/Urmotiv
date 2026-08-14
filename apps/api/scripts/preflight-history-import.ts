@@ -1,7 +1,7 @@
 /**
  * 历史导入预检 CLI：确定性对账 + 零数据库变更检查。
- * 命令行只接收环境变量名和非敏感数量；路径、身份、标签、提交与摘要值均
- * 从环境变量读取。stdout 只输出聚合计数与稳定状态码。
+ * 命令行只接收环境变量名；路径、身份、标签、提交与摘要值均从环境变量读取。
+ * stdout 只输出聚合计数与稳定状态码。
  */
 import { join } from "node:path";
 
@@ -11,7 +11,13 @@ import { sha256Hex } from "../src/history-migration/digests";
 import { HistoryMigrationError } from "../src/history-migration/errors";
 import { packageReportPayloadSchema } from "../src/history-migration/import-phase";
 import {
+  verifyApprovedPackageSourceIdentities,
+  type VerifyApprovedPackageSourceIdentitiesOptions,
+} from "../src/history-migration/core";
+import {
   historyImportRequiredTables,
+  bindAuthoritativePackageIdentities,
+  bindAuthoritativeRevisionContent,
   reconcileHistoryImportBatch,
   recomputeSourceBindingsIdentity,
   runZeroMutationDatabasePreflight,
@@ -29,6 +35,11 @@ import {
   removePrivateRegularFile,
   writePrivateFile,
 } from "../src/history-migration/private-files";
+import {
+  assertPermittedPhase2EvidenceRoot,
+  verifyExecutionProvenance,
+  type ExecutionProvenance,
+} from "../src/history-migration/execution-provenance";
 
 const allowedTargetClasses = ["scratch-temporary", "designated-validation", "designated-real"] as const;
 const digestPattern = /^[a-f0-9]{64}$/;
@@ -39,7 +50,9 @@ interface PreflightInputs {
   readonly listMetadata: string;
   readonly packageDirectory: string;
   readonly outputDirectory: string;
-  readonly expectedRecordCount: number;
+  readonly materializedDirectory: string;
+  readonly preparedDirectory: string;
+  readonly approvalFile: string;
   readonly databaseUrl: string;
   readonly groupingFile: string;
   readonly tagId: string;
@@ -88,7 +101,9 @@ export function resolvePreflightInputs(
     "list-metadata-env",
     "package-directory-env",
     "output-directory-env",
-    "expected-record-count",
+    "materialized-directory-env",
+    "prepared-directory-env",
+    "approval-file-env",
     "database-url-env",
     "grouping-file-env",
     "tag-id-env",
@@ -104,11 +119,6 @@ export function resolvePreflightInputs(
     if (!allowedKeys.has(key)) {
       throw new HistoryMigrationError("INVALID_ARGUMENTS", "命令行包含未批准的参数。");
     }
-  }
-  const expectedRaw = values.get("expected-record-count");
-  const expectedRecordCount = Number(expectedRaw);
-  if (!Number.isInteger(expectedRecordCount) || expectedRecordCount < 1 || expectedRecordCount > 10_000) {
-    throw new HistoryMigrationError("INVALID_ARGUMENTS", "expected-record-count 必须是 1 到 10000 的整数。");
   }
   const targetClassRaw = environmentValue(values, env, "target-class-env");
   if (!allowedTargetClasses.includes(targetClassRaw as TargetClass)) {
@@ -135,7 +145,9 @@ export function resolvePreflightInputs(
     listMetadata: environmentValue(values, env, "list-metadata-env"),
     packageDirectory: environmentValue(values, env, "package-directory-env"),
     outputDirectory: environmentValue(values, env, "output-directory-env"),
-    expectedRecordCount,
+    materializedDirectory: environmentValue(values, env, "materialized-directory-env"),
+    preparedDirectory: environmentValue(values, env, "prepared-directory-env"),
+    approvalFile: environmentValue(values, env, "approval-file-env"),
     databaseUrl: environmentValue(values, env, "database-url-env"),
     groupingFile: environmentValue(values, env, "grouping-file-env"),
     tagId: environmentValue(values, env, "tag-id-env"),
@@ -152,11 +164,20 @@ export function resolvePreflightInputs(
 export const preflightReceiptName = "history-import-preflight.private.json";
 export const preflightPassMarkerName = "PREFLIGHT_PASS";
 
+export interface HistoryImportPreflightHooks {
+  readonly verifyProvenance?: ((commit: string) => Promise<ExecutionProvenance>) | undefined;
+  readonly verifySourceIdentities?:
+    | ((
+        options: VerifyApprovedPackageSourceIdentitiesOptions,
+      ) => ReturnType<typeof verifyApprovedPackageSourceIdentities>)
+    | undefined;
+}
 function groupingIds(payload: unknown): string[] {
   if (
     typeof payload !== "object" ||
     payload === null ||
     !("groups" in payload) ||
+
     !Array.isArray(payload.groups)
   ) {
     return [];
@@ -173,14 +194,19 @@ function groupingIds(payload: unknown): string[] {
 export async function runHistoryImportPreflight(
   argv: readonly string[],
   env: NodeJS.ProcessEnv,
+  hooks: HistoryImportPreflightHooks = {},
 ): Promise<number> {
   const inputs = resolvePreflightInputs(argv, env);
+  await assertPermittedPhase2EvidenceRoot(inputs.privateRoot);
   await assertPrivateDirectoryMode(inputs.privateRoot);
   await assertPrivateDirectoryMode(inputs.outputDirectory);
   const receiptPath = join(inputs.outputDirectory, preflightReceiptName);
   const markerPath = join(inputs.outputDirectory, preflightPassMarkerName);
   const pathChecks: { path: string; kind: "existing" | "new" }[] = [
     { path: inputs.listMetadata, kind: "existing" },
+    { path: inputs.materializedDirectory, kind: "existing" },
+    { path: inputs.preparedDirectory, kind: "existing" },
+    { path: inputs.approvalFile, kind: "existing" },
     { path: inputs.packageDirectory, kind: "existing" },
     { path: inputs.outputDirectory, kind: "existing" },
     { path: inputs.groupingFile, kind: "existing" },
@@ -194,11 +220,31 @@ export async function runHistoryImportPreflight(
   await assertNewOutputPath(receiptPath);
   await assertNewOutputPath(markerPath);
 
+  const provenance = await (hooks.verifyProvenance ?? verifyExecutionProvenance)(inputs.gitCommit);
+  const authoritativeIdentities = await (
+    hooks.verifySourceIdentities ?? verifyApprovedPackageSourceIdentities
+  )({
+    privateRootDirectory: inputs.privateRoot,
+    materializedDirectory: inputs.materializedDirectory,
+    metadataFile: inputs.listMetadata,
+    preparedDirectory: inputs.preparedDirectory,
+    approvalFile: inputs.approvalFile,
+  });
+
   const metadataRead = await readPrivateJsonWithDigest(inputs.listMetadata);
   const reportRead = await readPrivateJsonWithDigest(join(inputs.packageDirectory, "report.json"));
   const groupingRead = await readPrivateJsonWithDigest(inputs.groupingFile);
   const reportParsed = packageReportPayloadSchema.parse(reportRead.value);
   const scan = await scanPackageDirectory(inputs.packageDirectory, reportParsed);
+  const authoritativeRevisionIdentitySha256 = bindAuthoritativeRevisionContent(
+    scan.expectedRevisionInventory,
+    authoritativeIdentities,
+  );
+  const authoritativeContentMatches = true;
+  const authoritativePackageIdentitySha256 = bindAuthoritativePackageIdentities(
+    reportParsed,
+    authoritativeIdentities,
+  );
   const contentSummary = summarizePackageEntryNames(scan.entryNames);
   const groupingMetadataIds = groupingIds(groupingRead.value);
 
@@ -214,7 +260,7 @@ export async function runHistoryImportPreflight(
     listMetadata: metadataRead.value,
     packageReport: reportRead.value,
     packageEntryNames: scan.entryNames,
-    expectedRecordCount: inputs.expectedRecordCount,
+    expectedRecordCount: authoritativeIdentities.length,
     importManifest: manifest,
     missingPackageFileCount: scan.missingPackageFileCount,
     packageBytesMismatchCount: scan.packageBytesMismatchCount,
@@ -227,6 +273,8 @@ export async function runHistoryImportPreflight(
   const approvedInputMatches =
     reportParsed.batchSha256 === inputs.expectedBatchSha256 &&
     sourceBindingsSha256 === inputs.expectedSourceBindingsSha256;
+  const authoritativeCountMatches =
+    authoritativeIdentities.length === scan.expectedRevisionInventory.revisionCount;
 
   const database = createPostgresDatabase({
     connectionString: inputs.databaseUrl,
@@ -246,13 +294,15 @@ export async function runHistoryImportPreflight(
   const ready =
     reconciliation.verdict === "READY" &&
     approvedInputMatches &&
+    authoritativeCountMatches &&
+    authoritativeContentMatches &&
     databaseResult.readOnlyEnforced &&
     databaseResult.missingTableCount === 0 &&
     databaseResult.tagPresent === true &&
     databaseResult.principalPresent === true;
 
   const receipt = {
-    version: 2,
+    version: 3,
     generatedAt: new Date().toISOString(),
     targetClass: inputs.targetClass,
     inputBindings: {
@@ -262,12 +312,17 @@ export async function runHistoryImportPreflight(
       ...(manifestSha256 === undefined ? {} : { importManifestSha256: manifestSha256 }),
       batchSha256: reportParsed.batchSha256,
       sourceBindingsSha256,
+      authoritativePackageIdentitySha256,
+      authoritativeRevisionIdentitySha256,
+      codeInventoryEntryCount: provenance.codeInventoryEntryCount,
+      codeInventorySha256: provenance.codeInventorySha256,
       tagIdSha256: sha256Hex(inputs.tagId),
       gitCommitSha256: sha256Hex(inputs.gitCommit),
       principalSha256: sha256Hex(inputs.principal),
       executionIdSha256: sha256Hex(inputs.executionId),
     },
     approvedInputMatches,
+    authoritativeContentMatches,
     reconciliation,
     packagesChecked: contentSummary.packagesChecked,
     packagesWithEmbeddedAttachments: contentSummary.packagesWithEmbeddedAttachments,
@@ -281,6 +336,7 @@ export async function runHistoryImportPreflight(
       expectedStoredFilesRows: scan.expectedStoredFilesRows,
       expectedStoredBytes: scan.expectedStoredBytes,
       expectedStoredContentSha256: scan.expectedStoredContentSha256,
+      expectedRevisionInventory: scan.expectedRevisionInventory,
     },
     database: {
       serverVersion: databaseResult.serverVersion,
@@ -311,6 +367,8 @@ export async function runHistoryImportPreflight(
   console.log(`包摘要不一致: ${scan.packageDigestMismatchCount}`);
   console.log(`未登记额外包: ${scan.unreportedExtraPackageCount}`);
   console.log(`批准输入绑定一致: ${approvedInputMatches ? "是" : "否"}`);
+  console.log(`权威候选内容一致: ${authoritativeContentMatches ? "是" : "否"}`);
+  console.log(`权威来源数量一致: ${authoritativeCountMatches ? "是" : "否"}`);
   console.log(`数据库只读开关已验证: ${databaseResult.readOnlyEnforced ? "是" : "否"}`);
   console.log(`数据库必需表存在: ${databaseResult.presentTableCount}/${historyImportRequiredTables.length}`);
   console.log(`标签依赖存在: ${databaseResult.tagPresent === true ? "是" : "否"}`);

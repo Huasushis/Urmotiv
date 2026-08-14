@@ -10,7 +10,8 @@
     "bootstrap-admin": "tsx src/admin-bootstrap-cli.ts",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:phase2-postgres:acceptance": "URMOTIV_PHASE2_RUNNER_ACCEPTANCE=1 vitest run tests/history-phase2-runner-postgres.test.ts"
   },
   "dependencies": {
     "@fastify/cookie": "latest",

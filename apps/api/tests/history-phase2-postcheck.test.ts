@@ -1,6 +1,6 @@
 /**
  * 纯逻辑用例用合成计数验证 verifyPhase2Outcome 的判定；
- * PGlite 集成用例验证完整表清单与按导入问题清单统计缺失题解。
+ * PGlite 集成用例验证完整表清单与按导入问题清单分别统计 NULL/空题解。
  */
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -16,7 +16,7 @@ import { historyImportRequiredTables } from "../src/history-migration/import-pre
 import {
   assertScratchDatabaseName,
   captureHistoryImportTableCounts,
-  countMissingBasicSolutionsForProblems,
+  countSolutionStatesForProblems,
   expectedTableDeltas,
   verifyPhase2Outcome,
   type HistoryImportCountRow,
@@ -86,8 +86,10 @@ describe("verifyPhase2Outcome", () => {
     expectedJobItemRows: 3,
     expectedStoredFilesDelta: 3,
     expectedAuditDelta: 6,
-    expectedMissingSolutionCount: 0,
-    afterMissingSolutionCount: 0,
+    expectedNullSolutionCount: 0,
+    afterNullSolutionCount: 0,
+    expectedEmptySolutionCount: 0,
+    afterEmptySolutionCount: 0,
     expectedStoredBytes: 30,
     expectedStoredContentSha256: "inventory",
     afterFirstStoredInventory: {
@@ -178,9 +180,17 @@ describe("verifyPhase2Outcome", () => {
   it("基础题解状态漂移时判 FAIL（solution_state_drift）", () => {
     const result = verifyPhase2Outcome({
       ...baseInput,
-      afterMissingSolutionCount: 1,
+      afterNullSolutionCount: 1,
     });
     expect(result.verdict).toBe("FAIL");
+    expect(result.reasonCodes).toContain("solution_state_drift");
+  });
+
+  it("明确为空的题解状态漂移也独立判 FAIL", () => {
+    const result = verifyPhase2Outcome({
+      ...baseInput,
+      afterEmptySolutionCount: 1,
+    });
     expect(result.reasonCodes).toContain("solution_state_drift");
   });
 
@@ -222,15 +232,14 @@ describe("PGlite 集成", () => {
     for (const row of rows) expect(row.rows).toBeGreaterThanOrEqual(0);
   });
 
-  it("countMissingBasicSolutionsForProblems 只统计明确的问题清单", async () => {
+  it("countSolutionStatesForProblems 分别统计 NULL 与空字符串", async () => {
     const database = createLocalDatabase();
     openDatabases.push(database);
     await migrateDatabase(database);
     await seedCoreDatabase(database);
     const problemIds = ["999999"];
-    const missing = await countMissingBasicSolutionsForProblems(database, problemIds);
-    expect(missing).toBe(0);
-    const missingAgain = await countMissingBasicSolutionsForProblems(database, problemIds);
-    expect(missingAgain).toBe(missing);
+    const states = await countSolutionStatesForProblems(database, problemIds);
+    expect(states).toEqual({ nullSolutionCount: 0, emptySolutionCount: 0 });
+    expect(await countSolutionStatesForProblems(database, problemIds)).toEqual(states);
   });
 });

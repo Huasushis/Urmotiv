@@ -237,6 +237,21 @@ export interface PackageApprovedCandidatesOptions {
   };
 }
 
+export interface VerifyApprovedPackageSourceIdentitiesOptions {
+  readonly privateRootDirectory: string;
+  readonly materializedDirectory: string;
+  readonly metadataFile: string;
+  readonly preparedDirectory: string;
+  readonly approvalFile: string;
+}
+
+export interface AuthoritativePackageSourceIdentity {
+  readonly candidateId: string;
+  readonly contentSha256: string;
+  readonly sourceBindingSha256: string;
+  readonly problem: CanonicalProblem;
+}
+
 export interface PrepareHistoryCandidatesResult {
   readonly sourceCount: number;
   readonly candidateCount: number;
@@ -1406,45 +1421,14 @@ function buildRepairedCandidate(input: {
   });
 }
 
-export async function packageApprovedCandidates(
-  options: PackageApprovedCandidatesOptions,
-): Promise<PackageApprovedCandidatesResult> {
-  await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
-    { path: options.materializedDirectory, kind: "existing" },
-    { path: options.metadataFile, kind: "existing" },
-    { path: options.preparedDirectory, kind: "existing" },
-    { path: options.approvalFile, kind: "existing" },
-    { path: options.outputDirectory, kind: "new" },
-    { path: options.authorMappingOutput, kind: "new" },
-  ]);
-  assertSeparateAuthorMappingPath(options.outputDirectory, options.authorMappingOutput);
+type VerifiedHistoryMaterialization = Awaited<
+  ReturnType<typeof assertHistoryMaterializationComplete>
+>;
 
-  const materialization = await assertHistoryMaterializationComplete({
-    privateRootDirectory: options.privateRootDirectory,
-    materializedDirectory: options.materializedDirectory,
-  });
-  const attachmentCapability = await revalidateHistoryAttachmentMappingCapability(
-    options.attachmentMappingCapability,
-    {
-      privateRootDirectory: options.privateRootDirectory,
-      metadataFile: options.metadataFile,
-    },
-  );
-  if (attachmentCapability.groupingBatchSha256 !== materialization.groupingBatchSha256) {
-    throw new HistoryMigrationError(
-      "ATTACHMENT_MAPPING_CHANGED",
-      "附件映射与本次可信物化结果不属于同一个已确认题目分组批次。",
-    );
-  }
-  let attachmentPackagePlan: AttachmentPackagePlan | undefined;
-  if (attachmentCapability.attachmentCount > 0) {
-    attachmentPackagePlan = buildAttachmentPackagePlan(
-      attachmentCapability,
-      await materialization.readReport(),
-    );
-  }
-  await assertNewOutputPath(options.authorMappingOutput);
-
+async function loadAuthoritativelyApprovedCandidates(
+  options: VerifyApprovedPackageSourceIdentitiesOptions,
+  materialization: VerifiedHistoryMaterialization,
+): Promise<readonly ApprovedCandidate[]> {
   const { confirmedSources } = await loadConfirmedInputs(
     options.metadataFile,
     await materialization.readSourceConfirmation(),
@@ -1517,12 +1501,89 @@ export async function packageApprovedCandidates(
     assignedSourceIds.add(candidate.sourceId);
     approvedCandidates.push({ record: candidate, metadata: source.metadata, mapping: source.mapping });
   }
-
   await loadPreparationMarker(
     options.privateRootDirectory,
     options.preparedDirectory,
     confirmedSources,
   );
+  return approvedCandidates;
+}
+
+export async function verifyApprovedPackageSourceIdentities(
+  options: VerifyApprovedPackageSourceIdentitiesOptions,
+): Promise<readonly AuthoritativePackageSourceIdentity[]> {
+  await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+    { path: options.materializedDirectory, kind: "existing" },
+    { path: options.metadataFile, kind: "existing" },
+    { path: options.preparedDirectory, kind: "existing" },
+    { path: options.approvalFile, kind: "existing" },
+  ]);
+  const materialization = await assertHistoryMaterializationComplete({
+    privateRootDirectory: options.privateRootDirectory,
+    materializedDirectory: options.materializedDirectory,
+  });
+  try {
+    const approvedCandidates = await loadAuthoritativelyApprovedCandidates(options, materialization);
+    await materialization.assertUnchangedBeforePublish();
+    return approvedCandidates.map(({ record, mapping }) => ({
+      candidateId: record.candidateId,
+      contentSha256: record.contentSha256,
+      sourceBindingSha256:
+        record.sourceBindingSha256 ??
+        sourceBindingDigest({
+          sourceId: record.sourceId,
+          sourceContentSha256: record.sourceContentSha256,
+          sourcePath: mapping.sourcePath,
+          sourceSha256: mapping.sourceSha256,
+          metadataNumber: mapping.metadataNumber,
+        }),
+      problem: record.problem,
+    }));
+  } finally {
+    await materialization.close();
+  }
+}
+
+export async function packageApprovedCandidates(
+  options: PackageApprovedCandidatesOptions,
+): Promise<PackageApprovedCandidatesResult> {
+  await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+    { path: options.materializedDirectory, kind: "existing" },
+    { path: options.metadataFile, kind: "existing" },
+    { path: options.preparedDirectory, kind: "existing" },
+    { path: options.approvalFile, kind: "existing" },
+    { path: options.outputDirectory, kind: "new" },
+    { path: options.authorMappingOutput, kind: "new" },
+  ]);
+  assertSeparateAuthorMappingPath(options.outputDirectory, options.authorMappingOutput);
+
+  const materialization = await assertHistoryMaterializationComplete({
+    privateRootDirectory: options.privateRootDirectory,
+    materializedDirectory: options.materializedDirectory,
+  });
+  const attachmentCapability = await revalidateHistoryAttachmentMappingCapability(
+    options.attachmentMappingCapability,
+    {
+      privateRootDirectory: options.privateRootDirectory,
+      metadataFile: options.metadataFile,
+    },
+  );
+  if (attachmentCapability.groupingBatchSha256 !== materialization.groupingBatchSha256) {
+    throw new HistoryMigrationError(
+      "ATTACHMENT_MAPPING_CHANGED",
+      "附件映射与本次可信物化结果不属于同一个已确认题目分组批次。",
+    );
+  }
+  let attachmentPackagePlan: AttachmentPackagePlan | undefined;
+  if (attachmentCapability.attachmentCount > 0) {
+    attachmentPackagePlan = buildAttachmentPackagePlan(
+      attachmentCapability,
+      await materialization.readReport(),
+    );
+  }
+  await assertNewOutputPath(options.authorMappingOutput);
+
+  const approvedCandidates = await loadAuthoritativelyApprovedCandidates(options, materialization);
 
   await options.testingHooks?.afterMaterializationVerified?.();
   await materialization.assertUnchangedBeforePublish();

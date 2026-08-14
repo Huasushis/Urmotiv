@@ -278,6 +278,8 @@ const importManifestEntrySchema = z
   .object({
     candidateId: z.string().regex(/^candidate-[0-9]{6}$/),
     packageSha256: digestSchema,
+    contentSha256: digestSchema,
+    sourceBindingSha256: digestSchema,
     importJobId: z.string().uuid(),
     problemId: z.string().regex(/^(0|[1-9][0-9]*)$/),
     importedAt: z.string(),
@@ -302,6 +304,16 @@ type PackageReportEntry = z.infer<typeof packageReportEntrySchema>;
  */
 function entrySourceBindingKey(entry: PackageReportEntry): string {
   return entry.sourceBindingSha256 ?? entry.packageSha256;
+}
+
+function manifestIdentityFields(entry: PackageReportEntry): {
+  readonly contentSha256: string;
+  readonly sourceBindingSha256: string;
+} {
+  return {
+    contentSha256: entry.contentSha256,
+    sourceBindingSha256: entrySourceBindingKey(entry),
+  };
 }
 const importCompletePayloadSchema = z
   .object({
@@ -370,15 +382,20 @@ export async function importHistoryPackages(
   const entries = new Map<string, ImportManifestEntry>();
 
   if (existingManifest !== undefined) {
-    // 把既有清单条目与当前包报告逐条绑定：只有 candidateId 和 packageSha256
-    // 都与当前报告一致的条目才视为有效。这防止修复包后旧条目继续跳过，
+    // 把既有清单条目与当前包报告的候选、候选内容、来源绑定和包摘要逐条绑定。
+    // 四项都与当前报告一致的条目才可用于重放。
     // 也防止把另一个批次的清单混用到当前包集。
     const reportByCandidateId = new Map(
       report.packages.map((pkg) => [pkg.candidateId, pkg] as const),
     );
     for (const entry of existingManifest.entries) {
       const current = reportByCandidateId.get(entry.candidateId);
-      if (current !== undefined && current.packageSha256 === entry.packageSha256) {
+      if (
+        current !== undefined &&
+        current.packageSha256 === entry.packageSha256 &&
+        current.contentSha256 === entry.contentSha256 &&
+        entrySourceBindingKey(current) === entry.sourceBindingSha256
+      ) {
         entries.set(entry.candidateId, entry);
       }
     }
@@ -850,6 +867,7 @@ async function importSinglePackage(input: {
     return {
       candidateId: input.packageEntry.candidateId,
       packageSha256: input.packageEntry.packageSha256,
+      ...manifestIdentityFields(input.packageEntry),
       importJobId: job.id,
       problemId: item.importedProblemId,
       importedAt: (input.now ?? defaultNow)().toISOString(),
@@ -892,6 +910,7 @@ async function importSinglePackage(input: {
         return {
           candidateId: input.packageEntry.candidateId,
           packageSha256: input.packageEntry.packageSha256,
+          ...manifestIdentityFields(input.packageEntry),
           importJobId: job.id,
           problemId: item.importedProblemId,
           importedAt: (input.now ?? defaultNow)().toISOString(),
@@ -908,6 +927,7 @@ async function importSinglePackage(input: {
         return {
           candidateId: input.packageEntry.candidateId,
           packageSha256: input.packageEntry.packageSha256,
+          ...manifestIdentityFields(input.packageEntry),
           importJobId: job.id,
           problemId: item.importedProblemId,
           importedAt: (input.now ?? defaultNow)().toISOString(),
@@ -927,6 +947,7 @@ async function importSinglePackage(input: {
         return {
           candidateId: input.packageEntry.candidateId,
           packageSha256: input.packageEntry.packageSha256,
+          ...manifestIdentityFields(input.packageEntry),
           importJobId: job.id,
           problemId,
           importedAt: (input.now ?? defaultNow)().toISOString(),
@@ -957,6 +978,7 @@ async function importSinglePackage(input: {
   return {
     candidateId: input.packageEntry.candidateId,
     packageSha256: input.packageEntry.packageSha256,
+    ...manifestIdentityFields(input.packageEntry),
     importJobId: job.id,
     problemId: result!.problemId,
     importedAt: (input.now ?? defaultNow)().toISOString(),
