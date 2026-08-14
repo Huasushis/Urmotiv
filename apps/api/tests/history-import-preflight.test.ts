@@ -46,12 +46,16 @@ function candidateId(index: number): string {
   return `candidate-${String(index).padStart(6, "0")}`;
 }
 
+function packageDigest(index: number): string {
+  return sha256Hex(`package-${index}`);
+}
+
 function makeEntry(index: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     candidateId: candidateId(index),
     contentSha256: digest("a"),
     sourceBindingSha256: sha256Hex(`binding-${index}`),
-    packageSha256: digest("c"),
+    packageSha256: packageDigest(index),
     packageBytes: 128,
     status: "packaged",
     ...overrides,
@@ -256,7 +260,7 @@ describe("历史导入预检对账", () => {
       batchSha256: reportBatchSha256,
       entries: Array.from({ length: 3 }, (_unused, index) => ({
         candidateId: candidateId(index + 1),
-        packageSha256: digest("c"),
+        packageSha256: packageDigest(index + 1),
         importJobId: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
         problemId: String(index + 1),
         importedAt: "2026-01-01T00:00:00Z",
@@ -271,6 +275,17 @@ describe("历史导入预检对账", () => {
     );
     expect(complete.verdict).toBe("READY");
     expect(complete.importedCount).toBe(3);
+    const duplicate = reconcileHistoryImportBatch(
+      makeReconcileInput({
+        importManifest: {
+          ...base,
+          importedCount: 3,
+          entries: [base.entries[0], base.entries[0], base.entries[2]],
+        },
+      }),
+    );
+    expect(duplicate.verdict).toBe("NOT_READY");
+    expect(duplicate.reasonCodes).toContain("duplicate_manifest_entry");
   });
 
   it("非法清单元数据以稳定错误码拒绝", () => {
@@ -306,6 +321,20 @@ describe("历史导入预检对账", () => {
     expect(result.verdict).toBe("NOT_READY");
     expect(result.reasonCodes).toContain("duplicate_source_binding");
     expect(result.duplicateSourceBindingCount).toBe(1);
+  });
+
+  it("重复包摘要时判 NOT_READY", () => {
+    const report = makeReport(3, {
+      packages: [
+        makeEntry(1),
+        makeEntry(2, { packageSha256: packageDigest(1) }),
+        makeEntry(3),
+      ],
+    });
+    const result = reconcileHistoryImportBatch(makeReconcileInput({ packageReport: report }));
+    expect(result.verdict).toBe("NOT_READY");
+    expect(result.reasonCodes).toContain("duplicate_package_digest");
+    expect(result.duplicatePackageDigestCount).toBe(1);
   });
 
   it("包字节数不一致时判 NOT_READY", () => {
@@ -361,8 +390,8 @@ describe("历史导入预检对账", () => {
       importedCount: 3,
       entries: [
         { candidateId: candidateId(1), packageSha256: digest("9"), importJobId: "00000000-0000-4000-8000-000000000001", problemId: "1", importedAt: "2026-01-01T00:00:00Z" },
-        { candidateId: candidateId(2), packageSha256: digest("c"), importJobId: "00000000-0000-4000-8000-000000000002", problemId: "2", importedAt: "2026-01-01T00:00:00Z" },
-        { candidateId: candidateId(3), packageSha256: digest("c"), importJobId: "00000000-0000-4000-8000-000000000003", problemId: "3", importedAt: "2026-01-01T00:00:00Z" },
+        { candidateId: candidateId(2), packageSha256: packageDigest(2), importJobId: "00000000-0000-4000-8000-000000000002", problemId: "2", importedAt: "2026-01-01T00:00:00Z" },
+        { candidateId: candidateId(3), packageSha256: packageDigest(3), importJobId: "00000000-0000-4000-8000-000000000003", problemId: "3", importedAt: "2026-01-01T00:00:00Z" },
       ],
     };
     const result = reconcileHistoryImportBatch(makeReconcileInput({ packageReport: report, importManifest: manifest }));

@@ -1,276 +1,287 @@
 /**
- * 历史导入预检 CLI：确定性对账 + 零数据库变更检查（第 2 阶段真实导入前的收尾核对）。
- * 只输出聚合计数与稳定状态码；绝不打印题号、题目名称、候选正文、私有路径或连接串。
- * 收据与通过标记写入明确指定的服务器私有目录。
- *
- * 用法（所有路径必须位于 --private-root 内）：
- *     --private-root=<服务器私有目录> \
- *     --list-metadata=<清单元数据 JSON> \
- *     --package-directory=<打包输出目录（report.json + packages/*.zip）> \
- *     --output-directory=<预检输出目录> \
- *     --expected-record-count=<权威清单记录数> \
- *     --database-url-env=<承载连接串的环境变量名> \
- *     [--import-manifest=<已有导入批次 manifest>] \
- *     [--grouping-file=<分组阶段私有清单 JSON>] \
- *     [--tag-id=<依赖标签标识>] \
- *     [--git-commit=<当前代码提交>] \
- *     [--target-class=scratch-temporary|designated-validation|designated-real] \
- *     [--principal-env=<存放执行主体标识的环境变量名>]
- *
- * --database-url-env 只给出环境变量名，连接串本身不出现在命令行、日志或收据中。
- * 数据库侧使用显式只读事务：任何写操作都会被数据库直接拒绝。
- * 退出码 0 = READY；任何不一致、缺表或只读开关不可用都会以 1 退出；参数错误为 2。
+ * 历史导入预检 CLI：确定性对账 + 零数据库变更检查。
+ * 命令行只接收环境变量名和非敏感数量；路径、身份、标签、提交与摘要值均
+ * 从环境变量读取。stdout 只输出聚合计数与稳定状态码。
  */
 import { join } from "node:path";
-import { readdir } from "node:fs/promises";
 
 import { createPostgresDatabase } from "@urmotiv/database";
-import { readZipArchive } from "@urmotiv/problem-package";
 
+import { sha256Hex } from "../src/history-migration/digests";
 import { HistoryMigrationError } from "../src/history-migration/errors";
-import {
-  maximumImportPackageBytes,
-  packageReportPayloadSchema,
-} from "../src/history-migration/import-phase";
+import { packageReportPayloadSchema } from "../src/history-migration/import-phase";
 import {
   historyImportRequiredTables,
   reconcileHistoryImportBatch,
+  recomputeSourceBindingsIdentity,
   runZeroMutationDatabasePreflight,
+  scanPackageDirectory,
   summarizePackageEntryNames,
   type HistoryImportReconciliation,
   type ZeroMutationDatabaseResult,
 } from "../src/history-migration/import-preflight";
-import { sha256Hex } from "../src/history-migration/digests";
 import {
   assertPathsInsidePrivateRoot,
+  assertNewOutputPath,
   assertPrivateDirectoryMode,
   privateRegularFileExists,
   readPrivateJsonWithDigest,
-  readPrivateRegularBytes,
   removePrivateRegularFile,
   writePrivateFile,
 } from "../src/history-migration/private-files";
 
 const allowedTargetClasses = ["scratch-temporary", "designated-validation", "designated-real"] as const;
+const digestPattern = /^[a-f0-9]{64}$/;
 type TargetClass = (typeof allowedTargetClasses)[number];
 
-interface PreflightArguments {
+interface PreflightInputs {
   readonly privateRoot: string;
   readonly listMetadata: string;
   readonly packageDirectory: string;
   readonly outputDirectory: string;
   readonly expectedRecordCount: number;
-  readonly databaseUrlEnv: string;
+  readonly databaseUrl: string;
+  readonly groupingFile: string;
+  readonly tagId: string;
+  readonly gitCommit: string;
+  readonly targetClass: TargetClass;
+  readonly principal: string;
+  readonly executionId: string;
+  readonly expectedBatchSha256: string;
+  readonly expectedSourceBindingsSha256: string;
   readonly importManifest: string | undefined;
-  readonly groupingFile: string | undefined;
-  readonly tagId: string | undefined;
-  readonly gitCommit: string | undefined;
-  readonly targetClass: TargetClass | undefined;
-  readonly principalEnv: string | undefined;
 }
 
-function parseArguments(argv: readonly string[]): PreflightArguments {
+function environmentValue(
+  values: ReadonlyMap<string, string>,
+  env: NodeJS.ProcessEnv,
+  name: string,
+): string {
+  const variableName = values.get(name);
+  if (variableName === undefined || variableName.length === 0) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", `缺少必填参数 ${name}。`);
+  }
+  const value = env[variableName];
+  if (value === undefined || value.trim().length === 0) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", `${name} 指定的环境变量未设置。`);
+  }
+  return value;
+}
+
+export function resolvePreflightInputs(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+): PreflightInputs {
   const values = new Map<string, string>();
   for (const argument of argv) {
-    const match = /^--([a-z-]+)=(.*)$/s.exec(argument);
-    if (match === null) {
+    const match = /^--([a-z0-9-]+)=(.*)$/s.exec(argument);
+    if (match === null || match[1] === undefined || match[2] === undefined) {
       throw new HistoryMigrationError("INVALID_ARGUMENTS", "预检参数必须是 --名称=值 形式。");
     }
-    const key = match[1];
-    const val = match[2];
-    if (key !== undefined && val !== undefined) values.set(key, val);
-  }
-  const required = (name: string): string => {
-    const value = values.get(name);
-    if (value === undefined || value.length === 0) {
-      throw new HistoryMigrationError("INVALID_ARGUMENTS", `缺少必填参数 ${name}。`);
+    if (values.has(match[1])) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "命令行参数重复。");
     }
-    return value;
-  };
-  const optional = (name: string): string | undefined => {
-    const value = values.get(name);
-    return value === undefined || value.length === 0 ? undefined : value;
-  };
-  const expectedRaw = required("expected-record-count");
+    values.set(match[1], match[2]);
+  }
+  const allowedKeys = new Set([
+    "private-root-env",
+    "list-metadata-env",
+    "package-directory-env",
+    "output-directory-env",
+    "expected-record-count",
+    "database-url-env",
+    "grouping-file-env",
+    "tag-id-env",
+    "git-commit-env",
+    "target-class-env",
+    "principal-env",
+    "execution-id-env",
+    "batch-sha256-env",
+    "source-bindings-sha256-env",
+    "import-manifest-env",
+  ]);
+  for (const key of values.keys()) {
+    if (!allowedKeys.has(key)) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "命令行包含未批准的参数。");
+    }
+  }
+  const expectedRaw = values.get("expected-record-count");
   const expectedRecordCount = Number(expectedRaw);
   if (!Number.isInteger(expectedRecordCount) || expectedRecordCount < 1 || expectedRecordCount > 10_000) {
     throw new HistoryMigrationError("INVALID_ARGUMENTS", "expected-record-count 必须是 1 到 10000 的整数。");
   }
-  const targetClassRaw = optional("target-class");
-  let targetClass: TargetClass | undefined;
-  if (targetClassRaw !== undefined) {
-    if (!allowedTargetClasses.includes(targetClassRaw as TargetClass)) {
-      throw new HistoryMigrationError(
-        "INVALID_ARGUMENTS",
-        "target-class 必须是 scratch-temporary、designated-validation 或 designated-real。",
-      );
-    }
-    targetClass = targetClassRaw as TargetClass;
+  const targetClassRaw = environmentValue(values, env, "target-class-env");
+  if (!allowedTargetClasses.includes(targetClassRaw as TargetClass)) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "target-class 环境变量值不合法。");
+  }
+  const importManifestVariable = values.get("import-manifest-env");
+  const importManifest = importManifestVariable === undefined
+    ? undefined
+    : env[importManifestVariable];
+  if (importManifestVariable !== undefined && (importManifest === undefined || importManifest.length === 0)) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "import-manifest-env 指定的环境变量未设置。");
+  }
+  const expectedBatchSha256 = environmentValue(values, env, "batch-sha256-env");
+  const expectedSourceBindingsSha256 = environmentValue(
+    values,
+    env,
+    "source-bindings-sha256-env",
+  );
+  if (!digestPattern.test(expectedBatchSha256) || !digestPattern.test(expectedSourceBindingsSha256)) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "批准摘要环境变量值不合法。");
   }
   return {
-    privateRoot: required("private-root"),
-    listMetadata: required("list-metadata"),
-    packageDirectory: required("package-directory"),
-    outputDirectory: required("output-directory"),
+    privateRoot: environmentValue(values, env, "private-root-env"),
+    listMetadata: environmentValue(values, env, "list-metadata-env"),
+    packageDirectory: environmentValue(values, env, "package-directory-env"),
+    outputDirectory: environmentValue(values, env, "output-directory-env"),
     expectedRecordCount,
-    databaseUrlEnv: required("database-url-env"),
-    importManifest: optional("import-manifest"),
-    groupingFile: optional("grouping-file"),
-    tagId: optional("tag-id"),
-    gitCommit: optional("git-commit"),
-    targetClass,
-    principalEnv: optional("principal-env"),
+    databaseUrl: environmentValue(values, env, "database-url-env"),
+    groupingFile: environmentValue(values, env, "grouping-file-env"),
+    tagId: environmentValue(values, env, "tag-id-env"),
+    gitCommit: environmentValue(values, env, "git-commit-env"),
+    targetClass: targetClassRaw as TargetClass,
+    principal: environmentValue(values, env, "principal-env"),
+    executionId: environmentValue(values, env, "execution-id-env"),
+    expectedBatchSha256,
+    expectedSourceBindingsSha256,
+    importManifest,
   };
 }
 
-const preflightReceiptName = "history-import-preflight.private.json";
-const preflightPassMarkerName = "PREFLIGHT_PASS";
+export const preflightReceiptName = "history-import-preflight.private.json";
+export const preflightPassMarkerName = "PREFLIGHT_PASS";
 
-async function main(): Promise<number> {
-  const args = parseArguments(process.argv.slice(2));
-  await assertPrivateDirectoryMode(args.privateRoot);
+function groupingIds(payload: unknown): string[] {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("groups" in payload) ||
+    !Array.isArray(payload.groups)
+  ) {
+    return [];
+  }
+  return payload.groups
+    .map((group) =>
+      typeof group === "object" && group !== null && "metadataId" in group
+        ? group.metadataId
+        : undefined,
+    )
+    .filter((id): id is string => typeof id === "string");
+}
+
+export async function runHistoryImportPreflight(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+): Promise<number> {
+  const inputs = resolvePreflightInputs(argv, env);
+  await assertPrivateDirectoryMode(inputs.privateRoot);
+  await assertPrivateDirectoryMode(inputs.outputDirectory);
+  const receiptPath = join(inputs.outputDirectory, preflightReceiptName);
+  const markerPath = join(inputs.outputDirectory, preflightPassMarkerName);
   const pathChecks: { path: string; kind: "existing" | "new" }[] = [
-    { path: args.listMetadata, kind: "existing" },
-    { path: args.packageDirectory, kind: "existing" },
-    { path: args.outputDirectory, kind: "existing" },
-    { path: join(args.outputDirectory, preflightReceiptName), kind: "new" },
-    { path: join(args.outputDirectory, preflightPassMarkerName), kind: "new" },
+    { path: inputs.listMetadata, kind: "existing" },
+    { path: inputs.packageDirectory, kind: "existing" },
+    { path: inputs.outputDirectory, kind: "existing" },
+    { path: inputs.groupingFile, kind: "existing" },
+    { path: receiptPath, kind: "new" },
+    { path: markerPath, kind: "new" },
   ];
-  if (args.importManifest !== undefined) {
-    pathChecks.push({ path: args.importManifest, kind: "existing" });
+  if (inputs.importManifest !== undefined) {
+    pathChecks.push({ path: inputs.importManifest, kind: "existing" });
   }
-  if (args.groupingFile !== undefined) {
-    pathChecks.push({ path: args.groupingFile, kind: "existing" });
-  }
-  await assertPathsInsidePrivateRoot(args.privateRoot, pathChecks);
+  await assertPathsInsidePrivateRoot(inputs.privateRoot, pathChecks);
+  await assertNewOutputPath(receiptPath);
+  await assertNewOutputPath(markerPath);
 
-  const metadata = (await readPrivateJsonWithDigest(args.listMetadata)).value;
-  const report = (await readPrivateJsonWithDigest(join(args.packageDirectory, "report.json"))).value;
-  const reportParsed = packageReportPayloadSchema.parse(report);
-
-  // 逐包读取磁盘字节并核对：条目结构、字节数、摘要重算、未登记额外包。
-  const entryNames: string[][] = [];
-  let missingPackageFileCount = 0;
-  let packageBytesMismatchCount = 0;
-  let packageDigestMismatchCount = 0;
-  const expectedPackageFiles = new Set<string>();
-  for (const entry of reportParsed.packages) {
-    const fileName = `${entry.candidateId}.zip`;
-    expectedPackageFiles.add(fileName);
-    const packagePath = join(args.packageDirectory, "packages", fileName);
-    try {
-      const bytes = await readPrivateRegularBytes(packagePath, maximumImportPackageBytes);
-      const archive = readZipArchive(bytes);
-      entryNames.push(archive.summary.entries.map((item) => item.path));
-      if (bytes.byteLength !== entry.packageBytes) packageBytesMismatchCount += 1;
-      if (sha256Hex(bytes) !== entry.packageSha256) packageDigestMismatchCount += 1;
-    } catch {
-      missingPackageFileCount += 1;
-      entryNames.push([]);
-    }
-  }
-
-  // 拒绝磁盘上存在但报告未登记的包文件。
-  let unreportedExtraPackageCount = 0;
-  const packagesDir = join(args.packageDirectory, "packages");
-  let diskFiles: string[];
-  try {
-    diskFiles = await readdir(packagesDir);
-  } catch {
-    diskFiles = [];
-  }
-  for (const fileName of diskFiles) {
-    if (fileName.endsWith(".zip") && !expectedPackageFiles.has(fileName)) {
-      unreportedExtraPackageCount += 1;
-    }
-  }
-
-  // 包条目检查缺失的包不得静默算作已核对：核对数量不足会在对账里判 NOT_READY。
-  const contentSummary = summarizePackageEntryNames(entryNames);
-
-  // 分组阶段私有清单：提供时读取安全编号列表，机械核对题号↔安全编号连接。
-  let groupingMetadataIds: string[] | undefined;
-  if (args.groupingFile !== undefined) {
-    const groupingPayload = (await readPrivateJsonWithDigest(args.groupingFile)).value;
-    if (
-      typeof groupingPayload === "object" &&
-      groupingPayload !== null &&
-      "groups" in groupingPayload &&
-      Array.isArray(groupingPayload.groups)
-    ) {
-      groupingMetadataIds = groupingPayload.groups
-        .map((group) => (typeof group === "object" && group !== null && "metadataId" in group ? group.metadataId : undefined))
-        .filter((id): id is string => typeof id === "string");
-    }
-  }
+  const metadataRead = await readPrivateJsonWithDigest(inputs.listMetadata);
+  const reportRead = await readPrivateJsonWithDigest(join(inputs.packageDirectory, "report.json"));
+  const groupingRead = await readPrivateJsonWithDigest(inputs.groupingFile);
+  const reportParsed = packageReportPayloadSchema.parse(reportRead.value);
+  const scan = await scanPackageDirectory(inputs.packageDirectory, reportParsed);
+  const contentSummary = summarizePackageEntryNames(scan.entryNames);
+  const groupingMetadataIds = groupingIds(groupingRead.value);
 
   let manifest: unknown;
-  if (args.importManifest !== undefined) {
-    manifest = (await readPrivateJsonWithDigest(args.importManifest)).value;
+  let manifestSha256: string | undefined;
+  if (inputs.importManifest !== undefined) {
+    const manifestRead = await readPrivateJsonWithDigest(inputs.importManifest);
+    manifest = manifestRead.value;
+    manifestSha256 = manifestRead.sha256;
   }
 
   const reconciliation: HistoryImportReconciliation = reconcileHistoryImportBatch({
-    listMetadata: metadata,
-    packageReport: report,
-    packageEntryNames: entryNames,
-    expectedRecordCount: args.expectedRecordCount,
+    listMetadata: metadataRead.value,
+    packageReport: reportRead.value,
+    packageEntryNames: scan.entryNames,
+    expectedRecordCount: inputs.expectedRecordCount,
     importManifest: manifest,
-    missingPackageFileCount,
-    packageBytesMismatchCount,
-    packageDigestMismatchCount,
-    unreportedExtraPackageCount,
-    ...(groupingMetadataIds !== undefined ? { groupingMetadataIds } : {}),
+    missingPackageFileCount: scan.missingPackageFileCount,
+    packageBytesMismatchCount: scan.packageBytesMismatchCount,
+    packageDigestMismatchCount: scan.packageDigestMismatchCount,
+    unreportedExtraPackageCount: scan.unreportedExtraPackageCount,
+    groupingMetadataIds,
   });
 
-  // 数据库连接串只通过环境变量传入，命令行只接受变量名。
-  const databaseUrl = process.env[args.databaseUrlEnv];
-  if (databaseUrl === undefined || databaseUrl.trim().length === 0) {
-    throw new HistoryMigrationError(
-      "INVALID_ARGUMENTS",
-      "数据库连接串环境变量未设置；预检不会发起真实导入。",
-    );
-  }
-  const database = createPostgresDatabase({ connectionString: databaseUrl, maxConnections: 1 });
+  const sourceBindingsSha256 = recomputeSourceBindingsIdentity(reportParsed);
+  const approvedInputMatches =
+    reportParsed.batchSha256 === inputs.expectedBatchSha256 &&
+    sourceBindingsSha256 === inputs.expectedSourceBindingsSha256;
+
+  const database = createPostgresDatabase({
+    connectionString: inputs.databaseUrl,
+    maxConnections: 1,
+    applicationName: "urmotiv-history-import-preflight",
+  });
   let databaseResult: ZeroMutationDatabaseResult;
   try {
     databaseResult = await runZeroMutationDatabasePreflight(database, {
-      ...(args.tagId !== undefined ? { requiredTagId: args.tagId } : {}),
+      requiredTagId: inputs.tagId,
+      requiredPrincipalId: inputs.principal,
     });
   } finally {
     await database.close();
   }
 
-  // 执行主体标识只从环境变量读取，值只写入私有回执，不出现在 stdout。
-  let principal: string | undefined;
-  if (args.principalEnv !== undefined) {
-    const principalValue = process.env[args.principalEnv];
-    if (principalValue !== undefined && principalValue.length > 0) {
-      principal = principalValue;
-    }
-  }
-
-  const tagPresent = databaseResult.tagPresent === true;
-  const tagSatisfied = args.tagId === undefined || tagPresent;
-
   const ready =
     reconciliation.verdict === "READY" &&
+    approvedInputMatches &&
     databaseResult.readOnlyEnforced &&
     databaseResult.missingTableCount === 0 &&
-    tagSatisfied;
+    databaseResult.tagPresent === true &&
+    databaseResult.principalPresent === true;
 
   const receipt = {
-    version: 1,
+    version: 2,
     generatedAt: new Date().toISOString(),
-    gitCommit: args.gitCommit,
-    targetClass: args.targetClass,
-    principal: principal !== undefined ? "set" : "unset",
+    targetClass: inputs.targetClass,
+    inputBindings: {
+      listMetadataSha256: metadataRead.sha256,
+      packageReportSha256: reportRead.sha256,
+      groupingSha256: groupingRead.sha256,
+      ...(manifestSha256 === undefined ? {} : { importManifestSha256: manifestSha256 }),
+      batchSha256: reportParsed.batchSha256,
+      sourceBindingsSha256,
+      tagIdSha256: sha256Hex(inputs.tagId),
+      gitCommitSha256: sha256Hex(inputs.gitCommit),
+      principalSha256: sha256Hex(inputs.principal),
+      executionIdSha256: sha256Hex(inputs.executionId),
+    },
+    approvedInputMatches,
     reconciliation,
     packagesChecked: contentSummary.packagesChecked,
     packagesWithEmbeddedAttachments: contentSummary.packagesWithEmbeddedAttachments,
-    missingPackageFileCount,
-    packageBytesMismatchCount,
-    packageDigestMismatchCount,
-    unreportedExtraPackageCount,
+    packageScan: {
+      missingPackageFileCount: scan.missingPackageFileCount,
+      packageBytesMismatchCount: scan.packageBytesMismatchCount,
+      packageDigestMismatchCount: scan.packageDigestMismatchCount,
+      unreportedExtraPackageCount: scan.unreportedExtraPackageCount,
+      expectedSampleRows: scan.expectedSampleRows,
+      expectedProblemFileRows: scan.expectedProblemFileRows,
+      expectedStoredFilesRows: scan.expectedStoredFilesRows,
+      expectedStoredBytes: scan.expectedStoredBytes,
+      expectedStoredContentSha256: scan.expectedStoredContentSha256,
+    },
     database: {
       serverVersion: databaseResult.serverVersion,
       readOnlyEnforced: databaseResult.readOnlyEnforced,
@@ -278,45 +289,32 @@ async function main(): Promise<number> {
       missingTableCount: databaseResult.missingTableCount,
       requiredTableCount: historyImportRequiredTables.length,
       rowCounts: databaseResult.rowCounts,
-      tagId: args.tagId,
       tagPresent: databaseResult.tagPresent,
+      principalPresent: databaseResult.principalPresent,
     },
-    tagSatisfied,
     verdict: ready ? "READY" : "NOT_READY",
   };
-  await writePrivateFile(
-    join(args.outputDirectory, preflightReceiptName),
-    `${JSON.stringify(receipt, null, 2)}\n`,
-  );
-  const markerPath = join(args.outputDirectory, preflightPassMarkerName);
+  await writePrivateFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
   if (ready) {
     await writePrivateFile(markerPath, `${receipt.generatedAt}\n`);
   } else if (await privateRegularFileExists(markerPath)) {
     await removePrivateRegularFile(markerPath);
   }
 
-  // stdout 只输出聚合计数与稳定原因码，绝不输出题号、题名、摘要或路径。
   console.log(`预检清单记录数: ${reconciliation.listRecordCount}`);
   console.log(`预检包数量: ${reconciliation.packageCount}`);
   console.log(`预检保留材料数: ${reconciliation.preservedMaterialCount}`);
   console.log(`预检内嵌附件数: ${reconciliation.embeddedAttachmentCount}`);
   console.log(`结构性缺失基础题解的包数: ${reconciliation.missingBasicSolutionCount}`);
-  console.log(`缺失包文件数: ${missingPackageFileCount}`);
-  console.log(`包字节数不一致: ${packageBytesMismatchCount}`);
-  console.log(`包摘要不一致: ${packageDigestMismatchCount}`);
-  console.log(`未登记额外包: ${unreportedExtraPackageCount}`);
-  console.log(`批次身份一致: ${reconciliation.batchIdentityMatches ? "是" : "否"}`);
-  if (reconciliation.groupingJoin !== undefined) {
-    console.log(`分组连接匹配: ${reconciliation.groupingJoin.matchedIdentityCount}/${reconciliation.groupingJoin.groupingIdentityCount}`);
-    console.log(`分组连接重复: ${reconciliation.groupingJoin.duplicateIdentityCount}`);
-  }
+  console.log(`缺失包文件数: ${scan.missingPackageFileCount}`);
+  console.log(`包字节数不一致: ${scan.packageBytesMismatchCount}`);
+  console.log(`包摘要不一致: ${scan.packageDigestMismatchCount}`);
+  console.log(`未登记额外包: ${scan.unreportedExtraPackageCount}`);
+  console.log(`批准输入绑定一致: ${approvedInputMatches ? "是" : "否"}`);
   console.log(`数据库只读开关已验证: ${databaseResult.readOnlyEnforced ? "是" : "否"}`);
-  console.log(
-    `数据库必需表存在: ${databaseResult.presentTableCount}/${historyImportRequiredTables.length}`,
-  );
-  if (args.tagId !== undefined) {
-    console.log(`标签依赖存在: ${databaseResult.tagPresent === true ? "是" : "否"}`);
-  }
+  console.log(`数据库必需表存在: ${databaseResult.presentTableCount}/${historyImportRequiredTables.length}`);
+  console.log(`标签依赖存在: ${databaseResult.tagPresent === true ? "是" : "否"}`);
+  console.log(`执行主体存在: ${databaseResult.principalPresent === true ? "是" : "否"}`);
   if (reconciliation.reasonCodes.length > 0) {
     console.log(`不一致原因码: ${reconciliation.reasonCodes.join(", ")}`);
   }
@@ -324,15 +322,17 @@ async function main(): Promise<number> {
   return ready ? 0 : 1;
 }
 
-main()
-  .then((code) => {
-    process.exitCode = code;
-  })
-  .catch((error: unknown) => {
-    if (error instanceof HistoryMigrationError) {
-      console.error(`预检失败（${error.code}）：${error.message}`);
-    } else {
-      console.error("预检失败：未分类错误。");
-    }
-    process.exitCode = 2;
-  });
+if (import.meta.url === `file://${process.argv[1]}`) {
+  runHistoryImportPreflight(process.argv.slice(2), process.env)
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((error: unknown) => {
+      if (error instanceof HistoryMigrationError) {
+        console.error(`预检失败（${error.code}）：${error.message}`);
+      } else {
+        console.error("预检失败：未分类错误。");
+      }
+      process.exitCode = 2;
+    });
+}

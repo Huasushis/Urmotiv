@@ -1,464 +1,837 @@
 /**
- * 第 2 阶段验收导入 runner：在临时/验收库上做两遍导入精确对账。
- *
- * 设计契约：
- * - 所有连接串只通过环境变量名传入（--admin-url-env / --db-name-env / --principal-env），
- *   真实连接串绝不出现在命令行、日志或收据中。
- * - 拒绝 designated-real 目标分类：本阶段不触碰真实目标库。
- * - 校验在变更之前：预检对账、只读数据库检查与标签存在性全部通过后才进入导入流程。
- * - 独占窗口：先清理同名临时/验收库，再新建空库做迁移与种子。
- * - 快照只针对临时/验收库与本地存储：DB 用 CREATE DATABASE ... TEMPLATE，存储用整目录复制。
- * - 两遍导入后做精确表增量对账；任一漂移都会从快照恢复并重新核对。
- * - stdout 只输出聚合计数与稳定原因码；失败候选只输出失败码计数，不输出题号或候选编号。
- * - 退出码 0 = PASS；对账或导入不一致为 1；参数错误为 2。
+ * 第 2 阶段验收导入 runner：只允许新建临时/验收库；真实目标一概拒绝。
+ * 所有身份、摘要、路径和连接串均由命令行指定的环境变量读取。
  */
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { rm } from "node:fs/promises";
 
 import { sql } from "drizzle-orm";
+import { z } from "zod";
 import { createPostgresDatabase, type DatabaseHandle } from "@urmotiv/database";
 
+import { sha256Hex } from "../src/history-migration/digests";
 import { HistoryMigrationError } from "../src/history-migration/errors";
 import {
-  importHistoryPackages,
-  prepareHistoryImportDatabase,
   dropHistoryImportDatabase,
+  importHistoryPackages,
+  importManifestPayloadSchema,
+  packageReportPayloadSchema,
+  prepareHistoryImportDatabase,
 } from "../src/history-migration/import-phase";
 import {
-  reconcileHistoryImportBatch,
-  runZeroMutationDatabasePreflight,
   historyImportRequiredTables,
+  reconcileHistoryImportBatch,
+  recomputeSourceBindingsIdentity,
+  runZeroMutationDatabasePreflight,
+  scanPackageDirectory,
+  type HistoryImportReconciliation,
+  type PackageScanResult,
 } from "../src/history-migration/import-preflight";
 import {
   assertScratchDatabaseName,
   captureHistoryImportTableCounts,
-  countMissingBasicSolutions,
-  expectedTableDeltas,
+  captureStoredFileInventory,
+  countMissingBasicSolutionsForProblems,
+  countRevisionFilesForProblems,
   verifyPhase2Outcome,
   type HistoryImportCountRow,
   type Phase2PostcheckResult,
+  type StoredFileInventory,
 } from "../src/history-migration/phase2-postcheck";
 import {
+  captureStorageInventory,
   dropScratchSnapshot,
   restoreScratchDatabase,
   restoreStorageDirectory,
   snapshotScratchDatabase,
   snapshotStorageDirectory,
+  storageInventoriesEqual,
+  type StorageInventory,
 } from "../src/history-migration/history-import-snapshot";
 import {
-  assertPrivateDirectoryMode,
+  assertNewOutputPath,
   assertPathsInsidePrivateRoot,
+  assertPrivateDirectoryMode,
+  privateRegularFileExists,
   readPrivateJsonWithDigest,
   writePrivateFile,
 } from "../src/history-migration/private-files";
+import { preflightPassMarkerName } from "./preflight-history-import";
 
 const allowedTargetClasses = ["scratch-temporary", "designated-validation", "designated-real"] as const;
 type TargetClass = (typeof allowedTargetClasses)[number];
+const digestPattern = /^[a-f0-9]{64}$/;
+const importManifestName = "import-manifest.private.json";
+const runReceiptName = "phase2-run-receipt.private.json";
+const runPassMarkerName = "PHASE2_RUN_PASS";
 
 interface RunnerInputs {
   readonly privateRoot: string;
   readonly packageDirectory: string;
-  readonly adminUrlEnv: string;
-  readonly databaseNameEnv: string;
-  readonly principalEnv: string | undefined;
+  readonly listMetadata: string;
+  readonly groupingFile: string;
+  readonly preflightReceipt: string;
+  readonly receiptDirectory: string;
+  readonly storageRoot: string;
+  readonly importOutputDirectory: string;
+  readonly adminUrl: string;
+  readonly databaseName: string;
+  readonly principal: string;
   readonly tagId: string;
+  readonly gitCommit: string;
+  readonly expectedBatchSha256: string;
+  readonly expectedSourceBindingsSha256: string;
+  readonly expectedPreflightReceiptSha256: string;
+  readonly executionId: string;
   readonly targetClass: TargetClass;
   readonly expectedCount: number;
-  readonly listMetadata: string;
-  readonly groupingFile: string | undefined;
-  readonly gitCommit: string | undefined;
 }
 
-export function resolveRunnerInputs(argv: readonly string[], env: NodeJS.ProcessEnv): RunnerInputs {
+export interface Phase2RunnerHooks {
+  /** 仅供集成测试在快照完成后注入故障；CLI 路径永远未设置。 */
+  readonly afterSnapshot?: (() => Promise<void>) | undefined;
+}
+
+function environmentValue(
+  values: ReadonlyMap<string, string>,
+  env: NodeJS.ProcessEnv,
+  name: string,
+): string {
+  const variableName = values.get(name);
+  if (variableName === undefined || variableName.length === 0) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", `缺少必填参数 ${name}。`);
+  }
+  const value = env[variableName];
+  if (value === undefined || value.trim().length === 0) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", `${name} 指定的环境变量未设置。`);
+  }
+  return value;
+}
+
+export function resolveRunnerInputs(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+): RunnerInputs {
   const values = new Map<string, string>();
   for (const argument of argv) {
-    const match = /^--([a-z-]+)=(.*)$/s.exec(argument);
-    if (match === null) {
+    const match = /^--([a-z0-9-]+)=(.*)$/s.exec(argument);
+    if (match === null || match[1] === undefined || match[2] === undefined) {
       throw new HistoryMigrationError("INVALID_ARGUMENTS", "runner 参数必须是 --名称=值 形式。");
     }
-    const key = match[1];
-    const val = match[2];
-    if (key !== undefined && val !== undefined) values.set(key, val);
-  }
-  const required = (name: string): string => {
-    const value = values.get(name);
-    if (value === undefined || value.length === 0) {
-      throw new HistoryMigrationError("INVALID_ARGUMENTS", `缺少必填参数 ${name}。`);
+    if (values.has(match[1])) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "命令行参数重复。");
     }
-    return value;
-  };
-  const optional = (name: string): string | undefined => {
-    const value = values.get(name);
-    return value === undefined || value.length === 0 ? undefined : value;
-  };
-
-  const targetClassRaw = required("target-class");
-  if (!allowedTargetClasses.includes(targetClassRaw as TargetClass)) {
-    throw new HistoryMigrationError(
-      "INVALID_ARGUMENTS",
-      "target-class 必须是 scratch-temporary、designated-validation 或 designated-real。",
-    );
+    values.set(match[1], match[2]);
   }
-  const targetClass = targetClassRaw as TargetClass;
-  if (targetClass === "designated-real") {
-    throw new HistoryMigrationError(
-      "INVALID_ARGUMENTS",
-      "第 2 阶段禁止真实目标导入；target-class 不得为 designated-real。",
-    );
-  }
-
-  const expectedRaw = required("expected-count");
-  const expectedCount = Number(expectedRaw);
+  const expectedCount = Number(values.get("expected-count"));
   if (!Number.isInteger(expectedCount) || expectedCount < 1 || expectedCount > 10_000) {
     throw new HistoryMigrationError("INVALID_ARGUMENTS", "expected-count 必须是 1 到 10000 的整数。");
   }
-
-  const adminUrlEnv = required("admin-url-env");
-  const databaseNameEnv = required("db-name-env");
-  if (env[adminUrlEnv] === undefined || env[adminUrlEnv]!.trim().length === 0) {
-    throw new HistoryMigrationError("INVALID_ARGUMENTS", "管理连接串环境变量未设置。");
+  const targetClassRaw = environmentValue(values, env, "target-class-env");
+  const allowedKeys = new Set([
+    "private-root-env",
+    "package-directory-env",
+    "list-metadata-env",
+    "grouping-file-env",
+    "preflight-receipt-env",
+    "receipt-directory-env",
+    "storage-root-env",
+    "import-output-directory-env",
+    "admin-url-env",
+    "db-name-env",
+    "principal-env",
+    "tag-id-env",
+    "git-commit-env",
+    "batch-sha256-env",
+    "source-bindings-sha256-env",
+    "preflight-receipt-sha256-env",
+    "execution-id-env",
+    "target-class-env",
+    "expected-count",
+  ]);
+  for (const key of values.keys()) {
+    if (!allowedKeys.has(key)) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "命令行包含未批准的参数。");
+    }
   }
-  if (env[databaseNameEnv] === undefined || env[databaseNameEnv]!.trim().length === 0) {
-    throw new HistoryMigrationError("INVALID_ARGUMENTS", "目标库名环境变量未设置。");
+  if (!allowedTargetClasses.includes(targetClassRaw as TargetClass)) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "target-class 环境变量值不合法。");
   }
-
+  if (targetClassRaw === "designated-real") {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "第 2 阶段禁止真实目标导入。");
+  }
+  const expectedBatchSha256 = environmentValue(values, env, "batch-sha256-env");
+  const expectedSourceBindingsSha256 = environmentValue(values, env, "source-bindings-sha256-env");
+  const expectedPreflightReceiptSha256 = environmentValue(
+    values,
+    env,
+    "preflight-receipt-sha256-env",
+  );
+  if (
+    !digestPattern.test(expectedBatchSha256) ||
+    !digestPattern.test(expectedSourceBindingsSha256) ||
+    !digestPattern.test(expectedPreflightReceiptSha256)
+  ) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "批准摘要环境变量值不合法。");
+  }
+  const databaseName = environmentValue(values, env, "db-name-env");
+  assertScratchDatabaseName(databaseName);
   return {
-    privateRoot: required("private-root"),
-    packageDirectory: required("package-dir"),
-    adminUrlEnv,
-    databaseNameEnv,
-    principalEnv: optional("principal-env"),
-    tagId: required("tag-id"),
-    targetClass,
+    privateRoot: environmentValue(values, env, "private-root-env"),
+    packageDirectory: environmentValue(values, env, "package-directory-env"),
+    listMetadata: environmentValue(values, env, "list-metadata-env"),
+    groupingFile: environmentValue(values, env, "grouping-file-env"),
+    preflightReceipt: environmentValue(values, env, "preflight-receipt-env"),
+    receiptDirectory: environmentValue(values, env, "receipt-directory-env"),
+    storageRoot: environmentValue(values, env, "storage-root-env"),
+    importOutputDirectory: environmentValue(values, env, "import-output-directory-env"),
+    adminUrl: environmentValue(values, env, "admin-url-env"),
+    databaseName,
+    principal: environmentValue(values, env, "principal-env"),
+    tagId: environmentValue(values, env, "tag-id-env"),
+    gitCommit: environmentValue(values, env, "git-commit-env"),
+    expectedBatchSha256,
+    expectedSourceBindingsSha256,
+    expectedPreflightReceiptSha256,
+    executionId: environmentValue(values, env, "execution-id-env"),
+    targetClass: targetClassRaw as TargetClass,
     expectedCount,
-    listMetadata: required("list-metadata"),
-    groupingFile: optional("grouping-file"),
-    gitCommit: optional("git-commit"),
   };
 }
 
-interface CountRow { readonly count: number; readonly [key: string]: unknown }
+const countRowSchema = z.object({ table: z.string(), rows: z.number().int().min(0) }).strict();
+const preflightReceiptSchema = z
+  .object({
+    version: z.literal(2),
+    targetClass: z.enum(allowedTargetClasses),
+    inputBindings: z
+      .object({
+        listMetadataSha256: z.string().regex(digestPattern),
+        packageReportSha256: z.string().regex(digestPattern),
+        groupingSha256: z.string().regex(digestPattern),
+        importManifestSha256: z.string().regex(digestPattern).optional(),
+        batchSha256: z.string().regex(digestPattern),
+        sourceBindingsSha256: z.string().regex(digestPattern),
+        tagIdSha256: z.string().regex(digestPattern),
+        gitCommitSha256: z.string().regex(digestPattern),
+        principalSha256: z.string().regex(digestPattern),
+        executionIdSha256: z.string().regex(digestPattern),
+      })
+      .strict(),
+    approvedInputMatches: z.literal(true),
+    reconciliation: z
+      .object({
+        verdict: z.literal("READY"),
+        listRecordCount: z.number().int().min(0),
+        packageCount: z.number().int().min(0),
+        embeddedAttachmentCount: z.number().int().min(0),
+        missingBasicSolutionCount: z.number().int().min(0),
+        batchIdentityMatches: z.literal(true),
+        reasonCodes: z.array(z.string()).length(0),
+      })
+      .passthrough(),
+    packagesChecked: z.number().int().min(0),
+    packageScan: z
+      .object({
+        missingPackageFileCount: z.literal(0),
+        packageBytesMismatchCount: z.literal(0),
+        packageDigestMismatchCount: z.literal(0),
+        unreportedExtraPackageCount: z.literal(0),
+        expectedSampleRows: z.number().int().min(0),
+        expectedProblemFileRows: z.number().int().min(0),
+        expectedStoredFilesRows: z.number().int().min(0),
+        expectedStoredBytes: z.number().int().min(0),
+        expectedStoredContentSha256: z.string().regex(digestPattern),
+      })
+      .strict(),
+    database: z
+      .object({
+        readOnlyEnforced: z.literal(true),
+        presentTableCount: z.number().int().min(0),
+        missingTableCount: z.literal(0),
+        requiredTableCount: z.number().int().min(0),
+        rowCounts: z.array(countRowSchema),
+        tagPresent: z.literal(true),
+        principalPresent: z.literal(true),
+      })
+      .passthrough(),
+    verdict: z.literal("READY"),
+  })
+  .passthrough();
 
-async function countRows(database: DatabaseHandle, statement: ReturnType<typeof sql>): Promise<number> {
-  const rows = await database.query<CountRow>(statement);
-  return rows[0]?.count ?? 0;
-}
+type PreflightReceipt = z.infer<typeof preflightReceiptSchema>;
 
-async function captureCounts(database: DatabaseHandle): Promise<readonly HistoryImportCountRow[]> {
-  return captureHistoryImportTableCounts(database);
-}
-
-async function main(): Promise<number> {
-  const inputs = resolveRunnerInputs(process.argv.slice(2), process.env);
-
-  await assertPrivateDirectoryMode(inputs.privateRoot);
-  const pathChecks: { path: string; kind: "existing" | "new" }[] = [
-    { path: inputs.packageDirectory, kind: "existing" },
-    { path: inputs.listMetadata, kind: "existing" },
-  ];
-  if (inputs.groupingFile !== undefined) {
-    pathChecks.push({ path: inputs.groupingFile, kind: "existing" });
+function groupingIds(payload: unknown): string[] {
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("groups" in payload) ||
+    !Array.isArray(payload.groups)
+  ) {
+    return [];
   }
-  await assertPathsInsidePrivateRoot(inputs.privateRoot, pathChecks);
+  return payload.groups
+    .map((group) =>
+      typeof group === "object" && group !== null && "metadataId" in group
+        ? group.metadataId
+        : undefined,
+    )
+    .filter((id): id is string => typeof id === "string");
+}
 
-  const adminUrl = process.env[inputs.adminUrlEnv]!;
-  const databaseName = process.env[inputs.databaseNameEnv]!;
-  assertScratchDatabaseName(databaseName);
-
-  console.log(`=== 第 2 阶段验收导入 runner（目标分类：${inputs.targetClass}）===`);
-  console.log(`预期包数量：${inputs.expectedCount}`);
-
-  // ── 校验在变更之前 ──────────────────────────────────────────────
-  console.log("校验阶段：确定性对账 + 只读数据库检查（不在真实目标上变更）。");
-
-  const metadata = (await readPrivateJsonWithDigest(inputs.listMetadata)).value;
-  const report = (await readPrivateJsonWithDigest(join(inputs.packageDirectory, "report.json"))).value;
-
-  let groupingMetadataIds: string[] | undefined;
-  if (inputs.groupingFile !== undefined) {
-    const groupingPayload = (await readPrivateJsonWithDigest(inputs.groupingFile)).value;
-    if (
-      typeof groupingPayload === "object" &&
-      groupingPayload !== null &&
-      "groups" in groupingPayload &&
-      Array.isArray(groupingPayload.groups)
-    ) {
-      groupingMetadataIds = groupingPayload.groups
-        .map((group) =>
-          typeof group === "object" && group !== null && "metadataId" in group
-            ? group.metadataId
-            : undefined,
-        )
-        .filter((id): id is string => typeof id === "string");
+function countsEqual(
+  left: readonly HistoryImportCountRow[],
+  right: readonly HistoryImportCountRow[],
+): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index]?.table !== right[index]?.table || left[index]?.rows !== right[index]?.rows) {
+      return false;
     }
   }
+  return true;
+}
 
-  const reconciliation = reconcileHistoryImportBatch({
-    listMetadata: metadata,
-    packageReport: report,
-    packageEntryNames: [],
-    expectedRecordCount: inputs.expectedCount,
-    ...(groupingMetadataIds !== undefined ? { groupingMetadataIds } : {}),
-  });
+function storedInventoriesEqual(left: StoredFileInventory, right: StoredFileInventory): boolean {
+  return left.fileCount === right.fileCount &&
+    left.totalBytes === right.totalBytes &&
+    left.contentInventorySha256 === right.contentInventorySha256;
+}
 
-  if (reconciliation.verdict !== "READY") {
-    console.error(`校验失败：对账结论 NOT_READY（原因码：${reconciliation.reasonCodes.join(", ")}）。`);
-    return 1;
-  }
-  console.log(`对账结论：READY（包数量 ${reconciliation.packageCount}，批身一致 ${reconciliation.batchIdentityMatches ? "是" : "否"}）。`);
-
-  // 只读检查目标库的标签存在性与表存在性——在清理与新建之前对已有库做只读预检。
-  // 这里连接的是管理库（admin connection），不是目标库；标签检查在新建后重新做。
-  console.log("标签依赖检查将在新建空库迁移+种子完成后进行。");
-
-  // ── 独占窗口：清理 + 新建 ────────────────────────────────────────
-  console.log("独占窗口：清理同名临时/验收库并新建空库。");
-  await dropHistoryImportDatabase(adminUrl, databaseName);
-  const prepared = await prepareHistoryImportDatabase(adminUrl, databaseName);
-  console.log(`新建临时/验收库迁移与种子完成。`);
-
+async function scratchDatabaseExists(adminUrl: string, databaseName: string): Promise<boolean> {
   const database = createPostgresDatabase({
-    connectionString: prepared.connectionString,
-    maxConnections: 8,
-    applicationName: "urmotiv-history-import-phase2",
+    connectionString: adminUrl,
+    maxConnections: 1,
+    applicationName: "urmotiv-history-import-target-check",
   });
-
   try {
-    // 新建空库上做标签存在性只读检查。
-    const tagCheck = await runZeroMutationDatabasePreflight(database, {
-      requiredTagId: inputs.tagId,
-    });
-    if (!tagCheck.tagPresent) {
-      console.error(`校验失败：标签依赖不存在。`);
-      return 1;
-    }
-    if (tagCheck.missingTableCount > 0) {
-      console.error(`校验失败：必需表缺失 ${tagCheck.missingTableCount} 张。`);
-      return 1;
-    }
-    console.log(`标签依赖存在；只读开关已验证。`);
-
-    // ── 快照（仅在临时/验收库与本地存储上）─────────────────────────
-    console.log("快照阶段：复制临时/验收库与本地存储。");
-    await snapshotScratchDatabase(adminUrl, databaseName);
-    const storageRoot = join(inputs.privateRoot, "storage");
-    const storageSnapshotDir = join(inputs.privateRoot, "storage__snapshot");
-    const storageFileCount = await snapshotStorageDirectory(storageRoot, storageSnapshotDir);
-    console.log(`存储快照完成（普通文件 ${storageFileCount}）。`);
-
-    // ── 导入前计数 ──────────────────────────────────────────────────
-    const outDir = join(inputs.privateRoot, "imported");
-    await rm(outDir, { recursive: true, force: true }).catch(() => {});
-    const before = await captureCounts(database);
-
-    // ── 第 1 遍导入 ─────────────────────────────────────────────────
-    console.log("导入第 1 遍。");
-    const r1 = await importHistoryPackages({
-      privateRootDirectory: inputs.privateRoot,
-      packageDirectory: inputs.packageDirectory,
-      outputDirectory: outDir,
-      dependencies: {
-        database,
-        requestedByUserId: "0",
-        assignedTagId: inputs.tagId,
-        storageRoot,
-      },
-    });
-    const firstFailedByCode = aggregateFailedByCode(r1.failedCandidates);
-    console.log(`第 1 遍：imported=${r1.importedCount} skipped=${r1.skippedCount} failed=${r1.failedCount}`);
-    if (r1.failedCount > 0) {
-      console.log(`失败候选失败码计数：${JSON.stringify(firstFailedByCode)}`);
-    }
-    if (r1.failedCount > 0 || r1.importedCount !== inputs.expectedCount || r1.skippedCount > 0) {
-      console.error("第 1 遍导入不符合预期，跳过恢复并直接失败。");
-      await restoreAndVerify(adminUrl, databaseName, storageSnapshotDir, storageRoot, database);
-      return 1;
-    }
-
-    const afterFirst = await captureCounts(database);
-
-    // ── 标题编辑探针（聚合布尔，不输出题名）─────────────────────────
-    console.log("标题编辑探针。");
-    const revRows = await database.query<{ id: string }>(
-      sql`SELECT id FROM problem_revisions ORDER BY problem_id LIMIT 1`,
+    const rows = await database.query<{ total: bigint }>(
+      sql`select count(*)::bigint as total from pg_database where datname = ${databaseName}`,
     );
-    let titleEdited = false;
-    if (revRows.length > 0) {
-      const editedRevId = revRows[0]!.id;
-      await database.execute(
-        sql`UPDATE problem_revisions SET title = title || ' [已编辑]' WHERE id = ${editedRevId}::uuid`,
-      );
-      titleEdited = true;
-    }
-
-    // ── 第 2 遍重放 ─────────────────────────────────────────────────
-    console.log("导入第 2 遍（重放）。");
-    const r2 = await importHistoryPackages({
-      privateRootDirectory: inputs.privateRoot,
-      packageDirectory: inputs.packageDirectory,
-      outputDirectory: outDir,
-      dependencies: {
-        database,
-        requestedByUserId: "0",
-        assignedTagId: inputs.tagId,
-        storageRoot,
-      },
-    });
-    const replayFailedByCode = aggregateFailedByCode(r2.failedCandidates);
-    console.log(`第 2 遍：imported=${r2.importedCount} skipped=${r2.skippedCount} failed=${r2.failedCount}`);
-    if (r2.failedCount > 0) {
-      console.log(`重放失败候选失败码计数：${JSON.stringify(replayFailedByCode)}`);
-    }
-
-    const afterReplay = await captureCounts(database);
-
-    // ── 附件/存储/审计增量：用导入后只读查询取得实际值 ───────────────
-    const attachmentRows = await countRows(
-      database,
-      sql`SELECT COUNT(*)::int as count FROM problem_revision_files WHERE category IN ('public_attachment', 'internal_attachment')`,
-    );
-    const storedFilesDelta = await countRows(
-      database,
-      sql`SELECT COUNT(*)::int as count FROM stored_files WHERE purpose = 'import_input'`,
-    );
-    const auditDelta = await countRows(
-      database,
-      sql`SELECT COUNT(*)::int as count FROM audit_events`,
-    );
-    const afterMissingSolutionCount = await countMissingBasicSolutions(database);
-    // 预检阶段已经记录了结构性缺失基础题解的真状态数量；runner 从对账里取。
-    const expectedMissingSolutionCount = reconciliation.missingBasicSolutionCount;
-
-    const postcheck = verifyPhase2Outcome({
-      before,
-      afterFirst,
-      afterReplay,
-      firstPass: { imported: r1.importedCount, skipped: r1.skippedCount, failed: r1.failedCount },
-      replayPass: { imported: r2.importedCount, skipped: r2.skippedCount, failed: r2.failedCount },
-      expectedPackageCount: inputs.expectedCount,
-      expectedAttachmentRows: attachmentRows,
-      expectedStoredFilesDelta: storedFilesDelta,
-      expectedAuditDelta: auditDelta,
-      expectedMissingSolutionCount,
-      afterMissingSolutionCount,
-    });
-
-    console.log(`对账结论：${postcheck.verdict}`);
-    if (postcheck.reasonCodes.length > 0) {
-      console.log(`对账原因码：${postcheck.reasonCodes.join(", ")}`);
-    }
-    console.log(`漂移表数量：${postcheck.driftedTableCount}`);
-
-    // ── 标题编辑保留验证 ─────────────────────────────────────────────
-    let titlePreserved = false;
-    if (titleEdited) {
-      const editedRows = await database.query<{ title: string }>(
-        sql`SELECT title FROM problem_revisions WHERE title LIKE '% [已编辑]' LIMIT 1`,
-      );
-      titlePreserved = editedRows.length > 0;
-    }
-    console.log(`标题编辑保留：${titlePreserved ? "是" : "否"}`);
-
-    // ── 私有回执 ─────────────────────────────────────────────────────
-    let principal: string | undefined;
-    if (inputs.principalEnv !== undefined) {
-      const principalValue = process.env[inputs.principalEnv];
-      if (principalValue !== undefined && principalValue.length > 0) {
-        principal = principalValue;
-      }
-    }
-    const receipt = {
-      version: 1,
-      generatedAt: new Date().toISOString(),
-      gitCommit: inputs.gitCommit,
-      targetClass: inputs.targetClass,
-      principal: principal !== undefined ? "set" : "unset",
-      databaseName: "redacted",
-      expectedCount: inputs.expectedCount,
-      firstPass: { imported: r1.importedCount, skipped: r1.skippedCount, failed: r1.failedCount },
-      replayPass: { imported: r2.importedCount, skipped: r2.skippedCount, failed: r2.failedCount },
-      postcheck,
-      titlePreserved,
-      firstFailedByCode,
-      replayFailedByCode,
-    };
-    await writePrivateFile(
-      join(inputs.privateRoot, "phase2-run-receipt.private.json"),
-      `${JSON.stringify(receipt, null, 2)}\n`,
-    );
-
-    if (postcheck.verdict === "FAIL") {
-      console.error("对账失败：从快照恢复临时/验收库与存储并重新核对。");
-      await restoreAndVerify(adminUrl, databaseName, storageSnapshotDir, storageRoot, database);
-      return 1;
-    }
-
-    // ── 清理快照 ─────────────────────────────────────────────────────
-    await dropScratchSnapshot(adminUrl, databaseName);
-    await rm(storageSnapshotDir, { recursive: true, force: true }).catch(() => {});
-    await writePrivateFile(join(inputs.privateRoot, "PHASE2_RUN_PASS"), `${receipt.generatedAt}\n`);
-
-    console.log("第 2 阶段验收导入 PASS。");
-    return 0;
+    return Number(rows[0]?.total ?? 0) === 1;
   } finally {
     await database.close();
   }
 }
 
-interface FailedCandidateLike {
-  readonly code: string;
+interface ValidationContext {
+  readonly report: z.infer<typeof packageReportPayloadSchema>;
+  readonly scan: PackageScanResult;
+  readonly reconciliation: HistoryImportReconciliation;
+  readonly preflightReceiptSha256: string;
 }
 
-function aggregateFailedByCode(candidates: readonly FailedCandidateLike[]): Record<string, number> {
-  const counts: Record<string, number> = {};
-  for (const candidate of candidates) {
-    counts[candidate.code] = (counts[candidate.code] ?? 0) + 1;
+async function validateBeforeMutation(inputs: RunnerInputs): Promise<ValidationContext> {
+  await assertPrivateDirectoryMode(inputs.privateRoot);
+  await assertPrivateDirectoryMode(inputs.receiptDirectory);
+  await assertPrivateDirectoryMode(inputs.storageRoot);
+  const runReceiptPath = join(inputs.receiptDirectory, runReceiptName);
+  const passMarkerPath = join(inputs.receiptDirectory, runPassMarkerName);
+  const storageSnapshotDirectory = join(inputs.receiptDirectory, "storage.snapshot");
+  const markerPath = join(dirname(inputs.preflightReceipt), preflightPassMarkerName);
+  await assertPathsInsidePrivateRoot(inputs.privateRoot, [
+    { path: inputs.packageDirectory, kind: "existing" },
+    { path: inputs.listMetadata, kind: "existing" },
+    { path: inputs.groupingFile, kind: "existing" },
+    { path: inputs.preflightReceipt, kind: "existing" },
+    { path: markerPath, kind: "existing" },
+    { path: inputs.receiptDirectory, kind: "existing" },
+    { path: inputs.storageRoot, kind: "existing" },
+    { path: inputs.importOutputDirectory, kind: "new" },
+    { path: runReceiptPath, kind: "new" },
+    { path: passMarkerPath, kind: "new" },
+    { path: storageSnapshotDirectory, kind: "new" },
+  ]);
+  await assertNewOutputPath(inputs.importOutputDirectory);
+  await assertNewOutputPath(runReceiptPath);
+  await assertNewOutputPath(passMarkerPath);
+  await assertNewOutputPath(storageSnapshotDirectory);
+
+  const storageBefore = await captureStorageInventory(inputs.storageRoot);
+  if (storageBefore.fileCount !== 0 || storageBefore.totalBytes !== 0) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "第 2 阶段验收存储目录必须为空。");
   }
-  return counts;
+  if (!(await privateRegularFileExists(markerPath))) {
+    throw new HistoryMigrationError("INVALID_METADATA", "第 1 阶段通过标记不存在。");
+  }
+
+  const metadataRead = await readPrivateJsonWithDigest(inputs.listMetadata);
+  const reportRead = await readPrivateJsonWithDigest(join(inputs.packageDirectory, "report.json"));
+  const groupingRead = await readPrivateJsonWithDigest(inputs.groupingFile);
+  const receiptRead = await readPrivateJsonWithDigest(inputs.preflightReceipt);
+  const report = packageReportPayloadSchema.parse(reportRead.value);
+  const receipt = preflightReceiptSchema.parse(receiptRead.value);
+  const scan = await scanPackageDirectory(inputs.packageDirectory, report);
+  const sourceBindingsSha256 = recomputeSourceBindingsIdentity(report);
+  const reconciliation = reconcileHistoryImportBatch({
+    listMetadata: metadataRead.value,
+    packageReport: reportRead.value,
+    packageEntryNames: scan.entryNames,
+    expectedRecordCount: inputs.expectedCount,
+    missingPackageFileCount: scan.missingPackageFileCount,
+    packageBytesMismatchCount: scan.packageBytesMismatchCount,
+    packageDigestMismatchCount: scan.packageDigestMismatchCount,
+    unreportedExtraPackageCount: scan.unreportedExtraPackageCount,
+    groupingMetadataIds: groupingIds(groupingRead.value),
+  });
+
+  const receiptScanMatches =
+    receipt.packageScan.expectedSampleRows === scan.expectedSampleRows &&
+    receipt.packageScan.expectedProblemFileRows === scan.expectedProblemFileRows &&
+    receipt.packageScan.expectedStoredFilesRows === scan.expectedStoredFilesRows &&
+    receipt.packageScan.expectedStoredBytes === scan.expectedStoredBytes &&
+    receipt.packageScan.expectedStoredContentSha256 === scan.expectedStoredContentSha256;
+  const receiptBindingsMatch =
+    receiptRead.sha256 === inputs.expectedPreflightReceiptSha256 &&
+    receipt.targetClass === inputs.targetClass &&
+    receipt.inputBindings.listMetadataSha256 === metadataRead.sha256 &&
+    receipt.inputBindings.packageReportSha256 === reportRead.sha256 &&
+    receipt.inputBindings.groupingSha256 === groupingRead.sha256 &&
+    receipt.inputBindings.batchSha256 === report.batchSha256 &&
+    receipt.inputBindings.sourceBindingsSha256 === sourceBindingsSha256 &&
+    receipt.inputBindings.tagIdSha256 === sha256Hex(inputs.tagId) &&
+    receipt.inputBindings.gitCommitSha256 === sha256Hex(inputs.gitCommit) &&
+    receipt.inputBindings.principalSha256 === sha256Hex(inputs.principal) &&
+    receipt.inputBindings.executionIdSha256 === sha256Hex(inputs.executionId) &&
+    receipt.reconciliation.packageCount === inputs.expectedCount &&
+    receipt.packagesChecked === inputs.expectedCount &&
+    receipt.database.requiredTableCount === historyImportRequiredTables.length &&
+    receipt.database.presentTableCount === historyImportRequiredTables.length &&
+    receiptScanMatches;
+  const approvedEnvironmentMatches =
+    report.batchSha256 === inputs.expectedBatchSha256 &&
+    sourceBindingsSha256 === inputs.expectedSourceBindingsSha256;
+  if (
+    reconciliation.verdict !== "READY" ||
+    !receiptBindingsMatch ||
+    !approvedEnvironmentMatches
+  ) {
+    throw new HistoryMigrationError("INVALID_METADATA", "批准输入、收据或执行绑定不一致。");
+  }
+
+  const sourceDatabase = createPostgresDatabase({
+    connectionString: inputs.adminUrl,
+    maxConnections: 1,
+    applicationName: "urmotiv-history-import-runner-preflight",
+  });
+  try {
+    const databaseResult = await runZeroMutationDatabasePreflight(sourceDatabase, {
+      requiredTagId: inputs.tagId,
+      requiredPrincipalId: inputs.principal,
+    });
+    if (
+      !databaseResult.readOnlyEnforced ||
+      databaseResult.missingTableCount !== 0 ||
+      databaseResult.tagPresent !== true ||
+      databaseResult.principalPresent !== true
+    ) {
+      throw new HistoryMigrationError("INVALID_METADATA", "数据库只读依赖校验未通过。");
+    }
+  } finally {
+    await sourceDatabase.close();
+  }
+  if (await scratchDatabaseExists(inputs.adminUrl, inputs.databaseName)) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "临时/验收库已存在，拒绝覆盖。");
+  }
+
+  return {
+    report,
+    scan,
+    reconciliation,
+    preflightReceiptSha256: receiptRead.sha256,
+  };
+}
+
+interface TitleProbeState {
+  readonly revisionId: string;
+  readonly title: string;
+  readonly basicStatement: string;
+  readonly basicSolution: string | null;
+}
+
+interface TitleProbeRow {
+  readonly revision_id: string;
+  readonly title: string;
+  readonly basic_statement: string;
+  readonly basic_solution: string | null;
+  readonly [key: string]: unknown;
+}
+
+async function readTitleProbeState(database: DatabaseHandle, problemId: string): Promise<TitleProbeState> {
+  const rows = await database.query<TitleProbeRow>(
+    sql`select pr.id::text as revision_id, pr.title, pr.basic_statement, pr.basic_solution
+        from "public"."problems" p
+        inner join "public"."problem_revisions" pr
+          on pr.problem_id = p.id and pr.revision = p.current_revision
+        where p.id = ${problemId}::bigint`,
+  );
+  if (rows.length !== 1) {
+    throw new HistoryMigrationError("INVALID_METADATA", "无法精确定位导入问题的当前修订。");
+  }
+  return {
+    revisionId: rows[0]!.revision_id,
+    title: rows[0]!.title,
+    basicStatement: rows[0]!.basic_statement,
+    basicSolution: rows[0]!.basic_solution,
+  };
+}
+
+interface ExecutionSummary {
+  readonly firstPass: { readonly imported: number; readonly skipped: number; readonly failed: number };
+  readonly replayPass: { readonly imported: number; readonly skipped: number; readonly failed: number };
+  readonly postcheck: Phase2PostcheckResult;
+  readonly titleProbePassed: boolean;
+  readonly missingSolutionCount: number;
+  readonly attachmentCount: number;
+  readonly storageInventory: StorageInventory;
+}
+
+async function executeImport(
+  database: DatabaseHandle,
+  inputs: RunnerInputs,
+  context: ValidationContext,
+  before: readonly HistoryImportCountRow[],
+  hooks: Phase2RunnerHooks,
+): Promise<ExecutionSummary> {
+  const first = await importHistoryPackages({
+    privateRootDirectory: inputs.privateRoot,
+    packageDirectory: inputs.packageDirectory,
+    outputDirectory: inputs.importOutputDirectory,
+    dependencies: {
+      database,
+      requestedByUserId: inputs.principal,
+      assignedTagId: inputs.tagId,
+      storageRoot: inputs.storageRoot,
+    },
+  });
+  console.log(`第 1 遍聚合: imported=${first.importedCount} skipped=${first.skippedCount} failed=${first.failedCount}`);
+  if (
+    first.importedCount !== inputs.expectedCount ||
+    first.skippedCount !== 0 ||
+    first.failedCount !== 0
+  ) {
+    throw new HistoryMigrationError("INVALID_METADATA", "首遍导入聚合不符合批准数量。");
+  }
+
+  const manifestRead = await readPrivateJsonWithDigest(
+    join(inputs.importOutputDirectory, importManifestName),
+  );
+  const manifest = importManifestPayloadSchema.parse(manifestRead.value);
+  if (manifest.entries.length !== inputs.expectedCount || manifest.importedCount !== inputs.expectedCount) {
+    throw new HistoryMigrationError("INVALID_METADATA", "首遍导入清单不完整。");
+  }
+  const problemIds = manifest.entries.map((entry) => entry.problemId);
+  const uniqueProblemIds = new Set(problemIds);
+  if (uniqueProblemIds.size !== inputs.expectedCount) {
+    throw new HistoryMigrationError("INVALID_METADATA", "首遍导入清单包含重复问题身份。");
+  }
+
+  const afterFirst = await captureHistoryImportTableCounts(database);
+  const firstStoredInventory = await captureStoredFileInventory(database);
+  const firstStorageInventory = await captureStorageInventory(inputs.storageRoot);
+  await hooks.afterFirstPass?.();
+  const probeBefore = await readTitleProbeState(database, problemIds[0]!);
+  const editedTitle = `${probeBefore.title} [验收编辑]`;
+  const updatedRows = await database.query<TitleProbeRow>(
+    sql`update "public"."problem_revisions"
+        set title = ${editedTitle}
+        where id = ${probeBefore.revisionId}::uuid
+        returning id::text as revision_id, title, basic_statement, basic_solution`,
+  );
+  if (
+    updatedRows.length !== 1 ||
+    updatedRows[0]!.title !== editedTitle ||
+    updatedRows[0]!.basic_statement !== probeBefore.basicStatement ||
+    updatedRows[0]!.basic_solution !== probeBefore.basicSolution
+  ) {
+    throw new HistoryMigrationError("INVALID_METADATA", "标题编辑或冻结内容核对失败。");
+  }
+
+  const replay = await importHistoryPackages({
+    privateRootDirectory: inputs.privateRoot,
+    packageDirectory: inputs.packageDirectory,
+    outputDirectory: inputs.importOutputDirectory,
+    dependencies: {
+      database,
+      requestedByUserId: inputs.principal,
+      assignedTagId: inputs.tagId,
+      storageRoot: inputs.storageRoot,
+    },
+  });
+  console.log(`重放聚合: imported=${replay.importedCount} skipped=${replay.skippedCount} failed=${replay.failedCount}`);
+  const afterReplay = await captureHistoryImportTableCounts(database);
+  const replayStoredInventory = await captureStoredFileInventory(database);
+  const replayStorageInventory = await captureStorageInventory(inputs.storageRoot);
+  const probeAfterReplay = await readTitleProbeState(database, problemIds[0]!);
+  const titleProbePassed =
+    probeAfterReplay.revisionId === probeBefore.revisionId &&
+    probeAfterReplay.title === editedTitle &&
+    probeAfterReplay.basicStatement === probeBefore.basicStatement &&
+    probeAfterReplay.basicSolution === probeBefore.basicSolution;
+  const missingSolutionCount = await countMissingBasicSolutionsForProblems(database, problemIds);
+  const attachmentCount = await countRevisionFilesForProblems(database, problemIds);
+  const postcheck = verifyPhase2Outcome({
+    before,
+    afterFirst,
+    afterReplay,
+    firstPass: {
+      imported: first.importedCount,
+      skipped: first.skippedCount,
+      failed: first.failedCount,
+    },
+    replayPass: {
+      imported: replay.importedCount,
+      skipped: replay.skippedCount,
+      failed: replay.failedCount,
+    },
+    expectedPackageCount: inputs.expectedCount,
+    expectedAttachmentRows: context.scan.expectedProblemFileRows,
+    expectedSampleRows: context.scan.expectedSampleRows,
+    expectedJobItemRows: inputs.expectedCount,
+    expectedStoredFilesDelta: context.scan.expectedStoredFilesRows,
+    expectedAuditDelta: inputs.expectedCount * 2,
+    expectedMissingSolutionCount: context.reconciliation.missingBasicSolutionCount,
+    afterMissingSolutionCount: missingSolutionCount,
+    expectedStoredBytes: context.scan.expectedStoredBytes,
+    expectedStoredContentSha256: context.scan.expectedStoredContentSha256,
+    afterFirstStoredInventory: firstStoredInventory,
+    afterReplayStoredInventory: replayStoredInventory,
+  });
+  const physicalStorageMatches =
+    firstStorageInventory.fileCount === context.scan.expectedStoredFilesRows &&
+    firstStorageInventory.totalBytes === context.scan.expectedStoredBytes &&
+    firstStorageInventory.contentInventorySha256 === context.scan.expectedStoredContentSha256 &&
+    storageInventoriesEqual(firstStorageInventory, replayStorageInventory);
+  if (
+    postcheck.verdict !== "PASS" ||
+    !titleProbePassed ||
+    missingSolutionCount !== context.reconciliation.missingBasicSolutionCount ||
+    attachmentCount !== context.scan.expectedProblemFileRows ||
+    !physicalStorageMatches
+  ) {
+    throw new HistoryMigrationError("INVALID_METADATA", "导入后精确对账失败。");
+  }
+
+  return {
+    firstPass: {
+      imported: first.importedCount,
+      skipped: first.skippedCount,
+      failed: first.failedCount,
+    },
+    replayPass: {
+      imported: replay.importedCount,
+      skipped: replay.skippedCount,
+      failed: replay.failedCount,
+    },
+    postcheck,
+    titleProbePassed,
+    missingSolutionCount,
+    attachmentCount,
+    storageInventory: replayStorageInventory,
+  };
+}
+
+export interface Phase2RunnerHooks {
+  readonly afterSnapshot?: () => Promise<void>;
+  readonly afterFirstPass?: () => Promise<void>;
 }
 
 async function restoreAndVerify(
-  adminUrl: string,
-  databaseName: string,
-  storageSnapshotDir: string,
-  storageRoot: string,
-  database: DatabaseHandle,
+  inputs: RunnerInputs,
+  connectionString: string,
+  baselineCounts: readonly HistoryImportCountRow[],
+  baselineStoredInventory: StoredFileInventory,
+  baselineStorageInventory: StorageInventory,
+  storageSnapshotDirectory: string,
 ): Promise<void> {
-  await database.close().catch(() => {});
-  await restoreScratchDatabase(adminUrl, databaseName);
-  const restoredFileCount = await restoreStorageDirectory(storageSnapshotDir, storageRoot);
-  console.log(`恢复完成（存储普通文件 ${restoredFileCount}）。`);
-  // 重新连接恢复后的库做只读计数验证。
-  const adminDb = createPostgresDatabase({
-    connectionString: adminUrl.replace(/\/[^/]*$/, `/${databaseName}`),
+  await restoreScratchDatabase(inputs.adminUrl, inputs.databaseName);
+  const restoredStorageInventory = await restoreStorageDirectory(
+    storageSnapshotDirectory,
+    inputs.storageRoot,
+    baselineStorageInventory,
+  );
+  const verifyDatabase = createPostgresDatabase({
+    connectionString,
     maxConnections: 1,
-    applicationName: "urmotiv-history-import-phase2-verify",
+    applicationName: "urmotiv-history-import-restore-verify",
   });
   try {
-    const restoredCounts = await runZeroMutationDatabasePreflight(adminDb);
-    console.log(
-      `恢复后只读计数完成：表 ${restoredCounts.presentTableCount}/${historyImportRequiredTables.length}。`,
-    );
+    const restoredCounts = await captureHistoryImportTableCounts(verifyDatabase);
+    const restoredStoredInventory = await captureStoredFileInventory(verifyDatabase);
+    if (
+      !countsEqual(restoredCounts, baselineCounts) ||
+      !storedInventoriesEqual(restoredStoredInventory, baselineStoredInventory) ||
+      !storageInventoriesEqual(restoredStorageInventory, baselineStorageInventory)
+    ) {
+      throw new HistoryMigrationError("INVALID_METADATA", "恢复后表计数或存储摘要不一致。");
+    }
   } finally {
-    await adminDb.close();
+    await verifyDatabase.close();
+  }
+  await rm(inputs.importOutputDirectory, { recursive: true, force: true });
+  await rm(join(inputs.receiptDirectory, runReceiptName), { force: true });
+  await rm(join(inputs.receiptDirectory, runPassMarkerName), { force: true });
+  await rm(storageSnapshotDirectory, { recursive: true, force: false });
+  await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName);
+}
+
+async function executeBoundRunner(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+  hooks: Phase2RunnerHooks,
+): Promise<number> {
+  const inputs = resolveRunnerInputs(argv, env);
+  const context = await validateBeforeMutation(inputs);
+  console.log(`批准输入校验: READY; 包数量=${context.reconciliation.packageCount}`);
+
+  const prepared = await prepareHistoryImportDatabase(inputs.adminUrl, inputs.databaseName);
+  let baseline: {
+    readonly counts: readonly HistoryImportCountRow[];
+    readonly storedInventory: StoredFileInventory;
+  };
+  try {
+    const baselineDatabase = createPostgresDatabase({
+      connectionString: prepared.connectionString,
+      maxConnections: 1,
+      applicationName: "urmotiv-history-import-baseline",
+    });
+    try {
+      const scratchPostcondition = await runZeroMutationDatabasePreflight(baselineDatabase, {
+        requiredTagId: inputs.tagId,
+        requiredPrincipalId: inputs.principal,
+      });
+      if (
+        scratchPostcondition.missingTableCount !== 0 ||
+        scratchPostcondition.tagPresent !== true ||
+        scratchPostcondition.principalPresent !== true
+      ) {
+        throw new HistoryMigrationError(
+          "INVALID_METADATA",
+          "新建验收库迁移或种子后置条件失败。",
+        );
+      }
+      const counts = await captureHistoryImportTableCounts(baselineDatabase);
+      const storedInventory = await captureStoredFileInventory(baselineDatabase);
+      if (storedInventory.fileCount !== 0) {
+        throw new HistoryMigrationError("INVALID_METADATA", "新建验收库的存储记录不是空集。");
+      }
+      baseline = { counts, storedInventory };
+    } finally {
+      await baselineDatabase.close();
+    }
+  } catch (error) {
+    await dropHistoryImportDatabase(inputs.adminUrl, inputs.databaseName);
+    throw error;
+  }
+
+  const baselineStorageInventory = await captureStorageInventory(inputs.storageRoot);
+  const storageSnapshotDirectory = join(inputs.receiptDirectory, "storage.snapshot");
+  try {
+    await snapshotScratchDatabase(inputs.adminUrl, inputs.databaseName);
+  } catch (error) {
+    await dropHistoryImportDatabase(inputs.adminUrl, inputs.databaseName);
+    throw error;
+  }
+  try {
+    await snapshotStorageDirectory(inputs.storageRoot, storageSnapshotDirectory);
+  } catch (error) {
+    await rm(storageSnapshotDirectory, { recursive: true, force: true });
+    await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName);
+    await dropHistoryImportDatabase(inputs.adminUrl, inputs.databaseName);
+    throw error;
+  }
+
+  let execution: ExecutionSummary;
+  let receipt: {
+    readonly generatedAt: string;
+    readonly [key: string]: unknown;
+  };
+  try {
+    await hooks.afterSnapshot?.();
+    const importDatabase = createPostgresDatabase({
+      connectionString: prepared.connectionString,
+      maxConnections: 8,
+      applicationName: "urmotiv-history-import-phase2",
+    });
+    try {
+      execution = await executeImport(importDatabase, inputs, context, baseline.counts, hooks);
+    } finally {
+      await importDatabase.close();
+    }
+
+    receipt = {
+      version: 2,
+      generatedAt: new Date().toISOString(),
+      targetClass: inputs.targetClass,
+      inputBindings: {
+        preflightReceiptSha256: context.preflightReceiptSha256,
+        batchSha256: context.report.batchSha256,
+        sourceBindingsSha256: recomputeSourceBindingsIdentity(context.report),
+        tagIdSha256: sha256Hex(inputs.tagId),
+        gitCommitSha256: sha256Hex(inputs.gitCommit),
+        principalSha256: sha256Hex(inputs.principal),
+        executionIdSha256: sha256Hex(inputs.executionId),
+      },
+      packageCount: inputs.expectedCount,
+      firstPass: execution.firstPass,
+      replayPass: execution.replayPass,
+      postcheck: execution.postcheck,
+      titleProbePassed: execution.titleProbePassed,
+      missingSolutionCount: execution.missingSolutionCount,
+      attachmentCount: execution.attachmentCount,
+      storedObjectCount: execution.storageInventory.fileCount,
+      storedBytes: execution.storageInventory.totalBytes,
+      verdict: "PASS",
+    };
+    await writePrivateFile(
+      join(inputs.receiptDirectory, runReceiptName),
+      `${JSON.stringify(receipt, null, 2)}\n`,
+    );
+  } catch (error) {
+    await restoreAndVerify(
+      inputs,
+      prepared.connectionString,
+      baseline.counts,
+      baseline.storedInventory,
+      baselineStorageInventory,
+      storageSnapshotDirectory,
+    );
+    throw error;
+  }
+
+  await rm(storageSnapshotDirectory, { recursive: true, force: false });
+  await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName);
+  await writePrivateFile(
+    join(inputs.receiptDirectory, runPassMarkerName),
+    `${receipt.generatedAt}\n`,
+  );
+  console.log(
+    `第 2 阶段验收: PASS; 缺失题解=${execution.missingSolutionCount}; 附件=${execution.attachmentCount}`,
+  );
+  return 0;
+}
+
+export async function runPhase2Acceptance(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+  hooks: Phase2RunnerHooks = {},
+): Promise<number> {
+  try {
+    return await executeBoundRunner(argv, env, hooks);
+  } catch (error: unknown) {
+    if (error instanceof HistoryMigrationError) {
+      console.error(`第 2 阶段验收失败（${error.code}）。`);
+      return error.code === "INVALID_ARGUMENTS" ? 2 : 1;
+    }
+    console.error("第 2 阶段验收失败（UNCLASSIFIED）。");
+    return 1;
   }
 }
 
-// 仅在直接执行时运行 main（允许 import.meta.url 守卫供单元测试导入）。
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main()
-    .then((code) => {
-      process.exitCode = code;
-    })
-    .catch((error: unknown) => {
-      if (error instanceof HistoryMigrationError) {
-        console.error(`runner 失败（${error.code}）：${error.message}`);
-      } else {
-        console.error("runner 失败：未分类错误。");
-      }
-      process.exitCode = 2;
-    });
+  runPhase2Acceptance(process.argv.slice(2), process.env).then((code) => {
+    process.exitCode = code;
+  });
 }
 
 export type { RunnerInputs, TargetClass };
-export { main as runPhase2Acceptance };

@@ -684,58 +684,44 @@ SHA-256。Python 工具不自行运行 Git；可信调用方仍须在调用前�
 
 ## 历史导入零数据库变更预检（Phase 1）
 
-正式导入前先做确定性对账与只读数据库预检，工具是
-`apps/api/scripts/preflight-history-import.ts`：
+正式导入前先运行 `apps/api/scripts/preflight-history-import.ts`。命令行只允许出现环境变量名：
+`--private-root-env`、`--list-metadata-env`、`--package-directory-env`、`--output-directory-env`、
+`--database-url-env`、`--grouping-file-env`、`--tag-id-env`、`--git-commit-env`、
+`--target-class-env`、`--principal-env`、`--execution-id-env`、`--batch-sha256-env` 和
+`--source-bindings-sha256-env`；可选既有导入清单也只能用 `--import-manifest-env`。
+唯一可直接传入的是非敏感整数 `--expected-record-count`。路径、连接串、库名、执行主体、标签、执行编号和
+批准摘要都不得作为命令行值。不要用 shell 的 `source` 或 `.` 加载环境文件。
 
-```bash
-pnpm exec tsx scripts/preflight-history-import.ts \
-  --private-root=<私有根> \
-  --list-metadata=<清单元数据 .private.json> \
-  --package-directory=<已打包目录（含 report.json 与 packages/）> \
-  --output-directory=<回执输出目录，必须在私有根内> \
-  --expected-record-count=<权威清单题目数> \
-  --database-url-env=<存放连接串的环境变量名> \
-  [--import-manifest=<既有导入清单 .private.json>]
-```
+脚本先确认私有目录权限和全部路径边界，再逐个重新读取 ZIP：校验包字节数与摘要，用正式原生适配器解析，
+独立计算样例行、附件行、存储对象数、总字节和内容清单摘要，并拒绝额外包、重复候选、重复包摘要或重复导入
+清单项。批次摘要、按顺序的候选/来源绑定摘要、分组和批准环境值必须全部一致。基础题解结构性缺失只计数，
+不判失败。
 
-连接串只能通过环境变量传入，脚本内不保留任何凭据。所有路径必须位于私有根之内；
-只接受目录形式的私有根（拒绝单文件冒充）。逐包以
-`apps/api/src/history-migration/import-preflight.ts` 的对账逻辑核对：清单元数据记录数、
-打包报告条目、来源绑定、批次摘要、规范 §2 包内布局、附件数（声明数应等于包内嵌入数
-加保全数）与已有导入清单。题目身份只由包清单五元组和来源绑定摘要确定，题名仍是可编辑
-的元数据；基础题解结构性缺失只计数，不判失败。
-
-数据库检查全部在显式只读事务内完成（`transaction_read_only`，确认开关生效后才继续），
-只验证必需表存在并列出行数，绝不写入或准备导入数据。成功输出聚合计数、回执
-`history-import-preflight.private.json` 与完成标记 `PREFLIGHT_PASS`；任何一项失败都会移除
-完成标记并以退出码 1 结束（参数错误为 2），不输出题名、题号、摘要或内容。
-
-预检 READY 后才能进入 Phase 2：对指定的验收 PostgreSQL 执行
-`importHistoryPackages`（现有 `apps/api/src/history-migration/import-phase.ts` 流程），
-Phase 2 另行起步，不共用 Phase 1 的只读连接。
+数据库检查在显式只读事务内验证只读开关、当前十张必需表、标签和执行主体。所有文件与数据库校验通过前
+不写回执；输出路径必须是私有根内的新路径。成功只写不含原始身份值的
+`history-import-preflight.private.json` 和最后发布的 `PREFLIGHT_PASS`。必须由独立复核者核对该回执及其
+SHA-256 后，才把摘要通过新的环境变量交给 Phase 2。
 
 ## Phase 2 验收导入 runner
 
-Phase 2 runner（`apps/api/scripts/run-real-import.ts`）在临时/验收库上做两遍导入精确对账，
-不触碰真实目标库。运行契约：
+`apps/api/scripts/run-real-import.ts` 只在临时库或指定验收库执行，固定拒绝 `designated-real`。正式目标导入
+属于验收通过后的独立受控步骤，本 runner 不会自动触发。
 
-- **环境变量输入**：连接串只通过环境变量名传入（`--admin-url-env`、`--db-name-env`、
-  `--principal-env`），命令行、日志和收据中不出现任何凭据或库名。
-- **目标分类限制**：`--target-class` 只接受 `scratch-temporary` 或 `designated-validation`；
-  `designated-real` 一律拒绝——第 2 阶段禁止真实目标导入。
-- **校验在变更之前**：runner 先做确定性对账（`reconcileHistoryImportBatch`）和只读数据库
-  检查（标签存在性、必需表存在性），全部通过后才进入导入流程。
-- **独占窗口**：先清理同名临时/验收库（库名必须匹配 `urmotiv_history_import_` 前缀），
-  再新建空库做迁移与种子。
-- **快照与恢复**：导入前对临时/验收库（`CREATE DATABASE ... TEMPLATE`）和本地存储
-  （整目录复制）做快照；对账失败时从快照恢复并重新只读核对。快照只在临时/验收库上操作，
-  真实目标永远被拒绝。
-- **两遍导入**：第 1 遍期望 `imported=N skipped=0 failed=0`；标题编辑探针后第 2 遍重放期望
-  `imported=0 skipped=N failed=0`。标题编辑在重放后必须保留（来源绑定幂等，不覆盖已编辑标题）。
-- **精确表增量对账**：导入前后对全部八张必需表做行数对比，与 `expectedTableDeltas` 的精确
-  预期增量逐表核对；任一漂移都会判 FAIL。
-- **私有回执**：聚合结果写入 `phase2-run-receipt.private.json`；成功时写 `PHASE2_RUN_PASS`
-  标记。
-- **聚合输出**：stdout 只输出聚合计数和稳定原因码；失败候选只输出失败码计数，不输出题号
-  或候选编号。
-- **退出码**：0 = PASS；对账或导入不一致为 1；参数错误为 2。
+- **环境变量输入**：除 `--expected-count` 外，CLI 只接收 `*-env` 参数。私有根、包目录、元数据、分组、
+  Phase 1 回执、回执目录、存储根、导入输出、管理连接、验收库名、执行主体、标签、提交、批次摘要、
+  来源绑定摘要、Phase 1 回执摘要、执行编号和目标分类都必须来自命名环境变量。
+- **变更前完整校验**：重新扫描全部包并重算上述清单；重新读取 Phase 1 回执和完成标记；核对三个批准摘要、
+  提交/主体/标签/执行编号绑定；只读验证来源数据库十张表、标签、执行主体和目标库不存在。任一失败均不
+  创建验收库、导入输出或 runner 回执。
+- **快照与恢复**：新建验收库完成迁移和种子后关闭全部连接，再用 PostgreSQL `TEMPLATE` 创建库快照；
+  本地存储快照按文件路径、字节数和内容摘要校验。失败恢复先建立 staging 库并验证，再原子替换目标；
+  存储也用 staging/backup 原子切换。数据库和存储都恢复到精确基线并复核后才删除快照。清理失败会向上
+  返回，不能写通过标记。
+- **两遍导入**：第 1 遍必须为 `N/0/0`，标题编辑探针后重放必须为 `0/N/0`。重放不能新增任何表行，
+  已编辑标题必须保留，题面与题解必须保持原值。
+- **精确增量**：逐表核对当前完整十表集合：用户、题目、修订、修订标签、修订附件、样例、导入任务、
+  导入任务项、审计事件和存储记录。样例、附件、存储对象、存储总字节和内容清单都来自包扫描结果，而非
+  从数据库结果反推；缺失题解和附件只按本次清单的问题标识统计。
+- **私有证明**：成功回执 `phase2-run-receipt.private.json` 只含摘要绑定、聚合计数和稳定判定码；快照清理
+  完成后才最后发布 `PHASE2_RUN_PASS`。stdout/stderr 不输出路径、库名、身份、摘要、题名、正文或凭据。
+- **退出码**：0 = PASS；对账、导入、恢复或清理失败 = 1；参数错误 = 2。

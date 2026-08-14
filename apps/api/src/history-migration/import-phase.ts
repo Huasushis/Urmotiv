@@ -1755,17 +1755,22 @@ export async function prepareHistoryImportDatabase(
     await admin.close();
   }
   const connectionString = databaseConnectionString(adminConnectionString, databaseName);
-  const database = createPostgresDatabase({
-    connectionString,
-    maxConnections: 8,
-    applicationName: "urmotiv-history-import",
-  });
   try {
-    await migrateDatabase(database);
-    await seedCoreDatabase(database);
-    await seedDatabaseDemoData(database);
-  } finally {
-    await database.close();
+    const database = createPostgresDatabase({
+      connectionString,
+      maxConnections: 8,
+      applicationName: "urmotiv-history-import",
+    });
+    try {
+      await migrateDatabase(database);
+      await seedCoreDatabase(database);
+      await seedDatabaseDemoData(database);
+    } finally {
+      await database.close();
+    }
+  } catch (error) {
+    await dropHistoryImportDatabase(adminConnectionString, databaseName);
+    throw error;
   }
   return { databaseName, connectionString };
 }

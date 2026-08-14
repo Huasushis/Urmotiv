@@ -1,8 +1,10 @@
 /**
- * 第 2 阶段专项：导入前后精确对账（postcheck）与失败即非零退出。
+ * 第 2 阶段专项：导入前后精确对账与失败即非零退出。
  * 一切计数都来自只读事务内的聚合查询；任何一项漂移都会以稳定原因码失败，
  * 绝不输出题号、候选编号、题名、摘要或路径。
  */
+import { createHash } from "node:crypto";
+
 import { sql } from "drizzle-orm";
 import type { DatabaseHandle } from "@urmotiv/database";
 
@@ -12,14 +14,14 @@ import {
   runZeroMutationDatabasePreflight,
 } from "./import-preflight";
 
-/** 只允许在该命名前缀下的临时/验收库上做快照与恢复；真实目标永远被拒绝。 */
-export const scratchDatabaseNamePattern = /^urmotiv_history_import_[a-z0-9_]+$/;
+/** 只允许短且明确的临时/验收库名；为 __snapshot/__restore 后缀预留空间。 */
+export const scratchDatabaseNamePattern = /^urmotiv_history_import_[a-z0-9_]{1,20}$/;
 
 export function assertScratchDatabaseName(name: string): void {
   if (!scratchDatabaseNamePattern.test(name)) {
     throw new HistoryMigrationError(
       "INVALID_ARGUMENTS",
-      "目标库名不属于临时/验收库前缀，本工具拒绝继续。",
+      "目标库名不属于安全的临时/验收库命名范围，本工具拒绝继续。",
     );
   }
 }
@@ -29,15 +31,45 @@ export interface HistoryImportCountRow {
   readonly rows: number;
 }
 
-/** 只读采集八张必需表的行数；沿用零变更预检的只读事务保证。 */
+/** 只读采集全部十张受影响/边界表的行数。 */
 export async function captureHistoryImportTableCounts(
   database: DatabaseHandle,
 ): Promise<readonly HistoryImportCountRow[]> {
   const result = await runZeroMutationDatabasePreflight(database);
-  if (!result.readOnlyEnforced) {
-    throw new HistoryMigrationError("INVALID_ARGUMENTS", "只读事务未生效，计数采集中止。");
+  if (!result.readOnlyEnforced || result.missingTableCount !== 0) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "只读计数或完整表清单验证失败。");
   }
   return result.rowCounts;
+}
+
+export interface StoredFileInventory {
+  readonly fileCount: number;
+  readonly totalBytes: number;
+  readonly contentInventorySha256: string;
+}
+
+interface StoredFileRow {
+  readonly sha256: string;
+  readonly byte_size: bigint;
+  readonly [key: string]: unknown;
+}
+
+/** 只读绑定 stored_files 中每个对象的内容摘要与字节数，不返回单项信息。 */
+export async function captureStoredFileInventory(
+  database: DatabaseHandle,
+): Promise<StoredFileInventory> {
+  const rows = await database.transaction(async (executor) => {
+    await executor.execute(sql`set local transaction_read_only = on`);
+    return executor.query<StoredFileRow>(
+      sql`select sha256, byte_size from "public"."stored_files" order by sha256, byte_size`,
+    );
+  });
+  const entries = rows.map((row) => ({ sha256: row.sha256, bytes: Number(row.byte_size) }));
+  return {
+    fileCount: entries.length,
+    totalBytes: entries.reduce((sum, entry) => sum + entry.bytes, 0),
+    contentInventorySha256: createHash("sha256").update(JSON.stringify(entries)).digest("hex"),
+  };
 }
 
 /** 导入两遍执行结果的关键聚合；失败一律体现为非零的 failed 计数。 */
@@ -48,26 +80,23 @@ export interface HistoryImportPassTally {
 }
 
 export interface Phase2PostcheckInput {
-  /** 首次导入前的表计数。 */
   readonly before: readonly HistoryImportCountRow[];
-  /** 首次导入后的表计数。 */
   readonly afterFirst: readonly HistoryImportCountRow[];
-  /** 幂等重放后的表计数。 */
   readonly afterReplay: readonly HistoryImportCountRow[];
   readonly firstPass: HistoryImportPassTally;
   readonly replayPass: HistoryImportPassTally;
-  /** 本批包数量（如本批为 137）。 */
   readonly expectedPackageCount: number;
-  /** problem_revision_files 的预期增量（结构化附件条目数）。 */
   readonly expectedAttachmentRows: number;
-  /** stored_files 的预期增量（import_input 每件一行）。 */
+  readonly expectedSampleRows: number;
+  readonly expectedJobItemRows: number;
   readonly expectedStoredFilesDelta: number;
-  /** audit_events 的预期增量。 */
   readonly expectedAuditDelta: number;
-  /** 结构性缺失基础题解的预期真状态数量。 */
   readonly expectedMissingSolutionCount: number;
-  /** 导入后实测的结构性缺失基础题解数量。 */
   readonly afterMissingSolutionCount: number;
+  readonly expectedStoredBytes: number;
+  readonly expectedStoredContentSha256: string;
+  readonly afterFirstStoredInventory: StoredFileInventory;
+  readonly afterReplayStoredInventory: StoredFileInventory;
 }
 
 export const phase2PostcheckReasonCodes = [
@@ -78,13 +107,13 @@ export const phase2PostcheckReasonCodes = [
   "replay_mutation_present",
   "table_delta_drift",
   "solution_state_drift",
+  "stored_inventory_drift",
 ] as const;
 export type Phase2PostcheckReasonCode = (typeof phase2PostcheckReasonCodes)[number];
 
 export interface Phase2PostcheckResult {
   readonly verdict: "PASS" | "FAIL";
   readonly reasonCodes: readonly Phase2PostcheckReasonCode[];
-  /** 与预期不符的表数量。 */
   readonly driftedTableCount: number;
 }
 
@@ -94,10 +123,12 @@ function rowsOf(counts: readonly HistoryImportCountRow[], table: string): number
   return rows;
 }
 
-/** 按导入写入语义计算的每张表精确预期增量；全部为零或精确加项。 */
+/** 按导入写入语义计算全部十张表的精确预期增量。 */
 export function expectedTableDeltas(input: {
   readonly imported: number;
   readonly attachmentRows: number;
+  readonly sampleRows: number;
+  readonly jobItemRows: number;
   readonly storedFilesDelta: number;
   readonly auditDelta: number;
 }): readonly { readonly table: string; readonly delta: number }[] {
@@ -107,22 +138,30 @@ export function expectedTableDeltas(input: {
     { table: "problem_revisions", delta: input.imported },
     { table: "problem_revision_tags", delta: input.imported },
     { table: "problem_revision_files", delta: input.attachmentRows },
+    { table: "problem_samples", delta: input.sampleRows },
     { table: "import_jobs", delta: input.imported },
+    { table: "import_job_items", delta: input.jobItemRows },
     { table: "audit_events", delta: input.auditDelta },
     { table: "stored_files", delta: input.storedFilesDelta },
   ];
 }
 
-/** 精确对账两遍导入结果与全部表计数；任一漂移都会判 FAIL。 */
+function storedInventoriesEqual(left: StoredFileInventory, right: StoredFileInventory): boolean {
+  return left.fileCount === right.fileCount &&
+    left.totalBytes === right.totalBytes &&
+    left.contentInventorySha256 === right.contentInventorySha256;
+}
+
+/** 精确对账两遍导入结果、全部表计数与存储对象内容清单。 */
 export function verifyPhase2Outcome(input: Phase2PostcheckInput): Phase2PostcheckResult {
   const reasonCodes: Phase2PostcheckReasonCode[] = [];
   if (input.firstPass.imported !== input.expectedPackageCount) {
     reasonCodes.push("first_import_count_mismatch");
   }
-  if (input.firstPass.failed > 0 || input.replayPass.failed > 0) {
+  if (input.firstPass.failed !== 0 || input.replayPass.failed !== 0) {
     reasonCodes.push("failed_candidates_present");
   }
-  if (input.firstPass.skipped > 0) reasonCodes.push("unexpected_skipped_first_import");
+  if (input.firstPass.skipped !== 0) reasonCodes.push("unexpected_skipped_first_import");
   if (
     input.replayPass.imported !== 0 ||
     input.replayPass.skipped !== input.expectedPackageCount
@@ -138,6 +177,8 @@ export function verifyPhase2Outcome(input: Phase2PostcheckInput): Phase2Postchec
   const expectations = expectedTableDeltas({
     imported: input.expectedPackageCount,
     attachmentRows: input.expectedAttachmentRows,
+    sampleRows: input.expectedSampleRows,
+    jobItemRows: input.expectedJobItemRows,
     storedFilesDelta: input.expectedStoredFilesDelta,
     auditDelta: input.expectedAuditDelta,
   });
@@ -150,6 +191,17 @@ export function verifyPhase2Outcome(input: Phase2PostcheckInput): Phase2Postchec
   if (input.afterMissingSolutionCount !== input.expectedMissingSolutionCount) {
     reasonCodes.push("solution_state_drift");
   }
+  const expectedStoredInventory: StoredFileInventory = {
+    fileCount: input.expectedStoredFilesDelta,
+    totalBytes: input.expectedStoredBytes,
+    contentInventorySha256: input.expectedStoredContentSha256,
+  };
+  if (
+    !storedInventoriesEqual(input.afterFirstStoredInventory, expectedStoredInventory) ||
+    !storedInventoriesEqual(input.afterReplayStoredInventory, input.afterFirstStoredInventory)
+  ) {
+    reasonCodes.push("stored_inventory_drift");
+  }
   return {
     verdict: reasonCodes.length === 0 ? "PASS" : "FAIL",
     reasonCodes,
@@ -157,23 +209,47 @@ export function verifyPhase2Outcome(input: Phase2PostcheckInput): Phase2Postchec
   };
 }
 
-/** 导入后只读查询结构性缺失基础题解的数量。 */
-export async function countMissingBasicSolutions(
+function problemIdList(problemIds: readonly string[]) {
+  if (problemIds.length === 0) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "导入清单没有可核对的问题标识。");
+  }
+  return sql.join(problemIds.map((problemId) => sql`${problemId}::bigint`), sql`, `);
+}
+
+/** 只统计导入清单精确绑定的问题修订，不使用范围或时间猜测。 */
+export async function countMissingBasicSolutionsForProblems(
   database: DatabaseHandle,
-  sinceProblemId?: number,
+  problemIds: readonly string[],
 ): Promise<number> {
-  // NULL 或空字符串都算结构性缺失；限定 problem_id 上界以下时用于批次内判定。
+  const ids = problemIdList(problemIds);
   const rows = await database.transaction(async (executor) => {
-    await executor.execute(sql`SET LOCAL transaction_read_only = on`);
-    if (sinceProblemId !== undefined) {
-      return executor.query<{ total: bigint }>(
-        sql`select count(*)::bigint as total from "public"."problem_revisions"
-            where problem_id > ${sinceProblemId} and coalesce(basic_solution, '') = ''`,
-      );
-    }
+    await executor.execute(sql`set local transaction_read_only = on`);
     return executor.query<{ total: bigint }>(
-      sql`select count(*)::bigint as total from "public"."problem_revisions"
-          where coalesce(basic_solution, '') = ''`,
+      sql`select count(*)::bigint as total
+          from "public"."problems" p
+          inner join "public"."problem_revisions" pr
+            on pr.problem_id = p.id and pr.revision = p.current_revision
+          where p.id in (${ids}) and coalesce(pr.basic_solution, '') = ''`,
+    );
+  });
+  return Number(rows[0]?.total ?? 0);
+}
+
+/** 精确统计导入清单问题当前修订关联的附件行数。 */
+export async function countRevisionFilesForProblems(
+  database: DatabaseHandle,
+  problemIds: readonly string[],
+): Promise<number> {
+  const ids = problemIdList(problemIds);
+  const rows = await database.transaction(async (executor) => {
+    await executor.execute(sql`set local transaction_read_only = on`);
+    return executor.query<{ total: bigint }>(
+      sql`select count(*)::bigint as total
+          from "public"."problem_revision_files" prf
+          inner join "public"."problem_revisions" pr on pr.id = prf.revision_id
+          inner join "public"."problems" p
+            on p.id = pr.problem_id and p.current_revision = pr.revision
+          where p.id in (${ids})`,
     );
   });
   return Number(rows[0]?.total ?? 0);

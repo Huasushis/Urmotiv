@@ -1,7 +1,6 @@
 /**
- * 第 2 阶段导入后精确对账（postcheck）单测。
  * 纯逻辑用例用合成计数验证 verifyPhase2Outcome 的判定；
- * PGlite 集成用例验证 captureHistoryImportTableCounts 与 countMissingBasicSolutions。
+ * PGlite 集成用例验证完整表清单与按导入问题清单统计缺失题解。
  */
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -13,10 +12,11 @@ import {
 } from "@urmotiv/database";
 import { sql } from "drizzle-orm";
 
+import { historyImportRequiredTables } from "../src/history-migration/import-preflight";
 import {
   assertScratchDatabaseName,
   captureHistoryImportTableCounts,
-  countMissingBasicSolutions,
+  countMissingBasicSolutionsForProblems,
   expectedTableDeltas,
   verifyPhase2Outcome,
   type HistoryImportCountRow,
@@ -42,17 +42,21 @@ const allTables: Record<string, number> = {
   problem_revisions: 0,
   problem_revision_tags: 0,
   problem_revision_files: 0,
+  problem_samples: 0,
   import_jobs: 0,
+  import_job_items: 0,
   audit_events: 0,
   stored_files: 0,
 };
 
 describe("expectedTableDeltas", () => {
-  it("导入 N 个包时各表预期增量精确", () => {
+  it("按导入语义生成全部十张表的预期增量", () => {
     const deltas = expectedTableDeltas({
       imported: 137,
       attachmentRows: 38,
-      storedFilesDelta: 137,
+      sampleRows: 15,
+      jobItemRows: 137,
+      storedFilesDelta: 175,
       auditDelta: 274,
     });
     const map = new Map(deltas.map((d) => [d.table, d.delta]));
@@ -61,25 +65,41 @@ describe("expectedTableDeltas", () => {
     expect(map.get("problem_revisions")).toBe(137);
     expect(map.get("problem_revision_tags")).toBe(137);
     expect(map.get("problem_revision_files")).toBe(38);
+    expect(map.get("problem_samples")).toBe(15);
     expect(map.get("import_jobs")).toBe(137);
+    expect(map.get("import_job_items")).toBe(137);
     expect(map.get("audit_events")).toBe(274);
-    expect(map.get("stored_files")).toBe(137);
+    expect(map.get("stored_files")).toBe(175);
   });
 });
 
 describe("verifyPhase2Outcome", () => {
   const baseInput = {
     before: counts(allTables),
-    afterFirst: counts({ ...allTables, problems: 3, problem_revisions: 3, problem_revision_tags: 3, import_jobs: 3, stored_files: 3, audit_events: 6 }),
-    afterReplay: counts({ ...allTables, problems: 3, problem_revisions: 3, problem_revision_tags: 3, import_jobs: 3, stored_files: 3, audit_events: 6 }),
+    afterFirst: counts({ ...allTables, problems: 3, problem_revisions: 3, problem_revision_tags: 3, import_jobs: 3, import_job_items: 3, stored_files: 3, audit_events: 6 }),
+    afterReplay: counts({ ...allTables, problems: 3, problem_revisions: 3, problem_revision_tags: 3, import_jobs: 3, import_job_items: 3, stored_files: 3, audit_events: 6 }),
     firstPass: { imported: 3, skipped: 0, failed: 0 },
     replayPass: { imported: 0, skipped: 3, failed: 0 },
     expectedPackageCount: 3,
     expectedAttachmentRows: 0,
+    expectedSampleRows: 0,
+    expectedJobItemRows: 3,
     expectedStoredFilesDelta: 3,
     expectedAuditDelta: 6,
     expectedMissingSolutionCount: 0,
     afterMissingSolutionCount: 0,
+    expectedStoredBytes: 30,
+    expectedStoredContentSha256: "inventory",
+    afterFirstStoredInventory: {
+      fileCount: 3,
+      totalBytes: 30,
+      contentInventorySha256: "inventory",
+    },
+    afterReplayStoredInventory: {
+      fileCount: 3,
+      totalBytes: 30,
+      contentInventorySha256: "inventory",
+    },
   };
 
   it("全部一致时判 PASS", () => {
@@ -135,9 +155,20 @@ describe("verifyPhase2Outcome", () => {
   });
 
   it("表增量漂移时判 FAIL（table_delta_drift）并报告漂移表数量", () => {
+    const driftedCounts = counts({
+      ...allTables,
+      problems: 2,
+      problem_revisions: 3,
+      problem_revision_tags: 3,
+      import_jobs: 3,
+      import_job_items: 3,
+      stored_files: 3,
+      audit_events: 6,
+    });
     const result = verifyPhase2Outcome({
       ...baseInput,
-      afterFirst: counts({ ...allTables, problems: 2, problem_revisions: 3, problem_revision_tags: 3, import_jobs: 3, stored_files: 3, audit_events: 6 }),
+      afterFirst: driftedCounts,
+      afterReplay: driftedCounts,
     });
     expect(result.verdict).toBe("FAIL");
     expect(result.reasonCodes).toContain("table_delta_drift");
@@ -151,6 +182,18 @@ describe("verifyPhase2Outcome", () => {
     });
     expect(result.verdict).toBe("FAIL");
     expect(result.reasonCodes).toContain("solution_state_drift");
+  });
+
+  it("存储对象数量、总字节或内容清单漂移时判 FAIL（stored_inventory_drift）", () => {
+    const result = verifyPhase2Outcome({
+      ...baseInput,
+      afterReplayStoredInventory: {
+        ...baseInput.afterReplayStoredInventory,
+        totalBytes: 31,
+      },
+    });
+    expect(result.verdict).toBe("FAIL");
+    expect(result.reasonCodes).toContain("stored_inventory_drift");
   });
 });
 
@@ -168,27 +211,26 @@ describe("assertScratchDatabaseName", () => {
 });
 
 describe("PGlite 集成", () => {
-  it("迁移+种子后：captureHistoryImportTableCounts 返回八张表的行数", async () => {
+  it("迁移+种子后：captureHistoryImportTableCounts 返回十张表的行数", async () => {
     const database = createLocalDatabase();
     openDatabases.push(database);
     await migrateDatabase(database);
     await seedCoreDatabase(database);
     const rows = await captureHistoryImportTableCounts(database);
-    expect(rows.length).toBe(8);
-    for (const row of rows) {
-      expect(row.rows).toBeGreaterThanOrEqual(0);
-    }
+    expect(rows.map((row) => row.table)).toEqual([...historyImportRequiredTables]);
+    expect(rows).toHaveLength(historyImportRequiredTables.length);
+    for (const row of rows) expect(row.rows).toBeGreaterThanOrEqual(0);
   });
 
-  it("countMissingBasicSolutions 在种子数据上返回非负值且只读安全", async () => {
+  it("countMissingBasicSolutionsForProblems 只统计明确的问题清单", async () => {
     const database = createLocalDatabase();
     openDatabases.push(database);
     await migrateDatabase(database);
     await seedCoreDatabase(database);
-    const missing = await countMissingBasicSolutions(database);
-    expect(missing).toBeGreaterThanOrEqual(0);
-    // 重复调用结果一致——证明只读不变更。
-    const missingAgain = await countMissingBasicSolutions(database);
+    const problemIds = ["999999"];
+    const missing = await countMissingBasicSolutionsForProblems(database, problemIds);
+    expect(missing).toBe(0);
+    const missingAgain = await countMissingBasicSolutionsForProblems(database, problemIds);
     expect(missingAgain).toBe(missing);
   });
 });
