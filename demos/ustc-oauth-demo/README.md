@@ -81,24 +81,38 @@ Windows 侧步骤（PowerShell，管理员）：
    `127.0.0.1 oj.ustc.edu.cn`（先备份原文件；测试结束删除该行还原）。
 2. 建 SSH 隧道（把本地 127.0.0.1:9798 转发到服务器上的 127.0.0.1:9797，即演示服务）：
    `ssh -N -L 9798:127.0.0.1:9797 ubuntu@<server>`
-3. 安装并信任本地 CA，签发证书：
-   `mkcert -install; mkcert oj.ustc.edu.cn 127.0.0.1 localhost`
-4. 本地 TLS 代理（Caddy，管理员运行；cert.pem/key.pem 为第 3 步产物）：
-   ```caddyfile
+3. 建一个专用 TLS 工作目录并在其中操作（证书与 Caddyfile 放一起，便于清理）：
+   ```
+   New-Item -ItemType Directory -Force C:\ustc-demo-tls; cd C:\ustc-demo-tls
+   ```
+   安装并信任本地 CA，**必须用 `-cert-file`/`-key-file` 固定文件名**（mkcert 默认会命名成
+   `oj.ustc.edu.cn+2.pem` / `oj.ustc.edu.cn+2-key.pem`，与下面 Caddyfile 引用的文件名不一致）：
+   ```
+   mkcert -install; mkcert -cert-file cert.pem -key-file key.pem oj.ustc.edu.cn 127.0.0.1 localhost
+   ```
+4. 在同一目录写 `Caddyfile`（用管理员 PowerShell 生成；也可手动保存，文件名必须是 `Caddyfile`）：
+   ```
+   Set-Content -Path .\Caddyfile -Encoding ascii -Value @'
    https://oj.ustc.edu.cn:443 {
      tls cert.pem key.pem
      reverse_proxy 127.0.0.1:9798 {
        header_up Host {http.request.host}
      }
    }
+   '@
    ```
    `header_up Host {http.request.host}` 必须保留：演示服务只信任真实 Host。
+   启动（管理员，仍在 TLS 目录内；Caddy 从当前目录读 `Caddyfile`）：
+   ```
+   caddy run --config .\Caddyfile
+   ```
 5. 服务器端配置私有 env 文件（见上一节）：`USTC_DEMO_REDIRECT_URI=https://oj.ustc.edu.cn/oauth/ustc/callback`、
    网站负责人**在本机**填入社团的 `client_id`/`client_secret`、新随机 `USTC_DEMO_SESSION_SECRET`；启动演示（先确认 SSH 隧道已连）。
 6. 浏览器打开 `https://oj.ustc.edu.cn/` → 点「使用统一身份认证登录」→ 完成一次**全新** SSO → 应回到演示的登录成功页。
 
-清理/还原：关闭 Caddy（Ctrl+C）→ 关闭 SSH 隧道 → 从 hosts 删除覆盖行（用备份还原）→
-可选 `mkcert -uninstall`。不触碰 oj.ustc.edu.cn 生产、不改 DNS、不开公网端口。
+清理/还原（只清上面生成的东西）：Ctrl+C 停本地 Caddy → Ctrl+C 断开 SSH 隧道 → 从 hosts 删除覆盖行（用备份还原）→
+删除 TLS 目录 `C:\ustc-demo-tls`（含 cert.pem、key.pem、Caddyfile）→ 可选 `mkcert -uninstall`（撤销本地 CA 信任）。
+不触碰 oj.ustc.edu.cn 生产、不改 DNS、不开公网端口。
 
 > 未拿到社团 client_secret 并确认注册回调前，不要把演示切到 live：配置按此写法会在注册路径不一致时
 > 拒绝启动（fail closed）。
