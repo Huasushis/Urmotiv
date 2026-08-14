@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   assertFormalDatabaseName,
+  assertProductionFormalImportCount,
+  designatedRealFormalImportCount,
   computeFormalTargetFingerprintSha256,
   formalTargetApprovalSchema,
   resolveFormalInputs,
@@ -239,6 +241,18 @@ describe("正式导入入口：参数校验与机械拒绝", () => {
     for (const code of codes) {
       expect(code === 1 || code === 2).toBe(true);
     }
-    expect(new Set(codes).has(0)).toBe(false);
+  });
+  it("数量闸门：仅指定批次精确数量通过", () => {
+    expect(() =>
+      assertProductionFormalImportCount(designatedRealFormalImportCount),
+    ).not.toThrow();
+    for (const count of [0, 1, 136, 138]) {
+      expect(() => assertProductionFormalImportCount(count)).toThrowError(
+        expect.objectContaining({ code: "INVALID_METADATA" }),
+      );
+    }
+  });
+  it("数量闸门绑定唯一生产常数，防止误改", () => {
+    expect(designatedRealFormalImportCount).toBe(137);
   });
 });

@@ -58,9 +58,9 @@ import {
   historyImportDatabaseConnectionString,
   importHistoryPackages,
   prepareHistoryImportDatabase,
-  sha256Hex,
-} from "../src/history-migration/index";
-import type { HistoryImportPublisher } from "../src/history-migration/index";
+  type HistoryImportPublisher,
+} from "../src/history-migration/import-phase";
+import { sha256Hex } from "../src/history-migration/digests";
 import type { CreateStoredFileInput, StoredFileRecord } from "@urmotiv/contracts";
 import { readPrivateJson } from "../src/history-migration/private-files";
 const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;

@@ -942,7 +942,12 @@ async function executeBoundRunner(
   // 正式门禁结构，机械拒绝，无法原样通过。
   const adminIdentity = (() => {
     const parsed = parsePostgresIdentity(inputs.adminUrl);
-    return { host: parsed.host, port: parsed.port, user: parsed.user };
+    return {
+      host: parsed.host,
+      port: parsed.port,
+      user: parsed.user,
+      database: parsed.database,
+    };
   })();
   await writeNewPrivateJson(join(inputs.receiptDirectory, targetApprovalTemplateName), {
     version: 2,

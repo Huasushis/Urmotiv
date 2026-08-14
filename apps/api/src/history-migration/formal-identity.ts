@@ -21,12 +21,12 @@ export function computeFormalTargetFingerprintSha256(target: FormalTargetIdentit
   return sha256Hex(parts.map((part) => `${part.length}:${part}`).join("|") + "|formal-target-v1");
 }
 
-/** 管理员连接身份指纹：只绑定主机/端口/用户，不绑定库名（备份库名是派生的）。 */
+/** 管理员连接身份指纹：绑定主机/端口/用户与维护库名，任何字段变化都会改变摘要。 */
 export function computeFormalAdminFingerprintSha256(
-  adminTarget: Pick<FormalTargetIdentity, "host" | "port" | "user">,
+  adminTarget: Pick<FormalTargetIdentity, "host" | "port" | "user" | "database">,
 ): string {
-  const parts = [adminTarget.user, adminTarget.host, adminTarget.port];
-  return sha256Hex(parts.map((part) => `${part.length}:${part}`).join("|") + "|formal-admin-v1");
+  const parts = [adminTarget.user, adminTarget.host, adminTarget.port, adminTarget.database];
+  return sha256Hex(parts.map((part) => `${part.length}:${part}`).join("|") + "|formal-admin-v2");
 }
 
 /** 存储根身份：绑定真实路径（解符号链接后的绝对路径）。 */

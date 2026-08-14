@@ -1087,6 +1087,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
         host: formalAdminIdentity.host,
         port: formalAdminIdentity.port,
         user: formalAdminIdentity.user,
+        database: formalAdminIdentity.database,
       });
       const formalBaseDocuments = {
         preflightReceiptSha256: runnerTemplate.preflightReceiptSha256,
@@ -1213,6 +1214,73 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       expect((await captureStorageInventory(rollbackStorageRoot)).fileCount).toBe(0);
       expect(await databaseExists(formalAdmin, `${formalDatabaseName}__formal_backup`)).toBe(false);
       expect(await exists(join(rollbackOutput, "formal.storage.before.snapshot"))).toBe(false);
+
+      // （二 b）收尾故障：PASS 收据刚写入（绑定此地）后注入清理失败；
+      // 必须联合回滚数据库与存储、消灭 PASS 标记并签发 FAIL 收据。
+      const cleanupFaultStorageRoot = join(formalBatch.root, "formal-cleanup-fault-storage");
+      await privateDirectory(cleanupFaultStorageRoot);
+      const cleanupFaultApprovalFile = join(
+        formalBatch.root,
+        "formal-target-approval-cleanup-fault.private.json",
+      );
+      await writeFormalTargetApproval(cleanupFaultApprovalFile, {
+        ...formalBaseDocuments,
+        formalTargetFingerprintSha256: formalTargetFingerprint,
+        prestateStorageInventorySha256: (await captureStorageInventory(cleanupFaultStorageRoot))
+          .contentInventorySha256,
+        storageRootIdentitySha256: await computeStorageRootIdentitySha256(cleanupFaultStorageRoot),
+      });
+      const cleanupFaultOutput = join(formalBatch.root, "formal-cleanup-fault-output");
+      const cleanupFaultImportOutput = join(formalBatch.root, "formal-cleanup-fault-import-output");
+      const cleanupFaultEnv = await formalEnvironment(
+        formalBatch,
+        formalConnectionString,
+        adminUrl,
+        cleanupFaultApprovalFile,
+        cleanupFaultOutput,
+        cleanupFaultStorageRoot,
+        cleanupFaultImportOutput,
+        "synthetic-formal-phase1",
+      );
+      expect(
+        await runFormalImportBound(
+          formalArguments(),
+          cleanupFaultEnv,
+          {
+            finalization: {
+              afterPassReceiptWrite: async () => {
+                throw new Error("synthetic after-pass-receipt cleanup failure");
+              },
+            },
+          },
+          formalHooks,
+        ),
+      ).toBe(1);
+      expect(await exists(join(cleanupFaultOutput, formalPassMarkerName))).toBe(false);
+      expect(await exists(join(cleanupFaultOutput, formalRollbackVerifiedMarkerName))).toBe(true);
+      expect(await exists(join(cleanupFaultOutput, formalRestoreRefusedMarkerName))).toBe(false);
+      const cleanupFaultReceipt = JSON.parse(
+        await readFile(join(cleanupFaultOutput, formalReceiptName), "utf8"),
+      ) as {
+        verdict: "PASS" | "FAIL";
+        refusalCode: string;
+        rollback: { storageRestored: boolean; databaseRestored: boolean };
+      };
+      expect(cleanupFaultReceipt).toMatchObject({
+        verdict: "FAIL",
+        refusalCode: "finalization_cleanup_refused",
+        rollback: { storageRestored: true, databaseRestored: true },
+      });
+      const cleanupFaultCheck = createPostgresDatabase({
+        connectionString: formalConnectionString,
+        maxConnections: 1,
+      });
+      expect(await captureHistoryImportTableCounts(cleanupFaultCheck)).toEqual(formalBefore);
+      await cleanupFaultCheck.close();
+      expect((await captureStorageInventory(cleanupFaultStorageRoot)).fileCount).toBe(0);
+      expect(await databaseExists(formalAdmin, `${formalDatabaseName}__formal_backup`)).toBe(false);
+      expect(await exists(join(cleanupFaultOutput, "formal.storage.before.snapshot"))).toBe(false);
+
 
       // （三）正确批准书：单遍导入 + 独立自证核对 + v4 通过收据。
       const formalStorageRoot = join(formalBatch.root, "formal-storage");

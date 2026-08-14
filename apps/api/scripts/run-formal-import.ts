@@ -15,6 +15,8 @@ export {
   parsePostgresIdentity,
   assertFormalDatabaseName,
   assertProductionFormalDatabaseName,
+  assertProductionFormalImportCount,
+  designatedRealFormalImportCount,
   assertSyntheticFormalDatabaseAllowed,
   formalTargetApprovalSchema,
   formalReceiptName,
