@@ -13,6 +13,7 @@ import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
+import { assessFormalShard } from "./phase2-acceptance-verdict.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const apiDirectory = fileURLToPath(new URL("..", import.meta.url));
@@ -262,26 +263,28 @@ evidence.runnerExitCode = acceptance.status ?? 1;
     evidence.reasonCodes.push("PHASE2_ROUTE_SHARD_UNREADABLE");
   }
   if (shard !== null) {
+    const assessment = assessFormalShard(shard, {
+      headCommit: head,
+      runnerExitCode: evidence.runnerExitCode,
+    });
+    evidence.reasonCodes.push(...assessment.reasons);
     evidence.route = {
-      formalExitCode: shard.formalExitCode,
-      formalVerdict: shard.formalVerdict,
-      formalTargetSynthetic: shard.formalTargetSynthetic,
-      bindings: shard.bindings,
-      route: shard.route,
-      headCommit: shard.headCommit,
+      formalExitCode:
+        typeof shard.formalExitCode === "number" ? shard.formalExitCode : null,
+      formalVerdict: typeof shard.formalVerdict === "string" ? shard.formalVerdict : null,
+      formalTargetSynthetic:
+        typeof shard.formalTargetSynthetic === "boolean" ? shard.formalTargetSynthetic : null,
+      bindings:
+        typeof shard.bindings === "object" && shard.bindings !== null
+          ? shard.bindings
+          : null,
+      route: typeof shard.route === "string" ? shard.route : null,
+      headCommit: typeof shard.headCommit === "string" ? shard.headCommit : null,
     };
-    if (shard.formalVerdict === "REAL_PASS" && shard.formalTargetSynthetic === false) {
+    if (assessment.admission === "REAL_PASS") {
       evidence.reasonCodes.push("PHASE2_ROUTE_PASS");
-    } else if (shard.formalVerdict === "REAL_PASS") {
-      evidence.reasonCodes.push("PHASE2_ROUTE_FAKE_PASS_REJECTED");
-    } else if (shard.formalVerdict === "SYNTHETIC_READINESS") {
+    } else if (assessment.admission === "SYNTHETIC_READINESS") {
       evidence.reasonCodes.push("PHASE2_ROUTE_SYNTHETIC_READINESS");
-    } else if (shard.formalVerdict === "NOT_AUTHORIZED") {
-      evidence.reasonCodes.push("PHASE2_ROUTE_NOT_AUTHORIZED");
-    } else if (shard.formalVerdict === "PASS") {
-      evidence.reasonCodes.push("PHASE2_ROUTE_FAKE_PASS_REJECTED");
-    } else {
-      evidence.reasonCodes.push("PHASE2_ROUTE_FAILED_UNADJUDICATED");
     }
   } else {
     evidence.reasonCodes.push("PHASE2_ROUTE_SHARD_MISSING");
