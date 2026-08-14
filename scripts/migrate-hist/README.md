@@ -713,3 +713,29 @@ pnpm exec tsx scripts/preflight-history-import.ts \
 预检 READY 后才能进入 Phase 2：对指定的验收 PostgreSQL 执行
 `importHistoryPackages`（现有 `apps/api/src/history-migration/import-phase.ts` 流程），
 Phase 2 另行起步，不共用 Phase 1 的只读连接。
+
+## Phase 2 验收导入 runner
+
+Phase 2 runner（`apps/api/scripts/run-real-import.ts`）在临时/验收库上做两遍导入精确对账，
+不触碰真实目标库。运行契约：
+
+- **环境变量输入**：连接串只通过环境变量名传入（`--admin-url-env`、`--db-name-env`、
+  `--principal-env`），命令行、日志和收据中不出现任何凭据或库名。
+- **目标分类限制**：`--target-class` 只接受 `scratch-temporary` 或 `designated-validation`；
+  `designated-real` 一律拒绝——第 2 阶段禁止真实目标导入。
+- **校验在变更之前**：runner 先做确定性对账（`reconcileHistoryImportBatch`）和只读数据库
+  检查（标签存在性、必需表存在性），全部通过后才进入导入流程。
+- **独占窗口**：先清理同名临时/验收库（库名必须匹配 `urmotiv_history_import_` 前缀），
+  再新建空库做迁移与种子。
+- **快照与恢复**：导入前对临时/验收库（`CREATE DATABASE ... TEMPLATE`）和本地存储
+  （整目录复制）做快照；对账失败时从快照恢复并重新只读核对。快照只在临时/验收库上操作，
+  真实目标永远被拒绝。
+- **两遍导入**：第 1 遍期望 `imported=N skipped=0 failed=0`；标题编辑探针后第 2 遍重放期望
+  `imported=0 skipped=N failed=0`。标题编辑在重放后必须保留（来源绑定幂等，不覆盖已编辑标题）。
+- **精确表增量对账**：导入前后对全部八张必需表做行数对比，与 `expectedTableDeltas` 的精确
+  预期增量逐表核对；任一漂移都会判 FAIL。
+- **私有回执**：聚合结果写入 `phase2-run-receipt.private.json`；成功时写 `PHASE2_RUN_PASS`
+  标记。
+- **聚合输出**：stdout 只输出聚合计数和稳定原因码；失败候选只输出失败码计数，不输出题号
+  或候选编号。
+- **退出码**：0 = PASS；对账或导入不一致为 1；参数错误为 2。

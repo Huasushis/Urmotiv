@@ -6,12 +6,14 @@
  * 预检自身无法变更数据库。基础题解缺失与未决附件属于真状态，预检如实
  * 计数，但不把它们当作失败原因。
  */
+import { z } from "zod";
 import { sql } from "drizzle-orm";
 import type { DatabaseHandle } from "@urmotiv/database";
 
 import { HistoryMigrationError } from "./errors";
 import { historyMetadataFileSchema } from "./schema";
 import { importManifestPayloadSchema, packageReportPayloadSchema } from "./import-phase";
+import { sha256Hex } from "./digests";
 
 /** 真实导入中经 DatabaseImportedProblemWriter 原子写入的全部表。 */
 export const historyImportRequiredTables = [
@@ -44,6 +46,23 @@ export const historyImportPreflightReasonCodes = [
   "database_table_missing",
 ] as const;
 
+/** 打包报告载荷的解析类型；供批次身份重算与收据复用。 */
+export type PackageReportPayload = z.infer<typeof packageReportPayloadSchema>;
+
+/** 第 2 阶段预检补充原因码；一律以稳定 ASCII 码输出，绝不携带私有内容。 */
+export const historyImportPreflightExtendedReasonCodes = [
+  "duplicate_source_binding",
+  "batch_identity_mismatch",
+  "package_digest_mismatch",
+  "package_bytes_mismatch",
+  "unreported_extra_packages",
+  "grouping_join_mismatch",
+  "database_tag_missing",
+  "manifest_entry_mismatch",
+] as const;
+export type HistoryImportPreflightExtendedReasonCode =
+  (typeof historyImportPreflightExtendedReasonCodes)[number];
+
 export type HistoryImportPreflightReasonCode =
   (typeof historyImportPreflightReasonCodes)[number];
 
@@ -52,6 +71,7 @@ export interface PackageReportSummary {
   readonly declaredPackageCount: number;
   readonly duplicateCandidateCount: number;
   readonly missingSourceBindingCount: number;
+  readonly duplicateSourceBindingCount: number;
   readonly embeddedAttachmentCount: number;
   readonly declaredAttachmentCount: number | undefined;
   readonly preservedMaterialCount: number;
@@ -70,11 +90,17 @@ export function summarizePackageReport(payload: unknown): PackageReportSummary {
   let duplicateCandidateCount = 0;
   let missingSourceBindingCount = 0;
   let embeddedAttachmentCount = 0;
+  const sourceBindings = new Set<string>();
+  let duplicateSourceBindingCount = 0;
   let zeroBytePackageCount = 0;
   for (const entry of report.packages) {
     if (candidateIds.has(entry.candidateId)) duplicateCandidateCount += 1;
     candidateIds.add(entry.candidateId);
     if (entry.sourceBindingSha256 === undefined) missingSourceBindingCount += 1;
+    if (entry.sourceBindingSha256 !== undefined) {
+      if (sourceBindings.has(entry.sourceBindingSha256)) duplicateSourceBindingCount += 1;
+      sourceBindings.add(entry.sourceBindingSha256);
+    }
     if (entry.attachments !== undefined) embeddedAttachmentCount += entry.attachments.length;
     if (entry.packageBytes === 0) zeroBytePackageCount += 1;
   }
@@ -83,11 +109,93 @@ export function summarizePackageReport(payload: unknown): PackageReportSummary {
     declaredPackageCount: report.packageCount,
     duplicateCandidateCount,
     missingSourceBindingCount,
-    embeddedAttachmentCount,
+    duplicateSourceBindingCount,
     declaredAttachmentCount: report.attachmentCount,
+    embeddedAttachmentCount,
     preservedMaterialCount: report.preservedMaterials?.length ?? 0,
     declaredPreservedMaterialCount: report.preservedMaterialCount,
     zeroBytePackageCount,
+  };
+}
+
+/** 批次身份按打包阶段 core.ts 的精确字段顺序重算；任何一项漂移都会失败。 */
+export function recomputePackageBatchIdentity(report: PackageReportPayload): string {
+  const entries = report.packages.map((entry) => ({
+    candidateId: entry.candidateId,
+    contentSha256: entry.contentSha256,
+    sourceBindingSha256: entry.sourceBindingSha256,
+    packageSha256: entry.packageSha256,
+    packageBytes: entry.packageBytes,
+    status: entry.status,
+    ...(entry.attachments !== undefined && entry.attachments.length > 0
+      ? {
+          attachments: entry.attachments.map((attachment) => ({
+            attachmentId: attachment.attachmentId,
+            contentSha256: attachment.contentSha256,
+            semanticRole: attachment.semanticRole,
+            visibility: attachment.visibility,
+            targetPath: attachment.targetPath,
+          })),
+        }
+      : {}),
+  }));
+  const batchPayload = {
+    version: 1,
+    packages: entries,
+    ...(report.attachmentCount === undefined || report.preservedMaterialCount === undefined
+      ? {}
+      : {
+          attachmentCount: report.attachmentCount,
+          preservedMaterialCount: report.preservedMaterialCount,
+          preservedMaterials: (report.preservedMaterials ?? []).map((material) => ({
+            attachmentId: material.attachmentId,
+            contentSha256: material.contentSha256,
+            semanticRole: material.semanticRole,
+            preservationPath: material.preservationPath,
+          })),
+        }),
+  };
+  return sha256Hex(JSON.stringify(batchPayload));
+}
+
+/** 安全编号（如 M-0000123）与清单题号的规范化等价形式：仅比较数字后缀。 */
+function normalizedMetadataIdentity(raw: string): string {
+  const digits = raw.replace(/\D/g, "").replace(/^0+(?=\d)/, "");
+  return digits;
+}
+
+export interface GroupingJoinVerification {
+  readonly metadataRecordCount: number;
+  readonly groupingIdentityCount: number;
+  readonly matchedIdentityCount: number;
+  readonly duplicateIdentityCount: number;
+}
+
+/**
+ * 机械核对清单元数据到分组安全编号的连接：题号数字后缀必须与安全编号
+ * 一一对应，分组数量与清单记录数一致；任何一边多、少或重复都会失败。
+ */
+export function verifyGroupingJoin(
+  metadataNumbers: readonly string[],
+  groupingMetadataIds: readonly string[],
+): GroupingJoinVerification {
+  const metadataNormalized = metadataNumbers.map(normalizedMetadataIdentity);
+  const groupingNormalized = groupingMetadataIds.map(normalizedMetadataIdentity);
+  const seen = new Set<string>();
+  let duplicateIdentityCount = 0;
+  for (const identity of groupingNormalized) {
+    if (seen.has(identity)) duplicateIdentityCount += 1;
+    seen.add(identity);
+  }
+  let matchedIdentityCount = 0;
+  for (const identity of groupingNormalized) {
+    if (metadataNormalized.includes(identity)) matchedIdentityCount += 1;
+  }
+  return {
+    metadataRecordCount: metadataNumbers.length,
+    groupingIdentityCount: groupingMetadataIds.length,
+    matchedIdentityCount,
+    duplicateIdentityCount,
   };
 }
 
@@ -148,33 +256,52 @@ export interface HistoryImportReconciliationInput {
   readonly packageEntryNames: readonly (readonly string[])[];
   /** 权威清单的期望记录数；不一致直接判 NOT_READY。 */
   readonly expectedRecordCount?: number;
-  /** 已有导入批次的 manifest 内容；必须与报告绑定同一摘要不完整。 */
+  /** 已有导入批次的 manifest 内容；必须与报告逐条绑定同一身份且条目完整。 */
   readonly importManifest?: unknown;
   /** 报告条目中未能读到包文件的数量。 */
   readonly missingPackageFileCount?: number;
+  /** 磁盘上包字节数与报告声明不一致的数量。 */
+  readonly packageBytesMismatchCount?: number;
+  /** 磁盘上包摘要重算与报告声明不一致的数量。 */
+  readonly packageDigestMismatchCount?: number;
+  /** 磁盘上存在但报告未登记的包数量。 */
+  readonly unreportedExtraPackageCount?: number;
+  /** 分组阶段安全编号列表；提供时与清单题号做机械连接核对。 */
+  readonly groupingMetadataIds?: readonly string[];
 }
 
 export interface HistoryImportReconciliation {
   readonly verdict: "READY" | "NOT_READY";
-  readonly reasonCodes: readonly HistoryImportPreflightReasonCode[];
+  readonly reasonCodes: readonly (
+    | HistoryImportPreflightReasonCode
+    | HistoryImportPreflightExtendedReasonCode
+  )[];
   readonly listRecordCount: number;
   readonly packageCount: number;
   readonly duplicateCandidateCount: number;
+  readonly duplicateSourceBindingCount: number;
   readonly missingSourceBindingCount: number;
   readonly embeddedAttachmentCount: number;
   readonly preservedMaterialCount: number;
   readonly missingBasicSolutionCount: number;
   readonly unexpectedEntryNameCount: number;
   readonly importedCount: number | undefined;
+  /** 批次身份按打包阶段公式重算后是否与报告一致。 */
+  readonly batchIdentityMatches: boolean;
+  /** 清单↔分组安全编号机械连接结果；未提供分组输入时为 undefined。 */
+  readonly groupingJoin: GroupingJoinVerification | undefined;
 }
 
-function codesFromReportSummary(summary: PackageReportSummary): HistoryImportPreflightReasonCode[] {
-  const codes: HistoryImportPreflightReasonCode[] = [];
+function codesFromReportSummary(
+  summary: PackageReportSummary,
+): (HistoryImportPreflightReasonCode | HistoryImportPreflightExtendedReasonCode)[] {
+  const codes: (HistoryImportPreflightReasonCode | HistoryImportPreflightExtendedReasonCode)[] = [];
   if (summary.declaredPackageCount !== summary.packageCount) {
     codes.push("report_declared_count_mismatch");
   }
   if (summary.duplicateCandidateCount > 0) codes.push("duplicate_candidate");
   if (summary.missingSourceBindingCount > 0) codes.push("source_binding_missing");
+  if (summary.duplicateSourceBindingCount > 0) codes.push("duplicate_source_binding");
   if (summary.zeroBytePackageCount > 0) codes.push("empty_package");
   if (
     summary.declaredPreservedMaterialCount !== undefined &&
@@ -221,6 +348,27 @@ export function reconcileHistoryImportBatch(
     reasonCodes.push("entry_names_incomplete");
   }
   if ((input.missingPackageFileCount ?? 0) > 0) reasonCodes.push("package_file_missing");
+  if ((input.packageBytesMismatchCount ?? 0) > 0) reasonCodes.push("package_bytes_mismatch");
+  if ((input.packageDigestMismatchCount ?? 0) > 0) reasonCodes.push("package_digest_mismatch");
+  if ((input.unreportedExtraPackageCount ?? 0) > 0) reasonCodes.push("unreported_extra_packages");
+  const recomputedBatchIdentity = recomputePackageBatchIdentity(report.data);
+  const batchIdentityMatches = recomputedBatchIdentity === report.data.batchSha256;
+  if (!batchIdentityMatches) reasonCodes.push("batch_identity_mismatch");
+
+  let groupingJoin: GroupingJoinVerification | undefined;
+  if (input.groupingMetadataIds !== undefined) {
+    groupingJoin = verifyGroupingJoin(
+      metadata.data.records.map((record) => record.number),
+      input.groupingMetadataIds,
+    );
+    if (
+      groupingJoin.groupingIdentityCount !== listRecordCount ||
+      groupingJoin.matchedIdentityCount !== listRecordCount ||
+      groupingJoin.duplicateIdentityCount > 0
+    ) {
+      reasonCodes.push("grouping_join_mismatch");
+    }
+  }
 
   let importedCount: number | undefined;
   if (input.importManifest !== undefined) {
@@ -231,6 +379,19 @@ export function reconcileHistoryImportBatch(
     importedCount = manifest.data.importedCount;
     if (manifest.data.batchSha256 !== report.data.batchSha256) reasonCodes.push("manifest_batch_mismatch");
     if (manifest.data.importedCount !== reportSummary.packageCount) reasonCodes.push("manifest_incomplete");
+    // 逐条比对：manifest 的每个条目都必须在报告中出现且包摘要一致，反之亦然。
+    const reportDigestsByCandidate = new Map<string, string>();
+    for (const entry of report.data.packages) {
+      reportDigestsByCandidate.set(entry.candidateId, entry.packageSha256);
+    }
+    let manifestEntryMismatches = 0;
+    if (manifest.data.entries.length !== report.data.packages.length) manifestEntryMismatches += 1;
+    for (const entry of manifest.data.entries) {
+      if (reportDigestsByCandidate.get(entry.candidateId) !== entry.packageSha256) {
+        manifestEntryMismatches += 1;
+      }
+    }
+    if (manifestEntryMismatches > 0) reasonCodes.push("manifest_entry_mismatch");
   }
 
   return {
@@ -244,6 +405,9 @@ export function reconcileHistoryImportBatch(
     preservedMaterialCount: reportSummary.preservedMaterialCount,
     missingBasicSolutionCount: contentSummary.missingBasicSolutionCount,
     unexpectedEntryNameCount: contentSummary.unexpectedEntryNameCount,
+    duplicateSourceBindingCount: reportSummary.duplicateSourceBindingCount,
+    batchIdentityMatches,
+    groupingJoin,
     importedCount,
   };
 }
@@ -254,6 +418,8 @@ export interface ZeroMutationDatabaseResult {
   readonly presentTableCount: number;
   readonly missingTableCount: number;
   readonly rowCounts: readonly { readonly table: string; readonly rows: number }[];
+  readonly tagPresent?: boolean | undefined;
+  /** 指定的标签依赖是否存在；未提供标签参数时为 undefined。 */
 }
 
 /**
@@ -263,6 +429,7 @@ export interface ZeroMutationDatabaseResult {
  */
 export async function runZeroMutationDatabasePreflight(
   database: DatabaseHandle,
+  options: { readonly requiredTagId?: string } = {},
 ): Promise<ZeroMutationDatabaseResult> {
   // 不限制引擎：PGlite 同样是完整 PostgreSQL，只读事务与 SHOW/to_regclass
   // 语义一致，可用于确定性单测；真正的防变更保证由只读开关失败即中止提供。
@@ -279,6 +446,13 @@ export async function runZeroMutationDatabasePreflight(
       );
     }
     const versionRows = await executor.query<{ server_version: string }>(sql`SHOW server_version`);
+    let tagPresent: boolean | undefined;
+    if (options.requiredTagId !== undefined) {
+      const tagRows = await executor.query<{ total: bigint }>(
+        sql`select count(*)::bigint as total from "public"."tags" where id = ${options.requiredTagId}`,
+      );
+      tagPresent = Number(tagRows[0]?.total ?? 0) === 1;
+    }
     const rowCounts: { readonly table: string; readonly rows: number }[] = [];
     let presentTableCount = 0;
     let missingTableCount = 0;
@@ -299,6 +473,7 @@ export async function runZeroMutationDatabasePreflight(
     }
     return {
       serverVersion: versionRows[0]?.server_version ?? "",
+      tagPresent,
       readOnlyEnforced,
       presentTableCount,
       missingTableCount,
