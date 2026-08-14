@@ -40,6 +40,7 @@ import {
   verifyExecutionProvenance,
   type ExecutionProvenance,
 } from "../src/history-migration/execution-provenance";
+import { assertTestSeamRuntime } from "../src/history-migration/test-seam";
 
 const allowedTargetClasses = ["scratch-temporary", "designated-validation", "designated-real"] as const;
 const digestPattern = /^[a-f0-9]{64}$/;
@@ -196,8 +197,10 @@ export async function runHistoryImportPreflight(
   env: NodeJS.ProcessEnv,
   hooks: HistoryImportPreflightHooks = {},
 ): Promise<number> {
+  if (Object.keys(hooks).length > 0) {
+    assertTestSeamRuntime(env);
+  }
   const inputs = resolvePreflightInputs(argv, env);
-  await assertPermittedPhase2EvidenceRoot(inputs.privateRoot);
   await assertPrivateDirectoryMode(inputs.privateRoot);
   await assertPrivateDirectoryMode(inputs.outputDirectory);
   const receiptPath = join(inputs.outputDirectory, preflightReceiptName);

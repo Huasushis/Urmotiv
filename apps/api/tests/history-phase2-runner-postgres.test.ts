@@ -10,6 +10,7 @@ import {
   seedCoreDatabase,
   type DatabaseHandle,
 } from "@urmotiv/database";
+import { createFileStorage, type FileStorage } from "@urmotiv/storage";
 import {
   urmotivNativeAdapter,
   writeZipArchive,
@@ -23,9 +24,14 @@ import {
   type HistoryImportPreflightHooks,
 } from "../scripts/preflight-history-import";
 import {
+  computeFormalTargetFingerprintSha256,
   formalPassMarkerName,
+  formalRollbackVerifiedMarkerName,
+  formalBackupVerifiedMarkerName,
+  formalRestoreRefusedMarkerName,
   formalReceiptName,
   runFormalImport,
+  runFormalImportForTestSeam,
 } from "../scripts/run-formal-import";
 import { runPhase2Acceptance, type Phase2RunnerHooks } from "../scripts/run-real-import";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo";
@@ -461,10 +467,12 @@ function formalArguments(): string[] {
     "--approval-file-env=APPROVAL_FILE",
     "--preflight-receipt-env=PREFLIGHT_RECEIPT",
     "--phase2-receipt-env=PHASE2_RECEIPT",
+    "--target-approval-env=TARGET_APPROVAL",
     "--output-directory-env=FORMAL_OUTPUT",
     "--storage-root-env=STORAGE_ROOT",
     "--import-output-directory-env=IMPORT_OUTPUT_DIRECTORY",
     "--database-url-env=DATABASE_URL",
+    "--admin-url-env=ADMIN_URL",
     "--principal-env=PRINCIPAL",
     "--tag-id-env=TAG_ID",
     "--git-commit-env=GIT_COMMIT",
@@ -478,6 +486,8 @@ function formalArguments(): string[] {
 async function formalEnvironment(
   batch: SyntheticBatch,
   databaseUrl: string,
+  adminUrlValue: string,
+  targetApprovalFile: string,
   outputDirectory: string,
   storageRoot: string,
   importOutputDirectory: string,
@@ -488,10 +498,46 @@ async function formalEnvironment(
     ...base,
     PREFLIGHT_RECEIPT: join(batch.preflightOutput, preflightReceiptName),
     PHASE2_RECEIPT: join(batch.runnerReceiptDirectory, "phase2-run-receipt.private.json"),
+    TARGET_APPROVAL: targetApprovalFile,
+    ADMIN_URL: adminUrlValue,
     FORMAL_OUTPUT: outputDirectory,
     STORAGE_ROOT: storageRoot,
     IMPORT_OUTPUT_DIRECTORY: importOutputDirectory,
     TARGET_CLASS: "designated-real",
+    // 测试缝（hook/故障注入）在 Vitest 运行时且仅对回环合成正式目标生效。
+    VITEST: "true",
+  };
+}
+
+interface FormalApprovalDocuments {
+  readonly preflightReceiptSha256: string;
+  readonly phase2ReceiptSha256: string;
+  readonly scratchDatabaseFingerprintSha256: string;
+  readonly formalTargetFingerprintSha256: string;
+}
+
+async function writeFormalTargetApproval(
+  targetApprovalFile: string,
+  documents: FormalApprovalDocuments,
+): Promise<void> {
+  await privateFile(
+    targetApprovalFile,
+    `${JSON.stringify({ version: 1, generatedAt: new Date().toISOString(), ...documents }, null, 2)}\n`,
+  );
+}
+
+function formalTargetIdentity(connectionString: string): {
+  readonly host: string;
+  readonly port: string;
+  readonly user: string;
+  readonly database: string;
+} {
+  const parsed = new URL(connectionString);
+  return {
+    host: parsed.hostname,
+    port: parsed.port === "" ? "5432" : parsed.port,
+    user: decodeURIComponent(parsed.username),
+    database: decodeURIComponent(parsed.pathname.replace(/^\//, "")),
   };
 }
 
@@ -531,6 +577,7 @@ async function approvedEnvironment(
     EXECUTION_ID: executionId,
     BATCH_SHA256: batch.report.batchSha256,
     SOURCE_BINDINGS_SHA256: recomputeSourceBindingsIdentity(batch.report),
+    ...(acceptanceMode ? {} : { VITEST: "true" }),
   };
 }
 
@@ -576,7 +623,13 @@ function trackDatabaseFamily(name: string): void {
 afterEach(async () => {
   if (adminUrl !== undefined) {
     for (const name of temporaryDatabaseNames.splice(0).reverse()) {
-      await dropHistoryImportDatabase(adminUrl, name);
+      if (/^urmotiv_formal_/u.test(name)) {
+        const admin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
+        await admin.execute(sql`drop database if exists ${sql.identifier(name)} with (force)`);
+        await admin.close();
+      } else {
+        await dropHistoryImportDatabase(adminUrl, name);
+      }
     }
   }
   for (const directory of temporaryDirectories.splice(0)) {
@@ -627,6 +680,23 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
     expect(await exists(join(batch.runnerReceiptDirectory, "PHASE2_RUN_PASS"))).toBe(true);
     expect(await exists(join(batch.runnerReceiptDirectory, "storage.snapshot"))).toBe(false);
     expect(await exists(join(batch.runnerReceiptDirectory, "PHASE2_RECOVERY_IN_PROGRESS"))).toBe(false);
+    const runnerTemplate = JSON.parse(
+      await readFile(
+        join(batch.runnerReceiptDirectory, "phase2-target-approval-template.private.json"),
+        "utf8",
+      ),
+    ) as {
+      preflightReceiptSha256: string;
+      phase2ReceiptSha256: string;
+      scratchDatabaseFingerprintSha256: string;
+    };
+    const preflightReceiptBytes = await readFile(join(batch.preflightOutput, preflightReceiptName));
+    expect(runnerTemplate.preflightReceiptSha256).toBe(sha256Hex(preflightReceiptBytes));
+    expect(runnerTemplate.phase2ReceiptSha256).toBe(sha256Hex(receiptBytes));
+    expect(runnerTemplate.scratchDatabaseFingerprintSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(receipt.scratchDatabaseFingerprintSha256).toBe(
+      runnerTemplate.scratchDatabaseFingerprintSha256,
+    );
 
     const targetDatabase = createPostgresDatabase({
       connectionString: historyImportDatabaseConnectionString(adminUrl, targetName),
@@ -822,9 +892,34 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
     expect(await exists(join(cleanupBatch.runnerReceiptDirectory, "PHASE2_CLEANUP_REFUSED"))).toBe(true);
     expect(await exists(join(cleanupBatch.runnerReceiptDirectory, "PHASE2_RECOVERY_IN_PROGRESS"))).toBe(false);
     expect(await exists(join(cleanupBatch.preflightOutput, preflightPassMarkerName))).toBe(true);
+    const cleanupEvidence = JSON.parse(
+      await readFile(
+        join(cleanupBatch.runnerReceiptDirectory, "cleanup-recovery-evidence.private.json"),
+        "utf8",
+      ),
+    ) as {
+      databaseSnapshotMatchesExecution: boolean;
+      storageRecoveryMatchesExecution: boolean;
+      databaseSnapshotRetained: boolean;
+      storageRecoveryRetained: boolean;
+      databaseSnapshotContentSha256: string;
+      executionDatabaseContentSha256: string;
+      storageRecoveryContentSha256: string;
+    };
+    expect(cleanupEvidence).toMatchObject({
+      databaseSnapshotMatchesExecution: true,
+      storageRecoveryMatchesExecution: true,
+      databaseSnapshotRetained: true,
+      storageRecoveryRetained: true,
+    });
+    expect(cleanupEvidence.databaseSnapshotContentSha256).toBe(
+      cleanupEvidence.executionDatabaseContentSha256,
+    );
+    expect(cleanupEvidence.storageRecoveryContentSha256).not.toBe("");
     const recoverySnapshotDirectory = join(cleanupBatch.runnerReceiptDirectory, "storage.recovery");
     expect(await exists(recoverySnapshotDirectory)).toBe(true);
-    // 恢复可行性证明（文件系统）：重建的快照可以把目标存储完整恢复到干净目录。
+    // 恢复可行性证明（文件系统）：重建的快照可以把目标存储完整恢复到干净目录，
+    // 且与执行后现场一致（恢复快照与保留的数据库快照描述同一状态）。
     const restoredStorageRoot = join(cleanupBatch.root, "storage-restored-from-recovery");
     await privateDirectory(restoredStorageRoot);
     await restoreStorageDirectory(
@@ -832,32 +927,47 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       restoredStorageRoot,
       await captureStorageInventory(cleanupBatch.storageRoot),
     );
-    // 恢复可行性证明（数据库）：保留的模板快照能重建基线库并精确对上计数。
+    // 恢复可行性证明（数据库）：保留的模板快照能重建出与执行后现场完全一致的库。
     const restoreDatabaseName = `${cleanupTarget}__restore`;
     const cleanupAdmin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
-    expect(await databaseExists(cleanupAdmin, `${cleanupTarget}__snapshot`)).toBe(true);
-    await cleanupAdmin.execute(
-      sql`create database ${sql.identifier(restoreDatabaseName)} template ${sql.identifier(
-        `${cleanupTarget}__snapshot`,
-      )}`,
-    );
-    const restoredFromSnapshot = createPostgresDatabase({
-      connectionString: historyImportDatabaseConnectionString(adminUrl, restoreDatabaseName),
+    const cleanupTargetDatabase = createPostgresDatabase({
+      connectionString: historyImportDatabaseConnectionString(adminUrl, cleanupTarget),
       maxConnections: 1,
     });
-    expect(await captureHistoryImportTableCounts(restoredFromSnapshot)).toEqual(expectedCounts);
-    expect(await captureStoredFileInventory(restoredFromSnapshot)).toEqual(expectedStored);
-    await restoredFromSnapshot.close();
-    await cleanupAdmin.close();
+    try {
+      const executionCounts = await captureHistoryImportTableCounts(cleanupTargetDatabase);
+      const executionStored = await captureStoredFileInventory(cleanupTargetDatabase);
+      expect(await databaseExists(cleanupAdmin, `${cleanupTarget}__snapshot`)).toBe(true);
+      await cleanupAdmin.execute(
+        sql`create database ${sql.identifier(restoreDatabaseName)} template ${sql.identifier(
+          `${cleanupTarget}__snapshot`,
+        )}`,
+      );
+      const restoredFromSnapshot = createPostgresDatabase({
+        connectionString: historyImportDatabaseConnectionString(adminUrl, restoreDatabaseName),
+        maxConnections: 1,
+      });
+      try {
+        expect(await captureHistoryImportTableCounts(restoredFromSnapshot)).toEqual(executionCounts);
+        expect(await captureStoredFileInventory(restoredFromSnapshot)).toEqual(executionStored);
+      } finally {
+        await restoredFromSnapshot.close();
+      }
+    } finally {
+      await cleanupTargetDatabase.close();
+      await cleanupAdmin.close();
+    }
     await chmod(join(cleanupSnapshotDir, "blocked"), 0o700);
   }, 300_000);
-  it("正式导入入口：真实 PostgreSQL 门禁全过、精确导入、原样重放被机械拒绝", async () => {
+  it("正式导入：带外批准书门禁、伪造拒绝、v4 单遍收据与中途故障双向回滚", async () => {
     assertNode24();
     if (adminUrl === undefined) throw new Error("缺少 PostgreSQL 管理连接配置。");
-    // 正式目标库：名称不能落入临时验收范围，结构与种子与验收库一致。
+    // 正式目标库：名称不能落入临时验收范围，结构与种子与验收库一致；
+    // 名称同时满足合成正式测试缝范围，让 hook/故障注入只能在测试内生效。
     const formalDatabaseName = `urmotiv_formal_${process.pid}${randomUUID()
       .replaceAll("-", "")
       .slice(0, 8)}`;
+    temporaryDatabaseNames.push(`${formalDatabaseName}__formal_backup`);
     const formalAdmin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
     let formalDropped = false;
     try {
@@ -880,7 +990,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
         await formalPreparation.close();
       }
       // 同一批次完整跑通第 1 阶段预检与第 2 阶段临时库验收，
-      // 收据文件本身就出自这两个阶段。
+      // 收据与带外模板文件本身就出自这两个阶段。
       const formalSourceName = scratchName("formsrc");
       trackDatabaseFamily(formalSourceName);
       await prepareHistoryImportDatabase(adminUrl, formalSourceName);
@@ -901,44 +1011,213 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       expect(
         await runPhase2Acceptance(runnerArguments(), formalSeedEnv, provenanceHooks()),
       ).toBe(0);
-      // 正式运行环境：收据、输出、存储与导入输出目录全部来自同一批次；
-      // 输出目录必须由正式门禁自己以 0700 创建并拒绝复用，测试不得预建。
-      const formalOutputDirectory = join(formalBatch.root, "formal-output");
-      const formalStorageRoot = join(formalBatch.root, "formal-storage");
-      await privateDirectory(formalStorageRoot);
-      const formalImportOutputDirectory = join(formalBatch.root, "formal-import-output");
-      const formalEnvironmentValue = await formalEnvironment(
-        formalBatch,
-        formalConnectionString,
-        formalOutputDirectory,
-        formalStorageRoot,
-        formalImportOutputDirectory,
-        "synthetic-formal-phase1",
+      // 临时库验收必须留下绑定实际临时库身份的模板；批准书由操作员
+      // 在收据目录之外带外发布，正式命令只读取核对。
+      const phase2ReceiptBytes = await readFile(
+        join(formalBatch.runnerReceiptDirectory, "phase2-run-receipt.private.json"),
       );
+      const runnerTemplate = JSON.parse(
+        await readFile(
+          join(
+            formalBatch.runnerReceiptDirectory,
+            "phase2-target-approval-template.private.json",
+          ),
+          "utf8",
+        ),
+      ) as {
+        preflightReceiptSha256: string;
+        phase2ReceiptSha256: string;
+        scratchDatabaseFingerprintSha256: string;
+      };
+      const preflightReceiptBytesForFormal = await readFile(
+        join(formalBatch.preflightOutput, preflightReceiptName),
+      );
+      expect(runnerTemplate.preflightReceiptSha256).toBe(
+        sha256Hex(preflightReceiptBytesForFormal),
+      );
+      expect(runnerTemplate.phase2ReceiptSha256).toBe(sha256Hex(phase2ReceiptBytes));
+      expect(runnerTemplate.scratchDatabaseFingerprintSha256).toMatch(/^[a-f0-9]{64}$/);
+      expect(
+        JSON.parse(phase2ReceiptBytes.toString("utf8")).scratchDatabaseFingerprintSha256,
+      ).toBe(runnerTemplate.scratchDatabaseFingerprintSha256);
+      const formalTargetApprovalFile = join(formalBatch.root, "formal-target-approval.private.json");
+      const formalTargetFingerprint = computeFormalTargetFingerprintSha256(
+        formalTargetIdentity(formalConnectionString),
+      );
+      await writeFormalTargetApproval(formalTargetApprovalFile, {
+        preflightReceiptSha256: runnerTemplate.preflightReceiptSha256,
+        phase2ReceiptSha256: runnerTemplate.phase2ReceiptSha256,
+        scratchDatabaseFingerprintSha256: runnerTemplate.scratchDatabaseFingerprintSha256,
+        formalTargetFingerprintSha256: formalTargetFingerprint,
+      });
       const formalBaselineClient = createPostgresDatabase({
         connectionString: formalConnectionString,
         maxConnections: 1,
       });
       const formalBefore = await captureHistoryImportTableCounts(formalBaselineClient);
       await formalBaselineClient.close();
+      const formalHooks = {
+        verifyProvenance: provenanceHooks().verifyProvenance,
+        runPreflight: async (preflightArgv: readonly string[], preflightEnv: NodeJS.ProcessEnv) =>
+          runHistoryImportPreflight(preflightArgv, preflightEnv, provenanceHooks()),
+      };
+
+      await privateDirectory(join(formalBatch.root, "formal-storage-forged"));
+      const forgedApprovalFile = join(formalBatch.root, "formal-target-approval-forged.private.json");
+      await writeFormalTargetApproval(forgedApprovalFile, {
+        preflightReceiptSha256: runnerTemplate.preflightReceiptSha256,
+        phase2ReceiptSha256: runnerTemplate.phase2ReceiptSha256,
+        scratchDatabaseFingerprintSha256: runnerTemplate.scratchDatabaseFingerprintSha256,
+        formalTargetFingerprintSha256: "f".repeat(64),
+      });
+      const forgedOutput = join(formalBatch.root, "formal-output-forged");
+      const forgedEnv = await formalEnvironment(
+        formalBatch,
+        formalConnectionString,
+        adminUrl,
+        forgedApprovalFile,
+        forgedOutput,
+        join(formalBatch.root, "formal-storage-forged"),
+        join(formalBatch.root, "formal-import-output-forged"),
+        "synthetic-formal-phase1",
+      );
+      expect(await runFormalImport(formalArguments(), forgedEnv, formalHooks)).toBe(1);
+      expect(await exists(forgedOutput)).toBe(false);
+      const forgedCheck = createPostgresDatabase({
+        connectionString: formalConnectionString,
+        maxConnections: 1,
+      });
+      expect(await captureHistoryImportTableCounts(forgedCheck)).toEqual(formalBefore);
+      await forgedCheck.close();
+      expect(await databaseExists(formalAdmin, `${formalDatabaseName}__formal_backup`)).toBe(false);
+
+      // （二）真实中途故障：注入的存储层在第 3 次发布时故障，
+      // 此时数据库行与文件对象均已部分存在，必须整体还原并证明等价。
+      const rollbackStorageRoot = join(formalBatch.root, "formal-rollback-storage");
+      await privateDirectory(rollbackStorageRoot);
+      const rollbackOutput = join(formalBatch.root, "formal-rollback-output");
+      const rollbackImportOutput = join(formalBatch.root, "formal-rollback-import-output");
+      const rollbackEnv = await formalEnvironment(
+        formalBatch,
+        formalConnectionString,
+        adminUrl,
+        formalTargetApprovalFile,
+        rollbackOutput,
+        rollbackStorageRoot,
+        rollbackImportOutput,
+        "synthetic-formal-phase1",
+      );
+      const realStorage = createFileStorage({
+        kind: "local",
+        rootDirectory: rollbackStorageRoot,
+        limits: { maxBytes: 2_000_000 },
+      });
+      let storagePublishCount = 0;
+      const failingStorage: FileStorage = {
+        stage: (input) => realStorage.stage(input),
+        publish: async (staged) => {
+          storagePublishCount += 1;
+          if (storagePublishCount > 2) {
+            throw new Error("synthetic mid-batch storage failure");
+          }
+          return realStorage.publish(staged);
+        },
+        discard: (staged) => realStorage.discard(staged),
+        open: (stored) => realStorage.open(stored),
+        delete: (stored) => realStorage.delete(stored),
+      };
       expect(
-        await runFormalImport(formalArguments(), formalEnvironmentValue, {
-          verifyProvenance: provenanceHooks().verifyProvenance,
-          runPreflight: async (preflightArgv, preflightEnv) =>
-            runHistoryImportPreflight(preflightArgv, preflightEnv, provenanceHooks()),
-        }),
+        await runFormalImportForTestSeam(
+          formalArguments(),
+          rollbackEnv,
+          { storage: failingStorage },
+          formalHooks,
+        ),
+      ).toBe(1);
+      expect(storagePublishCount).toBeGreaterThanOrEqual(3);
+      expect(await exists(join(rollbackOutput, formalRollbackVerifiedMarkerName))).toBe(true);
+      expect(await exists(join(rollbackOutput, formalRestoreRefusedMarkerName))).toBe(false);
+      const rollbackReceipt = JSON.parse(
+        await readFile(join(rollbackOutput, formalReceiptName), "utf8"),
+      ) as { verdict: "PASS" | "FAIL"; rollback: { storageRestored: boolean; databaseRestored: boolean } };
+      expect(rollbackReceipt).toMatchObject({
+        verdict: "FAIL",
+        rollback: { storageRestored: true, databaseRestored: true },
+      });
+      const rollbackCheck = createPostgresDatabase({
+        connectionString: formalConnectionString,
+        maxConnections: 1,
+      });
+      expect(await captureHistoryImportTableCounts(rollbackCheck)).toEqual(formalBefore);
+      await rollbackCheck.close();
+      expect((await captureStorageInventory(rollbackStorageRoot)).fileCount).toBe(0);
+      expect(await databaseExists(formalAdmin, `${formalDatabaseName}__formal_backup`)).toBe(false);
+      expect(await exists(join(rollbackOutput, "formal.storage.before.snapshot"))).toBe(false);
+
+      // （三）正确批准书：单遍导入 + 独立自证核对 + v4 通过收据。
+      const formalStorageRoot = join(formalBatch.root, "formal-storage");
+      await privateDirectory(formalStorageRoot);
+      const formalOutputDirectory = join(formalBatch.root, "formal-output");
+      const formalImportOutputDirectory = join(formalBatch.root, "formal-import-output");
+      const formalEnvironmentValue = await formalEnvironment(
+        formalBatch,
+        formalConnectionString,
+        adminUrl,
+        formalTargetApprovalFile,
+        formalOutputDirectory,
+        formalStorageRoot,
+        formalImportOutputDirectory,
+        "synthetic-formal-phase1",
+      );
+      expect(
+        await runFormalImport(formalArguments(), formalEnvironmentValue, formalHooks),
       ).toBe(0);
       const formalReceipt = JSON.parse(
         await readFile(join(formalOutputDirectory, formalReceiptName), "utf8"),
-      ) as { verdict: "PASS" | "FAIL"; packageCount: number; storedObjectCount: number };
-      expect(formalReceipt.verdict).toBe("PASS");
-      expect(formalReceipt.packageCount).toBe(6);
+      ) as {
+        version: number;
+        singlePass: boolean;
+        packageCount: number;
+        storedObjectCount: number;
+        verdict: "PASS" | "FAIL";
+        backupVerifiedBeforeMutation: boolean;
+        postcheck: {
+          verdict: string;
+          authoritativeInventoryEquality: Record<string, boolean>;
+        };
+      };
+      expect(formalReceipt).toMatchObject({
+        version: 4,
+        singlePass: true,
+        packageCount: 6,
+        verdict: "PASS",
+        backupVerifiedBeforeMutation: true,
+        postcheck: {
+          verdict: "PASS",
+          authoritativeInventoryEquality: {
+            revisionContent: true,
+            solutionStates: true,
+            attachmentCount: true,
+            tableDeltas: true,
+            titleUnmodified: true,
+            storage: true,
+            storedFiles: true,
+          },
+        },
+      });
       expect(await exists(join(formalOutputDirectory, formalPassMarkerName))).toBe(true);
+      expect(await exists(join(formalOutputDirectory, formalBackupVerifiedMarkerName))).toBe(true);
+      expect(await exists(join(formalOutputDirectory, formalRollbackVerifiedMarkerName))).toBe(false);
+      expect(await exists(join(formalOutputDirectory, formalRestoreRefusedMarkerName))).toBe(false);
+      expect(await exists(join(formalOutputDirectory, "formal.backup.evidence.available"))).toBe(false);
+      expect(await exists(join(formalOutputDirectory, "formal.storage.before.snapshot"))).toBe(false);
+      expect(await databaseExists(formalAdmin, `${formalDatabaseName}__formal_backup`)).toBe(false);
       const formalDatabase = createPostgresDatabase({
         connectionString: formalConnectionString,
         maxConnections: 1,
       });
       const formalCounts = await captureHistoryImportTableCounts(formalDatabase);
+      await formalDatabase.close();
       const formalBeforeMap = countMap(formalBefore);
       const formalAfterMap = countMap(formalCounts);
       for (const expectation of expectedTableDeltas({
@@ -954,34 +1233,29 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
             (formalBeforeMap.get(expectation.table) ?? 0),
         ).toBe(expectation.delta);
       }
-      await formalDatabase.close();
       const formalStorage = await captureStorageInventory(formalStorageRoot);
       expect(formalStorage.fileCount).toBe(formalReceipt.storedObjectCount);
-      const phase2Receipt = JSON.parse(
-        await readFile(
-          join(formalBatch.runnerReceiptDirectory, "phase2-run-receipt.private.json"),
-          "utf8",
-        ),
-      ) as { storedObjectCount: number };
-      expect(formalReceipt.storedObjectCount).toBe(phase2Receipt.storedObjectCount);
-      // 原样重放到新的输出目录：门禁之外的执行按聚合判定拒绝，且不得新增任何数据。
+      const phase2ReceiptForFormal = JSON.parse(phase2ReceiptBytes.toString("utf8")) as {
+        storedObjectCount: number;
+      };
+      expect(formalReceipt.storedObjectCount).toBe(phase2ReceiptForFormal.storedObjectCount);
+
+      // （四）原样重放到新的输出目录：已入库批次按聚合判定拒绝，
+      // 回滚已证明，数据不得有任何新增。
       const formalOutputSecond = join(formalBatch.root, "formal-output-second");
       const formalSecondEnv = await formalEnvironment(
         formalBatch,
         formalConnectionString,
+        adminUrl,
+        formalTargetApprovalFile,
         formalOutputSecond,
         formalStorageRoot,
         join(formalBatch.root, "formal-import-output-second"),
         "synthetic-formal-phase1",
       );
-      expect(
-        await runFormalImport(formalArguments(), formalSecondEnv, {
-          verifyProvenance: provenanceHooks().verifyProvenance,
-          runPreflight: async (preflightArgv, preflightEnv) =>
-            runHistoryImportPreflight(preflightArgv, preflightEnv, provenanceHooks()),
-        }),
-      ).toBe(1);
+      expect(await runFormalImport(formalArguments(), formalSecondEnv, formalHooks)).toBe(1);
       expect(await exists(join(formalOutputSecond, formalPassMarkerName))).toBe(false);
+      expect(await exists(join(formalOutputSecond, formalRollbackVerifiedMarkerName))).toBe(true);
       const formalDatabaseAfterReplay = createPostgresDatabase({
         connectionString: formalConnectionString,
         maxConnections: 1,
@@ -990,6 +1264,46 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
         formalCounts,
       );
       await formalDatabaseAfterReplay.close();
+      expect((await captureStorageInventory(formalStorageRoot)).fileCount).toBe(
+        formalReceipt.storedObjectCount,
+      );
+    if (acceptanceMode) {
+      const acceptanceDirectory = process.env.URMOTIV_PHASE2_ACCEPTANCE_DIR;
+      if (acceptanceDirectory === undefined) {
+        throw new Error("专用验收缺少证据输出根目录。");
+      }
+      const formalReceiptBytes = await readFile(join(formalOutputDirectory, formalReceiptName));
+      const phase2ReceiptJson = JSON.parse(phase2ReceiptBytes.toString("utf8")) as {
+        inputBindings?: Record<string, unknown>;
+      };
+      const inputBindings = phase2ReceiptJson.inputBindings ?? {};
+      const bindings: Record<string, unknown | null> = {};
+      for (const key of [
+        "batchSha256",
+        "manifestIdentitySha256",
+        "manifestContentBindingsSha256",
+        "codeInventorySha256",
+        "codeInventoryEntryCount",
+      ]) {
+        bindings[key] = (inputBindings as Record<string, unknown>)[key] ?? null;
+      }
+      const shard = {
+        version: 1,
+        generatedAt: new Date().toISOString(),
+        route: "formal",
+        headCommit: acceptanceCommit,
+        preflightReceiptFileSha256: runnerTemplate.preflightReceiptSha256,
+        phase2ReceiptFileSha256: runnerTemplate.phase2ReceiptSha256,
+        formalReceiptFileSha256: sha256Hex(formalReceiptBytes),
+        formalExitCode: 0,
+        formalVerdict: "PASS",
+        bindings,
+      };
+      await writeFile(
+        join(acceptanceDirectory, "shard-runner.private.json"),
+        `${JSON.stringify(shard, null, 2)}\n`,
+      );
+    }
     } finally {
       await formalAdmin.execute(
         sql`drop database if exists ${sql.identifier(formalDatabaseName)} with (force)`,

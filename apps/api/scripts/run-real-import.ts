@@ -17,6 +17,7 @@ import {
   importManifestPayloadSchema,
   packageReportPayloadSchema,
   prepareHistoryImportDatabase,
+  historyImportDatabaseConnectionString,
 } from "../src/history-migration/import-phase";
 import {
   verifyApprovedPackageSourceIdentities,
@@ -69,6 +70,7 @@ import {
   assertPrivateDirectoryMode,
   privateRegularFileExists,
   readPrivateJsonWithDigest,
+  writeNewPrivateJson,
   writePrivateFile,
 } from "../src/history-migration/private-files";
 import {
@@ -77,11 +79,14 @@ import {
   type ExecutionProvenance,
 } from "../src/history-migration/execution-provenance";
 import { preflightPassMarkerName } from "./preflight-history-import";
+import { assertScratchSeamAllowed } from "../src/history-migration/test-seam";
 
 const allowedTargetClasses = ["scratch-temporary", "designated-validation", "designated-real"] as const;
 type TargetClass = (typeof allowedTargetClasses)[number];
 const digestPattern = /^[a-f0-9]{64}$/;
 const importManifestName = "import-manifest.private.json";
+const targetApprovalTemplateName = "phase2-target-approval-template.private.json";
+const cleanupRecoveryEvidenceName = "cleanup-recovery-evidence.private.json";
 const runReceiptName = "phase2-run-receipt.private.json";
 const runPassMarkerName = "PHASE2_RUN_PASS";
 const recoveryMarkerName = "PHASE2_RECOVERY_IN_PROGRESS";
@@ -362,6 +367,7 @@ export const phase2RunReceiptSchema = z
       .strict(),
     databaseContentSha256: z.string().regex(digestPattern),
     baselineDatabaseContentSha256: z.string().regex(digestPattern),
+    scratchDatabaseFingerprintSha256: z.string().regex(digestPattern),
     verdict: z.literal("PASS"),
   })
   .passthrough();
@@ -1070,37 +1076,75 @@ async function executeBoundRunner(
   const storageRecoveryDirectory = join(inputs.receiptDirectory, "storage.recovery");
   await writePrivateFile(cleanupMarkerPath, `${new Date().toISOString()}\n`);
   try {
-    // 稍后要删除的文件系统快照此刻仍是导入前的空基线；先刷新为导入后的真实
-    // 证据内容，再交给删除步骤。这样删除中途失败时，保留在快照里的半删除
-    // 现场以及从目标存储重建的恢复快照才都是有内容的真实文件。
+    // 刷新数据库快照为导入后现场（先删基线快照再重建），让保留的
+    // 数据库快照与文件系统恢复工件描述同一状态，联合回滚才有确定性。
+    await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName);
+    await snapshotScratchDatabase(
+      inputs.adminUrl,
+      inputs.databaseName,
+      historyImportRequiredTables,
+      execution.databaseInventory,
+    );
+    // 文件系统快照同理：先刷新为导入后的真实证据内容，再交给删除步骤。
+    // 删除中途失败时，保留的半删除现场与重建恢复快照才都是真实文件。
     await rm(storageSnapshotDirectory, { recursive: true, force: false });
     await snapshotStorageDirectory(inputs.storageRoot, storageSnapshotDirectory);
     await hooks.beforeSnapshotCleanup?.();
     await rm(storageSnapshotDirectory, { recursive: true, force: false });
   } catch (error) {
-    // 真实的部分删除失败：重建文件系统恢复快照，保留数据库快照，
-    // 并发出拒绝标记。验收结果（已导入并验证的数据）与两个恢复工件都在场。
+    // 真实的部分删除/刷新失败：重建文件系统恢复快照，核对保留的数据库
+    // 快照与导入后现场一致，并把核对结果写成只含聚合的安全证据。
     try {
-      await snapshotStorageDirectory(inputs.storageRoot, storageRecoveryDirectory);
-      await writePrivateFile(
-        cleanupRefusedMarkerPath,
-        `${new Date().toISOString()} cleanup-storage-partial-failure\n`,
+      const storageRecovery = await snapshotStorageDirectory(
+        inputs.storageRoot,
+        storageRecoveryDirectory,
       );
-      console.error(
-        "快照清理未完成：文件系统快照无法完整删除；已重建文件系统恢复快照并保留数据库快照。",
+      const snapshotDatabase = createPostgresDatabase({
+        connectionString: historyImportDatabaseConnectionString(
+          inputs.adminUrl,
+          `${inputs.databaseName}__snapshot`,
+        ),
+        maxConnections: 1,
+        applicationName: "urmotiv-history-import-cleanup-evidence",
+      });
+      let databaseSnapshotInventory: DatabaseContentInventory;
+      try {
+        databaseSnapshotInventory = await captureDatabaseContentInventory(
+          snapshotDatabase,
+          historyImportRequiredTables,
+        );
+      } finally {
+        await snapshotDatabase.close();
+      }
+      const databaseSnapshotMatches = databaseContentInventoriesEqual(
+        databaseSnapshotInventory,
+        execution.databaseInventory,
       );
-    } catch (recoveryError) {
+      const storageRecoveryMatches = storageInventoriesEqual(
+        storageRecovery,
+        execution.storageInventory,
+      );
+      await writeNewPrivateJson(join(inputs.receiptDirectory, cleanupRecoveryEvidenceName), {
+        version: 1,
+        generatedAt: new Date().toISOString(),
+        databaseSnapshotMatchesExecution: databaseSnapshotMatches,
+        databaseSnapshotContentSha256: databaseSnapshotInventory.contentSha256,
+        executionDatabaseContentSha256: execution.databaseInventory.contentSha256,
+        storageRecoveryMatchesExecution: storageRecoveryMatches,
+        storageRecoveryFileCount: storageRecovery.fileCount,
+        storageRecoveryContentSha256: storageRecovery.contentInventorySha256,
+        databaseSnapshotRetained: true,
+        storageRecoveryRetained: true,
+      });
+      await writePrivateFile(cleanupRefusedMarkerPath, `${new Date().toISOString()}\n`);
+      console.error("快照清理未完成：两个恢复工件已保留并完成一致性核对。");
+    } catch {
       throw new HistoryMigrationError(
         "CLEANUP_FAILED",
-        `快照清理失败，且无法重建恢复快照：${String(
-          recoveryError instanceof Error ? recoveryError.message : recoveryError,
-        )}`,
+        "快照清理失败，恢复工件核对未完成；现场已保留。",
       );
     }
-    throw new HistoryMigrationError(
-      "CLEANUP_FAILED",
-      "验收数据已验证，但快照清理未完成；恢复工件已保留，现场待人工接管。",
-    );
+    throw new HistoryMigrationError("CLEANUP_FAILED", "验收数据已验证，但快照清理未完成。");
   }
   await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName);
   await rm(cleanupMarkerPath, { force: false });
@@ -1143,20 +1187,45 @@ async function executeBoundRunner(
     },
     databaseContentSha256: execution.databaseInventory.contentSha256,
     baselineDatabaseContentSha256: baseline.databaseInventory.contentSha256,
+    scratchDatabaseFingerprintSha256: sha256Hex(
+      `${inputs.databaseName}|${baseline.databaseInventory.contentSha256}|${execution.databaseInventory.contentSha256}`,
+    ),
     verdict: "PASS",
   };
-  await writePrivateFile(
-    join(inputs.receiptDirectory, runReceiptName),
-    `${JSON.stringify(receipt, null, 2)}\n`,
-  );
+  const receiptPayload = `${JSON.stringify(receipt, null, 2)}\n`;
+  await writePrivateFile(join(inputs.receiptDirectory, runReceiptName), receiptPayload);
   await writePrivateFile(
     join(inputs.receiptDirectory, runPassMarkerName),
     `${receipt.generatedAt}\n`,
   );
+  // 供操作员带外确认后用于正式门禁的批准书模板：绑定第 1/2 阶段收据文件
+  // 摘要与本库身份摘要。正式门禁只接受带外存放（不在收据目录内）的批准书。
+  await writeNewPrivateJson(join(inputs.receiptDirectory, targetApprovalTemplateName), {
+    version: 1,
+    generatedAt: receipt.generatedAt,
+    preflightReceiptSha256: context.preflightReceiptSha256,
+    phase2ReceiptSha256: sha256Hex(receiptPayload),
+    scratchDatabaseFingerprintSha256: receipt.scratchDatabaseFingerprintSha256,
+  });
   console.log(
     `第 2 阶段验收: PASS; 缺失题解=${execution.nullSolutionCount}; 空题解=${execution.emptySolutionCount}; 附件=${execution.attachmentCount}`,
   );
   return 0;
+}
+
+/** hook 注入只属于 Vitest 测试缝：回环 + 临时命名范围，无法指向真实目标。 */
+function assertHooksAuthorizedForScratch(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+  hooks: Phase2RunnerHooks,
+): void {
+  if (Object.keys(hooks).length === 0) return;
+  const inputs = resolveRunnerInputs(argv, env);
+  const parsed = new URL(inputs.adminUrl);
+  assertScratchSeamAllowed(env, {
+    host: parsed.hostname,
+    databaseName: inputs.databaseName,
+  });
 }
 
 export async function runPhase2Acceptance(
@@ -1165,17 +1234,14 @@ export async function runPhase2Acceptance(
   hooks: Phase2RunnerHooks = {},
 ): Promise<number> {
   try {
+    assertHooksAuthorizedForScratch(argv, env, hooks);
     return await executeBoundRunner(argv, env, hooks);
   } catch (error: unknown) {
     if (error instanceof HistoryMigrationError) {
       console.error(`第 2 阶段验收失败（${error.code}）。`);
       return error.code === "INVALID_ARGUMENTS" ? 2 : 1;
     }
-    console.error(
-      `第 2 阶段验收失败（UNCLASSIFIED）: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
+    console.error("第 2 阶段验收失败（UNCLASSIFIED）。");
     return 1;
   }
 }

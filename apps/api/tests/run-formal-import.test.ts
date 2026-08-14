@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   assertFormalDatabaseName,
+  computeFormalTargetFingerprintSha256,
+  formalTargetApprovalSchema,
   resolveFormalInputs,
   runFormalImport,
+  runFormalImportForTestSeam,
 } from "../scripts/run-formal-import";
 import { HistoryMigrationError } from "../src/history-migration";
 
@@ -19,10 +22,12 @@ describe("正式导入入口：参数校验与机械拒绝", () => {
       PREFLIGHT_RECEIPT:
         "/srv/urmotiv/private/phase2-evidence/preflight-run-private/done/preflight-receipt.private.json",
       PHASE2_RECEIPT: "/srv/urmotiv/private/phase2-evidence/phase2-run-receipt.private.json",
+      TARGET_APPROVAL: "/srv/urmotiv/private/target-approval.private.json",
       OUTPUT_DIRECTORY: "/srv/urmotiv/private/phase2-evidence/formal-output",
       STORAGE_ROOT: "/srv/urmotiv/private/storage",
       IMPORT_OUTPUT_DIRECTORY: "/srv/urmotiv/private/import-output",
       DATABASE_URL: "postgresql://urmotiv:secret@127.0.0.1:5433/urmotiv_formal_ok",
+      ADMIN_URL: "postgresql://urmotiv:secret@127.0.0.1:5433/urmotiv_admin",
       PRINCIPAL: "e48c53a9",
       TAG_ID: "tag.01.01",
       GIT_COMMIT: "d9068f1360c6b31c398741be0b1e1b51bc1b69f5",
@@ -43,10 +48,12 @@ describe("正式导入入口：参数校验与机械拒绝", () => {
     "--approval-file-env=APPROVAL_FILE",
     "--preflight-receipt-env=PREFLIGHT_RECEIPT",
     "--phase2-receipt-env=PHASE2_RECEIPT",
+    "--target-approval-env=TARGET_APPROVAL",
     "--output-directory-env=OUTPUT_DIRECTORY",
     "--storage-root-env=STORAGE_ROOT",
     "--import-output-directory-env=IMPORT_OUTPUT_DIRECTORY",
     "--database-url-env=DATABASE_URL",
+    "--admin-url-env=ADMIN_URL",
     "--principal-env=PRINCIPAL",
     "--tag-id-env=TAG_ID",
     "--git-commit-env=GIT_COMMIT",
@@ -113,13 +120,99 @@ describe("正式导入入口：参数校验与机械拒绝", () => {
     expectRefused(fullArguments, scratchName);
   });
 
+  it("维护连接必须与目标同实例同身份，否则机械拒绝", () => {
+    const otherHost = baseEnvironment();
+    otherHost.ADMIN_URL = "postgresql://urmotiv:secret@127.0.0.2:5433/urmotiv_admin";
+    expectRefused(fullArguments, otherHost);
+    const otherPort = baseEnvironment();
+    otherPort.ADMIN_URL = "postgresql://urmotiv:secret@127.0.0.1:5434/urmotiv_admin";
+    expectRefused(fullArguments, otherPort);
+    const otherUser = baseEnvironment();
+    otherUser.ADMIN_URL = "postgresql://postgres:secret@127.0.0.1:5433/urmotiv_admin";
+    expectRefused(fullArguments, otherUser);
+    const missingAdminKey = [...fullArguments].filter(
+      (argument) => !argument.startsWith("--admin-url-env"),
+    );
+    expectRefused(missingAdminKey, baseEnvironment());
+    const missingApprovalKey = [...fullArguments].filter(
+      (argument) => !argument.startsWith("--target-approval-env"),
+    );
+    expectRefused(missingApprovalKey, baseEnvironment());
+  });
+
+  it("正式目标身份指纹：同身份稳定、任何字段变化都改变摘要", () => {
+    const base = {
+      host: "127.0.0.1",
+      port: "5433",
+      user: "urmotiv",
+      database: "urmotiv_formal_ok",
+    };
+    expect(computeFormalTargetFingerprintSha256(base)).toMatch(/^[a-f0-9]{64}$/);
+    expect(computeFormalTargetFingerprintSha256(base)).toBe(
+      computeFormalTargetFingerprintSha256({ ...base }),
+    );
+    expect(computeFormalTargetFingerprintSha256({ ...base, database: "urmotiv_formal_ok2" })).not.toBe(
+      computeFormalTargetFingerprintSha256(base),
+    );
+    expect(
+      computeFormalTargetFingerprintSha256({
+        ...base,
+        host: "urmotiv.example",
+        user: "urmotiv",
+        database: "urmotiv_formal_ok",
+      }),
+    ).not.toBe(computeFormalTargetFingerprintSha256(base));
+  });
+
+  it("带外批准书结构：版本/字段严格，缺失或篡改一概拒绝", () => {
+    const good = {
+      version: 1,
+      generatedAt: "2026-08-14T00:00:00.000Z",
+      preflightReceiptSha256: "a".repeat(64),
+      phase2ReceiptSha256: "b".repeat(64),
+      scratchDatabaseFingerprintSha256: "c".repeat(64),
+      formalTargetFingerprintSha256: "d".repeat(64),
+    };
+    expect(formalTargetApprovalSchema.parse(good)).toEqual(good);
+    expect(() =>
+      formalTargetApprovalSchema.parse({ ...good, version: 2 }),
+    ).toThrow();
+    expect(() =>
+      formalTargetApprovalSchema.parse({ ...good, formalTargetFingerprintSha256: "nope" }),
+    ).toThrow();
+    const { formalTargetFingerprintSha256: _omitted, ...missing } = good;
+    expect(() => formalTargetApprovalSchema.parse(missing)).toThrow();
+    expect(() =>
+      formalTargetApprovalSchema.parse({ ...good, extra: "not-allowed" }),
+    ).toThrow();
+  });
+
   it("合法输入解析出完整正式参数，且门禁外拒绝返回非零退出码", async () => {
     const inputs = resolveFormalInputs(fullArguments, baseEnvironment());
     expect(inputs.databaseName).toBe("urmotiv_formal_ok");
+    expect(inputs.adminUrl).toBe(baseEnvironment().ADMIN_URL);
     expect(inputs.privateRoot).toBe("/srv/urmotiv/private");
     expect(inputs.tagId).toBe("tag.01.01");
     // 真实执行需要数据库与收据文件，直接运行必然在密码学门禁处拒绝，退出码不能是 0。
     const code = await runFormalImport(fullArguments, baseEnvironment());
     expect(code === 1 || code === 2).toBe(true);
+  });
+
+  it("hook 与测试缝只能在 Vitest 运行时生效，生产环境全部机械拒绝", async () => {
+    const validEnv = baseEnvironment();
+    delete validEnv.VITEST;
+    const seams = [
+      runFormalImport(fullArguments, validEnv, {
+        verifyProvenance: async () => {
+          throw new Error("测试缝外的 hook 永远不应执行");
+        },
+      }),
+      runFormalImportForTestSeam(fullArguments, validEnv, {}),
+    ];
+    const codes = await Promise.all(seams);
+    for (const code of codes) {
+      expect(code === 1 || code === 2).toBe(true);
+    }
+    expect(new Set(codes).has(0)).toBe(false);
   });
 });
