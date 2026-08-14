@@ -1,13 +1,15 @@
 // Offline tests for the USTC OAuth2 demo: full flows against a mock IdP plus state/config/security units.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, statSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, statSync, lstatSync, readFileSync, existsSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { once } from 'node:events';
 import http from 'node:http';
-import { loadConfig, parseEnvFile } from '../lib/config.mjs';
+import { loadConfig, parseEnvFile, OFFICIAL_ENDPOINTS } from '../lib/config.mjs';
 import { StateStore } from '../lib/state.mjs';
+import { SessionStore } from '../lib/sessions.mjs';
+import { hmacHex } from '../lib/accounts.mjs';
 import { createApp } from '../server.mjs';
 import { startMock, FIXTURE, fakeJwt } from './helpers.mjs';
 
@@ -27,6 +29,7 @@ function buildEnv(mock, overrides = {}) {
     USTC_DEMO_PROFILE_URL: mock.url('/cas/oauth2.0/profile'),
     USTC_DEMO_HTTP_TIMEOUT_MS: '500',
     USTC_DEMO_STATE_TTL_MS: '600000',
+    USTC_DEMO_TEST_SEAM: '1',
     ...overrides,
   };
 }
@@ -47,12 +50,23 @@ function rawGet(port, pathAndQuery, headers = {}) {
   });
 }
 
-async function startApp(env, { preSeed } = {}) {
+async function startApp(env, { preSeed, rawPreSeed, symlinkStore } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ustc-demo-'));
   const dataDir = join(dir, 'data');
-  if (preSeed) {
+  if (symlinkStore) {
+    // Planted symlink mimicking local escalation at the store path: load() must
+    // fail closed on the non-envelope target; no write may pass through it.
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-    writeFileSync(join(dataDir, 'accounts.json'), JSON.stringify(preSeed), { mode: 0o600 });
+    writeFileSync(join(dataDir, 'outside-target.json'), 'ORIGINAL', { mode: 0o600 });
+    symlinkSync(join(dataDir, 'outside-target.json'), join(dataDir, 'accounts.json'));
+  } else if (rawPreSeed !== undefined) {
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    writeFileSync(join(dataDir, 'accounts.json'), rawPreSeed, { mode: 0o600 });
+  } else if (preSeed) {
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const secret = String(env.USTC_DEMO_SESSION_SECRET || 'S'.repeat(32));
+    const envl = { v: 1, mac: hmacHex(secret, 'store', JSON.stringify(preSeed)), data: preSeed };
+    writeFileSync(join(dataDir, 'accounts.json'), JSON.stringify(envl, null, 1), { mode: 0o600 });
   }
   const cfg = loadConfig({ env: { ...env, USTC_DEMO_DATA_DIR: dataDir } });
   const logs = [];
@@ -85,7 +99,9 @@ async function fullLogin(app, { code = 'mockcode', host = HOST } = {}) {
 
 function accounts(app) {
   const file = join(app.dataDir, 'accounts.json');
-  return existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {};
+  if (!existsSync(file)) return {};
+  const envl = JSON.parse(readFileSync(file, 'utf8'));
+  return envl.data;
 }
 
 describe('config', () => {
@@ -152,6 +168,63 @@ describe('config', () => {
       /REDIRECT_URI/
     );
   });
+  test('refuses non-positive session TTL', () => {
+    const m = { url: (p) => `http://127.0.0.1:1${p}` };
+    assert.throws(
+      () => loadConfig({ env: { ...buildEnv(m), USTC_DEMO_SESSION_TTL_MS: '0' } }),
+      /SESSION_TTL_MS/
+    );
+    assert.throws(
+      () => loadConfig({ env: { ...buildEnv(m), USTC_DEMO_STATE_TTL_MS: '-5' } }),
+      /STATE_TTL_MS/
+    );
+  });
+  test('valid session TTL is honored', () => {
+    const m = { url: (p) => `http://127.0.0.1:1${p}` };
+    const cfg = loadConfig({ env: { ...buildEnv(m), USTC_DEMO_SESSION_TTL_MS: '3600000' } });
+    assert.equal(cfg.sessionTtlMs, 3600000);
+    assert.equal(cfg.sessionTtlMs, 36e5);
+  });
+  test('production config pins official endpoints (no seam, no overrides)', () => {
+    const cfg = loadConfig({
+      env: {
+        USTC_DEMO_HOST: '127.0.0.1',
+        USTC_DEMO_PORT: '0',
+        USTC_DEMO_CLIENT_ID: 'test-client-id',
+        USTC_DEMO_CLIENT_SECRET: 'Z'.repeat(24),
+        USTC_DEMO_SESSION_SECRET: 'S'.repeat(32),
+        USTC_DEMO_REDIRECT_URI: REDIRECT,
+        USTC_DEMO_HTTP_TIMEOUT_MS: '500',
+        USTC_DEMO_STATE_TTL_MS: '600000',
+      },
+    });
+    assert.equal(cfg.authorizeUrl, OFFICIAL_ENDPOINTS.authorizeUrl);
+    assert.equal(cfg.tokenUrl, OFFICIAL_ENDPOINTS.tokenUrl);
+    assert.equal(cfg.profileUrl, OFFICIAL_ENDPOINTS.profileUrl);
+    assert.equal(cfg.logoutUrl, OFFICIAL_ENDPOINTS.logoutUrl);
+  });
+  test('endpoint override without TEST_SEAM is refused', () => {
+    const m = { url: (p) => `http://127.0.0.1:1${p}` };
+    const env = buildEnv(m);
+    delete env.USTC_DEMO_TEST_SEAM;
+    assert.throws(
+      () => loadConfig({ env: { ...env, USTC_DEMO_PROFILE_URL: 'https://evil.example.com/x' } }),
+      /TEST_SEAM/
+    );
+  });
+  test('endpoint override with TEST_SEAM is accepted', () => {
+    const m = { url: (p) => `http://127.0.0.1:1${p}` };
+    const cfg = loadConfig({ env: { ...buildEnv(m), USTC_DEMO_PROFILE_URL: 'https://seam.test/p' } });
+    assert.equal(cfg.profileUrl, 'https://seam.test/p');
+    assert.equal(cfg.authorizeUrl, `http://127.0.0.1:1/cas/oauth2.0/authorize`);
+  });
+  test('invalid URL override is refused even with TEST_SEAM', () => {
+    const m = { url: (p) => `http://127.0.0.1:1${p}` };
+    assert.throws(
+      () => loadConfig({ env: { ...buildEnv(m), USTC_DEMO_PROFILE_URL: 'not a url' } }),
+      /URL/
+    );
+  });
 });
 
 describe('state store', () => {
@@ -179,6 +252,117 @@ describe('state store', () => {
     assert.equal(s.consume('garbage'), 'malformed');
     assert.equal(s.consume('a.b'), 'malformed');
     assert.equal(s.consume(42), 'malformed');
+  });
+  test('issue sweeps expired nonces to bound memory', () => {
+    const now = { v: 1000000 };
+    const s = new StateStore('k'.repeat(32), { ttlMs: 1000, now: () => now.v });
+    const first = s.issue();
+    now.v += 2000;
+    const second = s.issue();
+    assert.equal(s.active.size, 1, 'sweep pruned the expired nonce, only the live one remains');
+    assert.equal(s.consume(second.token), 'ok');
+    assert.equal(s.active.size, 0, 'live nonce consumed (single-use)');
+    assert.equal(s.consume(first.token), 'unknown'); // swept before it could be consumed
+  });
+});
+
+describe('session store', () => {
+  test('entry expires after TTL', () => {
+    const now = { v: 1000000 };
+    const s = new SessionStore({ ttlMs: 1000, now: () => now.v });
+    const id = s.create('h');
+    assert.ok(s.get(id));
+    now.v += 999;
+    assert.ok(s.get(id));
+    now.v += 2;
+    assert.equal(s.get(id), undefined);
+  });
+  test('create sweeps expired entries to bound the map', () => {
+    const now = { v: 1000000 };
+    const s = new SessionStore({ ttlMs: 1000, now: () => now.v });
+    const oldId = s.create('h1');
+    now.v += 2000;
+    const id = s.create('h2');
+    assert.equal(s.get(oldId), undefined, 'expired entry gone');
+    assert.ok(s.get(id), 'fresh entry alive');
+    assert.equal(s.map.size, 1);
+  });
+  test('destroy removes the entry (logout invalidation)', () => {
+    const s = new SessionStore({ ttlMs: 3600000 });
+    const id = s.create('h');
+    assert.ok(s.get(id));
+    s.destroy(id);
+    assert.equal(s.get(id), undefined);
+  });
+});
+
+describe('account store integrity', () => {
+  test('corrupt store fails closed: 400, file byte-for-byte untouched', async () => {
+    const mock = await startMock();
+    const raw = '{"not valid json !!!';
+    const app = await startApp(buildEnv(mock), { rawPreSeed: raw });
+    try {
+      const { cb } = await fullLogin(app);
+      assert.equal(cb.status, 400);
+      assert.equal(readFileSync(join(app.dataDir, 'accounts.json'), 'utf8'), raw);
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+  test('tampered store MAC fails closed: 400, file untouched', async () => {
+    const mock = await startMock();
+    const envl = { v: 1, mac: '0'.repeat(32), data: {} };
+    const app = await startApp(buildEnv(mock), { rawPreSeed: JSON.stringify(envl) });
+    try {
+      const { cb } = await fullLogin(app);
+      assert.equal(cb.status, 400);
+      assert.deepEqual(JSON.parse(readFileSync(join(app.dataDir, 'accounts.json'), 'utf8')), envl);
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+  test('planted symlink at the store path fails closed, target never written through', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock), { symlinkStore: true });
+    try {
+      // readFileSync follows the symlink: 'ORIGINAL' is not an envelope, so load()
+      // fails closed (400) and no save ever runs — the external target is never written.
+      const { cb } = await fullLogin(app);
+      assert.equal(cb.status, 400);
+      assert.equal(
+        readFileSync(join(app.dataDir, 'outside-target.json'), 'utf8'),
+        'ORIGINAL',
+        'symlink target must remain untouched'
+      );
+      assert.equal(lstatSync(join(app.dataDir, 'accounts.json')).isSymbolicLink(), true);
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+  test('subject reappearing with a different campus id refuses takeover', async () => {
+    const mock = await startMock();
+    const secret = 'S'.repeat(32);
+    const data = {
+      [`ustc:${hmacHex(secret, 'ustc', FIXTURE.attributes.gid)}`]: {
+        provider: 'ustc', handle: 'u00000000', subjectHmac: 'x',
+        campusIdPresent: true, campusIdHmac: 'different-hmac-known-to-attacker',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+    };
+    const app = await startApp(buildEnv(mock), {
+      preSeed: data,
+    });
+    try {
+      const { cb } = await fullLogin(app);
+      assert.equal(cb.status, 400, 'conflicting campus id must refuse');
+      assert.deepEqual(accounts(app), data, 'store untouched');
+    } finally {
+      await app.close();
+      await mock.close();
+    }
   });
 });
 
@@ -472,6 +656,132 @@ describe('full login', () => {
       for (const secret of [token, jwtSig, 'mockcode', state, FIXTURE.gid, FIXTURE.id, FIXTURE.attributes.email, FIXTURE.attributes.zjhm]) {
         assert.ok(!logText.includes(secret), `log must not contain ${secret}`);
       }
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('cookies are HttpOnly, SameSite=Lax and Secure', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock));
+    try {
+      const start = await rawGet(app.port, '/login', { host: HOST });
+      const startSet = String(start.headers['set-cookie'] || '');
+      assert.match(startSet, /HttpOnly/);
+      assert.match(startSet, /SameSite=Lax/);
+      assert.match(startSet, /Secure/);
+      const { cb } = await fullLogin(app);
+      const cbSet = String(cb.headers['set-cookie'] || '');
+      assert.match(cbSet, /HttpOnly/);
+      assert.match(cbSet, /SameSite=Lax/);
+      assert.match(cbSet, /Secure/);
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('identity provider error query aborts safely and invalidates the session', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock));
+    try {
+      // Establish a real session first, then prove the failed callback kills it.
+      const good = await fullLogin(app);
+      const sidCookie = String(good.cb.headers['set-cookie'] || '').split(';')[0];
+      const meBefore = await rawGet(app.port, '/me', { host: HOST, cookie: sidCookie });
+      assert.equal(meBefore.status, 200);
+      assert.ok(meBefore.body.includes('登录成功：内部句柄'), 'session handle visible before invalidation');
+      const tokensBefore = mock.calls.token;
+
+      const start = await rawGet(app.port, '/login', { host: HOST });
+      const state = new URL(start.headers.location).searchParams.get('state');
+      const stateCookie = String(start.headers['set-cookie'] || '').split(';')[0];
+
+      // Error param with a valid state: 400, session destroyed, cookie cleared, no IdP calls.
+      const cb = await rawGet(
+        app.port,
+        `/api/v1/auth/ustc/callback?error=access_denied&state=${encodeURIComponent(state)}`,
+        { host: HOST, cookie: `${stateCookie}; ${sidCookie}` }
+      );
+      assert.equal(cb.status, 400);
+      assert.ok(cb.body.includes('身份源返回错误'));
+      assert.match(String(cb.headers['set-cookie'] || ''), /Max-Age=0/, 'session cookie must be cleared');
+      assert.equal(mock.calls.token, tokensBefore, 'no token exchange on the error path');
+
+      // The previously valid session handle no longer resolves.
+      const meAfter = await rawGet(app.port, '/me', { host: HOST, cookie: sidCookie });
+      assert.equal(meAfter.status, 200);
+      assert.ok(meAfter.body.includes('未登录'), 'session must be destroyed after failed callback');
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('no campus id released: success, account without campus identifier', async () => {
+    const mock = await startMock({
+      profileBody: {
+        active: true,
+        client_id: 'test',
+        attributes: { gid: FIXTURE.attributes.gid, email: FIXTURE.attributes.email, name: '演示' },
+      },
+    });
+    const app = await startApp(buildEnv(mock));
+    try {
+      const { cb } = await fullLogin(app);
+      assert.equal(cb.status, 200);
+      assert.ok(cb.body.includes('未发布'));
+      assert.ok(!cb.body.includes('已发布'));
+      const acc = accounts(app);
+      const rec = Object.values(acc)[0];
+      assert.equal(rec.campusIdPresent, false);
+      assert.equal(rec.campusIdHmac, null);
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('timeout on profile endpoint -> safe 400 and timeout log', async () => {
+    const mock = await startMock({ profileDelayMs: 1500 });
+    const app = await startApp(buildEnv(mock));
+    try {
+      const { cb } = await fullLogin(app);
+      assert.equal(cb.status, 400);
+      assert.ok(app.logs.some((l) => l.includes('profile:timeout')), 'profile timeout must be logged');
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('token response over Content-Length cap is rejected', async () => {
+    const mock = await startMock({
+      tokenRawBody: JSON.stringify({ access_token: 'x'.repeat(9000), token_type: 'bearer', expires_in: 28800 }),
+    });
+    const app = await startApp(buildEnv(mock));
+    try {
+      const { cb } = await fullLogin(app);
+      assert.equal(cb.status, 400);
+      assert.ok(app.logs.some((l) => l.includes('token_exchange:response_too_large')), 'cap rejection logged');
+      assert.equal(mock.calls.profile, 0);
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('chunked profile response over stream cap is rejected mid-body', async () => {
+    const mock = await startMock({
+      profileRawBody: JSON.stringify({ active: true, attributes: { gid: 'x'.repeat(20000) } }),
+      chunkedProfile: true,
+    });
+    const app = await startApp(buildEnv(mock));
+    try {
+      const { cb } = await fullLogin(app);
+      assert.equal(cb.status, 400);
+      assert.ok(app.logs.some((l) => l.includes('profile:response_too_large')), 'stream cap rejection logged');
     } finally {
       await app.close();
       await mock.close();

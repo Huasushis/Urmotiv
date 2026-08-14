@@ -14,10 +14,19 @@ export class StateStore {
   }
 
   issue() {
+    this.sweep();
     const nonce = randomBytes(32).toString('base64url');
     const exp = this.now() + this.ttlMs;
     this.active.set(nonce, { exp });
     return { token: `${nonce}.${exp}.${sign(this.secret, `${nonce}.${exp}`)}`, exp };
+  }
+
+  // Purges expired nonces so the pending-state map stays bounded.
+  sweep() {
+    const nowMs = this.now();
+    for (const [nonce, rec] of this.active) {
+      if (rec.exp <= nowMs) this.active.delete(nonce);
+    }
   }
 
   // Returns 'ok' | 'malformed' | 'mismatch' | 'unknown' | 'expired'. Consumes the ticket in every case.

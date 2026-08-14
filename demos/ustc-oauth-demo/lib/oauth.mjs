@@ -21,7 +21,43 @@ export function authorizeUrl(cfg, stateToken) {
   return `${cfg.authorizeUrl}?${q}`;
 }
 
-async function postForm(url, params, timeoutMs) {
+// Hard caps on provider JSON bodies (wire bytes). OAuth token/profile
+// responses are small; anything larger is treated as hostile or broken.
+export const TOKEN_RESPONSE_CAP = 8192;
+export const PROFILE_RESPONSE_CAP = 16384;
+
+// Strict bounded streaming read. Validates Content-Length when present and
+// enforces the cap on actual wire bytes even for missing/chunked/compressed
+// bodies. On overflow the body is aborted and a normalized AppError is thrown
+// (the response body is never echoed or logged).
+async function readBounded(res, stage, capBytes) {
+  const raw = res.headers.get('content-length');
+  if (raw !== null) {
+    const cl = Number(raw);
+    if (Number.isFinite(cl) && cl > capBytes) {
+      if (res.body && typeof res.body.cancel === 'function') {
+        await Promise.resolve(res.body.cancel()).catch(() => {});
+      }
+      throw new AppError(stage, 'response_too_large');
+    }
+  }
+  if (!res.body) return '';
+  let tally = 0;
+  const chunks = [];
+  for await (const chunk of res.body) {
+    tally += chunk.length;
+    if (tally > capBytes) {
+      if (typeof res.body.cancel === 'function') {
+        await Promise.resolve(res.body.cancel()).catch(() => {});
+      }
+      throw new AppError(stage, 'response_too_large');
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function postForm(url, params, timeoutMs, capBytes, stage) {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -29,7 +65,7 @@ async function postForm(url, params, timeoutMs) {
     signal: AbortSignal.timeout(timeoutMs),
     redirect: 'error',
   });
-  const text = await res.text();
+  const text = await readBounded(res, stage, capBytes);
   if (!res.ok) throw new AppError(`${res.status}`.startsWith('4') ? 'provider_client_error' : 'provider_server_error', `http_${res.status}`);
   return text;
 }
@@ -49,7 +85,9 @@ export async function exchangeCode(cfg, code) {
         redirect_uri: cfg.redirectUri,
         code,
       },
-      cfg.timeoutMs
+      cfg.timeoutMs,
+      TOKEN_RESPONSE_CAP,
+      'token_exchange'
     );
   } catch (e) {
     throw mapNetError('token_exchange', 'network_or_timeout', e);
@@ -74,7 +112,9 @@ export async function fetchProfile(cfg, accessToken) {
     text = await postForm(
       cfg.profileUrl,
       { access_token: accessToken },
-      cfg.timeoutMs
+      cfg.timeoutMs,
+      PROFILE_RESPONSE_CAP,
+      'profile'
     );
   } catch (e) {
     throw mapNetError('profile', 'network_or_timeout', e);

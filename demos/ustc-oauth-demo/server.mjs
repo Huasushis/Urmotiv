@@ -28,8 +28,8 @@ function page(title, body, status = 200) {
 
 export function createApp(cfg, { log = console } = {}) {
   const states = new StateStore(cfg.sessionSecret, { ttlMs: cfg.stateTtlMs });
-  const sessions = new SessionStore();
-  const accounts = cfg.dataDir ? new AccountStore(join(cfg.dataDir, 'accounts.json')) : null;
+  const sessions = new SessionStore({ ttlMs: cfg.sessionTtlMs });
+  const accounts = cfg.dataDir ? new AccountStore(join(cfg.dataDir, 'accounts.json'), cfg.sessionSecret) : null;
   const redirect = cfg.redirectUri ? new URL(cfg.redirectUri) : null;
 
   function logline(kind, detail) {
@@ -39,7 +39,7 @@ export function createApp(cfg, { log = console } = {}) {
   function cookie(name, value, { maxAge } = {}) {
     const bits = [`${name}=${value}`, 'Path=/', 'HttpOnly', 'SameSite=Lax'];
     if (cfg.secureCookies) bits.push('Secure');
-    if (maxAge) bits.push(`Max-Age=${maxAge}`);
+    if (maxAge !== undefined) bits.push(`Max-Age=${maxAge}`);
     return bits.join('; ');
   }
 
@@ -54,39 +54,49 @@ export function createApp(cfg, { log = console } = {}) {
     return out;
   }
 
+  // Safe invalidation on callback/logout errors: destroys the browser session and
+  // clears its cookie, then writes the error page directly.
+  function fail(req, res, status, bodyHtml, why) {
+    const sid = readCookies(req)[SESSION_COOKIE];
+    if (sid) sessions.destroy(sid);
+    logline('callback_rejected', { why });
+    res.writeHead(status, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+      'Set-Cookie': cookie(SESSION_COOKIE, '', { maxAge: 0 }),
+    });
+    res.end(bodyHtml);
+    return null;
+  }
+
   async function callback(req, res, url) {
     if (cfg.mode !== 'live') {
-      return { status: 503, html: page('只读', '<p>就绪模式，不接受回调。</p>').html };
+      return fail(req, res, 503, page('只读', '<p>就绪模式，不接受回调。</p>').html, 'readiness');
     }
     // Host guard: only the real Host header is trusted. X-Forwarded-* is never
     // accepted (the demo binds loopback; a forwarding proxy must preserve Host).
     const hostHeader = (req.headers.host || '').split(':')[0].toLowerCase();
     if (!redirect || hostHeader !== redirect.hostname.toLowerCase()) {
-      logline('callback_rejected', { why: 'host_mismatch' });
-      return page('拒绝', '<p>回调主机与注册地址不一致。</p>', 400);
+      return fail(req, res, 400, page('拒绝', '<p>回调主机与注册地址不一致。</p>').html, 'host_mismatch');
     }
 
     const cookies = readCookies(req);
     const state = url.searchParams.get('state');
     const cookieState = cookies[STATE_COOKIE];
     if (!state || !cookieState || state !== cookieState) {
-      logline('callback_rejected', { why: 'state_missing_or_mismatch' });
-      return page('失败', '<p>state 校验失败。</p>', 400);
+      return fail(req, res, 400, page('失败', '<p>state 校验失败。</p>').html, 'state_missing_or_mismatch');
     }
     const verdict = states.consume(state);
     if (verdict !== 'ok') {
-      logline('callback_rejected', { why: `state_${verdict}` });
-      return page('失败', '<p>state 无效、已使用或已过期。</p>', 400);
+      return fail(req, res, 400, page('失败', '<p>state 无效、已使用或已过期。</p>').html, `state_${verdict}`);
     }
 
     if (url.searchParams.get('error')) {
-      logline('callback_rejected', { why: 'idp_error_parameter' });
-      return page('失败', '<p>身份源返回错误（细节不展示）。</p>', 400);
+      return fail(req, res, 400, page('失败', '<p>身份源返回错误（细节不展示）。</p>').html, 'idp_error_parameter');
     }
     const code = url.searchParams.get('code');
     if (!code) {
-      logline('callback_rejected', { why: 'no_code' });
-      return page('失败', '<p>缺少授权码。</p>', 400);
+      return fail(req, res, 400, page('失败', '<p>缺少授权码。</p>').html, 'no_code');
     }
 
     const { accessToken } = await exchangeCode(cfg, code);
@@ -98,8 +108,7 @@ export function createApp(cfg, { log = console } = {}) {
     const id = typeof profile.id === 'string' && profile.id.length > 0 ? profile.id : '';
     const subject = gid || id;
     if (!subject) {
-      logline('provision_aborted', { why: 'missing_stable_id' });
-      return page('失败', '<p>身份源未发布稳定身份字段（gid/id），无法建档。请管理员确认属性配置。</p>', 400);
+      return fail(req, res, 400, page('失败', '<p>身份源未发布稳定身份字段（gid/id），无法建档。请管理员确认属性配置。</p>').html, 'missing_stable_id');
     }
     const binding = subjectBinding(cfg.sessionSecret, subject);
 
@@ -210,8 +219,15 @@ export function createApp(cfg, { log = console } = {}) {
         res.end(result.html);
       }
     } catch (e) {
-      logline('auth_error', { stage: e && e.name === 'AppError' ? `${e.stage}:${e.reason}` : 'internal' });
-      res.writeHead(400, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      const sid = readCookies(req)[SESSION_COOKIE];
+      if (sid) sessions.destroy(sid);
+      const stage = e && e.name === 'AppError' ? `${e.stage}:${e.reason}` : 'internal';
+      logline('auth_error', { stage });
+      res.writeHead(400, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        'Set-Cookie': cookie(SESSION_COOKIE, '', { maxAge: 0 }),
+      });
       res.end(page('失败', '<p>认证失败，请重试。详情仅记录在服务端日志（不含敏感值）。</p>', 400).html);
     }
   };

@@ -43,6 +43,9 @@ export function startMock(opts = {}) {
     profileStatus = 200,
     tokenBody = null,
     profileBody = null,
+    tokenRawBody = null,
+    profileRawBody = null,
+    chunkedProfile = false,
     tokenShape = 'opaque',
   } = opts;
   const calls = { token: 0, profile: 0 };
@@ -60,6 +63,11 @@ export function startMock(opts = {}) {
         res.writeHead(tokenStatus, { 'content-type': 'application/json' });
         return res.end('{}');
       }
+      if (tokenRawBody !== null) {
+        // Single end() => Node sets Content-Length; exercises the CL cap path.
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(tokenRawBody);
+      }
       let token = '';
       if (tokenShape === 'jwt') token = fakeJwt();
       else if (tokenShape !== 'none') token = `AT-mock-${'x'.repeat(40)}`;
@@ -74,6 +82,17 @@ export function startMock(opts = {}) {
       if (profileStatus !== 200) {
         res.writeHead(profileStatus, { 'content-type': 'application/json' });
         return res.end('{}');
+      }
+      if (profileRawBody !== null) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        if (chunkedProfile) {
+          // No Content-Length, multiple writes => chunked transfer; exercises the stream cap path.
+          const mid = profileRawBody.length >> 1;
+          res.write(profileRawBody.slice(0, mid));
+          res.write(profileRawBody.slice(mid));
+          return res.end();
+        }
+        return res.end(profileRawBody);
       }
       const out =
         profileBody || { active: true, id: FIXTURE.id, client_id: 'test', attributes: FIXTURE.attributes };

@@ -110,16 +110,23 @@ Windows 侧步骤（PowerShell，管理员）：
 ```
 
 覆盖：成功建档/重复登录合并、稳定身份缺失、state 缺失/不一致/重放/过期、token/profile
-失败与超时、opaque 与 JWT 形态 token 分类脱敏、日志脱敏、非法回调 host、私有存储权限（0600/0700）、
-不接管无关既有本地账号。
+失败与超时（含超时日志）、opaque 与 JWT 形态 token 分类脱敏、日志脱敏、非法回调 host、
+X-Forwarded-Host 伪造拒绝、精确回调路径（未注册路径 404）、cookie 属性（HttpOnly/SameSite=Lax/Secure）、
+身份源 `error` 参数安全中止并销毁会话、无学工号发布时的降级建档、token/profile 响应大小上限
+（Content-Length 与分块流式两种）拒绝、私有存储权限（0600/0700）、不接管无关既有本地账号、
+会话 TTL/清理/登出与失败路径失效、账户存储信封完整性（损坏/MAC 不符/符号链接一律 fail closed，文件原样保留）。
 
 ## 安全与数据规则（本演示已内置）
 
 - 绑定键 = 固定 `ustc` 命名空间 + 发布的不变身份字段（`attributes.gid` 优先，其次顶层 `id`）；名称/邮箱不参与唯一键。
 - 校园身份号（学工号）只以 HMAC 摘要 + 存在性布尔值落盘，普通文本不进 Git/日志/页面。
-- 回调 host 必须与注册 redirect host 一致；state 单次使用 + 过期；会话 cookie HttpOnly/SameSite=Lax，HTTPS 下加 Secure。
-- 令牌/授权码/profile 值永不记录、永不写入 Git；页面只展示字段名/类型/格式分类/算法。
-- 不接管已存在的无关本地账号（不同 provider 或不同 subject 绝不合并）。
+- 回调 host 必须与注册 redirect host 一致（只信真实 Host 头，从不读取 X-Forwarded-Host）；state 单次使用 + 过期；会话 cookie HttpOnly/SameSite=Lax，HTTPS 下加 Secure。
+- 生产端点固定为官方值（authorize/accessToken/profile/logout），覆盖必须先开测试专用开关 `USTC_DEMO_TEST_SEAM`，且仍需是合法 http(s) URL。
+- 对 IdP 的 token/profile 响应做有界读取：先核 Content-Length、再按实际线上字节数拦截超大/分块/畸形响应（8192 / 16384 字节上限），超限即拒绝且不落任何内容。
+- 会话 8 小时过期（`USTC_DEMO_SESSION_TTL_MS` 可调，仅允许正数，过期防禁用），访问与新建时清理；登出、回调失败与回调异常一律销毁会话并清空会话 cookie（`Max-Age=0`）。
+- 账户存储 `accounts.json` 是信封 `{v, mac, data}`：JSON 损坏、信封结构不符、HMAC 不符或路径被替换成符号链接，一律拒绝登录并保留文件原样（人工核查），绝不静默覆盖。
+- 令牌/授权码/profile 值永不记录、永不写入 Git；页面只展示字段名/类型/格式分类/算法；错误日志只用常量原因串（如 `token_exchange:timeout`），不带任何值。
+- 不接管已存在的无关本地账号（不同 provider 或不同 subject 绝不合并）；同一 subject 若以不同学工号重现，拒绝合并并保留现场。
 
 ## 成功判定（脱敏收条）
 
