@@ -577,7 +577,7 @@ async function approvedEnvironment(
     EXECUTION_ID: executionId,
     BATCH_SHA256: batch.report.batchSha256,
     SOURCE_BINDINGS_SHA256: recomputeSourceBindingsIdentity(batch.report),
-    ...(acceptanceMode ? {} : { VITEST: "true" }),
+    VITEST: "true",
   };
 }
 
