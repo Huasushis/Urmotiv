@@ -1,0 +1,12 @@
+{
+  "name": "ustc-oauth-demo",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Minimal standalone USTC unified-identity OAuth2 login demo. Readiness-only until a registered *.ustc.edu.cn callback and an institutional client are supplied.",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test"
+  }
+}
