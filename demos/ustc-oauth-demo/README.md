@@ -56,6 +56,53 @@ http://127.0.0.1:9797/logout    退出本应用（不清除校 SSO）
 线上映射（学校反向代理）：公网 `https://<site>.ustc.edu.cn` → `127.0.0.1:9797`，
 回调路径经 `/api/v1/auth/ustc/callback`。
 
+回调路径不是任意选的：**live 模式下服务器只在注册 redirect_uri 的精确路径上服务回调**（自动从
+`USTC_DEMO_REDIRECT_URI` 的路径推导；`USTC_DEMO_CALLBACK_PATH` 只有与之一致才被接受，否则拒绝启动）。
+演示不提供回调别名路径——未注册的路径一律 404。
+
+## 复用 oj.ustc.edu.cn 现有 USTC 接入做本地测试（Windows，不改生产）
+
+已从公开无登录跳转验证（2026-08-14）：oj.ustc.edu.cn 的「Login With USTC」走 OAuth2 授权码模式，
+跳转 `https://id.ustc.edu.cn/cas/oauth2.0/authorize`，**注册回调地址精确为
+`https://oj.ustc.edu.cn/oauth/ustc/callback`**（路径 `/oauth/ustc/callback`）。client 由社团持有。
+
+复用的两个硬性前提：
+1. **回调地址精确相等** —— 本地用 hosts 覆盖 + 本地 TLS 代理把 `https://oj.ustc.edu.cn/oauth/ustc/callback` 原样送达演示服务；演示服务在 `/oauth/ustc/callback` 上服务回调（配置按下方写法即自动一致，无需别名路径）。
+2. **持有匹配的 client_secret** —— **只能由社团网站负责人从自己的注册记录取得，直接填进本机 0600 env 文件；不要在聊天中粘贴 client_id/client_secret 等任何值**。仓库与演示不存、不搜、不记录。
+
+> 安全注记：任何在聊天中泄露过的一次性 state、CAS 服务票据或授权码一律视为已失密/已过期，
+> 不得直接使用；每次登录演示都会重新生成自己的 state，测试时凭一次全新登录进行。
+> 443 是注册 URI 隐含的默认端口，IdP 会重定向到 `https://oj.ustc.edu.cn/oauth/ustc/callback`
+> （不带端口），因此本地必须监听 **127.0.0.1:443**（Windows 需管理员权限运行本地代理）。
+> 全程仅本机：不改 DNS、不开公网端口、不动 oj.ustc.edu.cn 生产服务。
+
+Windows 侧步骤（PowerShell，管理员）：
+1. 备份并追加 hosts（`C:\Windows\System32\drivers\etc\hosts`）：
+   `127.0.0.1 oj.ustc.edu.cn`（先备份原文件；测试结束删除该行还原）。
+2. 建 SSH 隧道（把本地 127.0.0.1:9798 转发到服务器上的 127.0.0.1:9797，即演示服务）：
+   `ssh -N -L 9798:127.0.0.1:9797 ubuntu@<server>`
+3. 安装并信任本地 CA，签发证书：
+   `mkcert -install; mkcert oj.ustc.edu.cn 127.0.0.1 localhost`
+4. 本地 TLS 代理（Caddy，管理员运行；cert.pem/key.pem 为第 3 步产物）：
+   ```caddyfile
+   https://oj.ustc.edu.cn:443 {
+     tls cert.pem key.pem
+     reverse_proxy 127.0.0.1:9798 {
+       header_up Host {http.request.host}
+     }
+   }
+   ```
+   `header_up Host {http.request.host}` 必须保留：演示服务只信任真实 Host。
+5. 服务器端配置私有 env 文件（见上一节）：`USTC_DEMO_REDIRECT_URI=https://oj.ustc.edu.cn/oauth/ustc/callback`、
+   网站负责人**在本机**填入社团的 `client_id`/`client_secret`、新随机 `USTC_DEMO_SESSION_SECRET`；启动演示（先确认 SSH 隧道已连）。
+6. 浏览器打开 `https://oj.ustc.edu.cn/` → 点「使用统一身份认证登录」→ 完成一次**全新** SSO → 应回到演示的登录成功页。
+
+清理/还原：关闭 Caddy（Ctrl+C）→ 关闭 SSH 隧道 → 从 hosts 删除覆盖行（用备份还原）→
+可选 `mkcert -uninstall`。不触碰 oj.ustc.edu.cn 生产、不改 DNS、不开公网端口。
+
+> 未拿到社团 client_secret 并确认注册回调前，不要把演示切到 live：配置按此写法会在注册路径不一致时
+> 拒绝启动（fail closed）。
+
 ## 测试
 
 ```sh

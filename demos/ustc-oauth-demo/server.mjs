@@ -58,8 +58,9 @@ export function createApp(cfg, { log = console } = {}) {
     if (cfg.mode !== 'live') {
       return { status: 503, html: page('只读', '<p>就绪模式，不接受回调。</p>').html };
     }
-    // Host guard: the incoming Host must equal the registered redirect host.
-    const hostHeader = (req.headers['x-forwarded-host'] || req.headers.host || '').split(':')[0].toLowerCase();
+    // Host guard: only the real Host header is trusted. X-Forwarded-* is never
+    // accepted (the demo binds loopback; a forwarding proxy must preserve Host).
+    const hostHeader = (req.headers.host || '').split(':')[0].toLowerCase();
     if (!redirect || hostHeader !== redirect.hostname.toLowerCase()) {
       logline('callback_rejected', { why: 'host_mismatch' });
       return page('拒绝', '<p>回调主机与注册地址不一致。</p>', 400);
@@ -179,7 +180,7 @@ export function createApp(cfg, { log = console } = {}) {
           res.end();
           return;
         }
-      } else if (path === '/api/v1/auth/ustc/callback') {
+      } else if (path === cfg.callbackPath) {
         result = await callback(req, res, url);
         if (result === null) return;
       } else if (path === '/me' && req.method === 'GET') {

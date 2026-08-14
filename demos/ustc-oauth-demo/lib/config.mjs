@@ -74,6 +74,8 @@ export function loadConfig({ env = process.env } = {}) {
     stateTtlMs: Number(v.USTC_DEMO_STATE_TTL_MS || 600000),
   };
 
+  cfg.callbackPath = v.USTC_DEMO_CALLBACK_PATH || '/api/v1/auth/ustc/callback';
+
   const configured = Boolean(clientId && clientSecret && redirectUri && sessionSecret);
   cfg.mode = configured ? 'live' : 'readiness';
 
@@ -91,6 +93,16 @@ export function loadConfig({ env = process.env } = {}) {
         'USTC_DEMO_REDIRECT_URI must be HTTPS on a *.ustc.edu.cn host (campus registration required)'
       );
     }
+    if (!u.pathname || u.pathname === '/' || !u.pathname.startsWith('/')) {
+      throw configError('USTC_DEMO_REDIRECT_URI must include a non-trivial callback path');
+    }
+    if (v.USTC_DEMO_CALLBACK_PATH && v.USTC_DEMO_CALLBACK_PATH !== u.pathname) {
+      throw configError(
+        'USTC_DEMO_CALLBACK_PATH must equal the registered redirect_uri path (exact callback equality)'
+      );
+    }
+    // The callback is served ONLY at the exact path of the registered redirect_uri.
+    cfg.callbackPath = u.pathname;
   }
 
   cfg.secureCookies = configured ? cfg.redirectUri.startsWith('https:') : false;

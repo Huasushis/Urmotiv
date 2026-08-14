@@ -132,6 +132,26 @@ describe('config', () => {
     assert.deepEqual(out, { A: '1', B: 'two words', C: 'x=y' });
     rmSync(d, { recursive: true, force: true });
   });
+  test('live callback path derives from the registered redirect_uri', () => {
+    const m = { url: (p) => `http://127.0.0.1:1${p}` };
+    const cfg = loadConfig({ env: buildEnv(m) });
+    assert.equal(cfg.mode, 'live');
+    assert.equal(cfg.callbackPath, '/api/v1/auth/ustc/callback');
+  });
+  test('refuses callback path that differs from the registered redirect_uri', () => {
+    const m = { url: (p) => `http://127.0.0.1:1${p}` };
+    assert.throws(
+      () => loadConfig({ env: { ...buildEnv(m), USTC_DEMO_CALLBACK_PATH: '/open/redirect' } }),
+      /CALLBACK_PATH/
+    );
+  });
+  test('refuses redirect_uri with no callback path', () => {
+    const m = { url: (p) => `http://127.0.0.1:1${p}` };
+    assert.throws(
+      () => loadConfig({ env: { ...buildEnv(m), USTC_DEMO_REDIRECT_URI: `https://${HOST}` } }),
+      /REDIRECT_URI/
+    );
+  });
 });
 
 describe('state store', () => {
@@ -390,6 +410,48 @@ describe('full login', () => {
     try {
       const res = await rawGet(app.port, '/api/v1/auth/ustc/callback?code=x&state=y', { host: 'evil.example.com' });
       assert.equal(res.status, 400);
+      assert.equal(mock.calls.token, 0);
+      assert.equal(mock.calls.profile, 0);
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('X-Forwarded-Host forgery cannot bypass the host guard', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock));
+    try {
+      // Forged XFH with a wrong real Host: still rejected before the provider.
+      const forged = await rawGet(app.port, '/api/v1/auth/ustc/callback?code=x&state=y', {
+        host: 'evil.example.com',
+        'x-forwarded-host': HOST,
+      });
+      assert.equal(forged.status, 400);
+      assert.equal(mock.calls.token, 0);
+      // Real Host with forged XFH: reaches the guard only (state gate fails next).
+      const real = await rawGet(app.port, '/api/v1/auth/ustc/callback?code=x&state=y', {
+        host: HOST,
+        'x-forwarded-host': 'evil.example.com',
+      });
+      assert.equal(real.status, 400);
+      assert.equal(mock.calls.token, 0, 'X-Forwarded-Host must never be consulted');
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('callback served only at the exact registered path', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock, { USTC_DEMO_REDIRECT_URI: `https://${HOST}/custom/cb` }));
+    try {
+      // The default path is no longer mounted once a different callback is registered.
+      const notFound = await rawGet(app.port, '/api/v1/auth/ustc/callback?code=x&state=y');
+      assert.equal(notFound.status, 404);
+      // The registered path is mounted: state gate fails (400) before any provider call.
+      const mounted = await rawGet(app.port, '/custom/cb?code=x&state=y');
+      assert.equal(mounted.status, 400);
       assert.equal(mock.calls.token, 0);
       assert.equal(mock.calls.profile, 0);
     } finally {
