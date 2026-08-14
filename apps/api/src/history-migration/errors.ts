@@ -31,6 +31,7 @@ export type HistoryMigrationErrorCode =
   | "SOURCE_INTENT_MISMATCH"
   | "LEASE_LOST"
   | "RECOVERY_PENDING"
+  | "CLEANUP_FAILED"
   | "INTERNAL_ERROR";
 
 export class HistoryMigrationError extends Error {

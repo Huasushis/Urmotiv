@@ -328,10 +328,17 @@ export function bindAuthoritativePackageIdentities(
   return sha256Hex(JSON.stringify(bindings));
 }
 
-export function verifyProducedManifestIdentity(
+interface BoundManifestContentEntry {
+  readonly candidateId: string;
+  readonly contentSha256: string;
+  readonly sourceBindingSha256: string;
+  readonly packageSha256: string;
+}
+
+function boundManifestContentEntries(
   report: PackageReportPayload,
   manifestInput: unknown,
-): string {
+): readonly BoundManifestContentEntry[] {
   const manifest = importManifestPayloadSchema.parse(manifestInput);
   if (
     manifest.batchSha256 !== report.batchSha256 ||
@@ -344,7 +351,7 @@ export function verifyProducedManifestIdentity(
   if (entriesByCandidate.size !== report.packages.length) {
     throw new HistoryMigrationError("INVALID_METADATA", "产出导入清单包含重复或缺失候选。");
   }
-  const boundEntries = report.packages.map((expected) => {
+  return report.packages.map((expected) => {
     const entry = entriesByCandidate.get(expected.candidateId);
     if (
       entry === undefined ||
@@ -359,9 +366,32 @@ export function verifyProducedManifestIdentity(
       contentSha256: entry.contentSha256,
       sourceBindingSha256: entry.sourceBindingSha256,
       packageSha256: entry.packageSha256,
-      problemIdSha256: sha256Hex(entry.problemId),
     };
   });
+}
+
+/**
+ * 与库状态无关的清单绑定：只哈希批内候选与内容/来源/包摘要。
+ * 正式导入必须与第 2 阶段收据比较这个值（problemId 与库内序号相关，不跨库比较）。
+ */
+export function manifestContentBindingsIdentity(
+  report: PackageReportPayload,
+  manifestInput: unknown,
+): string {
+  return sha256Hex(JSON.stringify(boundManifestContentEntries(report, manifestInput)));
+}
+
+export function verifyProducedManifestIdentity(
+  report: PackageReportPayload,
+  manifestInput: unknown,
+): string {
+  const contentEntries = boundManifestContentEntries(report, manifestInput);
+  const manifest = importManifestPayloadSchema.parse(manifestInput);
+  const entriesByCandidate = new Map(manifest.entries.map((entry) => [entry.candidateId, entry]));
+  const boundEntries = contentEntries.map((entry) => ({
+    ...entry,
+    problemIdSha256: sha256Hex(entriesByCandidate.get(entry.candidateId)!.problemId),
+  }));
   return sha256Hex(JSON.stringify(boundEntries));
 }
 

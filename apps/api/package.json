@@ -11,7 +11,7 @@
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:phase2-postgres:acceptance": "URMOTIV_PHASE2_RUNNER_ACCEPTANCE=1 vitest run tests/history-phase2-runner-postgres.test.ts"
+    "test:phase2-postgres:acceptance": "node scripts/phase2-acceptance.mjs"
   },
   "dependencies": {
     "@fastify/cookie": "latest",

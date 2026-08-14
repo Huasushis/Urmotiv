@@ -25,12 +25,13 @@ import {
 import {
   bindAuthoritativePackageIdentities,
   bindAuthoritativeRevisionContent,
-  verifyProducedManifestIdentity,
   historyImportRequiredTables,
+  manifestContentBindingsIdentity,
   reconcileHistoryImportBatch,
   recomputeSourceBindingsIdentity,
   runZeroMutationDatabasePreflight,
   scanPackageDirectory,
+  verifyProducedManifestIdentity,
   type HistoryImportReconciliation,
   type PackageScanResult,
 } from "../src/history-migration/import-preflight";
@@ -84,6 +85,9 @@ const importManifestName = "import-manifest.private.json";
 const runReceiptName = "phase2-run-receipt.private.json";
 const runPassMarkerName = "PHASE2_RUN_PASS";
 const recoveryMarkerName = "PHASE2_RECOVERY_IN_PROGRESS";
+const cleanupMarkerName = "PHASE2_CLEANUP_IN_PROGRESS";
+const cleanupRefusedMarkerName = "PHASE2_CLEANUP_REFUSED";
+
 
 interface RunnerInputs {
   readonly privateRoot: string;
@@ -229,7 +233,7 @@ export function resolveRunnerInputs(
 }
 
 const countRowSchema = z.object({ table: z.string(), rows: z.number().int().min(0) }).strict();
-const preflightReceiptSchema = z
+export const preflightReceiptSchema = z
   .object({
     version: z.literal(3),
     targetClass: z.enum(allowedTargetClasses),
@@ -302,7 +306,68 @@ const preflightReceiptSchema = z
   })
   .passthrough();
 
-type PreflightReceipt = z.infer<typeof preflightReceiptSchema>;
+const importPassTallySchema = z
+  .object({
+    imported: z.number().int().min(0),
+    skipped: z.number().int().min(0),
+    failed: z.number().int().min(0),
+  })
+  .strict();
+
+export const phase2RunReceiptSchema = z
+  .object({
+    version: z.literal(3),
+    targetClass: z.enum(allowedTargetClasses),
+    inputBindings: z
+      .object({
+        preflightReceiptSha256: z.string().regex(digestPattern),
+        batchSha256: z.string().regex(digestPattern),
+        sourceBindingsSha256: z.string().regex(digestPattern),
+        authoritativePackageIdentitySha256: z.string().regex(digestPattern),
+        authoritativeRevisionIdentitySha256: z.string().regex(digestPattern),
+        manifestIdentitySha256: z.string().regex(digestPattern),
+        manifestContentBindingsSha256: z.string().regex(digestPattern),
+        codeInventoryEntryCount: z.number().int().positive(),
+        codeInventorySha256: z.string().regex(digestPattern),
+        tagIdSha256: z.string().regex(digestPattern),
+        gitCommitSha256: z.string().regex(digestPattern),
+        principalSha256: z.string().regex(digestPattern),
+        executionIdSha256: z.string().regex(digestPattern),
+      })
+      .strict(),
+    packageCount: z.number().int().min(0),
+    firstPass: importPassTallySchema,
+    replayPass: importPassTallySchema,
+    postcheck: z
+      .object({
+        verdict: z.literal("PASS"),
+        reasonCodes: z.array(z.string()).length(0),
+        driftedTableCount: z.literal(0),
+      })
+      .passthrough(),
+    titleProbePassed: z.literal(true),
+    solutionStates: z
+      .object({ nullCount: z.number().int().min(0), emptyCount: z.number().int().min(0) })
+      .strict(),
+    attachmentCount: z.number().int().min(0),
+    storedObjectCount: z.number().int().min(0),
+    storedBytes: z.number().int().min(0),
+    revisionIntegrity: z
+      .object({
+        firstFullContentSha256: z.string().regex(digestPattern),
+        replayFullContentSha256: z.string().regex(digestPattern),
+        frozenContentSha256: z.string().regex(digestPattern),
+        replayDatabaseRowsSha256: z.string().regex(digestPattern),
+      })
+      .strict(),
+    databaseContentSha256: z.string().regex(digestPattern),
+    baselineDatabaseContentSha256: z.string().regex(digestPattern),
+    verdict: z.literal("PASS"),
+  })
+  .passthrough();
+
+export type Phase2RunReceipt = z.infer<typeof phase2RunReceiptSchema>;
+export type PreflightReceipt = z.infer<typeof preflightReceiptSchema>;
 
 function groupingIds(payload: unknown): string[] {
   if (
@@ -357,7 +422,7 @@ async function scratchDatabaseExists(adminUrl: string, databaseName: string): Pr
   }
 }
 
-interface ValidationContext {
+export interface ValidationContext {
   readonly report: z.infer<typeof packageReportPayloadSchema>;
   readonly scan: PackageScanResult;
   readonly reconciliation: HistoryImportReconciliation;
@@ -564,7 +629,7 @@ async function readTitleProbeState(database: DatabaseHandle, problemId: string):
   };
 }
 
-interface ExecutionSummary {
+export interface ExecutionSummary {
   readonly firstPass: { readonly imported: number; readonly skipped: number; readonly failed: number };
   readonly replayPass: { readonly imported: number; readonly skipped: number; readonly failed: number };
   readonly postcheck: Phase2PostcheckResult;
@@ -574,6 +639,7 @@ interface ExecutionSummary {
   readonly attachmentCount: number;
   readonly storageInventory: StorageInventory;
   readonly manifestIdentitySha256: string;
+  readonly manifestContentBindingsSha256: string;
   readonly firstRevisionInventory: RevisionContentInventory;
   readonly replayRevisionInventory: RevisionContentInventory;
   readonly databaseInventory: DatabaseContentInventory;
@@ -604,7 +670,7 @@ function frozenRevisionInventoryMatchesExpected(
   );
 }
 
-async function executeImport(
+export async function executeImport(
   database: DatabaseHandle,
   inputs: RunnerInputs,
   context: ValidationContext,
@@ -637,6 +703,7 @@ async function executeImport(
     join(inputs.importOutputDirectory, importManifestName),
   );
   const manifestIdentitySha256 = verifyProducedManifestIdentity(context.report, manifestRead.value);
+  const manifestContentBindingsSha256 = manifestContentBindingsIdentity(context.report, manifestRead.value);
   const manifest = importManifestPayloadSchema.parse(manifestRead.value);
   const identities = manifest.entries.map((entry) => ({
     candidateId: entry.candidateId,
@@ -801,6 +868,7 @@ async function executeImport(
     attachmentCount,
     storageInventory: replayStorageInventory,
     manifestIdentitySha256,
+    manifestContentBindingsSha256,
     firstRevisionInventory,
     replayRevisionInventory,
     databaseInventory: replayDatabaseInventory,
@@ -997,10 +1065,45 @@ async function executeBoundRunner(
     }
     throw error;
   }
-
-  await hooks.beforeSnapshotCleanup?.();
+  const cleanupMarkerPath = join(inputs.receiptDirectory, cleanupMarkerName);
+  const cleanupRefusedMarkerPath = join(inputs.receiptDirectory, cleanupRefusedMarkerName);
+  const storageRecoveryDirectory = join(inputs.receiptDirectory, "storage.recovery");
+  await writePrivateFile(cleanupMarkerPath, `${new Date().toISOString()}\n`);
+  try {
+    // 稍后要删除的文件系统快照此刻仍是导入前的空基线；先刷新为导入后的真实
+    // 证据内容，再交给删除步骤。这样删除中途失败时，保留在快照里的半删除
+    // 现场以及从目标存储重建的恢复快照才都是有内容的真实文件。
+    await rm(storageSnapshotDirectory, { recursive: true, force: false });
+    await snapshotStorageDirectory(inputs.storageRoot, storageSnapshotDirectory);
+    await hooks.beforeSnapshotCleanup?.();
+    await rm(storageSnapshotDirectory, { recursive: true, force: false });
+  } catch (error) {
+    // 真实的部分删除失败：重建文件系统恢复快照，保留数据库快照，
+    // 并发出拒绝标记。验收结果（已导入并验证的数据）与两个恢复工件都在场。
+    try {
+      await snapshotStorageDirectory(inputs.storageRoot, storageRecoveryDirectory);
+      await writePrivateFile(
+        cleanupRefusedMarkerPath,
+        `${new Date().toISOString()} cleanup-storage-partial-failure\n`,
+      );
+      console.error(
+        "快照清理未完成：文件系统快照无法完整删除；已重建文件系统恢复快照并保留数据库快照。",
+      );
+    } catch (recoveryError) {
+      throw new HistoryMigrationError(
+        "CLEANUP_FAILED",
+        `快照清理失败，且无法重建恢复快照：${String(
+          recoveryError instanceof Error ? recoveryError.message : recoveryError,
+        )}`,
+      );
+    }
+    throw new HistoryMigrationError(
+      "CLEANUP_FAILED",
+      "验收数据已验证，但快照清理未完成；恢复工件已保留，现场待人工接管。",
+    );
+  }
   await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName);
-  await rm(storageSnapshotDirectory, { recursive: true, force: false });
+  await rm(cleanupMarkerPath, { force: false });
   const receipt = {
     version: 3,
     generatedAt: new Date().toISOString(),
@@ -1012,6 +1115,7 @@ async function executeBoundRunner(
       authoritativePackageIdentitySha256: context.authoritativePackageIdentitySha256,
       authoritativeRevisionIdentitySha256: context.authoritativeRevisionIdentitySha256,
       manifestIdentitySha256: execution.manifestIdentitySha256,
+      manifestContentBindingsSha256: execution.manifestContentBindingsSha256,
       codeInventorySha256: context.provenance.codeInventorySha256,
       codeInventoryEntryCount: context.provenance.codeInventoryEntryCount,
       tagIdSha256: sha256Hex(inputs.tagId),
@@ -1067,7 +1171,11 @@ export async function runPhase2Acceptance(
       console.error(`第 2 阶段验收失败（${error.code}）。`);
       return error.code === "INVALID_ARGUMENTS" ? 2 : 1;
     }
-    console.error("第 2 阶段验收失败（UNCLASSIFIED）。");
+    console.error(
+      `第 2 阶段验收失败（UNCLASSIFIED）: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
     return 1;
   }
 }

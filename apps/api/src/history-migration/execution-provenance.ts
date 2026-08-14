@@ -9,13 +9,6 @@ import { assertPrivateDirectoryMode } from "./private-files";
 
 const execFileAsync = promisify(execFile);
 const fullCommitPattern = /^[0-9a-f]{40}$/;
-const loadBearingPaths = [
-  "apps/api/scripts/preflight-history-import.ts",
-  "apps/api/scripts/run-real-import.ts",
-  "apps/api/src/history-migration",
-  "packages/database",
-  "packages/problem-package",
-] as const;
 
 export interface ExecutionProvenance {
   readonly commit: string;
@@ -23,6 +16,11 @@ export interface ExecutionProvenance {
   readonly codeInventoryEntryCount: number;
 }
 
+/*
+ * 执行证据不采用人工维护的文件白名单：白名单漏加一个能削弱验收门的跟踪文件
+ * （验收脚本、PostgreSQL 验收测试、调度器、任何被插件调用的共享模块）就会破坏
+ * 绑定。这里默认对整个 Git 树的全部跟踪文件求清单，并对整个工作树做干净检查。
+ */
 export function historyRepositoryRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
 }
@@ -36,7 +34,7 @@ async function runGit(arguments_: readonly string[]): Promise<string> {
     const result = await execFileAsync("git", [...arguments_], {
       cwd: historyRepositoryRoot(),
       encoding: "utf8",
-      maxBuffer: 4 * 1024 * 1024,
+      maxBuffer: 64 * 1024 * 1024,
     });
     return result.stdout;
   } catch {
@@ -46,6 +44,7 @@ async function runGit(arguments_: readonly string[]): Promise<string> {
 
 export async function verifyExecutionProvenance(
   suppliedCommit: string,
+  pathScopes: readonly string[] = [],
 ): Promise<ExecutionProvenance> {
   if (!fullCommitPattern.test(suppliedCommit)) {
     throw new HistoryMigrationError("INVALID_ARGUMENTS", "批准提交必须是完整的 Git 提交摘要。");
@@ -59,24 +58,19 @@ export async function verifyExecutionProvenance(
   if (commit !== suppliedCommit) {
     throw new HistoryMigrationError("INVALID_ARGUMENTS", "批准提交与当前执行检出不一致。");
   }
+  // 整树干净检查：任何跟踪文件的未提交修改（包括验收脚本与测试）都会拒绝。
+  // 仅当调用方显式给出路径范围时才缩小干净检查；验收与正式门必须使用整树。
   const status = await runGit([
     "status",
     "--porcelain=v1",
     "--untracked-files=all",
     "--",
-    ...loadBearingPaths,
+    ...pathScopes,
   ]);
   if (status.trim().length !== 0) {
-    throw new HistoryMigrationError("INVALID_ARGUMENTS", "执行代码与批准提交的内容不一致。");
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "执行检出与批准提交的所有跟踪内容不一致。");
   }
-  const inventory = await runGit([
-    "ls-tree",
-    "-r",
-    "--full-tree",
-    commit,
-    "--",
-    ...loadBearingPaths,
-  ]);
+  const inventory = await runGit(["ls-tree", "-r", "--full-tree", commit, "--", ...pathScopes]);
   if (inventory.trim().length === 0) {
     throw new HistoryMigrationError("INVALID_ARGUMENTS", "批准提交没有可验证的执行代码清单。");
   }
