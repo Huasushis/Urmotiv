@@ -4,11 +4,11 @@
 // 脚本或测试自身的修改）都会在启动前被拒绝，避免削弱验收门。
 //
 // 同时输出三类只含聚合的安全证据（存放于操作员所有的非 Git 目录）：
-//   1) worker 基线 vs 当前检出：同一命令、当前失败标签集合一致性；
-//   2) 全 API 工作区测试：计数 + 失败标签（可选项，由环境变量开启）；
-//   3) Phase-2 路由：合并测试运行内部写出的路线收据分片。
-// 证据文件只记录命令字符串、计数、测试标签与文件摘要，绝不记录
-// 真实题面、路径、数据库身份或任何私有素材。
+//   1) worker 基线 vs 当前检出：同一命令、失败标签集合一致性，且当前零失败；
+//   2) 全 API 工作区测试：必跑，只有零失败才发放通过标记；
+//   3) Phase-2 路由：只接受 NOT_AUTHORIZED / SYNTHETIC_READINESS / REAL_PASS
+//      三种真实判定；合成库上的 PASS 一律记 FAKE_PASS 并拒绝升级，
+//      最终状态只有 PASS / IMPLEMENTATION_READY / INCONCLUSIVE，退出码如实。
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -215,23 +215,27 @@ function parseReport(reportFile) {
     evidence.reasonCodes.push(`WORKER_BASE_FAILED_${base.numFailedTests}`);
     evidence.reasonCodes.push(`WORKER_CURRENT_FAILED_${String(current.numFailedTests)}`);
   }
+  // 当前检出必须零失败，否则任何基线一致性都不得升级状态。
+  if (current.numFailedTests === 0) {
+    evidence.reasonCodes.push("WORKER_CURRENT_ZERO_FAIL");
+  } else {
+    evidence.reasonCodes.push("WORKER_CURRENT_NOT_GREEN");
+  }
 }
 
-// 全 API 单元测试：可选；失败标签集合适用于净差，不输出任何错误正文。
-if (process.env.URMOTIV_PHASE2_RUN_FULL_API === "1") {
+// 全 API 单元测试：必跑。只有零失败（numFailedTests === 0）才发放 FULL_API_PASS；
+// 失败标签集合仅用于净差证据，绝不输出任何错误正文。
+{
   const { result, reportFile } = runVitestReport(["--exclude", acceptanceTestFile], apiDirectory);
   const exitCode = result.status ?? 1;
-  if (exitCode === 0) {
+  const parsed = [0, 1].includes(exitCode) ? parseReport(reportFile) : null;
+  if (exitCode === 0 && parsed !== null && parsed.numFailedTests === 0) {
     evidence.reasonCodes.push("FULL_API_PASS");
   } else {
     evidence.reasonCodes.push("FULL_API_FAILED_UNADJUDICATED");
+    evidence.reasonCodes.push(`FULL_API_FAILED_COUNT_${String(parsed?.numFailedTests ?? -1)}`);
   }
-  evidence.fullApi = {
-    exitCode,
-    report: [0, 1].includes(exitCode) ? parseReport(reportFile) : null,
-  };
-} else {
-  evidence.reasonCodes.push("FULL_API_NOT_ENABLED");
+  evidence.fullApi = { exitCode, report: parsed };
 }
 
 // Phase-2 路由：在验收模式下运行测试，由测试自身把路线收据分片写进证据目录。
@@ -263,16 +267,21 @@ evidence.runnerExitCode = acceptance.status ?? 1;
     evidence.route = {
       formalExitCode: shard.formalExitCode,
       formalVerdict: shard.formalVerdict,
+      formalTargetSynthetic: shard.formalTargetSynthetic,
       bindings: shard.bindings,
       route: shard.route,
       headCommit: shard.headCommit,
     };
-    if (
-      shard.formalExitCode === 0 &&
-      shard.formalVerdict === "PASS" &&
-      shard.headCommit === head
-    ) {
+    if (shard.formalVerdict === "REAL_PASS" && shard.formalTargetSynthetic === false) {
       evidence.reasonCodes.push("PHASE2_ROUTE_PASS");
+    } else if (shard.formalVerdict === "REAL_PASS") {
+      evidence.reasonCodes.push("PHASE2_ROUTE_FAKE_PASS_REJECTED");
+    } else if (shard.formalVerdict === "SYNTHETIC_READINESS") {
+      evidence.reasonCodes.push("PHASE2_ROUTE_SYNTHETIC_READINESS");
+    } else if (shard.formalVerdict === "NOT_AUTHORIZED") {
+      evidence.reasonCodes.push("PHASE2_ROUTE_NOT_AUTHORIZED");
+    } else if (shard.formalVerdict === "PASS") {
+      evidence.reasonCodes.push("PHASE2_ROUTE_FAKE_PASS_REJECTED");
     } else {
       evidence.reasonCodes.push("PHASE2_ROUTE_FAILED_UNADJUDICATED");
     }
@@ -281,21 +290,36 @@ evidence.runnerExitCode = acceptance.status ?? 1;
   }
 }
 
-// 定级：必须带外基线齐全、同命令 worker 标签一致、测试全过、路由指出正式导入通过。
+// 定级：任何硬失败或基线不一致都压为 INCONCLUSIVE；只有形式路由给出
+// REAL_PASS 才是 PASS；合成库给出 SYNTHETIC_READINESS 仅是实现就绪。
 const codes = new Set(evidence.reasonCodes);
-if (
-  codes.has("CRASHED_WORKER_TEST_RUN") ||
-  codes.has("WORKER_FAILURE_LABELS_CHANGED") ||
-  codes.has("BASE_WORKER_EVIDENCE_COMMIT_MISMATCH")
-) {
-  evidence.status = "INCONCLUSIVE";
-} else if (
-  evidence.runnerExitCode === 0 &&
-  codes.has("PHASE2_ROUTE_PASS") &&
-  codes.has("WORKER_BASE_CURRENT_LABELS_EQUAL") &&
-  (codes.has("FULL_API_PASS") || codes.has("FULL_API_NOT_ENABLED"))
-) {
+const hardFailures = [
+  "CRASHED_WORKER_TEST_RUN",
+  "WORKER_FAILURE_LABELS_CHANGED",
+  "BASE_WORKER_EVIDENCE_COMMIT_MISMATCH",
+  "WORKER_CURRENT_NOT_GREEN",
+  "FULL_API_FAILED_UNADJUDICATED",
+  "PHASE2_ROUTE_SHARD_COMMIT_MISMATCH",
+  "PHASE2_ROUTE_FAKE_PASS_REJECTED",
+  "PHASE2_ROUTE_FAILED_UNADJUDICATED",
+  "PHASE2_ROUTE_NOT_AUTHORIZED",
+  "PHASE2_ROUTE_SHARD_MISSING",
+  "PHASE2_ROUTE_SHARD_UNREADABLE",
+];
+if (codes.has("PHASE2_ROUTE_PASS") && !hardFailures.some((code) => codes.has(code))) {
   evidence.status = "PASS";
+} else if (
+  codes.has("PHASE2_ROUTE_SYNTHETIC_READINESS") &&
+  evidence.runnerExitCode === 0 &&
+  codes.has("WORKER_CURRENT_ZERO_FAIL") &&
+  codes.has("FULL_API_PASS") &&
+  !codes.has("CRASHED_WORKER_TEST_RUN") &&
+  !codes.has("WORKER_FAILURE_LABELS_CHANGED") &&
+  !codes.has("BASE_WORKER_EVIDENCE_COMMIT_MISMATCH")
+) {
+  evidence.status = "IMPLEMENTATION_READY";
+} else {
+  evidence.status = "INCONCLUSIVE";
 }
 const payload = `${JSON.stringify(evidence, null, 2)}\n`;
 writeFileSync(join(acceptanceDirectory, evidenceFileName), payload);
@@ -303,4 +327,7 @@ console.log(`phase2-acceptance: 证据状态=${evidence.status}`);
 console.log(
   `phase2-acceptance: 证据文件 sha256=${sha256Hex(payload)}（仅聚合内容，不含任何私有素材）`,
 );
-process.exit(acceptance.status ?? 1);
+// 启动器退出码必须反映真实判定：只有 PASS / IMPLEMENTATION_READY 得 0。
+process.exit(
+  evidence.status === "PASS" || evidence.status === "IMPLEMENTATION_READY" ? 0 : 1,
+);

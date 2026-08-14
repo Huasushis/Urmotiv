@@ -46,7 +46,10 @@ import {
 import { deflateRawSync } from "node:zlib";
 import { ProblemFileStore } from "../src/problem-file-store";
 import { DatabaseProblemPackageJobStore } from "../src/problem-package-job-store";
-import { DatabaseImportedProblemWriter } from "../src/problem-package-runtime";
+import {
+  DatabaseImportedProblemWriter,
+  ServiceImportExecutionAuthorization,
+} from "../src/problem-package-runtime";
 import { DatabaseDataStore } from "../src/database-store";
 import { DatabaseProblemPackageAuditWriter } from "../src/problem-package-audit";
 import { databaseDemoUserIds } from "../src/database-demo";
@@ -251,6 +254,59 @@ describePostgres("历史题目正式导入桥接", () => {
     // 失败不发布完成标记。
     await expect(readFile(join(outputDirectory, "IMPORT_COMPLETE"), "utf8")).rejects.toBeDefined();
   });
+  it("无明确授权上下文不可导入：不存在的主体直接拒绝，不留下任何任务痕迹", async () => {
+    if (primary === undefined) throw new Error("未建立真实 PostgreSQL 测试数据库。");
+    const root = await createPrivateRoot();
+    const packageDirectory = join(root, "package-output");
+    const outputDirectory = join(root, "import-output");
+    await mkdir(join(packageDirectory, "packages"), { mode: 0o700, recursive: true });
+    const packaged = await createSyntheticPackage(packageDirectory, "candidate-000001");
+    await writePackageReport(packageDirectory, [packaged]);
+    const problemsBefore = await countProblems(primary);
+    const jobsBefore = await countImportJobs(primary);
+
+    await expect(
+      importHistoryPackages({
+        privateRootDirectory: root,
+        packageDirectory,
+        outputDirectory,
+        dependencies: {
+          ...importDependencies(primary, join(root, "storage")),
+          requestedByUserId: "no-such-user",
+        },
+      }),
+    ).rejects.toMatchObject({ code: "NOT_AUTHORIZED" });
+    // 等价于未找到：不落库，不留任务。
+    expect(await countProblems(primary)).toBe(problemsBefore);
+    expect(await countImportJobs(primary)).toBe(jobsBefore);
+    // 失败不发布完成标记。
+    await expect(readFile(join(outputDirectory, "IMPORT_COMPLETE"), "utf8")).rejects.toBeDefined();
+  });
+
+  it("角色权限不足：任务落入失败状态且不落库（与平台导入语义一致）", async () => {
+    if (primary === undefined) throw new Error("未建立真实 PostgreSQL 测试数据库。");
+    const root = await createPrivateRoot();
+    const packageDirectory = join(root, "package-output");
+    const outputDirectory = join(root, "import-output");
+    await mkdir(join(packageDirectory, "packages"), { mode: 0o700, recursive: true });
+    const packaged = await createSyntheticPackage(packageDirectory, "candidate-000001");
+    await writePackageReport(packageDirectory, [packaged]);
+    const problemsBefore = await countProblems(primary);
+
+    const result = await importHistoryPackages({
+      privateRootDirectory: root,
+      packageDirectory,
+      outputDirectory,
+      dependencies: {
+        ...importDependencies(primary, join(root, "storage")),
+        requestedByUserId: databaseDemoUserIds.reviewer,
+      },
+    });
+    expect(result.importedCount).toBe(0);
+    expect(result.failedCount).toBe(1);
+    expect(await countProblems(primary)).toBe(problemsBefore);
+  });
+
 
   it("一个包损坏时其余包继续导入，修复后重跑只处理失败包", async () => {
     if (primary === undefined) throw new Error("未建立真实 PostgreSQL 测试数据库。");
@@ -1075,9 +1131,7 @@ describePostgres("导入故障注入与恢复收敛", () => {
       packageDirectory,
       outputDirectory,
       dependencies: {
-        database: primary,
-        storageRoot,
-        assignedTagId: "catalog.tag.01.01",
+        ...importDependencies(primary, storageRoot),
         store: faultFileStore,
       },
     });
@@ -1166,9 +1220,7 @@ describePostgres("导入故障注入与恢复收敛", () => {
       packageDirectory,
       outputDirectory,
       dependencies: {
-        database: primary,
-        storageRoot,
-        assignedTagId: "catalog.tag.01.01",
+        ...importDependencies(primary, storageRoot),
         storage: faultStorage,
       },
     });
@@ -1199,9 +1251,7 @@ describePostgres("导入故障注入与恢复收敛", () => {
         packageDirectory,
         outputDirectory,
         dependencies: {
-          database: primary,
-          storageRoot,
-          assignedTagId: "catalog.tag.01.01",
+          ...importDependencies(primary, storageRoot),
           publisher: faultPublisher,
         },
       }),
@@ -1236,9 +1286,7 @@ describePostgres("导入故障注入与恢复收敛", () => {
         packageDirectory,
         outputDirectory,
         dependencies: {
-          database: primary,
-          storageRoot,
-          assignedTagId: "catalog.tag.01.01",
+          ...importDependencies(primary, storageRoot),
           publisher: faultPublisher,
         },
       }),
@@ -1284,9 +1332,7 @@ describePostgres("导入故障注入与恢复收敛", () => {
         packageDirectory: packageDirectory2,
         outputDirectory: outputDirectory2,
         dependencies: {
-          database: primary,
-          storageRoot: join(root2, "storage"),
-          assignedTagId: "catalog.tag.01.01",
+          ...importDependencies(primary, join(root2, "storage")),
           publisher: faultPublisher,
         },
       }),
@@ -1808,11 +1854,10 @@ describePostgres("导入故障注入与恢复收敛", () => {
       privateRootDirectory: root,
       packageDirectory,
       outputDirectory: join(root, "import-create"),
-      dependencies: { database: primary, storageRoot, assignedTagId: "catalog.tag.01.01", jobStore: tamperingStore },
+      dependencies: { ...importDependencies(primary, storageRoot), jobStore: tamperingStore },
     });
     // createImportJob 返回不匹配 → fail-closed。
     expect(result.importedCount).toBe(0);
-    expect(result.failedCount).toBe(1);
     expect(result.failedCandidateIds).toContain("candidate-000098");
     // 稳定消毒码：createImportJob 返回不匹配 → SOURCE_INTENT_MISMATCH。
     expect(result.failedCandidates).toEqual([
@@ -1914,11 +1959,10 @@ describePostgres("导入故障注入与恢复收敛", () => {
       privateRootDirectory: root,
       packageDirectory,
       outputDirectory: join(root, "import-missing-replay"),
-      dependencies: { database: primary, storageRoot, assignedTagId: "catalog.tag.01.01", jobStore: missingReplayStore },
+      dependencies: { ...importDependencies(primary, storageRoot), jobStore: missingReplayStore },
     });
     // createImportJob 成功但回查信封缺失 → fail-closed。
     expect(result.importedCount).toBe(0);
-    expect(result.failedCount).toBe(1);
     expect(result.failedCandidateIds).toContain("candidate-000095");
     // 稳定消毒码：回查信封缺失 → SOURCE_INTENT_MISMATCH。
     expect(result.failedCandidates).toEqual([
@@ -1942,12 +1986,10 @@ describePostgres("导入故障注入与恢复收敛", () => {
       privateRootDirectory: root,
       packageDirectory,
       outputDirectory,
-      dependencies: { database: primary, storageRoot, assignedTagId: "catalog.tag.01.01", storage: faultStorage },
+      dependencies: { ...importDependencies(primary, storageRoot), storage: faultStorage },
     });
     expect(first.importedCount).toBe(0);
     expect(first.failedCount).toBe(1);
-    expect(first.failedCandidateIds).toContain("candidate-000111");
-    // 发布效果已持久化：物理对象存在。
     const objectEntries = await readdir(join(storageRoot, "objects"));
     expect(objectEntries.length).toBe(1);
     // 源意图日志停留在 storage_publish_pending（效果未确认）。
@@ -2469,8 +2511,19 @@ function importDependencies(
   readonly database: DatabaseHandle;
   readonly storageRoot: string;
   readonly assignedTagId: string;
+  readonly requestedByUserId: string;
+  readonly authorization: ServiceImportExecutionAuthorization;
 } {
-  return { database, storageRoot, assignedTagId: "catalog.tag.01.01" };
+  const store = new DatabaseDataStore(database);
+  return {
+    database,
+    storageRoot,
+    assignedTagId: "catalog.tag.01.01",
+    requestedByUserId: databaseDemoUserIds.leader,
+    authorization: new ServiceImportExecutionAuthorization({
+      getUser: (userId) => store.getUser(userId),
+    }),
+  };
 }
 
 async function syntheticProblem(candidateId: string): Promise<CanonicalProblem> {

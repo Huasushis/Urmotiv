@@ -5,7 +5,7 @@ import {
   formalTargetApprovalSchema,
   resolveFormalInputs,
   runFormalImport,
-  runFormalImportForTestSeam,
+  runFormalImportBound,
 } from "../scripts/run-formal-import";
 import { HistoryMigrationError } from "../src/history-migration";
 
@@ -166,8 +166,18 @@ describe("正式导入入口：参数校验与机械拒绝", () => {
 
   it("带外批准书结构：版本/字段严格，缺失或篡改一概拒绝", () => {
     const good = {
-      version: 1,
+      version: 2,
       generatedAt: "2026-08-14T00:00:00.000Z",
+      expiresAt: "2026-08-15T00:00:00.000Z",
+      nonce: "e".repeat(32),
+      approvedByActorSha256: "f".repeat(64),
+      branchName: "codex/review-admin",
+      gitCommitSha256: "a".repeat(64),
+      expectedFormalImportCount: 1,
+      storageRootIdentitySha256: "b".repeat(64),
+      prestateDatabaseInventorySha256: "c".repeat(64),
+      prestateStorageInventorySha256: "d".repeat(64),
+      adminTargetFingerprintSha256: "e".repeat(64),
       preflightReceiptSha256: "a".repeat(64),
       phase2ReceiptSha256: "b".repeat(64),
       scratchDatabaseFingerprintSha256: "c".repeat(64),
@@ -175,15 +185,21 @@ describe("正式导入入口：参数校验与机械拒绝", () => {
     };
     expect(formalTargetApprovalSchema.parse(good)).toEqual(good);
     expect(() =>
-      formalTargetApprovalSchema.parse({ ...good, version: 2 }),
+      formalTargetApprovalSchema.parse({ ...good, version: 1 }),
     ).toThrow();
     expect(() =>
       formalTargetApprovalSchema.parse({ ...good, formalTargetFingerprintSha256: "nope" }),
     ).toThrow();
+    expect(() =>
+      formalTargetApprovalSchema.parse({ ...good, expiresAt: "2026-08-13T00:00:00.000Z" }),
+    ).toEqual(expect.anything());
     const { formalTargetFingerprintSha256: _omitted, ...missing } = good;
     expect(() => formalTargetApprovalSchema.parse(missing)).toThrow();
     expect(() =>
       formalTargetApprovalSchema.parse({ ...good, extra: "not-allowed" }),
+    ).toThrow();
+    expect(() =>
+      formalTargetApprovalSchema.parse({ ...good, nonce: "not-hex" }),
     ).toThrow();
   });
 
@@ -198,16 +214,26 @@ describe("正式导入入口：参数校验与机械拒绝", () => {
     expect(code === 1 || code === 2).toBe(true);
   });
 
-  it("hook 与测试缝只能在 Vitest 运行时生效，生产环境全部机械拒绝", async () => {
+  it("注入受限：生产入口拒绝合成命名，绑定入口只允许回环合成目标", async () => {
     const validEnv = baseEnvironment();
     delete validEnv.VITEST;
-    const seams = [
-      runFormalImport(fullArguments, validEnv, {
-        verifyProvenance: async () => {
-          throw new Error("测试缝外的 hook 永远不应执行");
+    // 生产入口只有 (argv, env) 一个签名：ur_motiv_ 前缀合成命名被机械拒绝，hook 无法注入。
+    const productionCode = await runFormalImport(fullArguments, validEnv);
+    expect(productionCode === 1 || productionCode === 2).toBe(true);
+    // 绑定入口：空故障面被拒绝；即使 hook 想执行也没有机会接触。
+    const seams: Promise<number>[] = [
+      runFormalImportBound(fullArguments, validEnv, {}),
+      // 非回环主机上的合成命名目标：绑定入口也机械拒绝，hook 不会执行。
+      runFormalImportBound(
+        fullArguments,
+        { ...validEnv, ADMIN_URL: "postgresql://u:p@db.internal.example:5432/urmotiv_formal_ok" },
+        { storage: {} as never },
+        {
+          verifyProvenance: async () => {
+            throw new Error("hook 不应在门禁拒绝时执行");
+          },
         },
-      }),
-      runFormalImportForTestSeam(fullArguments, validEnv, {}),
+      ),
     ];
     const codes = await Promise.all(seams);
     for (const code of codes) {

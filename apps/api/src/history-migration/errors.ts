@@ -32,8 +32,8 @@ export type HistoryMigrationErrorCode =
   | "LEASE_LOST"
   | "RECOVERY_PENDING"
   | "CLEANUP_FAILED"
+  | "NOT_AUTHORIZED"
   | "INTERNAL_ERROR";
-
 export class HistoryMigrationError extends Error {
   public readonly code: HistoryMigrationErrorCode;
 

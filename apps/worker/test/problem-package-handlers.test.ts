@@ -75,6 +75,9 @@ class FakeProblemPackageJobStore implements ProblemPackageJobStore {
       idempotencyKey: "import-1",
       startedAt: null,
       finishedAt: null,
+      executionAttempt: 0,
+      leaseId: null,
+      leaseExpiresAt: null,
       createdAt: fixedNow,
       ...overrides
     });

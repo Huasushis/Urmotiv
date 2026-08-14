@@ -32,7 +32,10 @@ import {
   summarizePackageEntryNames,
   summarizePackageReport,
 } from "../src/history-migration/import-preflight";
-import { expectedRevisionContentInventory } from "../src/history-migration/revision-integrity";
+import {
+  expectedRevisionContentInventory,
+  type RevisionContentInventory,
+} from "../src/history-migration/revision-integrity";
 
 const openDatabases: DatabaseHandle[] = [];
 
@@ -433,6 +436,16 @@ describe("历史导入预检对账", () => {
         { ...inventory, fullContentSha256: sha256Hex("tampered-title") },
         authoritative,
       ),
+    ).toThrow(HistoryMigrationError);
+    expect(() =>
+      bindAuthoritativeRevisionContent(
+        { ...inventory, databaseRowsSha256: sha256Hex("tampered-rows") },
+        authoritative,
+      ),
+    ).toThrow(HistoryMigrationError);
+    const { databaseRowsSha256: _stripped, ...missingRowsDigest } = inventory;
+    expect(() =>
+      bindAuthoritativeRevisionContent(missingRowsDigest as unknown as RevisionContentInventory, authoritative),
     ).toThrow(HistoryMigrationError);
   });
 });

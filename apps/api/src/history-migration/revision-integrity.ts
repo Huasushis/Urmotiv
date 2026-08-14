@@ -16,7 +16,9 @@ export interface RevisionContentInventory {
   readonly emptySolutionCount: number;
   readonly fullContentSha256: string;
   readonly frozenContentSha256: string;
-  readonly databaseRowsSha256?: string;
+  // 修订内容面向数据库行的确定性投影摘要。期望侧与数据库实拍侧都必须
+  // 生成并相等；任一侧缺失即对账失败（失败关闭），不允许 OR 不对称放行。
+  readonly databaseRowsSha256: string;
 }
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { readonly [key: string]: JsonValue };
@@ -84,10 +86,7 @@ function canonicalRecord(candidateId: string, revision: number, problem: Canonic
   };
 }
 
-function buildInventory(
-  records: readonly CanonicalRevisionRecord[],
-  databaseRows?: readonly JsonValue[],
-): RevisionContentInventory {
+function buildInventory(records: readonly CanonicalRevisionRecord[]): RevisionContentInventory {
   const ordered = [...records].sort((left, right) => {
     const candidateOrder = left.candidateId.localeCompare(right.candidateId);
     return candidateOrder === 0 ? left.revision - right.revision : candidateOrder;
@@ -101,9 +100,7 @@ function buildInventory(
     ).length,
     fullContentSha256: sha256Hex(JSON.stringify(ordered)),
     frozenContentSha256: sha256Hex(JSON.stringify(frozen)),
-    ...(databaseRows === undefined
-      ? {}
-      : { databaseRowsSha256: sha256Hex(JSON.stringify(databaseRows)) }),
+    databaseRowsSha256: sha256Hex(JSON.stringify(ordered.map(canonicalJson))),
   };
 }
 
@@ -169,8 +166,8 @@ export async function captureImportedRevisionContentInventory(
          where problem_id in (${ids})
          order by problem_id, revision`,
   );
+
   const canonicalRecords: CanonicalRevisionRecord[] = [];
-  const databaseRows: JsonValue[] = [];
   for (const row of rows) {
     const candidateId = candidateByProblem.get(row.problem_id);
     if (candidateId === undefined) {
@@ -197,15 +194,6 @@ export async function captureImportedRevisionContentInventory(
       formatExtensions: canonicalJson(row.format_extensions),
     };
     canonicalRecords.push(canonical);
-    databaseRows.push(canonicalJson({
-      ...canonical,
-      status: row.status,
-      changedFields: row.changed_fields,
-      contentHash: row.content_hash,
-      changeReason: row.change_reason,
-      createdByUserId: row.created_by_user_id,
-      createdAt: row.created_at,
-    }));
   }
-  return buildInventory(canonicalRecords, databaseRows);
+  return buildInventory(canonicalRecords);
 }

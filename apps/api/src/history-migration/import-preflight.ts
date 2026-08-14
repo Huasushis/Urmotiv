@@ -411,7 +411,8 @@ export function bindAuthoritativeRevisionContent(
     packageInventory.nullSolutionCount !== expected.nullSolutionCount ||
     packageInventory.emptySolutionCount !== expected.emptySolutionCount ||
     packageInventory.fullContentSha256 !== expected.fullContentSha256 ||
-    packageInventory.frozenContentSha256 !== expected.frozenContentSha256
+    packageInventory.frozenContentSha256 !== expected.frozenContentSha256 ||
+    packageInventory.databaseRowsSha256 !== expected.databaseRowsSha256
   ) {
     throw new HistoryMigrationError(
       "INVALID_METADATA",

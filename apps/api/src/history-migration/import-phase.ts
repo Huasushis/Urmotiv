@@ -36,6 +36,7 @@ import {
   type AtomicImportedProblemWriter,
   type HistoryImportJobStore,
   type HistoryImportJobClaim,
+  type ImportExecutionAuthorization,
   type ImportJobReplayResult,
   type ProblemPackageImportChoices,
   type ProblemPackageImportJob,
@@ -43,7 +44,7 @@ import {
 } from "@urmotiv/jobs";
 import { LocalFileStorage, type FileStorage } from "@urmotiv/storage";
 
-import { databaseDemoUserIds, seedDatabaseDemoData } from "../database-demo";
+import { seedDatabaseDemoData } from "../database-demo";
 import { DatabaseDataStore } from "../database-store";
 import {
   DatabaseImportedProblemWriter,
@@ -132,8 +133,12 @@ export interface HistoryImportPhaseDependencies {
    * 指定注入一个目录叶子标签。
    */
   readonly assignedTagId: string;
-  /** 缺省使用演示组长账号（拥有 problem.import 权限）。 */
-  readonly requestedByUserId?: string;
+  readonly requestedByUserId: string;
+  /**
+   * 导入执行授权：开始与每个包前都重新检查 problem.import；明确拒绝或
+   * 查询失败都会中断本次运行，不与 writer 的落笔校验互为替代。
+   */
+  readonly authorization: ImportExecutionAuthorization;
   /** 可注入自定义 writer；缺省使用 DatabaseImportedProblemWriter。 */
   readonly writer?: AtomicImportedProblemWriter;
   /**
@@ -414,7 +419,18 @@ export async function importHistoryPackages(
     });
   const publisher = options.dependencies.publisher ?? defaultPublisher;
   const store = options.dependencies.store ?? new ProblemFileStore(database);
-  const requestedByUserId = options.dependencies.requestedByUserId ?? databaseDemoUserIds.leader;
+  const requestedByUserId = options.dependencies.requestedByUserId;
+
+  // 运行开始前的身份检查：执行主体必须存在；角色允许留到每次任务写入前
+  // 由同一个授权上下文实时复核。身份不确定直接终止，不留下任何任务痕迹。
+  if (
+    (await new DatabaseDataStore(database).getUser(requestedByUserId)) === undefined
+  ) {
+    throw new HistoryMigrationError(
+      "NOT_AUTHORIZED",
+      "导入执行主体不存在或已被删除；本次运行没有开始。",
+    );
+  }
 
   // 预检：分配标签必须是活跃目录标签（与正式写入路径的 hasTags 一致），
   // 失败发生在任何任务创建之前。
@@ -446,10 +462,11 @@ export async function importHistoryPackages(
         database,
         requestedByUserId,
         assignedTagId: options.dependencies.assignedTagId,
+        authorization: options.dependencies.authorization,
         ...(options.dependencies.now === undefined ? {} : { now: options.dependencies.now }),
       });
-      entries.set(entry.candidateId, entry);
       importedThisRun += 1;
+      entries.set(entry.candidateId, entry);
     } catch (error) {
       // 单个包失败不影响其余包；失败项不会进入清单，重跑会重试。
       // 只记录稳定消毒码，绝不记录原始错误（可能含路径、题面片段或上游正文）。
@@ -489,7 +506,7 @@ export async function importHistoryPackages(
   // ── 批次发布日志：持久化 pending/confirmed 阶段 ──
   // 日志绑定 batchSha256 身份和清单/完成标记载荷摘要。
   // 响应丢失后重跑时，通过日志阶段判断已发布效果，避免重复写入。
-const batchJournalPath = join(options.outputDirectory, batchPublicationFileName);
+  const batchJournalPath = join(options.outputDirectory, batchPublicationFileName);
   const existingBatch = await readExistingBatchPublication(batchJournalPath);
   // 清单发布确认判定：同一批次身份 + 清单载荷摘要 + 阶段已越过 manifest_publish_confirmed。
   const manifestAlreadyPublished =
@@ -586,11 +603,11 @@ async function importSinglePackage(input: {
   readonly database: DatabaseHandle;
   readonly requestedByUserId: string;
   readonly assignedTagId: string;
+  readonly authorization: ImportExecutionAuthorization;
   readonly now?: () => Date;
 }): Promise<ImportManifestEntry> {
   // 有界读取：先用 O_NOFOLLOW 打开并 stat 实际大小，与包报告声明的
   // packageBytes 比对，再与硬上限比对，三者一致后才读入内存。防止私有
-  // 目录被替换成符号链接或超大文件后造成无界分配。
   const packagePath = join(
     input.packageDirectory,
     "packages",
@@ -885,6 +902,16 @@ async function importSinglePackage(input: {
     // 心跳续租：在写入期间定期续租，租约丢失时中止写入。
     const heartbeat = startHeartbeat(input.jobStore, job.id, leaseId, leaseDurationMs, abortController);
     try {
+      // 每次任务写入前的实时执行授权：拒绝走 ImportAccessRevokedError，
+      // 让围栏失败路径以 import_access_revoked 登记任务与条目（与平台语义一致）。
+      if (
+        !(await input.authorization.canImport({
+          requestedByUserId: input.requestedByUserId,
+          signal: abortController.signal,
+        }))
+      ) {
+        throw new ImportAccessRevokedError();
+      }
       result = await input.writer.write({
         importJobId: job.id,
         position: 0,
