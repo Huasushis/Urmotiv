@@ -17,11 +17,11 @@ export class SessionStore {
     }
   }
 
-  create(handle) {
+  create(handle, extra) {
     this.sweep();
     const id = randomBytes(32).toString('base64url');
     const exp = this.now() + this.ttlMs;
-    this.map.set(id, { handle, at: this.now(), exp });
+    this.map.set(id, { handle, at: this.now(), exp, ...(extra || {}) });
     return id;
   }
 

@@ -8,7 +8,7 @@ import { createHmac } from 'node:crypto';
 import { loadConfig } from './lib/config.mjs';
 import { StateStore } from './lib/state.mjs';
 import { authorizeUrl, exchangeCode, fetchProfile, AppError } from './lib/oauth.mjs';
-import { classifyToken, profileSummary } from './lib/redact.mjs';
+import { classifyToken, profileSummary, retainProfile } from './lib/redact.mjs';
 import { AccountStore, subjectBinding, hmacHex } from './lib/accounts.mjs';
 import { SessionStore } from './lib/sessions.mjs';
 
@@ -26,9 +26,44 @@ function page(title, body, status = 200) {
   return { status, html };
 }
 
+// Authenticated self-profile page: shows the OWN session holder's USTC profile fields.
+// Only allowlisted fields carry values (kept in the in-memory session, never on disk or
+// in logs); all other returned fields appear as name/type with their value discarded.
+// Restrictive CSP/referrer protections; no scripts, images, forms, or frames.
+function profilePage(s) {
+  const allowed = (s.retained || [])
+    .map(
+      (f) =>
+        `<tr><td>${esc(f.label)}</td><td><code>${esc(f.path)}</code></td><td><code>${esc(f.type)}</code></td><td><code>${esc(f.value)}</code></td></tr>`
+    )
+    .join('');
+  const others = (s.others || [])
+    .map(
+      (f) =>
+        `<tr><td><code>${esc(f.name)}</code></td><td><code>${esc(f.type)}</code></td><td>值未保留</td></tr>`
+    )
+    .join('');
+  const body =
+    `<h1>我的 USTC 资料</h1>` +
+    `<p><strong>Demo 专用</strong>：仅你本人可见；白名单字段的值只保存在服务器内存中，不写入文件、不记日志，退出登录或会话过期即丢弃。</p>` +
+    `<h2>白名单字段（值已保留，仅内存）</h2>` +
+    `<table border="1" cellspacing="0" cellpadding="4"><tbody>${allowed || '<tr><td>（无）</td></tr>'}</tbody></table>` +
+    `<h2>其他返回字段（仅字段名与类型，值未保留）</h2>` +
+    `<table border="1" cellspacing="0" cellpadding="4"><tbody>${others || '<tr><td>（无）</td></tr>'}</tbody></table>` +
+    `<p><a href="/">首页</a> | <a href="/logout">退出登录（立即丢弃本次资料）</a></p>`;
+  const p = page('我的 USTC 资料', body);
+  p.headers = {
+    'content-security-policy':
+      "default-src 'none'; script-src 'none'; img-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+  };
+  return p;
+}
+
 export function createApp(cfg, { log = console } = {}) {
   const states = new StateStore(cfg.sessionSecret, { ttlMs: cfg.stateTtlMs });
-  const sessions = new SessionStore({ ttlMs: cfg.sessionTtlMs });
+  const sessions = new SessionStore({ ttlMs: cfg.sessionTtlMs, now: cfg.now });
   const accounts = cfg.dataDir ? new AccountStore(join(cfg.dataDir, 'accounts.json'), cfg.sessionSecret) : null;
   const redirect = cfg.redirectUri ? new URL(cfg.redirectUri) : null;
 
@@ -54,6 +89,15 @@ export function createApp(cfg, { log = console } = {}) {
     return out;
   }
 
+  // Host guard: only the real Host header of the registered redirect host is trusted.
+  // X-Forwarded-* is never accepted (the demo binds loopback; a forwarding proxy must
+  // preserve Host). Shared by the callback and the authenticated self-profile page.
+  function hostMatches(req, redirect) {
+    if (!redirect) return false;
+    const hostHeader = (req.headers.host || '').split(':')[0].toLowerCase();
+    return hostHeader === redirect.hostname.toLowerCase();
+  }
+
   // Safe invalidation on callback/logout errors: destroys the browser session and
   // clears its cookie, then writes the error page directly.
   function fail(req, res, status, bodyHtml, why) {
@@ -75,8 +119,7 @@ export function createApp(cfg, { log = console } = {}) {
     }
     // Host guard: only the real Host header is trusted. X-Forwarded-* is never
     // accepted (the demo binds loopback; a forwarding proxy must preserve Host).
-    const hostHeader = (req.headers.host || '').split(':')[0].toLowerCase();
-    if (!redirect || hostHeader !== redirect.hostname.toLowerCase()) {
+    if (!hostMatches(req, redirect)) {
       return fail(req, res, 400, page('拒绝', '<p>回调主机与注册地址不一致。</p>').html, 'host_mismatch');
     }
 
@@ -128,7 +171,7 @@ export function createApp(cfg, { log = console } = {}) {
       campusIdHmac,
     });
 
-    const sid = sessions.create(account.handle);
+    const sid = sessions.create(account.handle, retainProfile(profile));
     const tokenInfo = classifyToken(accessToken);
     const summary = profileSummary(profile);
     logline('login_success', {
@@ -151,6 +194,10 @@ export function createApp(cfg, { log = console } = {}) {
     lines.push(`<p>Profile 字段（仅名称/类型）：</p><ul>` +
       summary.claims.map((c) => `<li>${esc(c.name)} : ${esc(c.type)}</li>`).join('') + `</ul>`);
     lines.push(`<p>校园身份号（学工号）字段：<code>${campusId ? '已发布（值不展示）' : '未发布'}</code></p>`);
+    lines.push(`<p><a href="/profile">查看我自己的真实资料字段（demo 专用）</a></p>`);
+    lines.push(
+      `<p>资料页说明：仅本次登录会话可见；白名单字段的值只保存在服务器内存中，不写入文件、不记日志，退出登录或会话过期即丢弃。</p>`
+    );
     lines.push(`<p><a href="/me">查看会话</a> | <a href="/logout">退出</a></p>`);
 
     const p = page('登录成功', lines.join(''), 200);
@@ -192,11 +239,23 @@ export function createApp(cfg, { log = console } = {}) {
       } else if (path === cfg.callbackPath) {
         result = await callback(req, res, url);
         if (result === null) return;
+      } else if (path === '/profile' && req.method === 'GET') {
+        if (!hostMatches(req, redirect)) {
+          result = page('拒绝', '<p>主机不符，拒绝展示。</p>', 403);
+        } else {
+          const sid = readCookies(req)[SESSION_COOKIE];
+          const s = sid ? sessions.get(sid) : undefined;
+          result = s
+            ? s.retained
+              ? profilePage(s)
+              : page('我的资料', '<p>本会话未保留资料，需要重新登录一次后才能查看。</p>')
+            : page('我的资料', '<p>未登录，无法查看资料。</p>');
+        }
       } else if (path === '/me' && req.method === 'GET') {
         const sid = readCookies(req)[SESSION_COOKIE];
         const s = sid ? sessions.get(sid) : undefined;
         result = s
-          ? page('会话', `<p>登录成功：内部句柄 <code>${esc(s.handle)}</code></p><p><a href="/logout">退出</a></p>`)
+          ? page('会话', `<p>登录成功：内部句柄 <code>${esc(s.handle)}</code></p><p><a href="/profile">我的资料</a> | <a href="/logout">退出</a></p>`)
           : page('会话', '<p>未登录。</p>');
       } else if (path === '/logout' && req.method === 'GET') {
         const sid = readCookies(req)[SESSION_COOKIE];
@@ -215,7 +274,11 @@ export function createApp(cfg, { log = console } = {}) {
         res.writeHead(result.status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
         res.end(JSON.stringify(result.json));
       } else {
-        res.writeHead(result.status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+        res.writeHead(result.status, {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+          ...(result.headers || {}),
+        });
         res.end(result.html);
       }
     } catch (e) {

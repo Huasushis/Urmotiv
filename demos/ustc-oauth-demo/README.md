@@ -50,6 +50,7 @@ USTC_DEMO_ENV_FILE=/home/ubuntu/codex-urmotiv/Urmotiv/private/ustc-oauth-demo/de
 http://127.0.0.1:9797/          首页
 http://127.0.0.1:9797/login     发起 OAuth（live 模式）
 http://127.0.0.1:9797/me        会话
+http://127.0.0.1:9797/profile   查看自己的真实资料字段（demo 专用，仅内存）
 http://127.0.0.1:9797/logout    退出本应用（不清除校 SSO）
 ```
 
@@ -117,6 +118,16 @@ Windows 侧步骤（PowerShell，管理员）：
 > 未拿到社团 client_secret 并确认注册回调前，不要把演示切到 live：配置按此写法会在注册路径不一致时
 > 拒绝启动（fail closed）。
 
+## 自资料页 /profile（demo 专用）
+
+登录成功后，成功页与 `/me` 会话页都会链接到 `/profile`：在**你自己的浏览器**里查看本次登录时
+身份源真实返回的 USTC profile 字段。属性如下：
+
+- **仅认证会话可见**：要求回调注册 host 的 Host 头一致（X-Forwarded-* 永不接受），并要求有效会话；未登录、伪造会话、过期会话或错误 Host 一律不展示任何资料。
+- **白名单保留值**：只有固定白名单（`active`、`id`、`attributes.gid/name/deptname/zjhm/jrzjhm/kind/email`）的值会留在服务端**内存会话**里；其余返回字段只保留字段名与类型（`attributes.deptCode` 等），值当场丢弃。
+- **绝不落盘/记日志**：任何 profile 值都不写入 `accounts.json`（账户存储仍是原来的 HMAC 信封，字段不变）、不写入日志、不进入 Git。登出、会话过期或服务重启即全部丢弃——因此**服务重启后需要重新登录一次**才能再次查看。
+- **演示专用**：页面带「Demo 专用 / 仅内存」说明；响应 `no-store`，并带严格 CSP（`default-src 'none'`，无脚本/图片/表单/iframe）、`Referrer-Policy: no-referrer`、`X-Content-Type-Options: nosniff`；所有值经 HTML 转义（测试覆盖恶意值）。
+
 ## 测试
 
 ```sh
@@ -128,7 +139,9 @@ Windows 侧步骤（PowerShell，管理员）：
 X-Forwarded-Host 伪造拒绝、精确回调路径（未注册路径 404）、cookie 属性（HttpOnly/SameSite=Lax/Secure）、
 身份源 `error` 参数安全中止并销毁会话、无学工号发布时的降级建档、token/profile 响应大小上限
 （Content-Length 与分块流式两种）拒绝、私有存储权限（0600/0700）、不接管无关既有本地账号、
-会话 TTL/清理/登出与失败路径失效、账户存储信封完整性（损坏/MAC 不符/符号链接一律 fail closed，文件原样保留）。
+会话 TTL/清理/登出与失败路径失效、账户存储信封完整性（损坏/MAC 不符/符号链接一律 fail closed，文件原样保留）、
+自资料页（未登录/伪造会话拒绝、错误 Host 拒绝、白名单值仅限内存、非白名单字段只留名称/类型、
+恶意值 HTML 转义、过期会话拒绝、登出即丢弃、store 与日志零残留、成功页指引）。
 
 ## 安全与数据规则（本演示已内置）
 
@@ -140,6 +153,7 @@ X-Forwarded-Host 伪造拒绝、精确回调路径（未注册路径 404）、co
 - 会话 8 小时过期（`USTC_DEMO_SESSION_TTL_MS` 可调，仅允许正数，过期防禁用），访问与新建时清理；登出、回调失败与回调异常一律销毁会话并清空会话 cookie（`Max-Age=0`）。
 - 账户存储 `accounts.json` 是信封 `{v, mac, data}`：JSON 损坏、信封结构不符、HMAC 不符或路径被替换成符号链接，一律拒绝登录并保留文件原样（人工核查），绝不静默覆盖。
 - 令牌/授权码/profile 值永不记录、永不写入 Git；页面只展示字段名/类型/格式分类/算法；错误日志只用常量原因串（如 `token_exchange:timeout`），不带任何值。
+- `/profile` 自资料页只在注册 host + 有效会话下可访问；值仅按白名单保留在内存会话，其余字段只留名称/类型；响应 no-store + 严格 CSP + no-referrer + nosniff，所有输出经 HTML 转义。
 - 不接管已存在的无关本地账号（不同 provider 或不同 subject 绝不合并）；同一 subject 若以不同学工号重现，拒绝合并并保留现场。
 
 ## 成功判定（脱敏收条）

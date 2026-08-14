@@ -50,7 +50,7 @@ function rawGet(port, pathAndQuery, headers = {}) {
   });
 }
 
-async function startApp(env, { preSeed, rawPreSeed, symlinkStore } = {}) {
+async function startApp(env, { preSeed, rawPreSeed, symlinkStore, now } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ustc-demo-'));
   const dataDir = join(dir, 'data');
   if (symlinkStore) {
@@ -68,7 +68,7 @@ async function startApp(env, { preSeed, rawPreSeed, symlinkStore } = {}) {
     const envl = { v: 1, mac: hmacHex(secret, 'store', JSON.stringify(preSeed)), data: preSeed };
     writeFileSync(join(dataDir, 'accounts.json'), JSON.stringify(envl, null, 1), { mode: 0o600 });
   }
-  const cfg = loadConfig({ env: { ...env, USTC_DEMO_DATA_DIR: dataDir } });
+  const cfg = loadConfig({ env: { ...env, USTC_DEMO_DATA_DIR: dataDir }, now });
   const logs = [];
   const app = createApp(cfg, { log: { log: (s) => logs.push(s) } });
   const server = app.listen(0, '127.0.0.1');
@@ -782,6 +782,167 @@ describe('full login', () => {
       const { cb } = await fullLogin(app);
       assert.equal(cb.status, 400);
       assert.ok(app.logs.some((l) => l.includes('profile:response_too_large')), 'stream cap rejection logged');
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+});
+
+describe('self profile page', () => {
+  function sidOf(res) {
+    return String(res.headers['set-cookie'] || '').split(';')[0];
+  }
+
+  test('unauthenticated and forged-session requests are denied without data', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock));
+    try {
+      const anon = await rawGet(app.port, '/profile', { host: HOST });
+      assert.equal(anon.status, 200);
+      assert.ok(anon.body.includes('未登录'));
+      assert.ok(!anon.body.includes(FIXTURE.attributes.name), 'no profile data for anonymous');
+      // Forged/tampered session id resolves to no session.
+      const forged = await rawGet(app.port, '/profile', { host: HOST, cookie: 'ustc_demo_sid=forged' });
+      assert.equal(forged.status, 200);
+      assert.ok(forged.body.includes('未登录'));
+      assert.ok(!forged.body.includes(FIXTURE.attributes.name));
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('wrong host is rejected even with a valid session', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock));
+    try {
+      const { cb } = await fullLogin(app);
+      const res = await rawGet(app.port, '/profile', { host: 'evil.example.com', cookie: sidOf(cb) });
+      assert.equal(res.status, 403);
+      assert.ok(!res.body.includes(FIXTURE.attributes.name), 'no data on wrong host');
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('allowlisted values shown to the owner, non-allowlisted fields name/type only', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock));
+    try {
+      const { cb } = await fullLogin(app);
+      const res = await rawGet(app.port, '/profile', { host: HOST, cookie: sidOf(cb) });
+      assert.equal(res.status, 200);
+      const html = res.body;
+      for (const v of [FIXTURE.attributes.name, FIXTURE.attributes.zjhm, FIXTURE.attributes.gid, FIXTURE.attributes.email]) {
+        assert.ok(html.includes(v), `allowlisted value visible to owner: ${v}`);
+      }
+      // Non-allowlisted fields: name/type present in the summary, value never retained.
+      assert.ok(html.includes('attributes.deptCode'));
+      assert.ok(html.includes('attributes.login'));
+      assert.ok(!html.includes(FIXTURE.attributes.deptCode), 'deptCode value must not be retained');
+      assert.ok(html.includes('值未保留'));
+      assert.ok(html.includes('Demo 专用'));
+      assert.ok(html.includes('仅内存'));
+      // Restrictive headers.
+      assert.match(String(res.headers['content-security-policy'] || ''), /default-src 'none'/);
+      assert.equal(String(res.headers['referrer-policy'] || ''), 'no-referrer');
+      assert.equal(String(res.headers['x-content-type-options'] || ''), 'nosniff');
+      assert.equal(String(res.headers['cache-control'] || ''), 'no-store');
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('unsafe allowlisted value is escaped (no script execution)', async () => {
+    const profileBody = {
+      active: true,
+      id: FIXTURE.id,
+      client_id: 'test',
+      attributes: { ...FIXTURE.attributes, name: "<script>alert('xss')</script>" },
+    };
+    const mock = await startMock({ profileBody });
+    const app = await startApp(buildEnv(mock));
+    try {
+      const { cb } = await fullLogin(app);
+      const res = await rawGet(app.port, '/profile', { host: HOST, cookie: sidOf(cb) });
+      const html = res.body;
+      assert.ok(html.includes('&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;'), 'value must be HTML-escaped');
+      assert.ok(!html.includes('<script>alert'), 'raw script tag must never appear rendered');
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('expired session denies profile access', async () => {
+    const mock = await startMock();
+    const now = { v: Date.now() };
+    const app = await startApp(buildEnv(mock, { USTC_DEMO_SESSION_TTL_MS: '60000' }), { now: () => now.v });
+    try {
+      const { cb } = await fullLogin(app);
+      const sid = sidOf(cb);
+      const before = await rawGet(app.port, '/profile', { host: HOST, cookie: sid });
+      assert.ok(before.body.includes(FIXTURE.attributes.name), 'live session sees profile');
+      now.v += 61 * 1000;
+      const after = await rawGet(app.port, '/profile', { host: HOST, cookie: sid });
+      assert.ok(after.body.includes('未登录'));
+      assert.ok(!after.body.includes(FIXTURE.attributes.name), 'expired session shows nothing');
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('logout discards the retained profile', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock));
+    try {
+      const { cb } = await fullLogin(app);
+      const sid = sidOf(cb);
+      const before = await rawGet(app.port, '/profile', { host: HOST, cookie: sid });
+      assert.ok(before.body.includes(FIXTURE.attributes.name));
+      await rawGet(app.port, '/logout', { host: HOST, cookie: sid });
+      const after = await rawGet(app.port, '/profile', { host: HOST, cookie: sid });
+      assert.ok(after.body.includes('未登录'));
+      assert.ok(!after.body.includes(FIXTURE.attributes.name));
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('profile retention never persists to the account store or logs', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock));
+    try {
+      const { cb } = await fullLogin(app);
+      await rawGet(app.port, '/profile', { host: HOST, cookie: sidOf(cb) });
+      const raw = JSON.stringify(accounts(app));
+      for (const v of [FIXTURE.attributes.name, FIXTURE.attributes.zjhm, FIXTURE.attributes.email, FIXTURE.attributes.gid]) {
+        assert.ok(!raw.includes(v), `store must not contain ${v}`);
+      }
+      const logText = app.logs.join('\n');
+      for (const v of [FIXTURE.attributes.name, FIXTURE.attributes.zjhm, FIXTURE.attributes.email, FIXTURE.attributes.gid]) {
+        assert.ok(!logText.includes(v), `logs must not contain ${v}`);
+      }
+    } finally {
+      await app.close();
+      await mock.close();
+    }
+  });
+
+  test('success page advertises the self-profile route and its in-memory semantics', async () => {
+    const mock = await startMock();
+    const app = await startApp(buildEnv(mock));
+    try {
+      const { cb } = await fullLogin(app);
+      assert.equal(cb.status, 200);
+      assert.ok(cb.body.includes('/profile'));
+      assert.ok(cb.body.includes('服务器内存'));
+      assert.ok(cb.body.includes('不写入文件'));
     } finally {
       await app.close();
       await mock.close();

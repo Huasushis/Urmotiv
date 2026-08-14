@@ -1,6 +1,55 @@
 // Token classification and claim redaction: names, types, semantics — never values.
 // JWT/JWS payloads are decoded locally for structure only; signatures are never verified offline.
 
+// Vetted self-profile allowlist. Only these USTC profile paths may keep their values,
+// and only inside the server-side in-memory session (never on disk, never in logs).
+// Any other returned field is retained as field name/type only — its value is discarded.
+export const PROFILE_ALLOWLIST = Object.freeze([
+  { path: 'active', label: '账户有效（active）' },
+  { path: 'id', label: 'ID（id）' },
+  { path: 'attributes.gid', label: '群组 ID（gid）' },
+  { path: 'attributes.name', label: '姓名（name）' },
+  { path: 'attributes.deptname', label: '单位/院系（deptname）' },
+  { path: 'attributes.zjhm', label: '学号/工号（zjhm）' },
+  { path: 'attributes.jrzjhm', label: '教工号（jrzjhm）' },
+  { path: 'attributes.kind', label: '人员类别（kind）' },
+  { path: 'attributes.email', label: '邮箱（email）' },
+]);
+
+function pathValue(obj, path) {
+  let cur = obj;
+  for (const part of path.split('.')) {
+    if (cur == null || typeof cur !== 'object') return undefined;
+    cur = cur[part];
+  }
+  return cur;
+}
+
+// Split the provider profile into (a) allowlisted fields present, with values kept
+// for the in-memory session only, and (b) every other present field as name/type only.
+export function retainProfile(profile) {
+  const retained = [];
+  if (profile && typeof profile === 'object') {
+    for (const { path, label } of PROFILE_ALLOWLIST) {
+      const v = pathValue(profile, path);
+      if (v !== undefined && v !== null) {
+        retained.push({ path, label, type: typeof v, value: String(v) });
+      }
+    }
+  }
+  const allow = new Set(PROFILE_ALLOWLIST.map((x) => x.path));
+  const others = [];
+  const visit = (obj, prefix) => {
+    for (const [k, v] of Object.entries(obj)) {
+      const p = prefix ? `${prefix}.${k}` : k;
+      if (v !== null && typeof v === 'object') visit(v, p);
+      else if (!allow.has(p)) others.push({ name: p, type: typeof v });
+    }
+  };
+  if (profile && typeof profile === 'object') visit(profile, '');
+  return { retained, others };
+}
+
 const KNOWN_SEMANTIC = new Set([
   'iss', 'aud', 'sub', 'exp', 'iat', 'nbf', 'jti', 'amr', 'nonce',
   'at_hash', 'auth_time', 'client_id', 'preferred_username',

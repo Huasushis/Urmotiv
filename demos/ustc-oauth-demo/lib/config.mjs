@@ -81,7 +81,7 @@ function endpointOr(envKey, v, official, testSeam) {
   return override;
 }
 
-export function loadConfig({ env = process.env } = {}) {
+export function loadConfig({ env = process.env, now = Date.now } = {}) {
   const fileVars = env.USTC_DEMO_ENV_FILE ? parseEnvFile(env.USTC_DEMO_ENV_FILE) : {};
   const v = { ...fileVars, ...env };
 
@@ -110,6 +110,7 @@ export function loadConfig({ env = process.env } = {}) {
     timeoutMs: durationMs('USTC_DEMO_HTTP_TIMEOUT_MS', v.USTC_DEMO_HTTP_TIMEOUT_MS, 10000),
     stateTtlMs: durationMs('USTC_DEMO_STATE_TTL_MS', v.USTC_DEMO_STATE_TTL_MS, 600000),
     sessionTtlMs: durationMs('USTC_DEMO_SESSION_TTL_MS', v.USTC_DEMO_SESSION_TTL_MS, 28800000),
+    now,
   };
 
   cfg.callbackPath = v.USTC_DEMO_CALLBACK_PATH || '/api/v1/auth/ustc/callback';
