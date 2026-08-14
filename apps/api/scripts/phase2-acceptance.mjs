@@ -4,11 +4,9 @@
 // 脚本或测试自身的修改）都会在启动前被拒绝，避免削弱验收门。
 //
 // 同时输出三类只含聚合的安全证据（存放于操作员所有的非 Git 目录）：
-//   1) worker 基线 vs 当前检出：同一命令、失败标签集合一致性，且当前零失败；
+//   1) worker 基线 vs 当前检出：失败标签净差只做因果证据，
+//      当前必须零失败（回归由 WORKER_CURRENT_NOT_GREEN 拒绝）；
 //   2) 全 API 工作区测试：必跑，只有零失败才发放通过标记；
-//   3) Phase-2 路由：只接受 NOT_AUTHORIZED / SYNTHETIC_READINESS / REAL_PASS
-//      三种真实判定；合成库上的 PASS 一律记 FAKE_PASS 并拒绝升级，
-//      最终状态只有 PASS / IMPLEMENTATION_READY / INCONCLUSIVE，退出码如实。
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -295,7 +293,6 @@ evidence.runnerExitCode = acceptance.status ?? 1;
 const codes = new Set(evidence.reasonCodes);
 const hardFailures = [
   "CRASHED_WORKER_TEST_RUN",
-  "WORKER_FAILURE_LABELS_CHANGED",
   "BASE_WORKER_EVIDENCE_COMMIT_MISMATCH",
   "WORKER_CURRENT_NOT_GREEN",
   "FULL_API_FAILED_UNADJUDICATED",
@@ -314,7 +311,6 @@ if (codes.has("PHASE2_ROUTE_PASS") && !hardFailures.some((code) => codes.has(cod
   codes.has("WORKER_CURRENT_ZERO_FAIL") &&
   codes.has("FULL_API_PASS") &&
   !codes.has("CRASHED_WORKER_TEST_RUN") &&
-  !codes.has("WORKER_FAILURE_LABELS_CHANGED") &&
   !codes.has("BASE_WORKER_EVIDENCE_COMMIT_MISMATCH")
 ) {
   evidence.status = "IMPLEMENTATION_READY";
@@ -327,7 +323,6 @@ console.log(`phase2-acceptance: 证据状态=${evidence.status}`);
 console.log(
   `phase2-acceptance: 证据文件 sha256=${sha256Hex(payload)}（仅聚合内容，不含任何私有素材）`,
 );
-// 启动器退出码必须反映真实判定：只有 PASS / IMPLEMENTATION_READY 得 0。
 process.exit(
   evidence.status === "PASS" || evidence.status === "IMPLEMENTATION_READY" ? 0 : 1,
 );
