@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
-  BINDING_KEYS,
   assessFormalShard,
   assessFormalShardBindings,
+  expectedBindingKind,
 } from "../scripts/phase2-acceptance-verdict.mjs";
 
-const strictBindings = Object.fromEntries(
-  BINDING_KEYS.map((key, index) => [key, `value-${index}`.padStart(64, "a")]),
-);
+const strictBindings = {
+  batchSha256: "a".repeat(64),
+  manifestIdentitySha256: "b".repeat(64),
+  manifestContentBindingsSha256: "c".repeat(64),
+  codeInventorySha256: "d".repeat(64),
+  codeInventoryEntryCount: 375,
+};
 
 const environment = { headCommit: "f".repeat(40), runnerExitCode: 0 };
 
@@ -25,8 +29,25 @@ function shardFixture(overrides) {
 }
 
 describe("assessFormalShardBindings", () => {
-  it("严格绑定全部为字符串时通过", () => {
+  it("严格绑定全部符合类型时通过", () => {
     expect(assessFormalShardBindings(strictBindings).strictOk).toBe(true);
+  });
+  it("条目计数必须是数字，摘要必须是字符串", () => {
+    expect(expectedBindingKind("codeInventoryEntryCount")).toBe("number");
+    expect(expectedBindingKind("batchSha256")).toBe("string");
+    expect(expectedBindingKind("unknown-key")).toBeNull();
+    const withStringCount = assessFormalShardBindings({
+      ...strictBindings,
+      codeInventoryEntryCount: "375",
+    });
+    expect(withStringCount.strictOk).toBe(false);
+    expect(withStringCount.wrongKind).toEqual(["codeInventoryEntryCount"]);
+    const withNumericHash = assessFormalShardBindings({
+      ...strictBindings,
+      batchSha256: 42,
+    });
+    expect(withNumericHash.wrongKind).toEqual(["batchSha256"]);
+    expect(withNumericHash.strictOk).toBe(false);
   });
   it("非对象结构直接拒绝", () => {
     const assessment = assessFormalShardBindings("not-an-object");

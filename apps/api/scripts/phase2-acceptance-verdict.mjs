@@ -16,11 +16,27 @@ export const BINDING_KEYS = [
   "codeInventoryEntryCount",
 ];
 
+/** 各绑定键的合法运行时类型：摘要必须是字符串，条目计数必须是数字。 */
+const BINDING_KINDS = new Map([
+  ["codeInventoryEntryCount", "number"],
+  ["batchSha256", "string"],
+  ["manifestIdentitySha256", "string"],
+  ["manifestContentBindingsSha256", "string"],
+  ["codeInventorySha256", "string"],
+]);
+
 /**
- * 绑定字段严格盘点：缺失、null/undefined、非字符串分别记录。
+ * @returns {"string"|"number"|null} 键的期望类型；未知键返回 null。
+ */
+export function expectedBindingKind(key) {
+  return BINDING_KINDS.get(key) ?? null;
+}
+
+/**
+ * 绑定字段严格盘点：缺失、null/undefined、类型不符分别记录。
  * 五项任一不满足即严格不通过（strictOk=false）。
  * @returns {{structureBroken: boolean, missing: string[], nulled: string[],
- *            nonString: string[], strictOk: boolean}}
+ *            nonString: string[], wrongKind: string[], strictOk: boolean}}
  */
 export function assessFormalShardBindings(bindings) {
   const assessment = {
@@ -28,6 +44,7 @@ export function assessFormalShardBindings(bindings) {
     missing: [],
     nulled: [],
     nonString: [],
+    wrongKind: [],
     strictOk: false,
   };
   if (typeof bindings !== "object" || bindings === null || Array.isArray(bindings)) {
@@ -44,14 +61,14 @@ export function assessFormalShardBindings(bindings) {
       assessment.nulled.push(key);
       continue;
     }
-    if (typeof value !== "string") {
-      assessment.nonString.push(key);
+    if (typeof value !== expectedBindingKind(key)) {
+      assessment.wrongKind.push(key);
     }
   }
   assessment.strictOk =
     assessment.missing.length === 0 &&
     assessment.nulled.length === 0 &&
-    assessment.nonString.length === 0;
+    assessment.wrongKind.length === 0;
   return assessment;
 }
 
