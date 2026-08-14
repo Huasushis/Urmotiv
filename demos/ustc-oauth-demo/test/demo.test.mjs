@@ -790,6 +790,9 @@ describe('full login', () => {
 });
 
 describe('self profile page', () => {
+  const FULL_CSP =
+    "default-src 'none'; script-src 'none'; img-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
   function sidOf(res) {
     return String(res.headers['set-cookie'] || '').split(';')[0];
   }
@@ -822,7 +825,7 @@ describe('self profile page', () => {
       assert.equal(res.status, 403);
       assert.ok(!res.body.includes(FIXTURE.attributes.name), 'no data on wrong host');
       // Denials carry the same immutable security headers as the success page.
-      assert.match(String(res.headers['content-security-policy'] || ''), /default-src 'none'/);
+      assert.equal(String(res.headers['content-security-policy'] || ''), FULL_CSP, 'exact full CSP, no dropped directive');
       assert.equal(String(res.headers['referrer-policy'] || ''), 'no-referrer');
       assert.equal(String(res.headers['x-content-type-options'] || ''), 'nosniff');
     } finally {
@@ -850,7 +853,7 @@ describe('self profile page', () => {
       assert.ok(html.includes('Demo 专用'));
       assert.ok(html.includes('仅内存'));
       // Restrictive headers.
-      assert.match(String(res.headers['content-security-policy'] || ''), /default-src 'none'/);
+      assert.equal(String(res.headers['content-security-policy'] || ''), FULL_CSP, 'exact full CSP, no dropped directive');
       assert.equal(String(res.headers['referrer-policy'] || ''), 'no-referrer');
       assert.equal(String(res.headers['x-content-type-options'] || ''), 'nosniff');
       assert.equal(String(res.headers['cache-control'] || ''), 'no-store');
@@ -996,7 +999,7 @@ describe('self profile page', () => {
 });
 
 describe('session store sweep', () => {
-  test('accessing a live session discards stale unrelated retained profiles', () => {
+  test('any session access discards stale unrelated retained profiles', () => {
     const now = { v: 1000 };
     const st = new SessionStore({ ttlMs: 100, now: () => now.v });
     const a = st.create('h1', { retained: [{ path: 'attributes.name', label: '姓名', type: 'string', value: 'secret-value' }] });
