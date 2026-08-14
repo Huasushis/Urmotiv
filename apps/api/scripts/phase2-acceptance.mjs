@@ -11,7 +11,7 @@
 // 真实题面、路径、数据库身份或任何私有素材。
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, tmpdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, tmpdir, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
@@ -133,7 +133,7 @@ if (evidence.codeInventory.sameInventory) {
 
 function runVitestReport(vitestArgs, cwd) {
   const reportFile = join(
-    tmpdirSync(),
+    tmpdir(),
     `urmotiv-vitest-${process.pid}-${Math.random().toString(16).slice(2)}.json`,
   );
   const result = spawnSync(
