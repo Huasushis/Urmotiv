@@ -50,30 +50,8 @@ function readBaseWorkerCommit() {
   return parsed.commit;
 }
 
-const sharedExcludePath = join(repositoryRoot, ".git", "info", "exclude");
-const gate9ExcludeLines = [
-  "/node_modules",
-  "/apps/api/node_modules",
-  "/apps/worker/node_modules",
-];
-let sharedExcludeOriginal = "";
-
-function enableSharedExcludes() {
-  sharedExcludeOriginal = readFileSync(sharedExcludePath, "utf8");
-  const existing = new Set(sharedExcludeOriginal.split("\n"));
-  const additions = gate9ExcludeLines.filter((line) => !existing.has(line));
-  if (additions.length !== 0) {
-    writeFileSync(sharedExcludePath, `${sharedExcludeOriginal}${additions.join("\n")}\n`);
-  }
-}
-
-function restoreSharedExcludes() {
-  if (sharedExcludeOriginal !== "") {
-    writeFileSync(sharedExcludePath, sharedExcludeOriginal);
-    sharedExcludeOriginal = "";
-  }
-}
-
+const worktrees = [];
+const evidenceDirectories = [];
 function makeWorktree() {
   const directory = mkdtempSync(join(tmpdir(), "urmotiv-gate9-worktree-"));
   git(repositoryRoot, "worktree", "add", "--detach", directory, "HEAD");
@@ -98,6 +76,7 @@ function runAcceptanceLauncher(worktreeDirectory, { verdict, hookMode }) {
     throw new Error("Gate 9 集成测试要求 URMOTIV_TEST_POSTGRES_ADMIN_URL。");
   }
   const evidenceDirectory = mkdtempSync(join(tmpdir(), "urmotiv-gate9-evidence-"));
+  evidenceDirectories.push(evidenceDirectory);
   const env = {
     ...process.env,
     URMOTIV_TEST_POSTGRES_ADMIN_URL: adminUrl,
@@ -152,17 +131,47 @@ function readEvidence(evidenceDirectory, result) {
   expect(existsSync(path)).toBe(true);
   return JSON.parse(readFileSync(path, "utf8"));
 }
-
-const worktrees = [];
-
-function assertMainRepositoryClean() {
-  for (const worktreeDirectory of worktrees) {
+function removeGate9Resources() {
+  // 只动测试自己申请的一次性资源；任何一步失败都抛错，绝不让残留静默存活。
+  for (const worktreeDirectory of worktrees.splice(0)) {
     git(repositoryRoot, "worktree", "remove", "--force", worktreeDirectory);
-    rmSync(worktreeDirectory, { recursive: true, force: true });
+    if (existsSync(worktreeDirectory)) {
+      rmSync(worktreeDirectory, { recursive: true, force: true });
+      throw new Error(`worktree 目录移除后仍有残留：${worktreeDirectory}`);
+    }
   }
-  worktrees.length = 0;
-  const status = git(repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all");
-  expect(status.trim()).toBe("");
+  for (const evidenceDirectory of evidenceDirectories.splice(0)) {
+    rmSync(evidenceDirectory, { recursive: true, force: true });
+    if (existsSync(evidenceDirectory)) {
+      throw new Error(`证据目录移除后仍有残留：${evidenceDirectory}`);
+    }
+  }
+}
+
+// 链接型 worktree 对根 .gitignore 的锚定模式实测不生效（git 只对目录套用），
+// 唯一验证过的归宿是共享 .git/info/exclude 的锚定条目。条目不覆盖任何
+// 证据路径（证据只落在 /tmp 证据目录与 .acceptance-evidence），并在硬门前
+// 按字节还原，杜绝借排除项掩盖验收突变。
+const sharedExcludePath = join(repositoryRoot, ".git", "info", "exclude");
+const gate9ExcludeLines = [
+  "/node_modules",
+  "/apps/api/node_modules",
+  "/apps/worker/node_modules",
+];
+let sharedExcludeOriginal = "";
+
+function enableSharedExcludes() {
+  sharedExcludeOriginal = readFileSync(sharedExcludePath, "utf8");
+  const existing = new Set(sharedExcludeOriginal.split("\n"));
+  const additions = gate9ExcludeLines.filter((line) => !existing.has(line));
+  if (additions.length !== 0) {
+    writeFileSync(sharedExcludePath, `${sharedExcludeOriginal}${additions.join("\n")}\n`);
+  }
+}
+
+function restoreSharedExcludes() {
+  writeFileSync(sharedExcludePath, sharedExcludeOriginal);
+  sharedExcludeOriginal = "";
 }
 
 describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () => {
@@ -171,26 +180,27 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
   });
 
   afterAll(() => {
+    let failure = null;
     try {
       restoreSharedExcludes();
-    } finally {
-      try {
-        assertMainRepositoryClean();
-      } catch (error) {
-        // 无论如何都先尝试清场，避免残留 worktree 影响后续会话。
-        for (const worktreeDirectory of worktrees.splice(0)) {
-          try {
-            git(repositoryRoot, "worktree", "remove", "--force", worktreeDirectory);
-          } catch {
-            // 忽略：结算在主硬门断言。
-          }
-          rmSync(worktreeDirectory, { recursive: true, force: true });
-        }
-        throw error;
-      }
+    } catch (error) {
+      failure = error;
+    }
+    try {
+      removeGate9Resources();
+    } catch (error) {
+      failure ??= error;
+    }
+    try {
+      const status = git(repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all");
+      expect(status.trim()).toBe("");
+    } catch (error) {
+      failure ??= error;
+    }
+    if (failure !== null) {
+      throw failure;
     }
   });
-
   it(
     "脏树突变把本可成功的 IMPLEMENTATION_READY 压为 INCONCLUSIVE",
     { timeout: 1_800_000 },
