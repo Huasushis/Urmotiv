@@ -56,6 +56,7 @@ import {
   type HistoryNormalizer,
 } from "../src/history-migration/core";
 import { sha256Hex } from "../src/history-migration/digests";
+import { captureLiveMaintenanceIdentity } from "../src/history-migration/live-maintenance-identity";
 import {
   dropHistoryImportDatabase,
   historyImportDatabaseConnectionString,
@@ -1680,6 +1681,97 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
             })
           ).phase,
         ).toBe("scratch_finalized");
+      } finally {
+        await proxy.stop();
+        secondCluster.stop();
+      }
+    },
+  );
+  it(
+    "Gate 5 复核边界：活身份冻结后被改指，建库/绑定两条路径都零破坏性失败关闭",
+    { timeout: 600_000 },
+    async () => {
+      assertNode24();
+      if (adminUrl === undefined) throw new Error("缺少 PostgreSQL 管理连接配置。");
+      const clusterPort = await freePort();
+      const containerName = `urmotiv-livebound-${process.pid}`;
+      const secondCluster = startSecondCluster(containerName, clusterPort);
+      const proxy = await startTcpProxy(5434);
+      try {
+        expect(await postgresReady(secondCluster.url, 60)).toBe(true);
+        const liveSourceName = scratchName("lbsrc");
+        trackDatabaseFamily(liveSourceName);
+        // B 上预先建好同名库：复核连接能在 B 成功打开，身份复核本身
+        // （集群指纹不一致）才是拒绝原因，而不是连带连接失败顺带关门。
+        await prepareHistoryImportDatabase(secondCluster.url, liveSourceName);
+        await prepareHistoryImportDatabase(proxy.url, liveSourceName);
+        const liveSourceConnection = historyImportDatabaseConnectionString(
+          proxy.url,
+          liveSourceName,
+        );
+        // 冻结维护活身份（指向 A 集群）。
+        const frozen = await captureLiveMaintenanceIdentity(liveSourceConnection);
+        // (a) 管理连接复核：冻结之后、第一条 DDL（建库）之前改指到 B。
+        // 建库函数自身要先用同一条新连接复核身份 —— 复核失败，任何集群都不落库。
+        const repointedTarget = scratchName("lbddl");
+        trackDatabaseFamily(repointedTarget);
+        proxy.setTarget(clusterPort);
+        await expect(
+          prepareHistoryImportDatabase(liveSourceConnection, repointedTarget, frozen),
+        ).rejects.toThrow("维护活身份");
+        proxy.setTarget(5434);
+        const adminA = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
+        const adminB = createPostgresDatabase({
+          connectionString: secondCluster.url,
+          maxConnections: 1,
+        });
+        try {
+          expect(await databaseExists(adminA, repointedTarget)).toBe(false);
+          expect(await databaseExists(adminB, repointedTarget)).toBe(false);
+        } finally {
+          await adminA.close();
+          await adminB.close();
+        }
+        // (b) 绑定运行边界：afterLiveIdentityVerified 注入缝把端点改指到 B，
+        // 运行必须失败关闭（exits 1），A/B 都不出现目标库或任何快照工件。
+        const boundTarget = scratchName("lbbind");
+        trackDatabaseFamily(boundTarget);
+        const boundBatch = await createSyntheticBatch(1);
+        const boundEnv = await runApprovedPreflight(
+          boundBatch,
+          liveSourceConnection,
+          "synthetic-live-boundary",
+        );
+        boundEnv.ADMIN_URL = liveSourceConnection;
+        boundEnv.DATABASE_NAME = boundTarget;
+        let hookFired = false;
+        const exitCode = await runPhase2Bound(runnerArguments(), boundEnv, {
+          ...provenanceHooks(),
+          afterLiveIdentityVerified: async () => {
+            hookFired = true;
+            proxy.setTarget(clusterPort);
+          },
+        });
+        expect(hookFired).toBe(true);
+        expect(exitCode).toBe(1);
+        proxy.setTarget(5434);
+        const probeA = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
+        const probeB = createPostgresDatabase({
+          connectionString: secondCluster.url,
+          maxConnections: 1,
+        });
+        try {
+          for (const suffix of ["", "__snapshot", "__snapshot_g1", "__snapshot_g2", "__restore", "__failed"]) {
+            const name = `${boundTarget}${suffix}`;
+            expect(await databaseExists(probeA, name)).toBe(false);
+            expect(await databaseExists(probeB, name)).toBe(false);
+          }
+        } finally {
+          await probeA.close();
+          await probeB.close();
+        }
+        expect(await readFormalRecoveryState(boundBatch.runnerReceiptDirectory)).toBeUndefined();
+        expect(await readdir(boundBatch.runnerReceiptDirectory)).toEqual([]);
       } finally {
         await proxy.stop();
         secondCluster.stop();

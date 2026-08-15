@@ -280,4 +280,55 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
       expect(result.status).not.toBe(0);
     },
   );
+  it(
+    "元数据掩盖缝（skip-worktree）：已跟踪文件改动被 Git 元数据隐形，porcelain 仍显干净但仍被识破",
+    { timeout: 1_800_000 },
+    () => {
+      const worktreeDirectory = makeWorktree();
+      worktrees.push(worktreeDirectory);
+      const { result, evidenceDirectory } = runAcceptanceLauncher(worktreeDirectory, {
+        verdict: "SYNTHETIC_READINESS",
+        hookMode: "skip-worktree",
+      });
+      const evidence = readEvidence(evidenceDirectory, result);
+      expect(evidence.status).toBe("INCONCLUSIVE");
+      expect(evidence.reasonCodes).toContain("POST_RUN_GIT_METADATA_HIDING");
+      expect(evidence.reasonCodes).toContain("GIT_LS_FILES_ASSUMUNCHANGED_OR_SKIPWORKTREE");
+      expect(result.status).not.toBe(0);
+    },
+  );
+  it(
+    "元数据掩盖缝（assume-unchanged）：已跟踪文件改动被隐形，porcelain 仍显干净但仍被识破",
+    { timeout: 1_800_000 },
+    () => {
+      const worktreeDirectory = makeWorktree();
+      worktrees.push(worktreeDirectory);
+      const { result, evidenceDirectory } = runAcceptanceLauncher(worktreeDirectory, {
+        verdict: "REAL_PASS",
+        hookMode: "assume-unchanged",
+      });
+      const evidence = readEvidence(evidenceDirectory, result);
+      expect(evidence.status).toBe("INCONCLUSIVE");
+      expect(evidence.reasonCodes).toContain("POST_RUN_GIT_METADATA_HIDING");
+      expect(evidence.reasonCodes).toContain("GIT_LS_FILES_ASSUMUNCHANGED_OR_SKIPWORKTREE");
+      expect(result.status).not.toBe(0);
+    },
+  );
+  it(
+    "元数据掩盖缝（info-exclude）：未跟踪文件被排除规则隐藏，porcelain 仍显干净但仍被识破",
+    { timeout: 1_800_000 },
+    () => {
+      const worktreeDirectory = makeWorktree();
+      worktrees.push(worktreeDirectory);
+      const { result, evidenceDirectory } = runAcceptanceLauncher(worktreeDirectory, {
+        verdict: "SYNTHETIC_READINESS",
+        hookMode: "info-exclude",
+      });
+      const evidence = readEvidence(evidenceDirectory, result);
+      expect(evidence.status).toBe("INCONCLUSIVE");
+      expect(evidence.reasonCodes).toContain("POST_RUN_GIT_METADATA_HIDING");
+      expect(evidence.reasonCodes).toContain("GIT_INFO_EXCLUDE_NON_EMPTY");
+      expect(result.status).not.toBe(0);
+    },
+  );
 });

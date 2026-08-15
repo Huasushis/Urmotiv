@@ -57,6 +57,10 @@ import { ProblemFileStore } from "../problem-file-store";
 import { sha256Hex } from "./digests";
 import { HistoryMigrationError } from "./errors";
 import {
+  verifyLiveMaintenanceIdentityOnConnection,
+  type Phase2LiveMaintenanceIdentity,
+} from "./live-maintenance-identity";
+import {
   assertPathsInsidePrivateRoot,
   createNewPrivateDirectory,
   privateRegularFileExists,
@@ -1786,6 +1790,7 @@ export interface PreparedHistoryImportDatabase {
 export async function prepareHistoryImportDatabase(
   adminConnectionString: string,
   databaseName: string,
+  maintenanceLiveIdentity?: Phase2LiveMaintenanceIdentity | undefined,
 ): Promise<PreparedHistoryImportDatabase> {
   if (!/^urmotiv_history_import_[a-z0-9_]{1,50}$/u.test(databaseName)) {
     throw new HistoryMigrationError(
@@ -1799,6 +1804,10 @@ export async function prepareHistoryImportDatabase(
     applicationName: "urmotiv-history-import-admin",
   });
   try {
+    // Gate 5：建库这条连接上先复核维护活身份，再执行 DDL。
+    if (maintenanceLiveIdentity !== undefined) {
+      await verifyLiveMaintenanceIdentityOnConnection(admin, maintenanceLiveIdentity);
+    }
     await admin.execute(sql`CREATE DATABASE ${sql.identifier(databaseName)}`);
   } finally {
     await admin.close();
@@ -1818,7 +1827,7 @@ export async function prepareHistoryImportDatabase(
       await database.close();
     }
   } catch (error) {
-    await dropHistoryImportDatabase(adminConnectionString, databaseName);
+    await dropHistoryImportDatabase(adminConnectionString, databaseName, maintenanceLiveIdentity);
     throw error;
   }
   return { databaseName, connectionString };
@@ -1828,6 +1837,7 @@ export async function prepareHistoryImportDatabase(
 export async function dropHistoryImportDatabase(
   adminConnectionString: string,
   databaseName: string,
+  maintenanceLiveIdentity?: Phase2LiveMaintenanceIdentity | undefined,
 ): Promise<void> {
   if (!/^urmotiv_history_import_[a-z0-9_]{1,50}$/u.test(databaseName)) {
     throw new HistoryMigrationError(
@@ -1841,6 +1851,10 @@ export async function dropHistoryImportDatabase(
     applicationName: "urmotiv-history-import-cleanup",
   });
   try {
+    // Gate 5：删除这条连接上先复核维护活身份，再执行 DDL。
+    if (maintenanceLiveIdentity !== undefined) {
+      await verifyLiveMaintenanceIdentityOnConnection(admin, maintenanceLiveIdentity);
+    }
     await admin.execute(sql`DROP DATABASE IF EXISTS ${sql.identifier(databaseName)}`);
   } finally {
     await admin.close();

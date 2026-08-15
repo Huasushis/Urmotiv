@@ -4,6 +4,7 @@ import {
   assessFormalShardBindings,
   expectedBindingKind,
   finalizeStatus,
+  gitMetadataHidingReasons,
   postRunDirtyReasons,
 } from "../scripts/phase2-acceptance-verdict.mjs";
 
@@ -233,5 +234,91 @@ describe("postRunDirtyReasons（Gate 9 运行时卫生）", () => {
     const result = postRunDirtyReasons({ headBefore: 42, headAfter: null, statusOutput: {} });
     expect(result.reasons).toEqual([]);
     expect(result.dirtyCount).toBe(0);
+  });
+});
+
+describe("gitMetadataHidingReasons（Gate 9 元数据掩盖探测）", () => {
+  it("全空/干净时无原因", () => {
+    expect(gitMetadataHidingReasons({})).toEqual({ reasons: [], hiding: false });
+  });
+  it("ls-files -v 含小写 h（assume-unchanged）即检出", () => {
+    const r = gitMetadataHidingReasons({ lsFilesVerbose: "H file1\nh file2\nS file3\n" });
+    expect(r.hiding).toBe(true);
+    expect(r.reasons).toContain("GIT_LS_FILES_ASSUMUNCHANGED_OR_SKIPWORKTREE");
+    expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");
+  });
+  it("ls-files -v 含小写 s（skip-worktree）即检出", () => {
+    const r = gitMetadataHidingReasons({ lsFilesVerbose: "H file1\ns file2\n" });
+    expect(r.hiding).toBe(true);
+    expect(r.reasons).toContain("GIT_LS_FILES_ASSUMUNCHANGED_OR_SKIPWORKTREE");
+  });
+  it("ls-files -v 全大写标记不算掩盖", () => {
+    const r = gitMetadataHidingReasons({ lsFilesVerbose: "H file1\nS file2\nM file3\n" });
+    expect(r.hiding).toBe(false);
+    expect(r.reasons).toEqual([]);
+  });
+  it("core.excludesFile 被设置即检出", () => {
+    const r = gitMetadataHidingReasons({ excludesFile: "/home/u/.gitignore" });
+    expect(r.hiding).toBe(true);
+    expect(r.reasons).toContain("GIT_CORE_EXCLUDES_FILE_SET");
+    expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");
+  });
+  it("info/exclude 非空即检出", () => {
+    const r = gitMetadataHidingReasons({ infoExcludeNonEmpty: true });
+    expect(r.hiding).toBe(true);
+    expect(r.reasons).toContain("GIT_INFO_EXCLUDE_NON_EMPTY");
+  });
+  it("sparse-checkout 启用即检出", () => {
+    const r = gitMetadataHidingReasons({ sparseCheckout: true });
+    expect(r.hiding).toBe(true);
+    expect(r.reasons).toContain("GIT_SPARSE_CHECKOUT_ENABLED");
+  });
+  it("sparse-checkout 文件存在即检出", () => {
+    const r = gitMetadataHidingReasons({ sparseCheckoutFilePresent: true });
+    expect(r.hiding).toBe(true);
+    expect(r.reasons).toContain("GIT_SPARSE_CHECKOUT_FILE_PRESENT");
+  });
+  it("多种掩盖同时出现，原因全记录", () => {
+    const r = gitMetadataHidingReasons({
+      lsFilesVerbose: "h f1\n",
+      excludesFile: "/tmp/exc",
+      infoExcludeNonEmpty: true,
+      sparseCheckout: true,
+      sparseCheckoutFilePresent: true,
+    });
+    expect(r.hiding).toBe(true);
+    expect(r.reasons).toContain("GIT_LS_FILES_ASSUMUNCHANGED_OR_SKIPWORKTREE");
+    expect(r.reasons).toContain("GIT_CORE_EXCLUDES_FILE_SET");
+    expect(r.reasons).toContain("GIT_INFO_EXCLUDE_NON_EMPTY");
+    expect(r.reasons).toContain("GIT_SPARSE_CHECKOUT_ENABLED");
+    expect(r.reasons).toContain("GIT_SPARSE_CHECKOUT_FILE_PRESENT");
+    expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");
+  });
+  it("非对象输入安全返回无原因", () => {
+    expect(gitMetadataHidingReasons(null)).toEqual({ reasons: [], hiding: false });
+    expect(gitMetadataHidingReasons(42)).toEqual({ reasons: [], hiding: false });
+  });
+  it("postRunDirtyReasons 集成 metadata 字段", () => {
+    const r = postRunDirtyReasons({
+      headBefore: "f".repeat(40),
+      headAfter: "f".repeat(40),
+      statusOutput: "",
+      metadata: { lsFilesVerbose: "h f1\n" },
+    });
+    expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");
+    expect(r.dirtyCount).toBe(0);
+  });
+});
+
+describe("finalizeStatus：元数据掩盖硬失败", () => {
+  it("POST_RUN_GIT_METADATA_HIDING 把 IMPLEMENTATION_READY 压为 INCONCLUSIVE", () => {
+    expect(
+      finalizeStatus({ candidate: "IMPLEMENTATION_READY", reasonCodes: ["POST_RUN_GIT_METADATA_HIDING"] }),
+    ).toBe("INCONCLUSIVE");
+  });
+  it("POST_RUN_GIT_METADATA_HIDING 把 PASS 压为 INCONCLUSIVE", () => {
+    expect(
+      finalizeStatus({ candidate: "PASS", reasonCodes: ["POST_RUN_GIT_METADATA_HIDING"] }),
+    ).toBe("INCONCLUSIVE");
   });
 });

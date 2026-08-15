@@ -9,8 +9,11 @@ import { join } from "node:path";
 
 import { sql } from "drizzle-orm";
 import { createPostgresDatabase, type DatabaseHandle } from "@urmotiv/database";
-
 import { HistoryMigrationError } from "./errors";
+import {
+  verifyLiveMaintenanceIdentityOnConnection,
+  type Phase2LiveMaintenanceIdentity,
+} from "./live-maintenance-identity";
 import { assertScratchDatabaseName } from "./phase2-postcheck";
 
 export interface StorageInventory {
@@ -117,6 +120,7 @@ function restoreBackupNameFor(name: string): string {
 
 async function withAdminConnection<T>(
   adminConnectionString: string,
+  maintenanceLiveIdentity: Phase2LiveMaintenanceIdentity | undefined,
   action: (database: DatabaseHandle) => Promise<T>,
 ): Promise<T> {
   const admin = createPostgresDatabase({
@@ -125,6 +129,12 @@ async function withAdminConnection<T>(
     applicationName: "urmotiv-history-import-snapshot-admin",
   });
   try {
+    // Gate 5：准备执行管理性 DDL 的连接本身上先原子复核维护活身份；
+    // 端点改指、端口改指、账户/库名变更都会在这条连接上核对失败，
+    // 后续 DDL 一律不执行（零破坏性效果）。
+    if (maintenanceLiveIdentity !== undefined) {
+      await verifyLiveMaintenanceIdentityOnConnection(admin, maintenanceLiveIdentity);
+    }
     return await action(admin);
   } finally {
     await admin.close();
@@ -138,18 +148,39 @@ async function databaseExists(admin: DatabaseHandle, name: string): Promise<bool
   return Number(rows[0]?.total ?? 0) === 1;
 }
 
+/**
+ * 先请求终止目标库的全部其它后端，再确认 pg_stat_activity 归零。
+ * 终止是异步生效的：刚发出 pg_terminate_backend 的会话在系统表中
+ * 还会残留片刻。这里按固定小步长轮询归零，消除「按活动连接数立即
+ * 断言」与后端回收之间的竞态（Gate 6），轮询超时才拒绝。
+ */
 async function terminateConnections(admin: DatabaseHandle, name: string): Promise<void> {
   await admin.execute(
     sql`select pg_terminate_backend(pid) from pg_stat_activity
         where datname = ${name} and pid <> pg_backend_pid()`,
   );
-  const remaining = await admin.query<{ total: bigint }>(
+  let remaining = await activeConnectionCount(admin, name);
+  for (let attempt = 0; attempt < 20 && remaining !== 0; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    if (attempt % 2 === 1) {
+      await admin.execute(
+        sql`select pg_terminate_backend(pid) from pg_stat_activity
+            where datname = ${name} and pid <> pg_backend_pid()`,
+      );
+    }
+    remaining = await activeConnectionCount(admin, name);
+  }
+  if (remaining !== 0) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "临时库仍有活动连接，拒绝快照或恢复。");
+  }
+}
+
+async function activeConnectionCount(admin: DatabaseHandle, name: string): Promise<number> {
+  const rows = await admin.query<{ total: bigint }>(
     sql`select count(*)::bigint as total from pg_stat_activity
         where datname = ${name} and pid <> pg_backend_pid()`,
   );
-  if (Number(remaining[0]?.total ?? 0) !== 0) {
-    throw new HistoryMigrationError("INVALID_ARGUMENTS", "临时库仍有活动连接，拒绝快照或恢复。");
-  }
+  return Number(rows[0]?.total ?? 0);
 }
 
 /** 源业务连接必须由调用者先关闭；函数再确认零连接后创建只读模板快照。 */
@@ -158,10 +189,11 @@ export async function snapshotScratchDatabase(
   scratchName: string,
   tableNames: readonly string[],
   expectedInventory: DatabaseContentInventory,
+  maintenanceLiveIdentity?: Phase2LiveMaintenanceIdentity | undefined,
 ): Promise<DatabaseContentInventory> {
   assertScratchDatabaseName(scratchName);
   const snapshotName = snapshotNameFor(scratchName);
-  await withAdminConnection(adminConnectionString, async (admin) => {
+  await withAdminConnection(adminConnectionString, maintenanceLiveIdentity, async (admin) => {
     if (!(await databaseExists(admin, scratchName))) {
       throw new HistoryMigrationError("INVALID_ARGUMENTS", "临时库不存在，无法创建快照。");
     }
@@ -179,7 +211,7 @@ export async function snapshotScratchDatabase(
     tableNames,
   );
   if (!databaseContentInventoriesEqual(snapshotInventory, expectedInventory)) {
-    await dropScratchSnapshot(adminConnectionString, scratchName);
+    await dropScratchSnapshot(adminConnectionString, scratchName, maintenanceLiveIdentity);
     throw new HistoryMigrationError("INVALID_ARGUMENTS", "数据库快照内容摘要与批准基线不一致。");
   }
   return snapshotInventory;
@@ -194,12 +226,13 @@ export async function restoreScratchDatabase(
   scratchName: string,
   tableNames: readonly string[],
   expectedInventory: DatabaseContentInventory,
+  maintenanceLiveIdentity?: Phase2LiveMaintenanceIdentity | undefined,
 ): Promise<DatabaseContentInventory> {
   assertScratchDatabaseName(scratchName);
   const snapshotName = snapshotNameFor(scratchName);
   const stagingName = restoreStagingNameFor(scratchName);
   const backupName = restoreBackupNameFor(scratchName);
-  await withAdminConnection(adminConnectionString, async (admin) => {
+  await withAdminConnection(adminConnectionString, maintenanceLiveIdentity, async (admin) => {
     if (!(await databaseExists(admin, snapshotName))) {
       throw new HistoryMigrationError("INVALID_ARGUMENTS", "数据库快照不存在，无法恢复。");
     }
@@ -218,7 +251,7 @@ export async function restoreScratchDatabase(
   if (!databaseContentInventoriesEqual(snapshotInventory, expectedInventory)) {
     throw new HistoryMigrationError("INVALID_ARGUMENTS", "数据库快照内容摘要不再匹配批准基线。");
   }
-  await withAdminConnection(adminConnectionString, async (admin) => {
+  await withAdminConnection(adminConnectionString, maintenanceLiveIdentity, async (admin) => {
     await terminateConnections(admin, snapshotName);
     await admin.execute(
       sql`create database ${sql.identifier(stagingName)} template ${sql.identifier(snapshotName)}`,
@@ -230,13 +263,13 @@ export async function restoreScratchDatabase(
     tableNames,
   );
   if (!databaseContentInventoriesEqual(stagingInventory, expectedInventory)) {
-    await withAdminConnection(adminConnectionString, async (admin) => {
+    await withAdminConnection(adminConnectionString, maintenanceLiveIdentity, async (admin) => {
       await terminateConnections(admin, stagingName);
       await admin.execute(sql`drop database ${sql.identifier(stagingName)}`);
     });
     throw new HistoryMigrationError("INVALID_ARGUMENTS", "数据库恢复 staging 内容摘要不一致。");
   }
-  await withAdminConnection(adminConnectionString, async (admin) => {
+  await withAdminConnection(adminConnectionString, maintenanceLiveIdentity, async (admin) => {
     await terminateConnections(admin, scratchName);
     await admin.execute(
       sql`alter database ${sql.identifier(scratchName)} rename to ${sql.identifier(backupName)}`,
@@ -259,6 +292,7 @@ export async function restoreScratchDatabase(
 export async function dropScratchSnapshot(
   adminConnectionString: string,
   scratchName: string,
+  maintenanceLiveIdentity?: Phase2LiveMaintenanceIdentity | undefined,
 ): Promise<void> {
   const names = [
     snapshotNameFor(scratchName),
@@ -266,7 +300,7 @@ export async function dropScratchSnapshot(
     restoreBackupNameFor(scratchName),
   ];
   const failures: unknown[] = [];
-  await withAdminConnection(adminConnectionString, async (admin) => {
+  await withAdminConnection(adminConnectionString, maintenanceLiveIdentity, async (admin) => {
     for (const name of names) {
       try {
         await terminateConnections(admin, name);
@@ -293,10 +327,11 @@ export async function snapshotScratchDatabaseGeneration(
   tableNames: readonly string[],
   expectedInventory: DatabaseContentInventory,
   generation: 1 | 2,
+  maintenanceLiveIdentity?: Phase2LiveMaintenanceIdentity | undefined,
 ): Promise<DatabaseContentInventory> {
   assertScratchDatabaseName(scratchName);
   const snapshotName = generationSnapshotNameFor(scratchName, generation);
-  await withAdminConnection(adminConnectionString, async (admin) => {
+  await withAdminConnection(adminConnectionString, maintenanceLiveIdentity, async (admin) => {
     if (!(await databaseExists(admin, scratchName))) {
       throw new HistoryMigrationError("INVALID_ARGUMENTS", "临时库不存在，无法创建换代快照。");
     }
@@ -314,7 +349,7 @@ export async function snapshotScratchDatabaseGeneration(
     tableNames,
   );
   if (!databaseContentInventoriesEqual(snapshotInventory, expectedInventory)) {
-    await dropScratchSnapshotGeneration(adminConnectionString, scratchName, generation);
+    await dropScratchSnapshotGeneration(adminConnectionString, scratchName, generation, maintenanceLiveIdentity);
     throw new HistoryMigrationError("INVALID_ARGUMENTS", "换代数据库快照内容摘要与批准基线不一致。");
   }
   return snapshotInventory;
@@ -324,9 +359,10 @@ export async function snapshotScratchDatabaseGeneration(
 export async function dropCanonicalScratchSnapshot(
   adminConnectionString: string,
   scratchName: string,
+  maintenanceLiveIdentity?: Phase2LiveMaintenanceIdentity | undefined,
 ): Promise<void> {
   const name = snapshotNameFor(scratchName);
-  await withAdminConnection(adminConnectionString, async (admin) => {
+  await withAdminConnection(adminConnectionString, maintenanceLiveIdentity, async (admin) => {
     await terminateConnections(admin, name);
     await admin.execute(sql`drop database if exists ${sql.identifier(name)}`);
   });
@@ -337,10 +373,11 @@ export async function promoteScratchDatabaseGeneration(
   adminConnectionString: string,
   scratchName: string,
   generation: 1 | 2,
+  maintenanceLiveIdentity?: Phase2LiveMaintenanceIdentity | undefined,
 ): Promise<void> {
   const generationName = generationSnapshotNameFor(scratchName, generation);
   const canonicalName = snapshotNameFor(scratchName);
-  await withAdminConnection(adminConnectionString, async (admin) => {
+  await withAdminConnection(adminConnectionString, maintenanceLiveIdentity, async (admin) => {
     if (!(await databaseExists(admin, generationName))) {
       throw new HistoryMigrationError("INVALID_ARGUMENTS", "待提升的换代快照不存在。");
     }
@@ -359,9 +396,10 @@ export async function dropScratchSnapshotGeneration(
   adminConnectionString: string,
   scratchName: string,
   generation: 1 | 2,
+  maintenanceLiveIdentity?: Phase2LiveMaintenanceIdentity | undefined,
 ): Promise<void> {
   const name = generationSnapshotNameFor(scratchName, generation);
-  await withAdminConnection(adminConnectionString, async (admin) => {
+  await withAdminConnection(adminConnectionString, maintenanceLiveIdentity, async (admin) => {
     await terminateConnections(admin, name);
     await admin.execute(sql`drop database if exists ${sql.identifier(name)}`);
   });
@@ -372,6 +410,7 @@ export async function probeScratchSnapshotGeneration(
   adminConnectionString: string,
   scratchName: string,
   tableNames: readonly string[],
+  maintenanceLiveIdentity?: Phase2LiveMaintenanceIdentity | undefined,
 ): Promise<{ readonly name: string | null; readonly inventory: DatabaseContentInventory | null }> {
   const candidates = [
     { name: snapshotNameFor(scratchName), kind: "canonical" },
@@ -379,7 +418,7 @@ export async function probeScratchSnapshotGeneration(
     { name: generationSnapshotNameFor(scratchName, 1), kind: "g1" },
   ] as const;
   let existingKind: (typeof candidates)[number] | undefined;
-  await withAdminConnection(adminConnectionString, async (admin) => {
+  await withAdminConnection(adminConnectionString, maintenanceLiveIdentity, async (admin) => {
     for (const candidate of candidates) {
       if (await databaseExists(admin, candidate.name)) {
         existingKind = candidate;

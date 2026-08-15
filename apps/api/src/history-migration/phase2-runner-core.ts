@@ -86,6 +86,11 @@ import {
   type FormalRecoveryPhase,
 } from "./formal-recovery-state";
 import {
+  captureLiveMaintenanceIdentity,
+  phase2LiveIdentitySha256,
+  type Phase2LiveMaintenanceIdentity,
+} from "./live-maintenance-identity";
+import {
   assertNewOutputPath,
   assertPathsInsidePrivateRoot,
   assertPrivateDirectoryMode,
@@ -152,6 +157,8 @@ export interface Phase2RunnerHooks {
   readonly afterFirstPass?: (() => Promise<void>) | undefined;
   readonly beforeSnapshotCleanup?: (() => Promise<void>) | undefined;
   readonly cleanupFaults?: Phase2CleanupFaultHooks | undefined;
+  /** Gate 5：维护活身份冻结之后、第一条管理性 DDL 之前（仅测试注入）。 */
+  readonly afterLiveIdentityVerified?: (() => Promise<void>) | undefined;
   readonly verifyProvenance?: ((commit: string) => Promise<ExecutionProvenance>) | undefined;
   readonly verifySourceIdentities?:
     | ((
@@ -686,6 +693,7 @@ async function restoreAndVerify(
   baselineDatabaseInventory: DatabaseContentInventory,
   baselineStorageInventory: StorageInventory,
   storageSnapshotDirectory: string,
+  maintenanceLiveIdentity: Phase2LiveMaintenanceIdentity,
 ): Promise<void> {
   const recoveryMarkerPath = join(inputs.receiptDirectory, recoveryMarkerName);
   await writePrivateFile(recoveryMarkerPath, `${new Date().toISOString()}\n`);
@@ -698,6 +706,7 @@ async function restoreAndVerify(
       inputs.databaseName,
       historyImportRequiredTables,
       baselineDatabaseInventory,
+      maintenanceLiveIdentity,
     );
     databaseRestored = true;
   } catch (error) {
@@ -755,7 +764,7 @@ async function restoreAndVerify(
   await rm(inputs.importOutputDirectory, { recursive: true, force: true });
   await rm(join(inputs.receiptDirectory, runReceiptName), { force: true });
   await rm(join(inputs.receiptDirectory, runPassMarkerName), { force: true });
-  await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName);
+  await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName, maintenanceLiveIdentity);
   await rm(storageSnapshotDirectory, { recursive: true, force: false });
   await rm(recoveryMarkerPath, { force: false });
 }
@@ -766,10 +775,17 @@ async function executeBoundRunner(
   hooks: Phase2RunnerHooks,
 ): Promise<number> {
   const inputs = resolveRunnerInputs(argv, env);
+  const maintenanceLiveIdentity = await captureLiveMaintenanceIdentity(inputs.adminUrl);
+  // Gate 5 边界：活身份已冻结；自此任何管理性 DDL 都必须在自身连接上复核。
+  await hooks.afterLiveIdentityVerified?.();
   const context = await validateBeforeMutation(inputs, hooks);
   console.log(`批准输入校验: READY; 包数量=${context.packageCount}`);
 
-  const prepared = await prepareHistoryImportDatabase(inputs.adminUrl, inputs.databaseName);
+  const prepared = await prepareHistoryImportDatabase(
+    inputs.adminUrl,
+    inputs.databaseName,
+    maintenanceLiveIdentity,
+  );
   let baseline: {
     readonly counts: readonly HistoryImportCountRow[];
     readonly storedInventory: StoredFileInventory;
@@ -810,7 +826,7 @@ async function executeBoundRunner(
       await baselineDatabase.close();
     }
   } catch (error) {
-    await dropHistoryImportDatabase(inputs.adminUrl, inputs.databaseName);
+    await dropHistoryImportDatabase(inputs.adminUrl, inputs.databaseName, maintenanceLiveIdentity);
     throw error;
   }
 
@@ -822,17 +838,18 @@ async function executeBoundRunner(
       inputs.databaseName,
       historyImportRequiredTables,
       baseline.databaseInventory,
+      maintenanceLiveIdentity,
     );
   } catch (error) {
-    await dropHistoryImportDatabase(inputs.adminUrl, inputs.databaseName);
+    await dropHistoryImportDatabase(inputs.adminUrl, inputs.databaseName, maintenanceLiveIdentity);
     throw error;
   }
   try {
     await snapshotStorageDirectory(inputs.storageRoot, storageSnapshotDirectory);
   } catch (error) {
     await rm(storageSnapshotDirectory, { recursive: true, force: true });
-    await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName);
-    await dropHistoryImportDatabase(inputs.adminUrl, inputs.databaseName);
+    await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName, maintenanceLiveIdentity);
+    await dropHistoryImportDatabase(inputs.adminUrl, inputs.databaseName, maintenanceLiveIdentity);
     throw error;
   }
 
@@ -859,6 +876,7 @@ async function executeBoundRunner(
         baseline.databaseInventory,
         baselineStorageInventory,
         storageSnapshotDirectory,
+        maintenanceLiveIdentity,
       );
     } catch {
       throw new HistoryMigrationError(
@@ -893,6 +911,7 @@ async function executeBoundRunner(
       historyImportRequiredTables,
       execution.databaseInventory,
       2,
+      maintenanceLiveIdentity,
     );
     await advanceFormalRecoveryPhase(
       inputs.receiptDirectory,
@@ -917,12 +936,12 @@ async function executeBoundRunner(
       "scratch_g2_sealed",
       "scratch_retiring_g1",
     );
-    await dropCanonicalScratchSnapshot(inputs.adminUrl, inputs.databaseName);
+    await dropCanonicalScratchSnapshot(inputs.adminUrl, inputs.databaseName, maintenanceLiveIdentity);
     await hooks.cleanupFaults?.afterDatabaseSnapshotRetired?.();
     await rm(storageSnapshotDirectory, { recursive: true, force: false });
     await rename(nextStorageSnapshotDirectory, storageSnapshotDirectory);
     await hooks.cleanupFaults?.afterStorageSnapshotPromoted?.();
-    await promoteScratchDatabaseGeneration(inputs.adminUrl, inputs.databaseName, 2);
+    await promoteScratchDatabaseGeneration(inputs.adminUrl, inputs.databaseName, 2, maintenanceLiveIdentity);
     await advanceFormalRecoveryPhase(
       inputs.receiptDirectory,
       "scratch_retiring_g1",
@@ -944,7 +963,7 @@ async function executeBoundRunner(
         if (!isMissingFilesystemEntryError(renameError)) throw renameError;
       },
     );
-    await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName);
+    await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName, maintenanceLiveIdentity);
     await hooks.cleanupFaults?.afterTerminalDatabaseDrop?.();
     await rm(terminalTrashDirectory, { recursive: true, force: false });
     await hooks.cleanupFaults?.beforeTerminalFinalizedWrite?.();
@@ -1173,96 +1192,26 @@ export async function runPhase2Acceptance(
 }
 
 /**
- * Gate 5 维护活身份：从活 PostgreSQL 服务器就地采集，任何字段缺失即拒
- * （fail-closed，绝不空串放过）。地址/端口取服务器视角的
- * inet_server_addr()/inet_server_port()，集群指纹取 initdb 生成的
- * system_identifier —— 三者合力能在连接串文本不变的情况下识破
- * 端点改指、端口改指、集群翻新与账户/库名变更。
+ * Gate 5 维护活身份采集与逐连接原子复核已抽取到
+ * ./live-maintenance-identity，本文件保持再导出，便于既有入口引用。
  */
-export interface Phase2LiveMaintenanceIdentity {
-  readonly serverAddress: string;
-  readonly serverPort: string;
-  readonly user: string;
-  readonly database: string;
-  readonly clusterIdentity: string;
-}
-
-export function phase2LiveIdentitySha256(identity: Phase2LiveMaintenanceIdentity): string {
-  return sha256Hex(
-    JSON.stringify([
-      "phase2-live-maintenance-v1",
-      identity.serverAddress,
-      identity.serverPort,
-      identity.user,
-      identity.database,
-      identity.clusterIdentity,
-    ]),
-  );
-}
+export {
+  captureLiveMaintenanceIdentity,
+  phase2LiveIdentitySha256,
+  type Phase2LiveMaintenanceIdentity,
+} from "./live-maintenance-identity";
 
 export function boundCleanupRecoveryIdentitySha256(
   generationBindingSha256: string,
-  liveIdentity: Phase2LiveMaintenanceIdentity,
+  maintenanceLiveIdentity: Phase2LiveMaintenanceIdentity,
 ): string {
   return sha256Hex(
     JSON.stringify([
-      "phase2-cleanup-recovery-v1",
+      "phase2-bound-cleanup-recovery-v1",
       generationBindingSha256,
-      phase2LiveIdentitySha256(liveIdentity),
+      phase2LiveIdentitySha256(maintenanceLiveIdentity),
     ]),
   );
-}
-
-export async function captureLiveMaintenanceIdentity(
-  adminUrl: string,
-): Promise<Phase2LiveMaintenanceIdentity> {
-  const database = createPostgresDatabase({
-    connectionString: adminUrl,
-    maxConnections: 1,
-    applicationName: "urmotiv-history-live-identity",
-  });
-  try {
-    const rows = await database.query<{
-      server_address: string | null;
-      server_port: number | null;
-      admin_user: string | null;
-      admin_database: string | null;
-      cluster_identifier: string | null;
-    }>(
-      sql`select inet_server_addr()::text as server_address, inet_server_port() as server_port,
-          current_user as admin_user, current_database() as admin_database,
-          system_identifier::text as cluster_identifier
-        from pg_control_system()`,
-    );
-    const row = rows[0];
-    if (
-      row === undefined ||
-      typeof row.server_address !== "string" ||
-      row.server_address.length === 0 ||
-      typeof row.server_port !== "number" ||
-      !Number.isInteger(row.server_port) ||
-      typeof row.admin_user !== "string" ||
-      row.admin_user.length === 0 ||
-      typeof row.admin_database !== "string" ||
-      row.admin_database.length === 0 ||
-      typeof row.cluster_identifier !== "string" ||
-      row.cluster_identifier.length === 0
-    ) {
-      throw new HistoryMigrationError("INVALID_METADATA", "维护连接的活身份字段不完整，拒绝续做。");
-    }
-    return {
-      serverAddress: row.server_address,
-      serverPort: String(row.server_port),
-      user: row.admin_user,
-      database: row.admin_database,
-      clusterIdentity: row.cluster_identifier,
-    };
-  } catch (error) {
-    if (error instanceof HistoryMigrationError) throw error;
-    throw new HistoryMigrationError("INVALID_METADATA", "维护连接的活身份无法采集，拒绝续做。");
-  } finally {
-    await database.close();
-  }
 }
 
 function verifyCleanupLiveIdentity(
@@ -1425,6 +1374,7 @@ export async function completePhase2TerminalCleanup(args: {
     args.adminUrl,
     args.databaseName,
     historyImportRequiredTables,
+    liveIdentity,
   );
   const canonicalProbe = await captureStorageInventoryIfPresent(canonicalDirectory);
   const trashProbe = await captureStorageInventoryIfPresent(trashDirectory);
@@ -1471,13 +1421,13 @@ export async function completePhase2TerminalCleanup(args: {
   }
   // 数据库快照是最后一道可回滚防线；此后失败不回滚、只续做清理。
   if (databaseProbe.inventory !== null) {
-    await dropScratchSnapshot(args.adminUrl, args.databaseName);
+    await dropScratchSnapshot(args.adminUrl, args.databaseName, liveIdentity);
   }
   const trashNow = await captureStorageInventoryIfPresent(trashDirectory);
   if (trashNow !== null) {
     await rm(trashDirectory, { recursive: true, force: false });
   }
-  await dropScratchSnapshotGeneration(args.adminUrl, args.databaseName, 2);
+  await dropScratchSnapshotGeneration(args.adminUrl, args.databaseName, 2, liveIdentity);
   await rm(nextDirectory, { recursive: true, force: true });
   const finalized = await advanceFormalRecoveryPhase(
     args.receiptDirectory,

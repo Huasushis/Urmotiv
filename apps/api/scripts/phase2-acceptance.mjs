@@ -56,6 +56,74 @@ function sha256Hex(content) {
   return createHash("sha256").update(content).digest("hex");
 }
 
+/**
+ * Gate 9 Git 元数据掩盖探测：收集可隐藏检出突变的元数据状态。
+ * porcelain status 无法识破 assume-unchanged/skip-worktree、info/exclude、
+ * core.excludesFile、sparse-checkout 等。本函数只采集原始 git 输出，
+ * 不解析内容、不输出路径。判定在 verdict 模块的纯函数完成。
+ */
+function captureGitMetadataHiding() {
+  let lsFilesVerbose = "";
+  try {
+    lsFilesVerbose = execFileSync("git", ["ls-files", "-v"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    });
+  } catch {
+    lsFilesVerbose = "";
+  }
+  let excludesFile = "";
+  try {
+    excludesFile = execFileSync("git", ["config", "--get", "core.excludesFile"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+    }).trim();
+  } catch {
+    excludesFile = "";
+  }
+  let infoExcludeNonEmpty = false;
+  try {
+    const excludePath = execFileSync("git", ["rev-parse", "--git-path", "info/exclude"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+    }).trim();
+    const content = readFileSync(excludePath, "utf8");
+    infoExcludeNonEmpty = content.split("\n").some((line) => {
+      const trimmed = line.trim();
+      return trimmed.length !== 0 && !trimmed.startsWith("#");
+    });
+  } catch {
+    infoExcludeNonEmpty = false;
+  }
+  let sparseCheckout = false;
+  try {
+    sparseCheckout = execFileSync("git", ["config", "--get", "core.sparseCheckout"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+    }).trim();
+  } catch {
+    sparseCheckout = false;
+  }
+  let sparseCheckoutFilePresent = false;
+  try {
+    const sparsePath = execFileSync("git", ["rev-parse", "--git-path", "info/sparse-checkout"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+    }).trim();
+    sparseCheckoutFilePresent = existsSync(sparsePath);
+  } catch {
+    sparseCheckoutFilePresent = false;
+  }
+  return {
+    lsFilesVerbose,
+    excludesFile,
+    infoExcludeNonEmpty,
+    sparseCheckout,
+    sparseCheckoutFilePresent,
+  };
+}
+
 // 代码清单摘要与入口的 verifyExecutionProvenance 保持同一命令与同一摘要构造。
 function codeInventoryForCommit(commit) {
   const raw = execFileSync("git", ["ls-tree", "-r", "--full-tree", commit, "--"], {
@@ -84,6 +152,22 @@ const status = execFileSync(
 );
 if (status.trim().length !== 0) {
   fail("整树必须干净且全部内容已提交；拒绝在未提交检出上发放验收。");
+}
+// Gate 9 预运行硬门：porcelain 干净不够——assume-unchanged/skip-worktree、
+// sparse-checkout 等元数据能掩盖已跟踪文件改动，在任何验收检出上都不合法，
+// 启动前即拒绝。info/exclude 与 excludesFile 可有合法用途（如 worktree
+// node_modules 排除），不在此硬拒，但会在运行后做前后差比对。
+const preRunMetadata = captureGitMetadataHiding();
+if (
+  preRunMetadata.lsFilesVerbose.split("\n").some((line) => {
+    const tag = line.charAt(0);
+    return tag === "h" || tag === "s";
+  }) ||
+  preRunMetadata.sparseCheckout === true ||
+  preRunMetadata.sparseCheckout === "true" ||
+  preRunMetadata.sparseCheckoutFilePresent
+) {
+  fail("检出存在可隐藏已跟踪文件改动的 Git 元数据（assume-unchanged/skip-worktree/sparse-checkout）；拒绝发放验收。");
 }
 if (
   process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL === undefined ||
@@ -301,10 +385,27 @@ if (seamState.afterChildHook) {
     ["status", "--porcelain=v1", "--untracked-files=all"],
     { cwd: repositoryRoot, encoding: "utf8" },
   );
+  const postMetadata = captureGitMetadataHiding();
+  // 运行后元数据探测：skip-worktree/assume-unchanged/sparse 是绝对非法的
+  // （预运行已拒，运行中出现即为掩盖突变）。info/exclude 与 excludesFile 用
+  // 前后差比对——运行中新增的排除规则才算掩盖，预运行已有的合法项不计。
+  const preExcludeCount = preRunMetadata.infoExcludeNonEmpty ? 1 : 0;
+  const postExcludeCount = postMetadata.infoExcludeNonEmpty ? 1 : 0;
+  const preExcludesFile = preRunMetadata.excludesFile;
+  const postExcludesFile = postMetadata.excludesFile;
+  const metadataForVerdict = {
+    lsFilesVerbose: postMetadata.lsFilesVerbose,
+    excludesFile:
+      postExcludesFile !== preExcludesFile ? postExcludesFile : "",
+    infoExcludeNonEmpty: postExcludeCount > preExcludeCount,
+    sparseCheckout: postMetadata.sparseCheckout,
+    sparseCheckoutFilePresent: postMetadata.sparseCheckoutFilePresent,
+  };
   const postRun = postRunDirtyReasons({
     headBefore: head,
     headAfter: postRunHead,
     statusOutput: postRunStatus,
+    metadata: metadataForVerdict,
   });
   evidence.dirtyCount = postRun.dirtyCount;
   evidence.reasonCodes.push(...postRun.reasons);
@@ -365,7 +466,7 @@ const hardFailures = [
   "PHASE2_ROUTE_SHARD_MISSING",
   "PHASE2_ROUTE_SHARD_UNREADABLE",
   "POST_RUN_HEAD_MOVED",
-  "POST_RUN_TREE_NOT_CLEAN",
+  "POST_RUN_GIT_METADATA_HIDING",
 ];
 let candidate;
 if (seamState.active) {

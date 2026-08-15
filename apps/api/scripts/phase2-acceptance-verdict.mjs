@@ -154,18 +154,88 @@ export function assessFormalShard(shard, environment) {
 }
 
 /**
+ * Gate 9 元数据掩盖检测（纯函数）：Git 的 porcelain status 只反映暂存/未暂存
+ * 改动，无法识破靠元数据隐藏的检出突变——已跟踪文件的 assume-unchanged /
+ * skip-worktree 会让已修改文件在 status 中隐形；.git/info/exclude 与
+ * core.excludesFile 能隐藏未跟踪文件；sparse-checkout 配置与 worktree 局部
+ * 元数据也可掩盖内容。这些都不出现在 porcelain 行中，必须逐项探测。
+ *
+ * 本函数只接收探测命令的原始 stdout 与配置值，不执行任何 git 命令（纯函数，
+ * 可单元测试）。任一探测命中即返回 POST_RUN_GIT_METADATA_HIDING（硬失败），
+ * 同时附上精确子码供证据归因。绝不输出路径或内容。
+ * @param {{
+ *   lsFilesVerbose?: unknown,
+ *   excludesFile?: unknown,
+ *   infoExcludeNonEmpty?: unknown,
+ *   sparseCheckout?: unknown,
+ *   sparseCheckoutFilePresent?: unknown,
+ * }} environment
+ * @returns {{reasons: string[], hiding: boolean}}
+ */
+export function gitMetadataHidingReasons(environment) {
+  const env =
+    typeof environment === "object" && environment !== null ? environment : {};
+  const reasons = [];
+  let hiding = false;
+  // git ls-files -v：小写标记 h(assume-unchanged)/s(skip-worktree) 表示
+  // 已跟踪文件被元数据标记隐藏。大写 H/S/c 等是正常状态。
+  const lsFilesVerbose = env.lsFilesVerbose;
+  if (typeof lsFilesVerbose === "string" && lsFilesVerbose.trim().length !== 0) {
+    for (const line of lsFilesVerbose.split("\n")) {
+      const tag = line.charAt(0);
+      if (tag === "h" || tag === "s") {
+        reasons.push("GIT_LS_FILES_ASSUMUNCHANGED_OR_SKIPWORKTREE");
+        hiding = true;
+        break;
+      }
+    }
+  }
+ // core.excludesFile 被显式设置：可指向检出外文件隐藏未跟踪内容。
+  const excludesFile = env.excludesFile;
+  if (typeof excludesFile === "string" && excludesFile.trim().length !== 0) {
+    reasons.push("GIT_CORE_EXCLUDES_FILE_SET");
+    hiding = true;
+  }
+  // .git/info/exclude 非空：worktree 局部排除规则，可隐藏未跟踪文件。
+  const infoExcludeNonEmpty = env.infoExcludeNonEmpty;
+  if (infoExcludeNonEmpty === true) {
+    reasons.push("GIT_INFO_EXCLUDE_NON_EMPTY");
+    hiding = true;
+  }
+  // core.sparseCheckout=true 或 .git/info/sparse-checkout 存在：稀疏检出
+  // 可掩盖整片目录内容。
+  const sparseCheckout = env.sparseCheckout;
+  if (sparseCheckout === true || sparseCheckout === "true") {
+    reasons.push("GIT_SPARSE_CHECKOUT_ENABLED");
+    hiding = true;
+  }
+  const sparseCheckoutFilePresent = env.sparseCheckoutFilePresent;
+  if (sparseCheckoutFilePresent === true) {
+    reasons.push("GIT_SPARSE_CHECKOUT_FILE_PRESENT");
+    hiding = true;
+  }
+  if (hiding) {
+    reasons.push("POST_RUN_GIT_METADATA_HIDING");
+  }
+  return { reasons, hiding };
+}
+
+/**
  * 验收运行结束后的整树卫生判定（Gate 9）：只比较提交摘要与暂存/未暂存
- * 行数，不输出任何路径或内容。验收本身不得改变检出。
- * @param {{headBefore: unknown, headAfter: unknown, statusOutput: unknown}} environment
+ * 行数，不输出任何路径或内容。验收本身不得改变检出。元数据掩盖检测
+ * （gitMetadataHidingReasons）的结果并入此处统一上报。
+ * @param {{headBefore: unknown, headAfter: unknown, statusOutput: unknown,
+ *          metadata?: {lsFilesVerbose?: unknown, excludesFile?: unknown,
+ *           infoExcludeNonEmpty?: unknown, sparseCheckout?: unknown,
+ *           sparseCheckoutFilePresent?: unknown}}} environment
  * @returns {{reasons: string[], dirtyCount: number}}
  */
 export function postRunDirtyReasons(environment) {
-  const headBefore =
-    typeof environment === "object" && environment !== null ? environment.headBefore : undefined;
-  const headAfter =
-    typeof environment === "object" && environment !== null ? environment.headAfter : undefined;
-  const statusOutput =
-    typeof environment === "object" && environment !== null ? environment.statusOutput : undefined;
+  const env =
+    typeof environment === "object" && environment !== null ? environment : {};
+  const headBefore = env.headBefore;
+  const headAfter = env.headAfter;
+  const statusOutput = env.statusOutput;
   const reasons = [];
   if (typeof headBefore === "string" && typeof headAfter === "string" && headAfter !== headBefore) {
     reasons.push("POST_RUN_HEAD_MOVED");
@@ -176,6 +246,10 @@ export function postRunDirtyReasons(environment) {
       : 0;
   if (dirtyCount > 0) {
     reasons.push("POST_RUN_TREE_NOT_CLEAN");
+  }
+  if (typeof env.metadata === "object" && env.metadata !== null) {
+    const meta = gitMetadataHidingReasons(env.metadata);
+    reasons.push(...meta.reasons);
   }
   return { reasons, dirtyCount };
 }
@@ -188,6 +262,7 @@ export function postRunDirtyReasons(environment) {
 export const POST_RUN_MUTATION_CODES = [
   "POST_RUN_HEAD_MOVED",
   "POST_RUN_TREE_NOT_CLEAN",
+  "POST_RUN_GIT_METADATA_HIDING",
 ];
 
 /**
