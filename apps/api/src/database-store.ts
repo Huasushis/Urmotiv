@@ -1274,6 +1274,11 @@ async function writeReview(
 export class DatabaseDataStore implements DataStore {
   public constructor(private readonly handle: DatabaseHandle) {}
 
+  /** 就绪检查：执行一次最廉价的查询确认连接可用。 */
+  public async ping(): Promise<void> {
+    await this.handle.execute(sql`SELECT 1`);
+  }
+
   public async getUser(userId: string): Promise<StoredUser | undefined> {
     const id = parseDatabaseId(userId);
     if (id === undefined) {

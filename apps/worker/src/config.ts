@@ -5,12 +5,19 @@ import { z } from "zod";
 const pollInterval = z.coerce.number().int().min(10).max(60_000);
 const leaseDuration = z.coerce.number().int().min(100).max(24 * 60 * 60 * 1_000);
 const retryDelay = z.coerce.number().int().min(0).max(24 * 60 * 60 * 1_000);
+const healthPortSchema = z.coerce.number().int().min(1).max(65_535);
+const healthStaleSchema = z.coerce.number().int().min(1_000).max(24 * 60 * 60 * 1_000);
+const healthExitAfterSchema = z.coerce.number().int().min(0).max(60);
 
 export interface WorkerConfig {
   readonly workerId: string;
   readonly pollIntervalMs: number;
   readonly leaseMs: number;
   readonly retryDelayMs: number;
+  readonly healthHost: string;
+  readonly healthPort: number;
+  readonly healthStaleMs: number;
+  readonly healthExitAfterUnready: number;
   readonly redis:
     | { readonly enabled: false }
     | { readonly enabled: true; readonly url: string; readonly prefix: string };
@@ -37,12 +44,35 @@ export function readWorkerConfig(
     retryDelay,
     "JOB_RETRY_DELAY_MS"
   );
+  const healthHost = environment.WORKER_HEALTH_HOST?.trim() || "127.0.0.1";
+  const healthPort = parseInteger(
+    environment.WORKER_HEALTH_PORT,
+    3010,
+    healthPortSchema,
+    "WORKER_HEALTH_PORT"
+  );
+  const healthStaleMs = parseInteger(
+    environment.URMOTIV_WORKER_HEALTH_STALE_MS,
+    60_000,
+    healthStaleSchema,
+    "URMOTIV_WORKER_HEALTH_STALE_MS"
+  );
+  const healthExitAfterUnready = parseInteger(
+    environment.URMOTIV_WORKER_HEALTH_EXIT_AFTER_UNREADY,
+    3,
+    healthExitAfterSchema,
+    "URMOTIV_WORKER_HEALTH_EXIT_AFTER_UNREADY"
+  );
 
   return {
     workerId: environment.WORKER_ID?.trim() || `worker-${randomUUID()}`,
     pollIntervalMs,
     leaseMs,
     retryDelayMs,
+    healthHost,
+    healthPort,
+    healthStaleMs,
+    healthExitAfterUnready,
     redis:
       redisUrl.length === 0
         ? { enabled: false }

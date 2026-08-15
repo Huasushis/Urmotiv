@@ -106,6 +106,8 @@ export interface DataStore {
     problemId: string,
     operation: (transaction: ProblemTransaction) => T | Promise<T>
   ): Promise<T>;
+  /** 就绪检查：确认持久化后端可达；不可达时抛出异常。 */
+  ping?(): Promise<void>;
 }
 
 export interface EmailCredential {
@@ -183,6 +185,11 @@ export class InMemoryDataStore implements DataStore {
   private nextUserId = 1_000_000;
   private readonly problemLocks = new Map<string, Promise<void>>();
   private reviewPolicy: StoredReviewPolicy;
+
+  /** 内存后端总是可达。 */
+  public async ping(): Promise<void> {
+    return undefined;
+  }
 
   public constructor(users: StoredUser[], tags: ProblemTag[]) {
     for (const user of users) {
