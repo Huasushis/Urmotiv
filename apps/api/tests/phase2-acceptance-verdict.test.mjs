@@ -3,6 +3,7 @@ import {
   assessFormalShard,
   assessFormalShardBindings,
   expectedBindingKind,
+  finalizeStatus,
   postRunDirtyReasons,
 } from "../scripts/phase2-acceptance-verdict.mjs";
 
@@ -63,6 +64,48 @@ describe("assessFormalShardBindings", () => {
     const missing = assessFormalShardBindings(withoutKey);
     expect(missing.missing).toEqual(["manifestIdentitySha256"]);
     expect(missing.strictOk).toBe(false);
+  });
+});
+
+describe("finalizeStatus：运行后整树突变必须压掉一切成功定级", () => {
+  it("两个成功分支在树脏时都压为 INCONCLUSIVE", () => {
+    expect(
+      finalizeStatus({ candidate: "PASS", reasonCodes: ["PHASE2_ROUTE_PASS", "POST_RUN_TREE_NOT_CLEAN"] }),
+    ).toBe("INCONCLUSIVE");
+    expect(
+      finalizeStatus({
+        candidate: "IMPLEMENTATION_READY",
+        reasonCodes: ["PHASE2_ROUTE_SYNTHETIC_READINESS", "POST_RUN_TREE_NOT_CLEAN"],
+      }),
+    ).toBe("INCONCLUSIVE");
+  });
+  it("两个成功分支在 HEAD 漂移时都压为 INCONCLUSIVE", () => {
+    expect(
+      finalizeStatus({ candidate: "PASS", reasonCodes: ["PHASE2_ROUTE_PASS", "POST_RUN_HEAD_MOVED"] }),
+    ).toBe("INCONCLUSIVE");
+    expect(
+      finalizeStatus({
+        candidate: "IMPLEMENTATION_READY",
+        reasonCodes: ["PHASE2_ROUTE_SYNTHETIC_READINESS", "POST_RUN_HEAD_MOVED"],
+      }),
+    ).toBe("INCONCLUSIVE");
+  });
+  it("两种突变同时出现同样压为 INCONCLUSIVE", () => {
+    expect(
+      finalizeStatus({
+        candidate: "PASS",
+        reasonCodes: ["POST_RUN_HEAD_MOVED", "POST_RUN_TREE_NOT_CLEAN"],
+      }),
+    ).toBe("INCONCLUSIVE");
+  });
+  it("干净检出的成功候选保持原定级，非成功候选不受影响", () => {
+    expect(finalizeStatus({ candidate: "PASS", reasonCodes: ["PHASE2_ROUTE_PASS"] })).toBe("PASS");
+    expect(
+      finalizeStatus({ candidate: "IMPLEMENTATION_READY", reasonCodes: [] }),
+    ).toBe("IMPLEMENTATION_READY");
+    expect(
+      finalizeStatus({ candidate: "INCONCLUSIVE", reasonCodes: ["POST_RUN_HEAD_MOVED"] }),
+    ).toBe("INCONCLUSIVE");
   });
 });
 

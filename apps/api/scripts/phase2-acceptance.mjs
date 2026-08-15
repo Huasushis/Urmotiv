@@ -13,7 +13,7 @@ import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { assessFormalShard, postRunDirtyReasons } from "./phase2-acceptance-verdict.mjs";
+import { assessFormalShard, finalizeStatus, postRunDirtyReasons } from "./phase2-acceptance-verdict.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const apiDirectory = fileURLToPath(new URL("..", import.meta.url));
@@ -328,8 +328,9 @@ const hardFailures = [
   "POST_RUN_HEAD_MOVED",
   "POST_RUN_TREE_NOT_CLEAN",
 ];
+let candidate;
 if (codes.has("PHASE2_ROUTE_PASS") && !hardFailures.some((code) => codes.has(code))) {
-  evidence.status = "PASS";
+  candidate = "PASS";
 } else if (
   codes.has("PHASE2_ROUTE_SYNTHETIC_READINESS") &&
   evidence.runnerExitCode === 0 &&
@@ -338,10 +339,12 @@ if (codes.has("PHASE2_ROUTE_PASS") && !hardFailures.some((code) => codes.has(cod
   !codes.has("CRASHED_WORKER_TEST_RUN") &&
   !codes.has("BASE_WORKER_EVIDENCE_COMMIT_MISMATCH")
 ) {
-  evidence.status = "IMPLEMENTATION_READY";
+  candidate = "IMPLEMENTATION_READY";
 } else {
-  evidence.status = "INCONCLUSIVE";
+  candidate = "INCONCLUSIVE";
 }
+// 运行后整树突变（HEAD 漂移 / 树脏）对每个本可成功的定级都是硬失败。
+evidence.status = finalizeStatus({ candidate, reasonCodes: evidence.reasonCodes });
 const payload = `${JSON.stringify(evidence, null, 2)}\n`;
 writeFileSync(join(acceptanceDirectory, evidenceFileName), payload);
 console.log(`phase2-acceptance: 证据状态=${evidence.status}`);

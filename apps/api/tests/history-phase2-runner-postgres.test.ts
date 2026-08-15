@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { access, chmod, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { sql } from "drizzle-orm";
@@ -992,9 +992,11 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
     }
     await chmod(join(cleanupSnapshotDir, "blocked"), 0o700);
 
-    // 终删阶段驻留故障：钩子正常结束，进入终删序列后存储删除被不可删除
-    // 目录挡住。此时数据库快照已按顺序先行删除，证据必须如实报告
-    // scratch_terminal_failed 且数据库快照未保留；随后用幂等续做回收残余。
+    // 终删阶段驻留故障：钩子正常结束，进入终删序列后隔离目录清理被不可
+    // 删除目录挡住（存储改名隔离本身可以完成）。数据库快照此时已删除，
+    // 证据必须如实报告 scratch_terminal_pending（已退役待清理）而非可回滚
+    // 的 scratch_terminal_failed：数据库快照未保留、terminalRecoveryCapable
+    // 为 false，隔离目录保留在 storage.snapshot.terminal-trash。
     const terminalCleanupTarget = scratchName("term");
     trackDatabaseFamily(terminalCleanupTarget);
     const terminalCleanupBatch = await createSyntheticBatch(1);
@@ -1037,28 +1039,198 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       recoveryPhase: string;
       databaseSnapshotName: string | null;
       databaseSnapshotRetained: boolean;
+      storageCanonicalPresent: boolean;
+      storageTrashPresent: boolean;
+      terminalRecoveryCapable: boolean;
       storageRecoveryMatchesExecution: boolean;
     };
-    expect(terminalEvidence.recoveryPhase).toBe("scratch_terminal_failed");
-    expect(terminalEvidence.databaseSnapshotName).toBeNull();
-    expect(terminalEvidence.databaseSnapshotRetained).toBe(false);
-    expect(terminalEvidence.storageRecoveryMatchesExecution).toBe(true);
-    await chmod(join(terminalCleanupSnapshotDir, "blocked"), 0o700);
-    // 幂等续做：数据库快照已删，存储快照残留被回收，进入 finalized。
+    expect(terminalEvidence).toMatchObject({
+      recoveryPhase: "scratch_terminal_pending",
+      databaseSnapshotName: null,
+      databaseSnapshotRetained: false,
+      storageCanonicalPresent: false,
+      storageTrashPresent: true,
+      terminalRecoveryCapable: false,
+      storageRecoveryMatchesExecution: true,
+    });
+    const terminalTrashDirectory = `${terminalCleanupSnapshotDir}.terminal-trash`;
+    expect(await exists(terminalTrashDirectory)).toBe(true);
+    expect(await exists(terminalCleanupSnapshotDir)).toBe(false);
+    // 测试钩子留下的驻留文件不属于执行现场：解锁后清掉，恢复隔离目录
+    // 与本批次执行现场一致，续做终删才允许完成。
+    await chmod(join(terminalTrashDirectory, "blocked"), 0o700);
+    await rm(join(terminalTrashDirectory, "blocked"), { recursive: true });
+    // 幂等续做（必须使用与运行期一致的管理员连接）：隔离残留被回收，
+    // 进入 scratch_finalized。
     expect(
       (
         await completePhase2TerminalCleanup({
           receiptDirectory: terminalCleanupBatch.runnerReceiptDirectory,
-          adminUrl,
+          adminUrl: sourceConnectionString,
           databaseName: terminalCleanupTarget,
         })
       ).phase,
     ).toBe("scratch_finalized");
+    expect(await exists(terminalTrashDirectory)).toBe(false);
     expect(await exists(terminalCleanupSnapshotDir)).toBe(false);
+    // 数据库快照删除后的喊停故障（afterTerminalDatabaseDrop）：成对代已
+    // 退役，证据必须保持 scratch_terminal_pending 且 terminalRecoveryCapable
+    // 为 false，绝不允许报告可回滚的终删失败。
+    const postDropTarget = scratchName("termhook");
+    trackDatabaseFamily(postDropTarget);
+    const postDropBatch = await createSyntheticBatch(1);
+    const postDropEnv = await runApprovedPreflight(
+      postDropBatch,
+      sourceConnectionString,
+      "synthetic-post-retirement-arrest",
+    );
+    postDropEnv.ADMIN_URL = sourceConnectionString;
+    postDropEnv.DATABASE_NAME = postDropTarget;
+    expect(
+      await runPhase2Bound(runnerArguments(), postDropEnv, {
+        ...provenanceHooks(),
+        cleanupFaults: {
+          afterTerminalDatabaseDrop: async () => {
+            throw new Error("synthetic post-retirement arrest");
+          },
+        },
+      }),
+    ).toBe(1);
+    const postDropEvidence = JSON.parse(
+      await readFile(
+        join(postDropBatch.runnerReceiptDirectory, "cleanup-recovery-evidence.private.json"),
+        "utf8",
+      ),
+    ) as {
+      recoveryPhase: string;
+      databaseSnapshotRetained: boolean;
+      storageCanonicalPresent: boolean;
+      storageTrashPresent: boolean;
+      terminalRecoveryCapable: boolean;
+    };
+    expect(postDropEvidence).toMatchObject({
+      recoveryPhase: "scratch_terminal_pending",
+      databaseSnapshotRetained: false,
+      storageCanonicalPresent: false,
+      storageTrashPresent: true,
+      terminalRecoveryCapable: false,
+    });
+    const postDropTrash = `${postDropBatch.runnerReceiptDirectory}/storage.snapshot.terminal-trash`;
+    expect(await exists(postDropTrash)).toBe(true);
+    expect(
+      (
+        await completePhase2TerminalCleanup({
+          receiptDirectory: postDropBatch.runnerReceiptDirectory,
+          adminUrl: sourceConnectionString,
+          databaseName: postDropTarget,
+        })
+      ).phase,
+    ).toBe("scratch_finalized");
+    expect(await exists(postDropTrash)).toBe(false);
 
+    // 终态写盘前喊停（beforeTerminalFinalizedWrite）：数据库快照与隔离
+    // 存储均已删除，证据相位仍是 pending；幂等续做直接完成终态且不报错。
+    const preFinalizeTarget = scratchName("termfinal");
+    trackDatabaseFamily(preFinalizeTarget);
+    const preFinalizeBatch = await createSyntheticBatch(1);
+    const preFinalizeEnv = await runApprovedPreflight(
+      preFinalizeBatch,
+      sourceConnectionString,
+      "synthetic-pre-finalize-arrest",
+    );
+    preFinalizeEnv.ADMIN_URL = sourceConnectionString;
+    preFinalizeEnv.DATABASE_NAME = preFinalizeTarget;
+    expect(
+      await runPhase2Bound(runnerArguments(), preFinalizeEnv, {
+        ...provenanceHooks(),
+        cleanupFaults: {
+          beforeTerminalFinalizedWrite: async () => {
+            throw new Error("synthetic pre-finalize arrest");
+          },
+        },
+      }),
+    ).toBe(1);
+    const preFinalizeEvidence = JSON.parse(
+      await readFile(
+        join(preFinalizeBatch.runnerReceiptDirectory, "cleanup-recovery-evidence.private.json"),
+        "utf8",
+      ),
+    ) as {
+      recoveryPhase: string;
+      databaseSnapshotRetained: boolean;
+      storageCanonicalPresent: boolean;
+      storageTrashPresent: boolean;
+      terminalRecoveryCapable: boolean;
+    };
+    expect(preFinalizeEvidence).toMatchObject({
+      recoveryPhase: "scratch_terminal_pending",
+      databaseSnapshotRetained: false,
+      storageCanonicalPresent: false,
+      storageTrashPresent: false,
+      terminalRecoveryCapable: false,
+    });
+    expect(
+      (
+        await completePhase2TerminalCleanup({
+          receiptDirectory: preFinalizeBatch.runnerReceiptDirectory,
+          adminUrl: sourceConnectionString,
+          databaseName: preFinalizeTarget,
+        })
+      ).phase,
+    ).toBe("scratch_finalized");
+    expect(
+      await exists(
+        join(preFinalizeBatch.runnerReceiptDirectory, "PHASE2_CLEANUP_REFUSED"),
+      ),
+    ).toBe(false);
+
+    // 终删续做的身份绑定：错误的管理员连接必须零效果拒绝，现场保持。
+    const wrongIdentityTarget = scratchName("wrongid");
+    trackDatabaseFamily(wrongIdentityTarget);
+    const wrongIdentityBatch = await createSyntheticBatch(1);
+    const wrongIdentityEnv = await runApprovedPreflight(
+      wrongIdentityBatch,
+      sourceConnectionString,
+      "synthetic-wrong-identity-terminal",
+    );
+    wrongIdentityEnv.ADMIN_URL = sourceConnectionString;
+    wrongIdentityEnv.DATABASE_NAME = wrongIdentityTarget;
+    expect(
+      await runPhase2Bound(runnerArguments(), wrongIdentityEnv, {
+        ...provenanceHooks(),
+        cleanupFaults: {
+          afterTerminalDatabaseDrop: async () => {
+            throw new Error("synthetic wrong-identity arrest");
+          },
+        },
+      }),
+    ).toBe(1);
+    await expect(
+      completePhase2TerminalCleanup({
+        receiptDirectory: wrongIdentityBatch.runnerReceiptDirectory,
+        adminUrl,
+        databaseName: wrongIdentityTarget,
+      }),
+    ).rejects.toThrow("管理员连接与中断证据不匹配");
+    const wrongIdentityState = await readFormalRecoveryState(
+      wrongIdentityBatch.runnerReceiptDirectory,
+    );
+    expect(wrongIdentityState?.phase).toBe("scratch_terminal_pending");
+    const wrongIdentityTrash = `${wrongIdentityBatch.runnerReceiptDirectory}/storage.snapshot.terminal-trash`;
+    expect(await exists(wrongIdentityTrash)).toBe(true);
+    expect(
+      (
+        await completePhase2TerminalCleanup({
+          receiptDirectory: wrongIdentityBatch.runnerReceiptDirectory,
+          adminUrl: sourceConnectionString,
+          databaseName: wrongIdentityTarget,
+        })
+      ).phase,
+    ).toBe("scratch_finalized");
+    expect(await exists(wrongIdentityTrash)).toBe(false);
     // 换代窗口故障：存储新代已提升为规范名、数据库 g2 尚未提升时被喊停。
     // 证据必须如实呈现“规范存储在场、规范数据库空缺、g2 数据库保留”的
-    // 错位现场；此时终删续做必须拒绝（相位不是 scratch_terminal_failed）。
+    // 错位现场；此时终删续做必须拒绝（相位不属于终删中断相位）。
     const generationTarget = scratchName("gen");
     trackDatabaseFamily(generationTarget);
     const generationBatch = await createSyntheticBatch(1);
@@ -1121,6 +1293,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
     temporaryDatabaseNames.push(`${formalDatabaseName}__formal_backup`);
     const formalAdmin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
     let formalDropped = false;
+    const extraProductionDrops: string[] = [];
     try {
       await formalAdmin.execute(
         sql`create database ${sql.identifier(formalDatabaseName)}`,
@@ -1291,6 +1464,77 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
             .includes(denialNonceSha256),
         ).toBe(false);
       }
+      // （一 c）真正生产入口的实时执行授权拒绝：直接调用 runFormalImport
+      // （不接受 hook/故障面/调用方给定权力），授权由服务端按 PRINCIPAL 实时
+      // 解析，授权先于任何作业/来源/暂存/输出/备份/存储/数据库副作用。
+      // 目标库使用非 urmotiv_ 前缀通过生产名称闸门，证明拒绝与命名无关。
+      const productionDenialDatabaseName = `formaldenial_${process.pid}${randomUUID()
+        .replaceAll("-", "")
+        .slice(0, 8)}`;
+      extraProductionDrops.push(
+        productionDenialDatabaseName,
+        `${productionDenialDatabaseName}__formal_backup`,
+      );
+      await formalAdmin.execute(
+        sql`create database ${sql.identifier(productionDenialDatabaseName)}`,
+      );
+      const productionDenialConnectionString = historyImportDatabaseConnectionString(
+        adminUrl,
+        productionDenialDatabaseName,
+      );
+      const productionDenialPreparation = createPostgresDatabase({
+        connectionString: productionDenialConnectionString,
+        maxConnections: 4,
+      });
+      try {
+        await migrateDatabase(productionDenialPreparation);
+        await seedCoreDatabase(productionDenialPreparation);
+        await seedDatabaseDemoData(productionDenialPreparation);
+      } finally {
+        await productionDenialPreparation.close();
+      }
+      const productionDenialBaselineClient = createPostgresDatabase({
+        connectionString: productionDenialConnectionString,
+        maxConnections: 1,
+      });
+      const productionDenialBefore = await captureHistoryImportTableCounts(
+        productionDenialBaselineClient,
+      );
+      await productionDenialBaselineClient.close();
+      const productionDenialOutput = join(formalBatch.root, "formal-output-denied-production");
+      const productionDenialImportOutput = join(
+        formalBatch.root,
+        "formal-import-output-denied-production",
+      );
+      const productionDenialEnv = await formalEnvironment(
+        formalBatch,
+        productionDenialConnectionString,
+        adminUrl,
+        denialApprovalFile,
+        productionDenialOutput,
+        denialStorageRoot,
+        productionDenialImportOutput,
+        "synthetic-formal-phase1",
+      );
+      productionDenialEnv.PRINCIPAL = databaseDemoUserIds.denied;
+      expect(await runFormalImport(formalArguments(), productionDenialEnv)).toBe(1);
+      expect(await exists(productionDenialOutput)).toBe(false);
+      expect(await exists(productionDenialImportOutput)).toBe(false);
+      const productionDenialCheck = createPostgresDatabase({
+        connectionString: productionDenialConnectionString,
+        maxConnections: 1,
+      });
+      expect(await captureHistoryImportTableCounts(productionDenialCheck)).toEqual(
+        productionDenialBefore,
+      );
+      await productionDenialCheck.close();
+      expect((await captureStorageInventory(denialStorageRoot)).fileCount).toBe(0);
+      expect(await databaseExists(formalAdmin, `${productionDenialDatabaseName}__formal_backup`)).toBe(
+        false,
+      );
+      expect(await exists(join(evidenceRoot, `formal-approval-log.${denialNonceSha256}.claim`))).toBe(
+        false,
+      );
       await privateDirectory(join(formalBatch.root, "formal-storage-forged"));
       const forgedApprovalFile = join(
         formalBatch.root,
@@ -1531,6 +1775,21 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       }
       expect((await captureStorageInventory(cleanupFaultStorageRoot)).fileCount).toBe(12);
       // Gate 4 幂等补做：销毁两个恢复副本并进入 finalized。
+      // Gate 4 身份绑定：错误维护连接必须零效果拒绝（相位不变、两个恢复
+      // 副本都在）。批准书绑定的是 postgres 库连接指纹。
+      await expect(
+        completeFormalFinalizationCleanup({
+          outputDirectory: cleanupFaultOutput,
+          adminUrl: adminUrl.replace(/\/postgres$/, "/template1"),
+        }),
+      ).rejects.toThrow(/身份与批准书不一致|身份与备份证据不一致|维护连接/);
+      expect((await readFormalRecoveryState(cleanupFaultOutput))?.phase).toBe(
+        "cleanup_incomplete",
+      );
+      expect(
+        await databaseExists(formalAdmin, `${cleanupFaultDatabaseName}__formal_backup`),
+      ).toBe(true);
+      expect(await exists(join(cleanupFaultOutput, "formal.storage.before.snapshot"))).toBe(true);
       expect(
         await completeFormalFinalizationCleanup({
           outputDirectory: cleanupFaultOutput,
@@ -1542,8 +1801,125 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       ).toBe(false);
       expect(await exists(join(cleanupFaultOutput, "formal.storage.before.snapshot"))).toBe(false);
       expect((await readFormalRecoveryState(cleanupFaultOutput))?.phase).toBe("finalized");
+      // （二 c）拒绝收据故障缝：写盘前把收据路径占为目录。运行必须拒绝
+      // 产出任何结论文本：无收据、无 PASS 标记、阶段停留在 rollback_verified、
+      // 数据库行与存储处处零残留、临时备份库不存在。
+      const refusalFaultDatabaseName = `urmotiv_formal_refusal_${process.pid}${randomUUID()
+        .replaceAll("-", "")
+        .slice(0, 8)}`;
+      temporaryDatabaseNames.push(
+        refusalFaultDatabaseName,
+        `${refusalFaultDatabaseName}__formal_backup`,
+      );
+      await formalAdmin.execute(sql`create database ${sql.identifier(refusalFaultDatabaseName)}`);
+      const refusalFaultConnectionString = historyImportDatabaseConnectionString(
+        adminUrl,
+        refusalFaultDatabaseName,
+      );
+      const refusalFaultPreparation = createPostgresDatabase({
+        connectionString: refusalFaultConnectionString,
+        maxConnections: 4,
+      });
+      try {
+        await migrateDatabase(refusalFaultPreparation);
+        await seedCoreDatabase(refusalFaultPreparation);
+        await seedDatabaseDemoData(refusalFaultPreparation);
+      } finally {
+        await refusalFaultPreparation.close();
+      }
+      const refusalFaultBaselineClient = createPostgresDatabase({
+        connectionString: refusalFaultConnectionString,
+        maxConnections: 1,
+      });
+      const refusalFaultBefore = await captureHistoryImportTableCounts(
+        refusalFaultBaselineClient,
+      );
+      const refusalFaultBeforeInventory = await captureDatabaseContentInventory(
+        refusalFaultBaselineClient,
+        historyImportRequiredTables,
+      );
+      await refusalFaultBaselineClient.close();
+      const refusalFaultStorageRoot = join(formalBatch.root, "formal-refusal-fault-storage");
+      await privateDirectory(refusalFaultStorageRoot);
+      const refusalFaultApprovalFile = join(
+        formalBatch.root,
+        "formal-target-approval-refusal-fault.private.json",
+      );
+      await writeFormalTargetApproval(refusalFaultApprovalFile, {
+        ...formalBaseDocuments,
+        formalTargetFingerprintSha256: computeFormalTargetFingerprintSha256(
+          formalTargetIdentity(refusalFaultConnectionString),
+        ),
+        prestateDatabaseInventorySha256: refusalFaultBeforeInventory.contentSha256,
+        prestateStorageInventorySha256: (await captureStorageInventory(refusalFaultStorageRoot))
+          .contentInventorySha256,
+        storageRootIdentitySha256: await computeStorageRootIdentitySha256(refusalFaultStorageRoot),
+      });
+      const refusalOutput = join(formalBatch.root, "formal-refusal-fault-output");
+      const refusalImportOutput = join(formalBatch.root, "formal-refusal-fault-import-output");
+      const refusalEnv = await formalEnvironment(
+        formalBatch,
+        refusalFaultConnectionString,
+        adminUrl,
+        refusalFaultApprovalFile,
+        refusalOutput,
+        refusalFaultStorageRoot,
+        refusalImportOutput,
+        "synthetic-formal-phase1",
+      );
+      const refusalRealStorage = createFileStorage({
+        kind: "local",
+        rootDirectory: refusalFaultStorageRoot,
+        limits: { maxBytes: 2_000_000 },
+      });
+      let refusalPublishCount = 0;
+      const refusalFailingStorage: FileStorage = {
+        stage: (input) => refusalRealStorage.stage(input),
+        publish: async (staged) => {
+          refusalPublishCount += 1;
+          if (refusalPublishCount > 2) {
+            throw new Error("synthetic refusal-seam storage failure");
+          }
+          return refusalRealStorage.publish(staged);
+        },
+        discard: (staged) => refusalRealStorage.discard(staged),
+        open: (stored) => refusalRealStorage.open(stored),
+        delete: (stored) => refusalRealStorage.delete(stored),
+      };
+      expect(
+        await runFormalImportBound(
+          formalArguments(),
+          refusalEnv,
+          {
+            storage: refusalFailingStorage,
+            refusal: {
+              beforeRefusalReceiptWrite: async () => {
+                await mkdir(join(refusalOutput, formalReceiptName), { recursive: true });
+              },
+            },
+          },
+          formalHooks,
+        ),
+      ).toBe(1);
+      expect(refusalPublishCount).toBeGreaterThanOrEqual(3);
+      expect((await stat(join(refusalOutput, formalReceiptName))).isDirectory()).toBe(true);
+      expect(await exists(join(refusalOutput, formalPassMarkerName))).toBe(false);
+      expect(await exists(join(refusalOutput, formalRollbackVerifiedMarkerName))).toBe(true);
+      expect(await exists(join(refusalOutput, formalRestoreRefusedMarkerName))).toBe(false);
+      const refusalCheck = createPostgresDatabase({
+        connectionString: refusalFaultConnectionString,
+        maxConnections: 1,
+      });
+      expect(await captureHistoryImportTableCounts(refusalCheck)).toEqual(refusalFaultBefore);
+      await refusalCheck.close();
+      expect((await captureStorageInventory(refusalFaultStorageRoot)).fileCount).toBe(0);
+      expect(await databaseExists(formalAdmin, `${refusalFaultDatabaseName}__formal_backup`)).toBe(
+        false,
+      );
+      expect((await readFormalRecoveryState(refusalOutput))?.phase).toBe("rollback_verified");
 
-      // （三）正确批准书：单遍导入 + 独立自证核对 + v4 通过收据。
+       // （三）正确批准书：单遍导入 + 独立自证核对 + v4 通过收据。
+
       const formalStorageRoot = join(formalBatch.root, "formal-storage");
       await privateDirectory(formalStorageRoot);
       await writeFormalTargetApproval(formalTargetApprovalFile, {
@@ -1729,12 +2105,17 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       );
     }
   } finally {
+    for (const extraDrop of extraProductionDrops) {
       await formalAdmin.execute(
-        sql`drop database if exists ${sql.identifier(formalDatabaseName)} with (force)`,
+        sql`drop database if exists ${sql.identifier(extraDrop)} with (force)`,
       );
-      formalDropped = true;
-      await formalAdmin.close();
     }
+    await formalAdmin.execute(
+      sql`drop database if exists ${sql.identifier(formalDatabaseName)} with (force)`,
+    );
+    formalDropped = true;
+    await formalAdmin.close();
+  }
     expect(formalDropped).toBe(true);
   }, 300_000);
 });

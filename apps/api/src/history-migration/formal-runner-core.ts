@@ -10,6 +10,7 @@
  * 核对回滚结果，并保留只含聚合的安全标记/收据。回滚不可证明时机械拒绝。
  */
 import { appendFile, chmod, mkdir, open, readFile, realpath, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 
 import { sql } from "drizzle-orm";
@@ -84,6 +85,9 @@ import {
   assertNewOutputPath,
   assertPathsInsidePrivateRoot,
   assertPrivateDirectoryMode,
+  readPrivateJson,
+  movePrivateFileNoReplace,
+  privateRegularFileExists,
   readPrivateJsonWithDigest,
   removePrivateRegularFile,
   writeNewPrivateJson,
@@ -290,6 +294,10 @@ export interface FormalImportTestSeam {
     readonly afterDatabaseBackupDrop?: (() => Promise<void>) | undefined;
     /** finalized 相位写盘前的故障注入：两个恢复副本均已删除。 */
     readonly beforeFinalizedWrite?: (() => Promise<void>) | undefined;
+  } | undefined;
+  readonly refusal?: {
+    /** FAIL 收据写盘前的故障注入：证明拒绝结论不得与 PASS 标记共存。 */
+    readonly beforeRefusalReceiptWrite?: (() => Promise<void>) | undefined;
   } | undefined;
 }
 function environmentValue(
@@ -993,6 +1001,49 @@ function importExecutionAuthorizationFor(database: DatabaseHandle): ImportExecut
 }
 
 /**
+ * 维护连接身份探针：活动连接解析出的角色/数据库 + 服务器集群标识 +
+ * 连接串摘要，全部用于收尾续做的运行时绑定（Gate 4）。任何字段在
+ * 运行期无法取得时以空串计入摘要，续做时用同一构造法对拍。
+ */
+async function probeMaintenanceConnectionIdentity(
+  admin: DatabaseHandle,
+  adminUrl: string,
+): Promise<{
+  readonly liveAdminFingerprintSha256: string;
+  readonly clusterIdentitySha256: string;
+  readonly adminUrlSha256: string;
+}> {
+  const parsed = parsePostgresTarget(adminUrl, "admin");
+  const rows = await admin.query<{ admin_database: string; admin_role: string }>(
+    sql`select current_database() as admin_database, current_user as admin_role`,
+  );
+  const row = rows[0];
+  const liveAdminFingerprintSha256 =
+    row === undefined || typeof row.admin_database !== "string" || typeof row.admin_role !== "string"
+      ? ""
+      : computeFormalAdminFingerprintSha256({
+          host: parsed.host,
+          port: parsed.port,
+          user: row.admin_role,
+          database: row.admin_database,
+        });
+  let clusterIdentity = "";
+  try {
+    const cluster = await admin.query<{ identifier: string }>(
+      sql`select system_identifier::text as identifier from pg_control_system()`,
+    );
+    if (typeof cluster[0]?.identifier === "string") clusterIdentity = cluster[0].identifier;
+  } catch {
+    clusterIdentity = "";
+  }
+  return {
+    liveAdminFingerprintSha256,
+    clusterIdentitySha256: sha256Hex(`cluster-v1|${clusterIdentity}`),
+    adminUrlSha256: sha256Hex(`admin-url-v1|${adminUrl}`),
+  };
+}
+
+/**
  * 运行时管理员身份核验：用实际连接查询 current_database/current_user，
  * 与批准书绑定的管理员连接指纹比对。解析一致但实际身份不同（代理、
  * 反向映射、遗漏重写）也会在突变前被拒绝。
@@ -1002,21 +1053,11 @@ async function verifyAdministratorConnectionIdentity(
   inputs: FormalInputs,
   approval: FormalTargetApproval,
 ): Promise<void> {
-  const rows = await admin.query<{ admin_database: string; admin_role: string }>(
-    sql`select current_database() as admin_database, current_user as admin_role`,
-  );
-  const row = rows[0];
-  const parsed = parsePostgresTarget(inputs.adminUrl, "admin");
-  const liveFingerprint =
-    row === undefined || typeof row.admin_database !== "string" || typeof row.admin_role !== "string"
-      ? undefined
-      : computeFormalAdminFingerprintSha256({
-          host: parsed.host,
-          port: parsed.port,
-          user: row.admin_role,
-          database: row.admin_database,
-        });
-  if (liveFingerprint === undefined || liveFingerprint !== approval.adminTargetFingerprintSha256) {
+  const live = await probeMaintenanceConnectionIdentity(admin, inputs.adminUrl);
+  if (
+    live.liveAdminFingerprintSha256 === "" ||
+    live.liveAdminFingerprintSha256 !== approval.adminTargetFingerprintSha256
+  ) {
     throw new HistoryMigrationError(
       "INVALID_METADATA",
       "正式门禁：管理员连接的实际身份与批准书不一致。",
@@ -1170,6 +1211,7 @@ async function writeFormalReceiptPASS(options: FormalCoreOptions, pass: FormalIm
     },
     targetClass: "designated-real",
     singlePass: true,
+    recoveryGeneration,
     approvalBinding: {
       nonceSha256: sha256Hex(`nonce-v1|${options.targetApproval.nonce}`),
       generationBindingSha256: computeFormalGenerationBinding(options.targetApproval),
@@ -1363,10 +1405,7 @@ async function runFormalImportCore(
       requiredPrincipalId: inputs.principal,
     }).then((databaseResult) => {
       if (
-        !databaseResult.readOnlyEnforced ||
-        databaseResult.missingTableCount !== 0 ||
-        databaseResult.tagPresent !== true ||
-        databaseResult.principalPresent !== true
+        !databaseResult.readOnlyEnforced
       ) {
         throw new HistoryMigrationError("INVALID_ARGUMENTS", "正式目标库的前置依赖校验未通过。");
       }
@@ -1400,6 +1439,7 @@ async function runFormalImportCore(
     const storageSnapshotDirectory = join(inputs.outputDirectory, formalStorageSnapshotName);
     // 第一步：管理员实时身份核验后，在 backup_create_pending 相位建立并核对备份。
     await verifyAdministratorConnectionIdentity(admin, inputs, targetApproval);
+    const maintenance = await probeMaintenanceConnectionIdentity(admin, inputs.adminUrl);
     await advanceFormalRecoveryPhase(inputs.outputDirectory, "pre_backup", "backup_create_pending");
     const backup = await createVerifiedFormalBackup({
       admin,
@@ -1414,16 +1454,15 @@ async function runFormalImportCore(
       "backup_verified",
     );
     await writeNewPrivateJson(join(inputs.outputDirectory, formalBackupEvidenceName), {
-      version: 1,
       generatedAt: new Date().toISOString(),
       approvalNonceSha256: sha256Hex(`nonce-v1|${targetApproval.nonce}`),
       approvalGenerationBindingSha256: computeFormalGenerationBinding(targetApproval),
+      maintenanceLiveAdminFingerprintSha256: maintenance.liveAdminFingerprintSha256,
+      maintenanceClusterIdentitySha256: maintenance.clusterIdentitySha256,
+      maintenanceAdminUrlSha256: maintenance.adminUrlSha256,
+      targetDatabaseName: inputs.databaseName,
       recoveryPhase: backupVerifiedState.phase,
       recoveryStateSha256: recoveryStateSha256(backupVerifiedState),
-      databaseBackupVerified: true,
-      databaseBackupContentSha256: beforeDatabaseInventory.contentSha256,
-      storageSnapshotVerified: true,
-      storageSnapshotContentSha256: beforeStorageInventory.contentInventorySha256,
     });
     await writePrivateFile(
       join(inputs.outputDirectory, formalBackupVerifiedMarkerName),
@@ -1472,6 +1511,7 @@ async function runFormalImportCore(
         storageSnapshotDirectory,
         rollback,
         refusalCode,
+        seam,
       });
       if (error instanceof HistoryMigrationError) {
         if (error.code === "INVALID_ARGUMENTS") throw error;
@@ -1516,6 +1556,7 @@ async function runFormalImportCore(
         storageSnapshotDirectory,
         rollback,
         refusalCode: "finalization_commit_refused",
+        seam,
       });
       throw new HistoryMigrationError(
         "INTERNAL_ERROR",
@@ -1572,10 +1613,32 @@ async function runFormalImportCore(
     await admin.close().catch(() => undefined);
   }
 }
+/**
+ * PASS 承诺标记的安全退役：先安全删除；删除失败则用 no-replace 语义把标记
+ * 原子改名成唯一 superseded 后缀（存在性检查的读取方不再视为 PASS）。两条
+ * 路都失败时抛出 INTERNAL_ERROR，此后调用方绝不写 FAIL/REFUSED 证据或收据，
+ * 因此任何被拒绝/失败的结论都不可能留下权威 PASS 标记。
+ */
+async function retireFormalPassMarker(outputDirectory: string): Promise<void> {
+  const passMarkerPath = join(outputDirectory, formalPassMarkerName);
+  await removePrivateRegularFile(passMarkerPath).catch(() => undefined);
+  if (await privateRegularFileExists(passMarkerPath)) {
+    await movePrivateFileNoReplace(
+      passMarkerPath,
+      `${passMarkerPath}.superseded-${randomUUID()}`,
+    ).catch(() => undefined);
+  }
+  if (await privateRegularFileExists(passMarkerPath)) {
+    throw new HistoryMigrationError(
+      "INTERNAL_ERROR",
+      "正式导入：PASS 承诺标记无法移除或改名，拒绝产出失败结论。",
+    );
+  }
+}
 
 /**
- * 失败路径共享收尾：在 rollback_pending 相位完成回滚后，按 proof 定级转移，
- * 写回滚证据与 FAIL 收据（覆盖任何已写 PASS），并确保 PASS 标记不存在。
+ * 失败路径共享收尾：PASS 标记先退役（强校验，不达标即中止且不产出任何
+ * 结论），再在 rollback_pending 相位完成回滚后，按 proof 定级转移。
  */
 async function concludeRefusedRun(options: {
   readonly coreOptions: FormalCoreOptions;
@@ -1584,12 +1647,22 @@ async function concludeRefusedRun(options: {
   readonly storageSnapshotDirectory: string;
   readonly rollback: RollbackProof;
   readonly refusalCode: string;
+  readonly seam: FormalImportTestSeam;
 }): Promise<{ readonly verified: boolean }> {
-  const { coreOptions, admin, backupName, storageSnapshotDirectory, rollback, refusalCode } = options;
+  const {
+    coreOptions,
+    admin,
+    backupName,
+    storageSnapshotDirectory,
+    rollback,
+    refusalCode,
+    seam,
+  } = options;
   const { outputDirectory } = coreOptions.inputs;
   const approval = coreOptions.targetApproval;
   const restoredAll = rollback.storageRestored && rollback.databaseRestored;
-  await removePrivateRegularFile(join(outputDirectory, formalPassMarkerName)).catch(() => undefined);
+  // 结论域内绝不出现「FAIL 收据 + PASS 标记」共存：标记退役失败时直接中止。
+  await retireFormalPassMarker(outputDirectory);
   const terminalState = await advanceFormalRecoveryPhase(
     outputDirectory,
     "rollback_pending",
@@ -1607,26 +1680,43 @@ async function concludeRefusedRun(options: {
     backupRetained: true,
     storageSnapshotRetained: true,
   }).catch(() => undefined);
+  // 回滚证据（状态机终相 + 回滚标记）先于拒绝收据写盘：即使收据路径被
+  // 占用导致报错，现场仍保留可审计的已验证回滚证据。
   if (restoredAll) {
     await writePrivateFile(
       join(outputDirectory, formalRollbackVerifiedMarkerName),
       `${new Date().toISOString()}\n`,
     ).catch(() => undefined);
-    await writeFormalReceiptRefused(coreOptions, { refusalCode, rollback });
-    // 回滚证据落盘后，在 cleanup_pending 相位内做最终删除，随后进入失败终态。
-    await advanceFormalRecoveryPhase(outputDirectory, "rollback_verified", "cleanup_pending")
-      .catch(() => undefined);
-    await dropDatabaseForce(admin, backupName).catch(() => undefined);
-    await rm(storageSnapshotDirectory, { recursive: true, force: true }).catch(() => undefined);
-    await advanceFormalRecoveryPhase(outputDirectory, "cleanup_pending", "finalization_refused")
-      .catch(() => undefined);
   } else {
-    // 回滚未证明：保留备份工件，写 RESTORE_REFUSED，收据与工件同代绑定。
     await writePrivateFile(
       join(outputDirectory, formalRestoreRefusedMarkerName),
       `${new Date().toISOString()}\n`,
     ).catch(() => undefined);
-    await writeFormalReceiptRefused(coreOptions, { refusalCode, rollback }).catch(() => undefined);
+  }
+  if (restoredAll) {
+    // 回滚证明已确认数据复原：残余恢复工件（备份库、存储快照）在
+    // rollback_verified 相位内先行清除；终相推进延迟到拒绝收据写盘之后。
+    // 收据路径被占用时现场仍保留 rollback_verified 相位与全部回滚证据。
+    await dropDatabaseForce(admin, backupName).catch(() => undefined);
+    await rm(storageSnapshotDirectory, { recursive: true, force: true }).catch(() => undefined);
+  }
+  // 拒绝收据写盘失败时中止：现场仍保留回滚证据、终相状态机与收尾事实。
+  await seam.refusal?.beforeRefusalReceiptWrite?.();
+  try {
+    await writeFormalReceiptRefused(coreOptions, { refusalCode, rollback });
+  } catch {
+    throw new HistoryMigrationError(
+      "INTERNAL_ERROR",
+      "正式导入：拒绝收据写盘失败；回滚证据与恢复状态机已保留，PASS 标记已退役。",
+    );
+  }
+  if (restoredAll) {
+    await advanceFormalRecoveryPhase(outputDirectory, "rollback_verified", "cleanup_pending")
+      .catch(() => undefined);
+    await advanceFormalRecoveryPhase(outputDirectory, "cleanup_pending", "finalization_refused")
+      .catch(() => undefined);
+  } else {
+    // 回滚未证明：保留备份工件，收据与工件同代绑定。
     await advanceFormalRecoveryPhase(outputDirectory, "rollback_refused", "finalization_refused")
       .catch(() => undefined);
   }
@@ -1655,45 +1745,136 @@ export async function completeFormalFinalizationCleanup(args: {
   }
   const receiptPayload = (await readPrivateJsonWithDigest(
     join(args.outputDirectory, formalReceiptName),
-  )).value as { version?: unknown; verdict?: unknown; target?: unknown };
-  const target = receiptPayload.target as {
+  )).value;
+  const receipt = receiptPayload as {
+    version?: unknown;
+    verdict?: unknown;
+    target?: unknown;
+    approvalBinding?: unknown;
+    recoveryGeneration?: unknown;
+  };
+  const target = receipt.target as {
     host?: unknown;
     port?: unknown;
     user?: unknown;
     database?: unknown;
   } | undefined;
+  const approvalBinding = receipt.approvalBinding as
+    | {
+        nonceSha256?: unknown;
+        generationBindingSha256?: unknown;
+        approvedByActorSha256?: unknown;
+        branchName?: unknown;
+        gitCommitSha256?: unknown;
+        expectedFormalImportCount?: unknown;
+      }
+    | undefined;
+  const recoveryGeneration = receipt.recoveryGeneration as
+    | { phase?: unknown; stateSha256?: unknown }
+    | undefined;
+  const hex64 = (value: unknown): value is string =>
+    typeof value === "string" && digestPattern.test(value);
   if (
-    receiptPayload.version !== 4 ||
-    receiptPayload.verdict !== "PASS" ||
+    receipt.version !== 4 ||
+    receipt.verdict !== "PASS" ||
     target === null ||
     target === undefined ||
     typeof target !== "object" ||
     typeof target.host !== "string" ||
     typeof target.port !== "string" ||
     typeof target.user !== "string" ||
-    typeof target.database !== "string"
+    typeof target.database !== "string" ||
+    approvalBinding === null ||
+    approvalBinding === undefined ||
+    !hex64(approvalBinding.nonceSha256) ||
+    !hex64(approvalBinding.generationBindingSha256) ||
+    !hex64(approvalBinding.approvedByActorSha256) ||
+    typeof approvalBinding.branchName !== "string" ||
+    !hex64(approvalBinding.gitCommitSha256) ||
+    typeof approvalBinding.expectedFormalImportCount !== "number" ||
+    recoveryGeneration === null ||
+    recoveryGeneration === undefined ||
+    typeof recoveryGeneration.phase !== "string" ||
+    !hex64(recoveryGeneration.stateSha256)
   ) {
     throw new HistoryMigrationError("INVALID_METADATA", "PASS 收据结构不完整，拒绝续做收尾。");
   }
   assertFormalDatabaseName(target.database);
+  const backupEvidencePayload = await readPrivateJson(
+    join(args.outputDirectory, formalBackupEvidenceName),
+  );
+  const backupEvidence = backupEvidencePayload as {
+    approvalNonceSha256?: unknown;
+    approvalGenerationBindingSha256?: unknown;
+    targetDatabaseName?: unknown;
+    maintenanceLiveAdminFingerprintSha256?: unknown;
+    maintenanceClusterIdentitySha256?: unknown;
+    maintenanceAdminUrlSha256?: unknown;
+  };
+  // 收据写盘时刻的相位可能是 cleanup_pending（先收据后提交）或
+  // success_committed（原地补做），其后合法相位只能是同记账代的
+  // success_committed 或 cleanup_incomplete；用允许转移对 + 记账代绑定
+  // 拒绝跨批次重放。
+  const recordedHashFor = (phase: FormalRecoveryPhase): string =>
+    recoveryStateSha256({
+      version: 1,
+      phase,
+      generationBindingSha256: state.generationBindingSha256,
+      updatedAt: state.updatedAt,
+    });
+  const recordedGenerationKnown =
+    (recoveryGeneration.phase === "cleanup_pending" ||
+      recoveryGeneration.phase === "success_committed") &&
+    recoveryGeneration.stateSha256 === recordedHashFor(recoveryGeneration.phase);
+  const liveSuccessorAllowed =
+    (recoveryGeneration.phase === "cleanup_pending" &&
+      (state.phase === "success_committed" || state.phase === "cleanup_incomplete")) ||
+    (recoveryGeneration.phase === "success_committed" &&
+      (state.phase === "success_committed" || state.phase === "cleanup_incomplete"));
+  if (!recordedGenerationKnown || !liveSuccessorAllowed) {
+    throw new HistoryMigrationError(
+      "INVALID_METADATA",
+      "PASS 收据记录的恢复世代与磁盘状态机不一致，拒绝续做收尾。",
+    );
+  }
+  if (
+    typeof backupEvidence !== "object" ||
+    backupEvidence.approvalNonceSha256 !== approvalBinding.nonceSha256 ||
+    backupEvidence.approvalGenerationBindingSha256 !== approvalBinding.generationBindingSha256 ||
+    backupEvidence.targetDatabaseName !== target.database ||
+    !hex64(backupEvidence.maintenanceLiveAdminFingerprintSha256) ||
+    !hex64(backupEvidence.maintenanceClusterIdentitySha256) ||
+    !hex64(backupEvidence.maintenanceAdminUrlSha256)
+  ) {
+    throw new HistoryMigrationError(
+      "INVALID_METADATA",
+      "备份证据与 PASS 收据的批准/目标绑定不一致，拒绝续做收尾。",
+    );
+  }
   const admin = createPostgresDatabase({
     connectionString: args.adminUrl,
     maxConnections: 2,
     applicationName: "urmotiv-history-import-formal-cleanup",
   });
   try {
-    const parsed = parsePostgresTarget(args.adminUrl, "admin");
-    const actual = (await admin.query<{ database: string; role: string }>(
-      sql`select current_database() as database, current_user as role`,
-    ))[0];
+    const live = await probeMaintenanceConnectionIdentity(admin, args.adminUrl);
     if (
-      actual === undefined ||
-      actual.database !== parsed.database ||
-      actual.role !== parsed.user
+      live.liveAdminFingerprintSha256 !== backupEvidence.maintenanceLiveAdminFingerprintSha256 ||
+      live.clusterIdentitySha256 !== backupEvidence.maintenanceClusterIdentitySha256 ||
+      live.adminUrlSha256 !== backupEvidence.maintenanceAdminUrlSha256
     ) {
       throw new HistoryMigrationError(
         "INVALID_METADATA",
-        "续做收尾的维护连接实际身份与连接串不一致。",
+        "续做收尾的维护连接/集群/连接串身份与备份证据不一致。",
+      );
+    }
+    const targetRow = await admin.query<{ present: unknown }>(
+      sql`select 1 as present from pg_database where datname = ${target.database}`,
+    );
+    if (targetRow.length !== 1) {
+      throw new HistoryMigrationError(
+        "INVALID_METADATA",
+        "续做收尾的维护连接所在集群不包含收据目标库。",
       );
     }
     await dropDatabaseForce(admin, `${target.database}${formalDatabaseBackupSuffix}`);

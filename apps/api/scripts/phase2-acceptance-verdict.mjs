@@ -179,3 +179,34 @@ export function postRunDirtyReasons(environment) {
   }
   return { reasons, dirtyCount };
 }
+
+/**
+ * 运行后整树突变编码：验收运行自己绝不能移动 HEAD 或弄脏检出。
+ * 这些编码对任何本可成功（PASS / IMPLEMENTATION_READY）的候选定级
+ * 都是硬失败，必须压为 INCONCLUSIVE 并以非零退出码结束。
+ */
+export const POST_RUN_MUTATION_CODES = [
+  "POST_RUN_HEAD_MOVED",
+  "POST_RUN_TREE_NOT_CLEAN",
+];
+
+/**
+ * 终判定级（纯函数）：把运行后整树突变硬失败套用到所有成功候选。
+ * 非成功候选（INCONCLUSIVE）保持原样。
+ * @param {{candidate: unknown, reasonCodes: unknown}} environment
+ * @returns {unknown} 最终 evidence.status。
+ */
+export function finalizeStatus(environment) {
+  const candidate =
+    typeof environment === "object" && environment !== null ? environment.candidate : undefined;
+  const reasonCodes =
+    typeof environment === "object" && environment !== null ? environment.reasonCodes : undefined;
+  const codes = new Set(Array.isArray(reasonCodes) ? reasonCodes : []);
+  if (candidate !== "PASS" && candidate !== "IMPLEMENTATION_READY") {
+    return candidate;
+  }
+  if (POST_RUN_MUTATION_CODES.some((code) => codes.has(code))) {
+    return "INCONCLUSIVE";
+  }
+  return candidate;
+}
