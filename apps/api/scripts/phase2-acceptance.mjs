@@ -13,7 +13,7 @@ import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
-import { assessFormalShard } from "./phase2-acceptance-verdict.mjs";
+import { assessFormalShard, postRunDirtyReasons } from "./phase2-acceptance-verdict.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const apiDirectory = fileURLToPath(new URL("..", import.meta.url));
@@ -250,6 +250,26 @@ const acceptance = spawnSync(process.execPath, [vitestBin, "run", acceptanceTest
   },
 });
 evidence.runnerExitCode = acceptance.status ?? 1;
+{
+  const postRunHead = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  })
+    .trim()
+    .replace(/\r?\n$/, "");
+  const postRunStatus = execFileSync(
+    "git",
+    ["status", "--porcelain=v1", "--untracked-files=all"],
+    { cwd: repositoryRoot, encoding: "utf8" },
+  );
+  const postRun = postRunDirtyReasons({
+    headBefore: head,
+    headAfter: postRunHead,
+    statusOutput: postRunStatus,
+  });
+  evidence.dirtyCount = postRun.dirtyCount;
+  evidence.reasonCodes.push(...postRun.reasons);
+}
 
 {
   let shard = null;
@@ -305,6 +325,8 @@ const hardFailures = [
   "PHASE2_ROUTE_NOT_AUTHORIZED",
   "PHASE2_ROUTE_SHARD_MISSING",
   "PHASE2_ROUTE_SHARD_UNREADABLE",
+  "POST_RUN_HEAD_MOVED",
+  "POST_RUN_TREE_NOT_CLEAN",
 ];
 if (codes.has("PHASE2_ROUTE_PASS") && !hardFailures.some((code) => codes.has(code))) {
   evidence.status = "PASS";

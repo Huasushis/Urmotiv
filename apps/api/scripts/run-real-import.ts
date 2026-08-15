@@ -9,8 +9,8 @@ import {
 export {
   runPhase2Acceptance,
   runPhase2Bound,
+  completePhase2TerminalCleanup,
   type Phase2RunnerHooks,
-  type ValidationContext,
 } from "../src/history-migration/phase2-runner-core";
 export { resolveRunnerInputs, preflightReceiptSchema, phase2RunReceiptSchema } from "../src/history-migration/runner-inputs";
 export type { RunnerInputs, TargetClass, PreflightReceipt, Phase2RunReceipt } from "../src/history-migration/runner-inputs";

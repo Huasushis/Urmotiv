@@ -26,6 +26,8 @@ export {
   formalRestoreRefusedMarkerName,
   formalBackupEvidenceName,
   formalRollbackEvidenceName,
+  formalCleanupPendingEvidenceName,
+  completeFormalFinalizationCleanup,
 } from "../src/history-migration/formal-runner-core";
 export type {
   FormalImportHooks,

@@ -3,6 +3,7 @@ import {
   assessFormalShard,
   assessFormalShardBindings,
   expectedBindingKind,
+  postRunDirtyReasons,
 } from "../scripts/phase2-acceptance-verdict.mjs";
 
 const strictBindings = {
@@ -156,5 +157,38 @@ describe("assessFormalShard 对抗性判定", () => {
     expect(assessFormalShard(null, environment).reasons).toContain(
       "PHASE2_ROUTE_SHARD_MISSING",
     );
+  });
+});
+
+describe("postRunDirtyReasons（Gate 9 运行时卫生）", () => {
+  it("干净且提交未移动时无原因", () => {
+    const result = postRunDirtyReasons({
+      headBefore: "f".repeat(40),
+      headAfter: "f".repeat(40),
+      statusOutput: "",
+    });
+    expect(result).toEqual({ reasons: [], dirtyCount: 0 });
+  });
+  it("有未提交内容 → POST_RUN_TREE_NOT_CLEAN 与行数", () => {
+    const result = postRunDirtyReasons({
+      headBefore: "f".repeat(40),
+      headAfter: "f".repeat(40),
+      statusOutput: " M apps/api/scripts/phase2-acceptance.mjs\n?? new-file.txt\n",
+    });
+    expect(result.reasons).toEqual(["POST_RUN_TREE_NOT_CLEAN"]);
+    expect(result.dirtyCount).toBe(2);
+  });
+  it("运行期间提交被改动 → POST_RUN_HEAD_MOVED", () => {
+    const result = postRunDirtyReasons({
+      headBefore: "f".repeat(40),
+      headAfter: "e".repeat(40),
+      statusOutput: "",
+    });
+    expect(result.reasons).toEqual(["POST_RUN_HEAD_MOVED"]);
+  });
+  it("非字符串输入一律按未提供处理，绝不崩溃", () => {
+    const result = postRunDirtyReasons({ headBefore: 42, headAfter: null, statusOutput: {} });
+    expect(result.reasons).toEqual([]);
+    expect(result.dirtyCount).toBe(0);
   });
 });

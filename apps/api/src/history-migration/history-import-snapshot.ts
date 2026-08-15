@@ -279,6 +279,143 @@ export async function dropScratchSnapshot(
   if (failures.length > 0) throw failures[0];
 }
 
+function generationSnapshotNameFor(name: string, generation: 1 | 2): string {
+  return `${snapshotNameFor(name)}_g${generation}`;
+}
+
+/**
+ * 换代快照：创建并核对后保留，绝不触碰规范名快照。与 `__snapshot`（旧代）
+ * 并行存在时不形成销毁空隙；核对失败只删除本次代名，旧代原样保留。
+ */
+export async function snapshotScratchDatabaseGeneration(
+  adminConnectionString: string,
+  scratchName: string,
+  tableNames: readonly string[],
+  expectedInventory: DatabaseContentInventory,
+  generation: 1 | 2,
+): Promise<DatabaseContentInventory> {
+  assertScratchDatabaseName(scratchName);
+  const snapshotName = generationSnapshotNameFor(scratchName, generation);
+  await withAdminConnection(adminConnectionString, async (admin) => {
+    if (!(await databaseExists(admin, scratchName))) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "临时库不存在，无法创建换代快照。");
+    }
+    if (await databaseExists(admin, snapshotName)) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "同名换代快照已存在，拒绝覆盖。");
+    }
+    await terminateConnections(admin, scratchName);
+    await admin.execute(
+      sql`create database ${sql.identifier(snapshotName)} template ${sql.identifier(scratchName)}`,
+    );
+  });
+  const snapshotInventory = await captureNamedDatabaseInventory(
+    adminConnectionString,
+    snapshotName,
+    tableNames,
+  );
+  if (!databaseContentInventoriesEqual(snapshotInventory, expectedInventory)) {
+    await dropScratchSnapshotGeneration(adminConnectionString, scratchName, generation);
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "换代数据库快照内容摘要与批准基线不一致。");
+  }
+  return snapshotInventory;
+}
+
+/** 只删除规范名快照本身（旧代退役）；分世代名与其他恢复工件不受影响。 */
+export async function dropCanonicalScratchSnapshot(
+  adminConnectionString: string,
+  scratchName: string,
+): Promise<void> {
+  const name = snapshotNameFor(scratchName);
+  await withAdminConnection(adminConnectionString, async (admin) => {
+    await terminateConnections(admin, name);
+    await admin.execute(sql`drop database if exists ${sql.identifier(name)}`);
+  });
+}
+
+/** 把已核对的换代快照原子改名为规范名；规范名必须空缺，否则拒绝。 */
+export async function promoteScratchDatabaseGeneration(
+  adminConnectionString: string,
+  scratchName: string,
+  generation: 1 | 2,
+): Promise<void> {
+  const generationName = generationSnapshotNameFor(scratchName, generation);
+  const canonicalName = snapshotNameFor(scratchName);
+  await withAdminConnection(adminConnectionString, async (admin) => {
+    if (!(await databaseExists(admin, generationName))) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "待提升的换代快照不存在。");
+    }
+    if (await databaseExists(admin, canonicalName)) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "规范快照名仍被占用，拒绝改名提升。");
+    }
+    await terminateConnections(admin, generationName);
+    await admin.execute(
+      sql`alter database ${sql.identifier(generationName)} rename to ${sql.identifier(canonicalName)}`,
+    );
+  });
+}
+
+/** 删除指定的分量名快照；核对失败回收与终删补做共用，允许不存在。 */
+export async function dropScratchSnapshotGeneration(
+  adminConnectionString: string,
+  scratchName: string,
+  generation: 1 | 2,
+): Promise<void> {
+  const name = generationSnapshotNameFor(scratchName, generation);
+  await withAdminConnection(adminConnectionString, async (admin) => {
+    await terminateConnections(admin, name);
+    await admin.execute(sql`drop database if exists ${sql.identifier(name)}`);
+  });
+}
+
+/** 清洗失败证据用：按规范名、g2、g1 的顺序探明保留的数据库快照代。 */
+export async function probeScratchSnapshotGeneration(
+  adminConnectionString: string,
+  scratchName: string,
+  tableNames: readonly string[],
+): Promise<{ readonly name: string | null; readonly inventory: DatabaseContentInventory | null }> {
+  const candidates = [
+    { name: snapshotNameFor(scratchName), kind: "canonical" },
+    { name: generationSnapshotNameFor(scratchName, 2), kind: "g2" },
+    { name: generationSnapshotNameFor(scratchName, 1), kind: "g1" },
+  ] as const;
+  let existingKind: (typeof candidates)[number] | undefined;
+  await withAdminConnection(adminConnectionString, async (admin) => {
+    for (const candidate of candidates) {
+      if (await databaseExists(admin, candidate.name)) {
+        existingKind = candidate;
+        return;
+      }
+    }
+  });
+  if (existingKind === undefined) return { name: null, inventory: null };
+  return {
+    name: existingKind.kind,
+    inventory: await captureNamedDatabaseInventory(
+      adminConnectionString,
+      existingKind.name,
+      tableNames,
+    ),
+  };
+}
+
+/** 存储快照目录若不存在返回 null；其他错误照常抛出。 */
+export async function captureStorageInventoryIfPresent(
+  directory: string,
+): Promise<StorageInventory | null> {
+  try {
+    return await captureStorageInventory(directory);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return null;
+    }
+    throw error;
+  }
+}
+
 async function collectStorageEntries(
   root: string,
   relativeDirectory: string,

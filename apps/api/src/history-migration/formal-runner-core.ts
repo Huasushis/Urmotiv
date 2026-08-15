@@ -20,6 +20,7 @@ import { z } from "zod";
 
 import { DatabaseDataStore } from "../database-store";
 import { ServiceImportExecutionAuthorization } from "../problem-package-runtime";
+import { ProblemPackageTemporaryError } from "@urmotiv/jobs";
 import { sha256Hex } from "./digests";
 import { HistoryMigrationError } from "./errors";
 import {
@@ -100,14 +101,15 @@ import {
   type PreflightReceipt,
 } from "./runner-inputs";
 import type { ValidationContext } from "./phase2-runner-core";
-import { preflightReceiptName, runHistoryImportPreflight } from "./preflight-core";
 import {
   advanceFormalRecoveryPhase,
   readFormalRecoveryState,
   recoveryStateSha256,
   startFormalRecoveryState,
+  type FormalRecoveryPhase,
   type FormalRecoveryState,
 } from "./formal-recovery-state";
+import { preflightReceiptName, runHistoryImportPreflight } from "./preflight-core";
 import { designatedRealFormalImportCount } from "./pipeline-constants";
 export { designatedRealFormalImportCount };
 const digestPattern = /^[a-f0-9]{64}$/;
@@ -119,6 +121,7 @@ export const formalRollbackVerifiedMarkerName = "FORMAL_ROLLBACK_VERIFIED";
 export const formalRestoreRefusedMarkerName = "FORMAL_RESTORE_REFUSED";
 export const formalBackupEvidenceName = "formal-backup-evidence.private.json";
 export const formalRollbackEvidenceName = "formal-rollback-evidence.private.json";
+export const formalCleanupPendingEvidenceName = "formal-cleanup-pending-evidence.private.json";
 const formalStorageSnapshotName = "formal.storage.before.snapshot";
 const formalDatabaseBackupSuffix = "__formal_backup";
 const importManifestFileName = "import-manifest.private.json";
@@ -276,8 +279,18 @@ export interface FormalImportHooks {
 /** 仅测试缝可注入的故障面；正式导出入口不接受任何此类参数。 */
 export interface FormalImportTestSeam {
   readonly storage?: FileStorage | undefined;
-  /** PASS 收据写盘之后、备份清理之前的故障注入：验证收尾失败必须联合回滚且不留 PASS。 */
-  readonly finalization?: { readonly afterPassReceiptWrite?: (() => Promise<void>) | undefined } | undefined;
+  readonly finalization?: {
+    /** PASS 收据写盘之前的故障注入：证明收据缺席时的失败必须联合回滚。 */
+    readonly beforePassReceiptWrite?: (() => Promise<void>) | undefined;
+    /** 成功承诺（success_committed）落盘前的故障注入：两个恢复副本仍完好。 */
+    readonly beforeSuccessCommittedWrite?: (() => Promise<void>) | undefined;
+    /** 承诺落盘后的故障注入：只能是尽力而为收尾、不得把 PASS 转失败。 */
+    readonly afterPassReceiptWrite?: (() => Promise<void>) | undefined;
+    /** 数据库备份已删除、存储快照删除前的故障注入。 */
+    readonly afterDatabaseBackupDrop?: (() => Promise<void>) | undefined;
+    /** finalized 相位写盘前的故障注入：两个恢复副本均已删除。 */
+    readonly beforeFinalizedWrite?: (() => Promise<void>) | undefined;
+  } | undefined;
 }
 function environmentValue(
   values: ReadonlyMap<string, string>,
@@ -1149,7 +1162,12 @@ async function writeFormalReceiptPASS(options: FormalCoreOptions, pass: FormalIm
   const receipt = {
     version: 4,
     generatedAt: new Date().toISOString(),
-    recoveryGeneration,
+    target: {
+      host: options.inputs.target.host,
+      port: options.inputs.target.port,
+      user: options.inputs.target.user,
+      database: options.inputs.target.database,
+    },
     targetClass: "designated-real",
     singlePass: true,
     approvalBinding: {
@@ -1220,6 +1238,12 @@ async function writeFormalReceiptRefused(
   const receipt = {
     version: 4,
     generatedAt: new Date().toISOString(),
+    target: {
+      host: options.inputs.target.host,
+      port: options.inputs.target.port,
+      user: options.inputs.target.user,
+      database: options.inputs.target.database,
+    },
     recoveryGeneration,
     targetClass: "designated-real",
     singlePass: true,
@@ -1262,9 +1286,10 @@ async function writeFormalReceiptRefused(
   );
 }
 /**
- * 正式导入核心：核销批准书 → 建立恢复状态机 → 管理员实时身份核验 →
- * 受保护相位内建备份 → 单遍导入自证 → 确定性双向回滚 →
- * 收尾只有在备份清理完成才 finalize；任何失败都联合回滚并消灭 PASS 证据。
+ * 正式导入核心：实时执行授权（任何副作用前）→ 核销批准书 → 建立恢复状态机 →
+ * 管理员实时身份核验 → 受保护相位内建备份 → 单遍导入自证 → 确定性双向回滚 →
+ * 成功承诺（PASS 收据 + success_committed）两个匹配恢复副本完好时落盘；承诺之后
+ * 的副本销毁与 finalized 为尽力而为收尾，失败只进入 cleanup_incomplete。
  */
 async function runFormalImportCore(
   argv: readonly string[],
@@ -1274,6 +1299,43 @@ async function runFormalImportCore(
   coreGate: { readonly productionRealCountGate?: boolean } = {},
 ): Promise<number> {
   const inputs = resolveFormalInputs(argv, env);
+  // 门禁 1：任何作业/来源/暂存/输出/备份/存储/数据库副作用之前的实时执行授权。
+  // 授权对象由服务端组装（实时用户表读取 + problem.import 权限），任何调用方
+  // 提供的布尔值或操作员身份都不能伪造。检查失败或权限缺失即刻拒绝且零改动。
+  {
+    const authorizationDatabase = createPostgresDatabase({
+      connectionString: inputs.databaseUrl,
+      maxConnections: 2,
+      applicationName: "urmotiv-history-import-formal-authz",
+    });
+    try {
+      const authorized = await importExecutionAuthorizationFor(authorizationDatabase).canImport({
+        requestedByUserId: inputs.principal,
+        signal: AbortSignal.timeout(60_000),
+      });
+      if (!authorized) {
+        throw new HistoryMigrationError(
+          "NOT_AUTHORIZED",
+          "正式导入实时执行授权未通过：拒绝执行且未产生任何改动。",
+        );
+      }
+    } catch (error) {
+      if (error instanceof HistoryMigrationError) {
+        await authorizationDatabase.close().catch(() => undefined);
+        throw error;
+      }
+      if (error instanceof ProblemPackageTemporaryError) {
+        await authorizationDatabase.close().catch(() => undefined);
+        throw new HistoryMigrationError(
+          "NOT_AUTHORIZED",
+          "正式导入实时执行授权检查暂时失败：拒绝执行且未产生任何改动。",
+        );
+      }
+      await authorizationDatabase.close().catch(() => undefined);
+      throw error;
+    }
+    await authorizationDatabase.close().catch(() => undefined);
+  }
   const validation = await validateFormalGate(inputs, env, hooks);
   const { context, phase2, targetApproval } = validation;
   if (coreGate.productionRealCountGate) {
@@ -1420,12 +1482,22 @@ async function runFormalImportCore(
     await importDatabase.close().catch(() => undefined);
     await advanceFormalRecoveryPhase(inputs.outputDirectory, "import_started", "import_verified");
 
-    // 第三步：清理相位内写 PASS 收据、清理备份工件；全程任一失败即联合回滚，
-    // 且任何以失败告终的路径都不保留 PASS 标记。
+    // 第三步：清理相位内的关键提交。PASS 收据与 success_committed 相位必须
+    // 在两个匹配恢复副本（数据库备份 + 存储快照）都完好时写盘；这一窗口内
+    // 任何失败都联合回滚、签名 FAIL 并消灭 PASS 标记。承诺持久化之后，
+    // 销毁恢复副本与写 finalized 只是尽力而为的收尾：失败只诚实进入
+    // cleanup_incomplete，绝不允许把已提交的 PASS 结果反转成失败报告。
     await advanceFormalRecoveryPhase(inputs.outputDirectory, "import_verified", "cleanup_pending");
     try {
+      await seam.finalization?.beforePassReceiptWrite?.();
       await writeFormalReceiptPASS(coreOptions, pass);
-    } catch (receiptError) {
+      await seam.finalization?.beforeSuccessCommittedWrite?.();
+      await advanceFormalRecoveryPhase(
+        inputs.outputDirectory,
+        "cleanup_pending",
+        "success_committed",
+      );
+    } catch {
       await removePrivateRegularFile(join(inputs.outputDirectory, formalPassMarkerName))
         .catch(() => undefined);
       await advanceFormalRecoveryPhase(inputs.outputDirectory, "cleanup_pending", "rollback_pending");
@@ -1443,45 +1515,57 @@ async function runFormalImportCore(
         backupName: backup.backupName,
         storageSnapshotDirectory,
         rollback,
-        refusalCode: "receipt_write_refused",
+        refusalCode: "finalization_commit_refused",
       });
       throw new HistoryMigrationError(
         "INTERNAL_ERROR",
-        "正式导入已写入，但 PASS 收据写入失败；数据库与存储已联合回滚并核验。",
+        "正式导入已写入，但成功承诺未能在两个恢复副本完好时落盘；数据库与存储已联合回滚并核验。",
       );
     }
+    // 成功承诺已持久化：以下每步失败都只能遗留清理待办，不得改变数据结论。
+    let databaseBackupRetained = true;
+    let storageSnapshotRetained = true;
+    let cleanupIncomplete = false;
     try {
       await seam.finalization?.afterPassReceiptWrite?.();
       await dropDatabaseForce(admin, backup.backupName);
+      databaseBackupRetained = false;
+      await seam.finalization?.afterDatabaseBackupDrop?.();
       await rm(storageSnapshotDirectory, { recursive: true, force: true });
-    } catch (cleanupError) {
-      await removePrivateRegularFile(join(inputs.outputDirectory, formalPassMarkerName))
-        .catch(() => undefined);
-      await advanceFormalRecoveryPhase(inputs.outputDirectory, "cleanup_pending", "rollback_pending");
-      const rollback = await rollbackFormalMutation({
-        admin,
-        inputs,
-        backupName: backup.backupName,
-        storageSnapshotDirectory,
-        beforeDatabaseInventory,
-        beforeStorageInventory,
+      storageSnapshotRetained = false;
+      await seam.finalization?.beforeFinalizedWrite?.();
+      await advanceFormalRecoveryPhase(inputs.outputDirectory, "success_committed", "finalized");
+    } catch {
+      cleanupIncomplete = true;
+      await advanceFormalRecoveryPhase(
+        inputs.outputDirectory,
+        "success_committed",
+        "cleanup_incomplete",
+      ).catch(() => undefined);
+    }
+    if (cleanupIncomplete) {
+      const pendingState = await readFormalRecoveryState(inputs.outputDirectory);
+      await writeNewPrivateJson(join(inputs.outputDirectory, formalCleanupPendingEvidenceName), {
+        version: 1,
+        generatedAt: new Date().toISOString(),
+        receiptVerdict: "PASS",
+        passReceiptWritten: true,
+        recoveryPhase: pendingState?.phase ?? "success_committed",
+        recoveryStateSha256:
+          pendingState === undefined ? "" : recoveryStateSha256(pendingState),
+        approvalNonceSha256: sha256Hex(`nonce-v1|${targetApproval.nonce}`),
+        approvalGenerationBindingSha256: computeFormalGenerationBinding(targetApproval),
+        databaseBackupRetained,
+        storageSnapshotRetained,
+      }).catch(() => {
+        console.error("正式导入：收尾未完成证据写入失败（成功承诺与状态机仍然有效）。");
       });
-      await concludeRefusedRun({
-        coreOptions,
-        admin,
-        backupName: backup.backupName,
-        storageSnapshotDirectory,
-        rollback,
-        refusalCode: "finalization_cleanup_refused",
-      });
-      throw new HistoryMigrationError(
-        "INTERNAL_ERROR",
-        "正式导入已写入，但备份清理失败；数据库与存储已联合回滚并核验。",
+      console.error(
+        "正式导入：数据已提交成功，恢复副本清理未完成；状态机处于 cleanup_incomplete，可调用 completeFormalFinalizationCleanup 幂等续做。",
       );
     }
-    await advanceFormalRecoveryPhase(inputs.outputDirectory, "cleanup_pending", "finalized");
     console.log(
-      `正式导入: PASS; 包数量=${context.packageCount}; 缺失题解=${pass.solutionStates.nullSolutionCount}; 空题解=${pass.solutionStates.emptySolutionCount}`,
+      `正式导入: PASS; 包数量=${context.packageCount}; 缺失题解=${pass.solutionStates.nullSolutionCount}; 空题解=${pass.solutionStates.emptySolutionCount}; 收尾=${cleanupIncomplete ? "cleanup_incomplete" : "finalized"}`,
     );
     return 0;
   } finally {
@@ -1547,6 +1631,85 @@ async function concludeRefusedRun(options: {
       .catch(() => undefined);
   }
   return { verified: restoredAll };
+}
+
+/**
+ * PASS 承诺持久化后的清理续做入口：状态机处于 cleanup_incomplete 或
+ * success_committed 时可幂等调用。先核对 PASS 收据版本、结论与目标命名，
+ * 再用活动连接核对维护身份，随后删除备份库与存储快照并进入 finalized。
+ * 任一中间失败都会保留当前相位，可安全重试；绝不在承诺之前销毁副本。
+ */
+export async function completeFormalFinalizationCleanup(args: {
+  readonly outputDirectory: string;
+  readonly adminUrl: string;
+}): Promise<{ readonly phase: FormalRecoveryPhase }> {
+  const state = await readFormalRecoveryState(args.outputDirectory);
+  if (state === undefined) {
+    throw new HistoryMigrationError("INVALID_METADATA", "恢复状态机尚未建立，无法续做收尾。");
+  }
+  if (state.phase !== "cleanup_incomplete" && state.phase !== "success_committed") {
+    throw new HistoryMigrationError(
+      "INVALID_METADATA",
+      `恢复状态机相位 ${state.phase} 不允许续做正式收尾。`,
+    );
+  }
+  const receiptPayload = (await readPrivateJsonWithDigest(
+    join(args.outputDirectory, formalReceiptName),
+  )).value as { version?: unknown; verdict?: unknown; target?: unknown };
+  const target = receiptPayload.target as {
+    host?: unknown;
+    port?: unknown;
+    user?: unknown;
+    database?: unknown;
+  } | undefined;
+  if (
+    receiptPayload.version !== 4 ||
+    receiptPayload.verdict !== "PASS" ||
+    target === null ||
+    target === undefined ||
+    typeof target !== "object" ||
+    typeof target.host !== "string" ||
+    typeof target.port !== "string" ||
+    typeof target.user !== "string" ||
+    typeof target.database !== "string"
+  ) {
+    throw new HistoryMigrationError("INVALID_METADATA", "PASS 收据结构不完整，拒绝续做收尾。");
+  }
+  assertFormalDatabaseName(target.database);
+  const admin = createPostgresDatabase({
+    connectionString: args.adminUrl,
+    maxConnections: 2,
+    applicationName: "urmotiv-history-import-formal-cleanup",
+  });
+  try {
+    const parsed = parsePostgresTarget(args.adminUrl, "admin");
+    const actual = (await admin.query<{ database: string; role: string }>(
+      sql`select current_database() as database, current_user as role`,
+    ))[0];
+    if (
+      actual === undefined ||
+      actual.database !== parsed.database ||
+      actual.role !== parsed.user
+    ) {
+      throw new HistoryMigrationError(
+        "INVALID_METADATA",
+        "续做收尾的维护连接实际身份与连接串不一致。",
+      );
+    }
+    await dropDatabaseForce(admin, `${target.database}${formalDatabaseBackupSuffix}`);
+    await rm(join(args.outputDirectory, formalStorageSnapshotName), {
+      recursive: true,
+      force: true,
+    });
+    const finalized = await advanceFormalRecoveryPhase(
+      args.outputDirectory,
+      state.phase,
+      "finalized",
+    );
+    return { phase: finalized.phase };
+  } finally {
+    await admin.close().catch(() => undefined);
+  }
 }
 
 /** 回环地址集合：仅测试用的绑定入口允许这些主机。 */

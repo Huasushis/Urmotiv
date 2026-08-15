@@ -152,3 +152,30 @@ export function assessFormalShard(shard, environment) {
   reasons.push("PHASE2_ROUTE_FAILED_UNADJUDICATED");
   return { admission: "UNADJUDICATED", reasons };
 }
+
+/**
+ * 验收运行结束后的整树卫生判定（Gate 9）：只比较提交摘要与暂存/未暂存
+ * 行数，不输出任何路径或内容。验收本身不得改变检出。
+ * @param {{headBefore: unknown, headAfter: unknown, statusOutput: unknown}} environment
+ * @returns {{reasons: string[], dirtyCount: number}}
+ */
+export function postRunDirtyReasons(environment) {
+  const headBefore =
+    typeof environment === "object" && environment !== null ? environment.headBefore : undefined;
+  const headAfter =
+    typeof environment === "object" && environment !== null ? environment.headAfter : undefined;
+  const statusOutput =
+    typeof environment === "object" && environment !== null ? environment.statusOutput : undefined;
+  const reasons = [];
+  if (typeof headBefore === "string" && typeof headAfter === "string" && headAfter !== headBefore) {
+    reasons.push("POST_RUN_HEAD_MOVED");
+  }
+  const dirtyCount =
+    typeof statusOutput === "string"
+      ? statusOutput.split("\n").filter((line) => line.trim().length > 0).length
+      : 0;
+  if (dirtyCount > 0) {
+    reasons.push("POST_RUN_TREE_NOT_CLEAN");
+  }
+  return { reasons, dirtyCount };
+}

@@ -24,10 +24,12 @@ import {
   type HistoryImportPreflightHooks,
 } from "../scripts/preflight-history-import";
 import {
+  completeFormalFinalizationCleanup,
   computeFormalAdminFingerprintSha256,
   computeFormalTargetFingerprintSha256,
   computeStorageRootIdentitySha256,
   formalBackupVerifiedMarkerName,
+  formalCleanupPendingEvidenceName,
   formalPassMarkerName,
   formalReceiptName,
   formalRestoreRefusedMarkerName,
@@ -36,7 +38,12 @@ import {
   runFormalImport,
   runFormalImportBound,
 } from "../scripts/run-formal-import";
-import { runPhase2Bound, type Phase2RunnerHooks } from "../scripts/run-real-import";
+import { readFormalRecoveryState } from "../src/history-migration/formal-recovery-state";
+import {
+  completePhase2TerminalCleanup,
+  runPhase2Bound,
+  type Phase2RunnerHooks,
+} from "../scripts/run-real-import";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo";
 import {
   prepareHistoryCandidates,
@@ -892,7 +899,8 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       await runPhase2Bound(runnerArguments(), cleanupEnv, {
         ...provenanceHooks(),
         beforeSnapshotCleanup: async () => {
-          // 真实的部分删除失败：先确证性地删掉一半文件，
+          // 真实的部分删除失败：先确证性地删掉一半文件，再制造一个
+          // 不可删除的驻留目录，并在任何终删开始前抛出（模拟被喊停）。
           const names = (await readdir(cleanupSnapshotDir)).filter((name) => name !== "blocked");
           expect(names.length).toBeGreaterThan(0);
           cleanupStage = "partially-deleted";
@@ -903,6 +911,9 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
           await mkdir(blockedDirectory);
           await privateFile(join(blockedDirectory, "locked.txt"), "locked");
           await chmod(blockedDirectory, 0o500);
+          // 终删前的真实驻留故障：删到一半被喊停。进入恢复证据分支，
+          // 任何终删都未开始，规范名数据库快照必须仍然保留。
+          throw new Error("synthetic pre-terminal storage deletion arrest");
         },
       }),
     ).toBe(1);
@@ -980,6 +991,124 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       await cleanupAdmin.close();
     }
     await chmod(join(cleanupSnapshotDir, "blocked"), 0o700);
+
+    // 终删阶段驻留故障：钩子正常结束，进入终删序列后存储删除被不可删除
+    // 目录挡住。此时数据库快照已按顺序先行删除，证据必须如实报告
+    // scratch_terminal_failed 且数据库快照未保留；随后用幂等续做回收残余。
+    const terminalCleanupTarget = scratchName("term");
+    trackDatabaseFamily(terminalCleanupTarget);
+    const terminalCleanupBatch = await createSyntheticBatch(1);
+    const terminalCleanupEnv = await runApprovedPreflight(
+      terminalCleanupBatch,
+      sourceConnectionString,
+      "synthetic-terminal-cleanup-failure",
+    );
+    terminalCleanupEnv.ADMIN_URL = sourceConnectionString;
+    terminalCleanupEnv.DATABASE_NAME = terminalCleanupTarget;
+    const terminalCleanupSnapshotDir = join(
+      terminalCleanupBatch.runnerReceiptDirectory,
+      "storage.snapshot",
+    );
+    expect(
+      await runPhase2Bound(runnerArguments(), terminalCleanupEnv, {
+        ...provenanceHooks(),
+        beforeSnapshotCleanup: async () => {
+          const blockedDirectory = join(terminalCleanupSnapshotDir, "blocked");
+          await mkdir(blockedDirectory);
+          await privateFile(join(blockedDirectory, "locked.txt"), "locked");
+          await chmod(blockedDirectory, 0o500);
+        },
+      }),
+    ).toBe(1);
+    expect(
+      await exists(
+        join(terminalCleanupBatch.runnerReceiptDirectory, "phase2-run-receipt.private.json"),
+      ),
+    ).toBe(false);
+    expect(
+      await exists(join(terminalCleanupBatch.runnerReceiptDirectory, "PHASE2_CLEANUP_IN_PROGRESS")),
+    ).toBe(true);
+    const terminalEvidence = JSON.parse(
+      await readFile(
+        join(terminalCleanupBatch.runnerReceiptDirectory, "cleanup-recovery-evidence.private.json"),
+        "utf8",
+      ),
+    ) as {
+      recoveryPhase: string;
+      databaseSnapshotName: string | null;
+      databaseSnapshotRetained: boolean;
+      storageRecoveryMatchesExecution: boolean;
+    };
+    expect(terminalEvidence.recoveryPhase).toBe("scratch_terminal_failed");
+    expect(terminalEvidence.databaseSnapshotName).toBeNull();
+    expect(terminalEvidence.databaseSnapshotRetained).toBe(false);
+    expect(terminalEvidence.storageRecoveryMatchesExecution).toBe(true);
+    await chmod(join(terminalCleanupSnapshotDir, "blocked"), 0o700);
+    // 幂等续做：数据库快照已删，存储快照残留被回收，进入 finalized。
+    expect(
+      (
+        await completePhase2TerminalCleanup({
+          receiptDirectory: terminalCleanupBatch.runnerReceiptDirectory,
+          adminUrl,
+          databaseName: terminalCleanupTarget,
+        })
+      ).phase,
+    ).toBe("scratch_finalized");
+    expect(await exists(terminalCleanupSnapshotDir)).toBe(false);
+
+    // 换代窗口故障：存储新代已提升为规范名、数据库 g2 尚未提升时被喊停。
+    // 证据必须如实呈现“规范存储在场、规范数据库空缺、g2 数据库保留”的
+    // 错位现场；此时终删续做必须拒绝（相位不是 scratch_terminal_failed）。
+    const generationTarget = scratchName("gen");
+    trackDatabaseFamily(generationTarget);
+    const generationBatch = await createSyntheticBatch(1);
+    const generationEnv = await runApprovedPreflight(
+      generationBatch,
+      sourceConnectionString,
+      "synthetic-generation-arrest",
+    );
+    generationEnv.ADMIN_URL = sourceConnectionString;
+    generationEnv.DATABASE_NAME = generationTarget;
+    expect(
+      await runPhase2Bound(runnerArguments(), generationEnv, {
+        ...provenanceHooks(),
+        cleanupFaults: {
+          afterStorageSnapshotPromoted: async () => {
+            throw new Error("synthetic generation promotion arrest");
+          },
+        },
+      }),
+    ).toBe(1);
+    const generationEvidence = JSON.parse(
+      await readFile(
+        join(generationBatch.runnerReceiptDirectory, "cleanup-recovery-evidence.private.json"),
+        "utf8",
+      ),
+    ) as {
+      recoveryPhase: string;
+      databaseSnapshotName: string | null;
+      databaseSnapshotMatchesExecution: boolean;
+      databaseSnapshotRetained: boolean;
+      storageCanonicalPresent: boolean;
+      storageCanonicalMatchesExecution: boolean;
+      storageNextPresent: boolean;
+    };
+    expect(generationEvidence).toMatchObject({
+      recoveryPhase: "scratch_retiring_g1",
+      databaseSnapshotName: "g2",
+      databaseSnapshotMatchesExecution: true,
+      databaseSnapshotRetained: true,
+      storageCanonicalPresent: true,
+      storageCanonicalMatchesExecution: true,
+      storageNextPresent: false,
+    });
+    await expect(
+      completePhase2TerminalCleanup({
+        receiptDirectory: generationBatch.runnerReceiptDirectory,
+        adminUrl,
+        databaseName: generationTarget,
+      }),
+    ).rejects.toThrow("不允许续做");
   }, 300_000);
   it("正式导入：带外批准书门禁、伪造拒绝、v4 单遍收据与中途故障双向回滚", async () => {
     assertNode24();
@@ -1107,6 +1236,55 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
         runPreflight: async (preflightArgv: readonly string[], preflightEnv: NodeJS.ProcessEnv) =>
           runHistoryImportPreflight(preflightArgv, preflightEnv, provenanceHooks()),
       };
+
+      // （一 b）门禁 1：实时执行授权先于任何作业/来源/输出/数据库副作用。
+      const denialStorageRoot = join(formalBatch.root, "formal-denial-storage");
+      await privateDirectory(denialStorageRoot);
+      const denialApprovalFile = join(
+        formalBatch.root,
+        "formal-target-approval-denial.private.json",
+      );
+      await writeFormalTargetApproval(denialApprovalFile, {
+        ...formalBaseDocuments,
+        formalTargetFingerprintSha256: formalTargetFingerprint,
+        prestateStorageInventorySha256: (
+          await captureStorageInventory(denialStorageRoot)
+        ).contentInventorySha256,
+        storageRootIdentitySha256: await computeStorageRootIdentitySha256(
+          denialStorageRoot,
+        ),
+      });
+      const denialOutput = join(formalBatch.root, "formal-output-denied");
+      const denialEnv = await formalEnvironment(
+        formalBatch,
+        formalConnectionString,
+        adminUrl,
+        denialApprovalFile,
+        denialOutput,
+        denialStorageRoot,
+        join(formalBatch.root, "formal-import-output-denied"),
+        "synthetic-formal-phase1",
+      );
+      denialEnv.PRINCIPAL = databaseDemoUserIds.denied;
+      expect(await runFormalImportBound(formalArguments(), denialEnv, {}, formalHooks)).toBe(1);
+      expect(await exists(denialOutput)).toBe(false);
+      // nonce 零核销：本次拒绝不得产生核销声明，也不得把该 nonce 写入日志。
+      const denialApproval = JSON.parse(
+        await readFile(denialApprovalFile, "utf8"),
+      ) as { nonce: string };
+      const denialNonceSha256 = sha256Hex(`nonce-v1|${denialApproval.nonce}`);
+      expect(
+        await exists(join(evidenceRoot, `formal-approval-log.${denialNonceSha256}.claim`)),
+      ).toBe(false);
+      if (await exists(join(evidenceRoot, "formal-approval-log"))) {
+        const formalApprovalLog = await readFile(join(evidenceRoot, "formal-approval-log"), "utf8");
+        expect(
+          formalApprovalLog
+            .split("\n")
+            .map((line) => line.split("\t")[0])
+            .includes(denialNonceSha256),
+        ).toBe(false);
+      }
       await privateDirectory(join(formalBatch.root, "formal-storage-forged"));
       const forgedApprovalFile = join(
         formalBatch.root,
@@ -1214,9 +1392,45 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       expect((await captureStorageInventory(rollbackStorageRoot)).fileCount).toBe(0);
       expect(await databaseExists(formalAdmin, `${formalDatabaseName}__formal_backup`)).toBe(false);
       expect(await exists(join(rollbackOutput, "formal.storage.before.snapshot"))).toBe(false);
-
-      // （二 b）收尾故障：PASS 收据刚写入（绑定此地）后注入清理失败；
-      // 必须联合回滚数据库与存储、消灭 PASS 标记并签发 FAIL 收据。
+      // （二 b）收尾故障：在独立合成正式目标库上验证成功承诺之后的清理失败。
+      // PASS 收据与 success_committed 必须在两个完好恢复副本都存在时落盘；注入
+      // 的收尾失败只能进入 cleanup_incomplete（退出 0、PASS 标记保留、恢复副本
+      // 保留、待清证据写盘），已提交数据绝不回退；随后由
+      // completeFormalFinalizationCleanup 幂等续做完成副本销毁。
+      const cleanupFaultDatabaseName = `urmotiv_formal_cleanup_${process.pid}${randomUUID()
+        .replaceAll("-", "")
+        .slice(0, 8)}`;
+      temporaryDatabaseNames.push(`${cleanupFaultDatabaseName}__formal_backup`);
+      await formalAdmin.execute(
+        sql`create database ${sql.identifier(cleanupFaultDatabaseName)}`,
+      );
+      const cleanupFaultConnectionString = historyImportDatabaseConnectionString(
+        adminUrl,
+        cleanupFaultDatabaseName,
+      );
+      const cleanupFaultPreparation = createPostgresDatabase({
+        connectionString: cleanupFaultConnectionString,
+        maxConnections: 4,
+      });
+      try {
+        await migrateDatabase(cleanupFaultPreparation);
+        await seedCoreDatabase(cleanupFaultPreparation);
+        await seedDatabaseDemoData(cleanupFaultPreparation);
+      } finally {
+        await cleanupFaultPreparation.close();
+      }
+      const cleanupFaultBaselineClient = createPostgresDatabase({
+        connectionString: cleanupFaultConnectionString,
+        maxConnections: 1,
+      });
+      const cleanupFaultBefore = await captureHistoryImportTableCounts(
+        cleanupFaultBaselineClient,
+      );
+      const cleanupFaultBeforeInventory = await captureDatabaseContentInventory(
+        cleanupFaultBaselineClient,
+        historyImportRequiredTables,
+      );
+      await cleanupFaultBaselineClient.close();
       const cleanupFaultStorageRoot = join(formalBatch.root, "formal-cleanup-fault-storage");
       await privateDirectory(cleanupFaultStorageRoot);
       const cleanupFaultApprovalFile = join(
@@ -1225,7 +1439,10 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       );
       await writeFormalTargetApproval(cleanupFaultApprovalFile, {
         ...formalBaseDocuments,
-        formalTargetFingerprintSha256: formalTargetFingerprint,
+        formalTargetFingerprintSha256: computeFormalTargetFingerprintSha256(
+          formalTargetIdentity(cleanupFaultConnectionString),
+        ),
+        prestateDatabaseInventorySha256: cleanupFaultBeforeInventory.contentSha256,
         prestateStorageInventorySha256: (await captureStorageInventory(cleanupFaultStorageRoot))
           .contentInventorySha256,
         storageRootIdentitySha256: await computeStorageRootIdentitySha256(cleanupFaultStorageRoot),
@@ -1234,7 +1451,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       const cleanupFaultImportOutput = join(formalBatch.root, "formal-cleanup-fault-import-output");
       const cleanupFaultEnv = await formalEnvironment(
         formalBatch,
-        formalConnectionString,
+        cleanupFaultConnectionString,
         adminUrl,
         cleanupFaultApprovalFile,
         cleanupFaultOutput,
@@ -1255,32 +1472,70 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
           },
           formalHooks,
         ),
-      ).toBe(1);
-      expect(await exists(join(cleanupFaultOutput, formalPassMarkerName))).toBe(false);
-      expect(await exists(join(cleanupFaultOutput, formalRollbackVerifiedMarkerName))).toBe(true);
+      ).toBe(0);
+      expect(await exists(join(cleanupFaultOutput, formalPassMarkerName))).toBe(true);
+      expect(await exists(join(cleanupFaultOutput, formalRollbackVerifiedMarkerName))).toBe(false);
       expect(await exists(join(cleanupFaultOutput, formalRestoreRefusedMarkerName))).toBe(false);
+      expect(
+        await databaseExists(formalAdmin, `${cleanupFaultDatabaseName}__formal_backup`),
+      ).toBe(true);
+      expect(await exists(join(cleanupFaultOutput, "formal.storage.before.snapshot"))).toBe(true);
       const cleanupFaultReceipt = JSON.parse(
         await readFile(join(cleanupFaultOutput, formalReceiptName), "utf8"),
+      ) as { version: number; verdict: "PASS" | "FAIL" };
+      expect(cleanupFaultReceipt).toMatchObject({ version: 4, verdict: "PASS" });
+      const cleanupFaultPendingEvidence = JSON.parse(
+        await readFile(join(cleanupFaultOutput, formalCleanupPendingEvidenceName), "utf8"),
       ) as {
-        verdict: "PASS" | "FAIL";
-        refusalCode: string;
-        rollback: { storageRestored: boolean; databaseRestored: boolean };
+        receiptVerdict: string;
+        passReceiptWritten: boolean;
+        recoveryPhase: string;
+        databaseBackupRetained: boolean;
+        storageSnapshotRetained: boolean;
+        recoveryStateSha256: string;
       };
-      expect(cleanupFaultReceipt).toMatchObject({
-        verdict: "FAIL",
-        refusalCode: "finalization_cleanup_refused",
-        rollback: { storageRestored: true, databaseRestored: true },
+      expect(cleanupFaultPendingEvidence).toMatchObject({
+        receiptVerdict: "PASS",
+        passReceiptWritten: true,
+        recoveryPhase: "cleanup_incomplete",
+        databaseBackupRetained: true,
+        storageSnapshotRetained: true,
       });
+      expect(cleanupFaultPendingEvidence.recoveryStateSha256).toMatch(/^[a-f0-9]{64}$/);
       const cleanupFaultCheck = createPostgresDatabase({
-        connectionString: formalConnectionString,
+        connectionString: cleanupFaultConnectionString,
         maxConnections: 1,
       });
-      expect(await captureHistoryImportTableCounts(cleanupFaultCheck)).toEqual(formalBefore);
+      const cleanupFaultAfter = await captureHistoryImportTableCounts(cleanupFaultCheck);
       await cleanupFaultCheck.close();
-      expect((await captureStorageInventory(cleanupFaultStorageRoot)).fileCount).toBe(0);
-      expect(await databaseExists(formalAdmin, `${formalDatabaseName}__formal_backup`)).toBe(false);
+      const cleanupFaultBeforeMap = countMap(cleanupFaultBefore);
+      const cleanupFaultAfterMap = countMap(cleanupFaultAfter);
+      for (const expectation of expectedTableDeltas({
+        imported: 6,
+        attachmentRows: 6,
+        sampleRows: 6,
+        jobItemRows: 6,
+        storedFilesDelta: 12,
+        auditDelta: 12,
+      })) {
+        expect(
+          (cleanupFaultAfterMap.get(expectation.table) ?? 0) -
+            (cleanupFaultBeforeMap.get(expectation.table) ?? 0),
+        ).toBe(expectation.delta);
+      }
+      expect((await captureStorageInventory(cleanupFaultStorageRoot)).fileCount).toBe(12);
+      // Gate 4 幂等补做：销毁两个恢复副本并进入 finalized。
+      expect(
+        await completeFormalFinalizationCleanup({
+          outputDirectory: cleanupFaultOutput,
+          adminUrl,
+        }),
+      ).toEqual({ phase: "finalized" });
+      expect(
+        await databaseExists(formalAdmin, `${cleanupFaultDatabaseName}__formal_backup`),
+      ).toBe(false);
       expect(await exists(join(cleanupFaultOutput, "formal.storage.before.snapshot"))).toBe(false);
-
+      expect((await readFormalRecoveryState(cleanupFaultOutput))?.phase).toBe("finalized");
 
       // （三）正确批准书：单遍导入 + 独立自证核对 + v4 通过收据。
       const formalStorageRoot = join(formalBatch.root, "formal-storage");

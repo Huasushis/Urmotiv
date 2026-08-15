@@ -19,11 +19,23 @@ export const formalRecoveryPhases = [
   "import_started",
   "import_verified",
   "cleanup_pending",
+  "success_committed",
+  "cleanup_incomplete",
   "rollback_pending",
   "rollback_verified",
   "rollback_refused",
   "finalization_refused",
   "finalized",
+  // 第 2 阶段收尾受同一状态机保护：基线代建立 → 换代核对 →
+  // 旧代退役 → 终删开始 → 终删失败或完成。任何相位都至少保留
+  // 一个经过核对的数据库+存储成对代，或把不完整现场标记为失败终态。
+  "scratch_established",
+  "scratch_g2_sealed",
+  "scratch_retiring_g1",
+  "scratch_g1_retired",
+  "scratch_terminal_pending",
+  "scratch_terminal_failed",
+  "scratch_finalized",
 ] as const;
 
 export type FormalRecoveryPhase = (typeof formalRecoveryPhases)[number];
@@ -41,13 +53,22 @@ const allowedTransitions = new Map<FormalRecoveryPhase, readonly FormalRecoveryP
   ["backup_verified", ["import_started"]],
   ["import_started", ["import_verified", "rollback_pending"]],
   ["import_verified", ["cleanup_pending"]],
-  ["cleanup_pending", ["finalized", "rollback_pending", "finalization_refused"]],
+  ["cleanup_pending", ["success_committed", "rollback_pending", "finalization_refused"]],
+  ["success_committed", ["finalized", "cleanup_incomplete"]],
+  ["cleanup_incomplete", ["finalized"]],
   ["rollback_pending", ["rollback_verified", "rollback_refused"]],
   ["rollback_verified", ["cleanup_pending", "finalization_refused"]],
   ["rollback_refused", ["finalization_refused"]],
   ["backup_failed", []],
   ["finalization_refused", []],
   ["finalized", []],
+  ["scratch_established", ["scratch_g2_sealed"]],
+  ["scratch_g2_sealed", ["scratch_retiring_g1"]],
+  ["scratch_retiring_g1", ["scratch_g1_retired"]],
+  ["scratch_g1_retired", ["scratch_terminal_pending"]],
+  ["scratch_terminal_pending", ["scratch_finalized", "scratch_terminal_failed"]],
+  ["scratch_terminal_failed", ["scratch_finalized"]],
+  ["scratch_finalized", []],
 ]);
 
 /** 状态记录的规范化摘要：收据与证据用它在写盘时刻绑定同一恢复世代。 */
@@ -65,10 +86,11 @@ function formalRecoveryStatePath(outputDirectory: string): string {
 export async function startFormalRecoveryState(
   outputDirectory: string,
   generationBindingSha256: string,
+  initialPhase: FormalRecoveryPhase = "pre_backup",
 ): Promise<FormalRecoveryState> {
   const state: FormalRecoveryState = {
     version: 1,
-    phase: "pre_backup",
+    phase: initialPhase,
     generationBindingSha256,
     updatedAt: new Date().toISOString(),
   };

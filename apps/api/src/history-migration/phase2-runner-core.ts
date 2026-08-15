@@ -1,5 +1,5 @@
 import { dirname, join } from "node:path";
-import { rm } from "node:fs/promises";
+import { rename, rm } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { sql } from "drizzle-orm";
 import { z } from "zod";
@@ -63,15 +63,28 @@ import {
   captureDatabaseContentInventory,
   captureStorageInventory,
   databaseContentInventoriesEqual,
+  captureStorageInventoryIfPresent,
+  dropCanonicalScratchSnapshot,
   dropScratchSnapshot,
+  dropScratchSnapshotGeneration,
+  probeScratchSnapshotGeneration,
+  promoteScratchDatabaseGeneration,
   restoreScratchDatabase,
   restoreStorageDirectory,
-  snapshotScratchDatabase,
   snapshotStorageDirectory,
+  snapshotScratchDatabase,
+  snapshotScratchDatabaseGeneration,
   storageInventoriesEqual,
   type DatabaseContentInventory,
   type StorageInventory,
 } from "./history-import-snapshot";
+import {
+  advanceFormalRecoveryPhase,
+  readFormalRecoveryState,
+  recoveryStateSha256,
+  startFormalRecoveryState,
+  type FormalRecoveryPhase,
+} from "./formal-recovery-state";
 import {
   assertNewOutputPath,
   assertPathsInsidePrivateRoot,
@@ -90,10 +103,23 @@ import { preflightPassMarkerName } from "./pipeline-constants";
 import { resolveRunnerInputs, type RunnerInputs } from "./runner-inputs";
 import { preflightReceiptSchema } from "./runner-inputs";
 import { importManifestName, targetApprovalTemplateName, cleanupRecoveryEvidenceName, runReceiptName, runPassMarkerName, recoveryMarkerName, cleanupMarkerName, cleanupRefusedMarkerName } from "./pipeline-constants";
+/** 换代与终删的故障注入缝（仅测试）；正式入口不提供这些参数。 */
+export interface Phase2CleanupFaultHooks {
+  /** 换代开始前：旧代完整保留的失败现场。 */
+  readonly beforeGenerationReplacement?: (() => Promise<void>) | undefined;
+  /** 新代（数据库 g2 + 存储 .next）均已建立并核对后。 */
+  readonly afterGenerationSealed?: (() => Promise<void>) | undefined;
+  /** 旧代数据库规范名已删除、存储换代开始前。 */
+  readonly afterDatabaseSnapshotRetired?: (() => Promise<void>) | undefined;
+  /** 存储 g2 已提升为规范名、数据库 g2 提升前。 */
+  readonly afterStorageSnapshotPromoted?: (() => Promise<void>) | undefined;
+}
+
 export interface Phase2RunnerHooks {
   readonly afterSnapshot?: (() => Promise<void>) | undefined;
   readonly afterFirstPass?: (() => Promise<void>) | undefined;
   readonly beforeSnapshotCleanup?: (() => Promise<void>) | undefined;
+  readonly cleanupFaults?: Phase2CleanupFaultHooks | undefined;
   readonly verifyProvenance?: ((commit: string) => Promise<ExecutionProvenance>) | undefined;
   readonly verifySourceIdentities?:
     | ((
@@ -814,51 +840,108 @@ async function executeBoundRunner(
   const cleanupRefusedMarkerPath = join(inputs.receiptDirectory, cleanupRefusedMarkerName);
   const storageRecoveryDirectory = join(inputs.receiptDirectory, "storage.recovery");
   await writePrivateFile(cleanupMarkerPath, `${new Date().toISOString()}\n`);
+  const scratchRecoveryBindingSha256 = sha256Hex(
+    `${inputs.databaseName}|${execution.databaseInventory.contentSha256}|${execution.storageInventory.contentInventorySha256}`,
+  );
+  await startFormalRecoveryState(
+    inputs.receiptDirectory,
+    scratchRecoveryBindingSha256,
+    "scratch_established",
+  );
+  let terminalDeletionStarted = false;
   try {
-    // 刷新数据库快照为导入后现场（先删基线快照再重建），让保留的
-    // 数据库快照与文件系统恢复工件描述同一状态，联合回滚才有确定性。
-    await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName);
-    await snapshotScratchDatabase(
+    // 换代：新代（数据库 __snapshot_g2 + 存储 storage.snapshot.next）与
+    // 旧代并行建立并各自核对；先有已验证的新代，才允许退役旧代。
+    // 任何中间失败都至少保留一个已核对成对代，绝不出现销毁空隙。
+    await hooks.cleanupFaults?.beforeGenerationReplacement?.();
+    await snapshotScratchDatabaseGeneration(
       inputs.adminUrl,
       inputs.databaseName,
       historyImportRequiredTables,
       execution.databaseInventory,
+      2,
     );
-    // 文件系统快照同理：先刷新为导入后的真实证据内容，再交给删除步骤。
-    // 删除中途失败时，保留的半删除现场与重建恢复快照才都是真实文件。
+    await advanceFormalRecoveryPhase(
+      inputs.receiptDirectory,
+      "scratch_established",
+      "scratch_g2_sealed",
+    );
+    const nextStorageSnapshotDirectory = `${storageSnapshotDirectory}.next`;
+    const nextStorageInventory = await snapshotStorageDirectory(
+      inputs.storageRoot,
+      nextStorageSnapshotDirectory,
+    );
+    if (!storageInventoriesEqual(nextStorageInventory, execution.storageInventory)) {
+      throw new HistoryMigrationError(
+        "CLEANUP_FAILED",
+        "换代存储快照与导入后现场不一致；两代工件均原样保留。",
+      );
+    }
+    await hooks.cleanupFaults?.afterGenerationSealed?.();
+    // 旧代退役：只删规范名快照，然后原子提升存储与数据库新代。
+    await advanceFormalRecoveryPhase(
+      inputs.receiptDirectory,
+      "scratch_g2_sealed",
+      "scratch_retiring_g1",
+    );
+    await dropCanonicalScratchSnapshot(inputs.adminUrl, inputs.databaseName);
+    await hooks.cleanupFaults?.afterDatabaseSnapshotRetired?.();
     await rm(storageSnapshotDirectory, { recursive: true, force: false });
-    await snapshotStorageDirectory(inputs.storageRoot, storageSnapshotDirectory);
+    await rename(nextStorageSnapshotDirectory, storageSnapshotDirectory);
+    await hooks.cleanupFaults?.afterStorageSnapshotPromoted?.();
+    await promoteScratchDatabaseGeneration(inputs.adminUrl, inputs.databaseName, 2);
+    await advanceFormalRecoveryPhase(
+      inputs.receiptDirectory,
+      "scratch_retiring_g1",
+      "scratch_g1_retired",
+    );
+    // 终删前的喊停点：与既有诊断语义一致（工件此时尚未开始删除）。
     await hooks.beforeSnapshotCleanup?.();
+    await advanceFormalRecoveryPhase(
+      inputs.receiptDirectory,
+      "scratch_g1_retired",
+      "scratch_terminal_pending",
+    );
+    terminalDeletionStarted = true;
+    await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName);
     await rm(storageSnapshotDirectory, { recursive: true, force: false });
+    await advanceFormalRecoveryPhase(
+      inputs.receiptDirectory,
+      "scratch_terminal_pending",
+      "scratch_finalized",
+    );
   } catch (error) {
-    // 真实的部分删除/刷新失败：重建文件系统恢复快照，核对保留的数据库
+    // 真实的部分删除/换代失败：重建文件系统恢复快照，核对保留的数据库
     // 快照与导入后现场一致，并把核对结果写成只含聚合的安全证据。
     try {
+      const stateBefore = await readFormalRecoveryState(inputs.receiptDirectory);
+      if (terminalDeletionStarted) {
+        await advanceFormalRecoveryPhase(
+          inputs.receiptDirectory,
+          "scratch_terminal_pending",
+          "scratch_terminal_failed",
+        ).catch(() => undefined);
+      }
+      const stateAfter = await readFormalRecoveryState(inputs.receiptDirectory);
       const storageRecovery = await snapshotStorageDirectory(
         inputs.storageRoot,
         storageRecoveryDirectory,
       );
-      const snapshotDatabase = createPostgresDatabase({
-        connectionString: historyImportDatabaseConnectionString(
-          inputs.adminUrl,
-          `${inputs.databaseName}__snapshot`,
-        ),
-        maxConnections: 1,
-        applicationName: "urmotiv-history-import-cleanup-evidence",
-      });
-      let databaseSnapshotInventory: DatabaseContentInventory;
-      try {
-        databaseSnapshotInventory = await captureDatabaseContentInventory(
-          snapshotDatabase,
-          historyImportRequiredTables,
-        );
-      } finally {
-        await snapshotDatabase.close();
-      }
-      const databaseSnapshotMatches = databaseContentInventoriesEqual(
-        databaseSnapshotInventory,
-        execution.databaseInventory,
+      const databaseSnapshotProbe = await probeScratchSnapshotGeneration(
+        inputs.adminUrl,
+        inputs.databaseName,
+        historyImportRequiredTables,
       );
+      const storageCanonicalProbe = await captureStorageInventoryIfPresent(storageSnapshotDirectory);
+      const storageNextProbe = await captureStorageInventoryIfPresent(
+        `${storageSnapshotDirectory}.next`,
+      );
+      const databaseSnapshotMatches =
+        databaseSnapshotProbe.inventory !== null &&
+        databaseContentInventoriesEqual(
+          databaseSnapshotProbe.inventory,
+          execution.databaseInventory,
+        );
       const storageRecoveryMatches = storageInventoriesEqual(
         storageRecovery,
         execution.storageInventory,
@@ -866,17 +949,32 @@ async function executeBoundRunner(
       await writeNewPrivateJson(join(inputs.receiptDirectory, cleanupRecoveryEvidenceName), {
         version: 1,
         generatedAt: new Date().toISOString(),
+        recoveryPhase: stateAfter?.phase ?? stateBefore?.phase ?? "scratch_established",
+        recoveryStateSha256: stateAfter === undefined ? "" : recoveryStateSha256(stateAfter),
+        databaseSnapshotName: databaseSnapshotProbe.name,
         databaseSnapshotMatchesExecution: databaseSnapshotMatches,
-        databaseSnapshotContentSha256: databaseSnapshotInventory.contentSha256,
+        databaseSnapshotContentSha256: databaseSnapshotProbe.inventory?.contentSha256 ?? null,
         executionDatabaseContentSha256: execution.databaseInventory.contentSha256,
+        storageCanonicalPresent: storageCanonicalProbe !== null,
+        storageCanonicalMatchesExecution:
+          storageCanonicalProbe === null
+            ? null
+            : storageInventoriesEqual(storageCanonicalProbe, execution.storageInventory),
+        storageCanonicalContentSha256: storageCanonicalProbe?.contentInventorySha256 ?? null,
+        storageNextPresent: storageNextProbe !== null,
+        storageNextMatchesExecution:
+          storageNextProbe === null
+            ? null
+            : storageInventoriesEqual(storageNextProbe, execution.storageInventory),
+        storageNextContentSha256: storageNextProbe?.contentInventorySha256 ?? null,
         storageRecoveryMatchesExecution: storageRecoveryMatches,
         storageRecoveryFileCount: storageRecovery.fileCount,
         storageRecoveryContentSha256: storageRecovery.contentInventorySha256,
-        databaseSnapshotRetained: true,
+        databaseSnapshotRetained: databaseSnapshotProbe.inventory !== null,
         storageRecoveryRetained: true,
       });
       await writePrivateFile(cleanupRefusedMarkerPath, `${new Date().toISOString()}\n`);
-      console.error("快照清理未完成：两个恢复工件已保留并完成一致性核对。");
+      console.error("快照清理未完成：恢复工件保留与一致性核对已写入证据。");
     } catch {
       throw new HistoryMigrationError(
         "CLEANUP_FAILED",
@@ -885,7 +983,6 @@ async function executeBoundRunner(
     }
     throw new HistoryMigrationError("CLEANUP_FAILED", "验收数据已验证，但快照清理未完成。");
   }
-  await dropScratchSnapshot(inputs.adminUrl, inputs.databaseName);
   await rm(cleanupMarkerPath, { force: false });
   const receipt = {
     version: 3,
@@ -1000,6 +1097,45 @@ export async function runPhase2Acceptance(
   argv: readonly string[],
   env: NodeJS.ProcessEnv,
 ): Promise<number> {
+
   return runPhase2Bound(argv, env, {});
+}
+/**
+ * 第 2 阶段终删失败（scratch_terminal_failed）的幂等续做：删除残留数据库
+ * 快照（规范名、g2 代名、恢复中间名）与存储快照，随后进入 scratch_finalized。
+ * 只在证据相位为终删失败时可用；任何中间失败均保留相位，可安全重试。
+ */
+export async function completePhase2TerminalCleanup(args: {
+  readonly receiptDirectory: string;
+  readonly adminUrl: string;
+  readonly databaseName: string;
+}): Promise<{ readonly phase: FormalRecoveryPhase }> {
+  assertScratchDatabaseName(args.databaseName);
+  const state = await readFormalRecoveryState(args.receiptDirectory);
+  if (state === undefined) {
+    throw new HistoryMigrationError("INVALID_METADATA", "恢复状态机尚未建立，无法续做终删。");
+  }
+  if (state.phase !== "scratch_terminal_failed") {
+    throw new HistoryMigrationError(
+      "INVALID_METADATA",
+      `恢复状态机相位 ${state.phase} 不允许续做第 2 阶段终删。`,
+    );
+  }
+  await dropScratchSnapshot(args.adminUrl, args.databaseName);
+  await dropScratchSnapshotGeneration(args.adminUrl, args.databaseName, 2);
+  await rm(join(args.receiptDirectory, "storage.snapshot"), {
+    recursive: true,
+    force: true,
+  });
+  await rm(`${join(args.receiptDirectory, "storage.snapshot")}.next`, {
+    recursive: true,
+    force: true,
+  });
+  const finalized = await advanceFormalRecoveryPhase(
+    args.receiptDirectory,
+    "scratch_terminal_failed",
+    "scratch_finalized",
+  );
+  return { phase: finalized.phase };
 }
 
