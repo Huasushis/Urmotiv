@@ -37,6 +37,21 @@ await worker.run();
 `REDIS_URL` 时拒绝启动。当前入口只提供队列连接和进程生命周期；导入、导出和插件处理器必须在应用组合层注册，不能让
 worker 直接读取 API 的内部文件或绕过数据库权限检查。
 
+## 健康检查
+
+`src/server.ts` 会启动一个内部健康服务（只监听回环地址），供容器健康检查使用：
+
+- `GET /live`：进程存在即返回 200。
+- `GET /ready`：最近一次队列进展未超过 `URMOTIV_WORKER_HEALTH_STALE_MS`（默认 60 秒）时返回 200，否则返回
+  503。队列进展包括空闲轮询和任务租约续期，因此“进程还活着但事件循环或续租已经卡住”时会进入不健康状态。
+
+连续不通过就绪检查达到 `URMOTIV_WORKER_HEALTH_EXIT_AFTER_UNREADY` 次（默认 3 次，设为 0 关闭）时，进程主动以
+非零码退出，由容器的 `restart` 策略重新拉起。相关环境变量：
+
+- `WORKER_HEALTH_HOST`（默认 `127.0.0.1`）与 `WORKER_HEALTH_PORT`（默认 `3010`）：健康服务的监听地址。
+- `URMOTIV_WORKER_HEALTH_STALE_MS`（默认 `60000`）：判定 worker 卡住的最近进展时间差。
+- `URMOTIV_WORKER_HEALTH_EXIT_AFTER_UNREADY`（默认 `3`）：连续不通过多少次后主动退出，`0` 表示关闭。
+
 默认日志只有：
 
 ```json

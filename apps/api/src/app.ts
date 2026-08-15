@@ -763,6 +763,24 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   app.get("/api/v1/health", async () => ({ status: "ok", service: "urmotiv-api" }));
 
+  app.get("/api/v1/health/ready", async (_request, reply) => {
+    try {
+      await dependencies.store.ping?.();
+    } catch {
+      reply.code(503);
+      return {
+        status: "unavailable",
+        service: "urmotiv-api",
+        checks: { database: "unavailable" }
+      };
+    }
+    return {
+      status: "ready",
+      service: "urmotiv-api",
+      checks: { database: "ok" }
+    };
+  });
+
   app.get("/api/v1/session", async (request) => {
     const user = await currentUser(request);
     return authSummary(user);

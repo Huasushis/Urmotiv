@@ -113,6 +113,28 @@ bash scripts/deploy/backup.sh \
 
 备份目录也会保存敏感业务数据，应使用受控的异地备份方式保存，且不要传入 Git、聊天记录或公开文件服务。MinIO 中的文件需按对象存储的官方方式另外备份；恢复数据库时应使用同一时点的对象存储备份，避免文件记录和实际文件不一致。
 
+## 健康检查语义
+
+系统区分存活（进程能响应 HTTP）与就绪（依赖可用、可以接收流量）两种状态，两个层级的判定互不影响。
+
+### API
+
+- `GET /api/v1/health`：存活检查。进程可响应 HTTP 即返回 `200 {"status":"ok"}`，不探测依赖。
+- `GET /api/v1/health/ready`：就绪检查。持久化后端（数据库）可达时返回 `200 {"status":"ready"}`，否则返回
+  `503 {"status":"unavailable"}`。检查只执行一次最廉价的查询，响应只包含固定字段，不暴露依赖地址或内部细节。
+
+### worker（后台任务进程）
+
+worker 自带健康服务，默认只监听 `127.0.0.1:3010`：
+
+- `GET /live`：存活检查。进程存在即返回 `200 {"status":"ok"}`。
+- `GET /ready`：就绪检查。最近一次队列进展（空闲轮询或任务租约续期）未超过 `URMOTIV_WORKER_HEALTH_STALE_MS`
+  （默认 60 秒）时返回 200，否则返回 503。这样可以把“进程还活着但已经卡住”的 worker 标记为不健康。
+
+Compose 里 worker 的健康检查每 10 秒访问一次 `/ready`，3 次失败即把容器标记为不健康（`docker compose ps` 可见）。
+worker 连续多次不通过就绪检查时会主动以非零码退出，交由 `restart: unless-stopped` 重新拉起；
+`URMOTIV_WORKER_HEALTH_EXIT_AFTER_UNREADY` 设为 0 可关闭主动退出，只保留健康检查的标记能力。
+
 ## 配置边界
 
 - 正式环境必须使用 PostgreSQL、Redis 和私有 S3 桶；应用不接受正式环境退回到本地文件数据库或单进程任务队列。

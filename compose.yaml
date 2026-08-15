@@ -129,11 +129,23 @@ services:
       NODE_ENV: production
       REDIS_URL: redis://redis:6379/0
       JOB_REDIS_PREFIX: ${JOB_REDIS_PREFIX:-urmotiv:jobs}
+      WORKER_HEALTH_HOST: 127.0.0.1
+      WORKER_HEALTH_PORT: "3010"
     depends_on:
       redis:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    healthcheck:
+      # worker 自带健康服务：/ready 在最近一次队列进展超过阈值（默认 60 秒）后返回 503，
+      # 用来识别进程还活着但已经卡住的情况；连接失败表示进程已经死亡。
+      # 两种失败都让健康检查不通过；配合 restart: unless-stopped 与 worker 自身的
+      # 连续不通过退出逻辑，卡住的 worker 会被重新拉起。
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3010/ready').then((r) => process.exit(r.status === 200 ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   web:
     build:

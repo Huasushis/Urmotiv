@@ -38,6 +38,7 @@ export class JobWorker {
   #pollController: AbortController | undefined;
   #running: Promise<void> | undefined;
   #currentExecution: Promise<void> | undefined;
+  #lastActivityAt: number = Date.now();
 
   public constructor(queue: JobQueue, options: JobWorkerOptions) {
     const parsed = workerOptionsSchema.parse({
@@ -88,6 +89,7 @@ export class JobWorker {
       leaseMs: this.#leaseMs
     });
     if (job === undefined) {
+      this.#lastActivityAt = Date.now();
       return false;
     }
 
@@ -98,7 +100,12 @@ export class JobWorker {
     } finally {
       this.#currentExecution = undefined;
     }
+    this.#lastActivityAt = Date.now();
     return true;
+  }
+
+  public lastActivityAt(): number {
+    return this.#lastActivityAt;
   }
 
   public async stop(): Promise<void> {
@@ -146,6 +153,9 @@ export class JobWorker {
       heartbeatRunning = true;
       void this.#queue
         .renewLease(job.id, job.lease.id, this.#leaseMs)
+        .then(() => {
+          this.#lastActivityAt = Date.now();
+        })
         .catch(() => {
           controller.abort();
           rejectLeaseLost(new JobQueueError("LEASE_LOST", "任务租约已失效。"));

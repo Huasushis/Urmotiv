@@ -92,6 +92,15 @@ describe("后台 worker", () => {
     );
   });
 
+  it("空闲轮询也会刷新最近一次队列进展时间", async () => {
+    const queue = new LocalJobQueue();
+    const worker = new JobWorker(queue, { workerId: "worker" });
+    const before = worker.lastActivityAt();
+    expect(before).toBeGreaterThan(0);
+    expect(await worker.runOnce()).toBe(false);
+    expect(worker.lastActivityAt()).toBeGreaterThanOrEqual(before);
+  });
+
   it("停止时结束轮询并等待当前状态稳定", async () => {
     const queue = new LocalJobQueue();
     const worker = new JobWorker(queue, {
