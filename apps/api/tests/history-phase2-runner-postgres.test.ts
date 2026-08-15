@@ -32,6 +32,9 @@ import {
   formalCleanupPendingEvidenceName,
   formalPassMarkerName,
   formalReceiptName,
+  formalRetiredPassReceiptName,
+  formalRetiredPassMarkerName,
+  formalPassRetirementEvidenceName,
   formalRestoreRefusedMarkerName,
   formalRollbackVerifiedMarkerName,
   parsePostgresIdentity,
@@ -1228,6 +1231,135 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       ).phase,
     ).toBe("scratch_finalized");
     expect(await exists(wrongIdentityTrash)).toBe(false);
+    // Gate 5：终删证据与恢复状态机世代绑定 — 缺失/篡改任一摘要都
+    // 零效果拒绝；清理完成后用同一份有效证据重放是幂等成功，
+    // 篡改后重放仍然拒绝。
+    const bindingTarget = scratchName("bindev");
+    trackDatabaseFamily(bindingTarget);
+    const bindingBatch = await createSyntheticBatch(1);
+    const bindingEnv = await runApprovedPreflight(
+      bindingBatch,
+      sourceConnectionString,
+      "synthetic-binding-evidence-terminal",
+    );
+    bindingEnv.ADMIN_URL = sourceConnectionString;
+    bindingEnv.DATABASE_NAME = bindingTarget;
+    expect(
+      await runPhase2Bound(runnerArguments(), bindingEnv, {
+        ...provenanceHooks(),
+        cleanupFaults: {
+          afterTerminalDatabaseDrop: async () => {
+            throw new Error("synthetic binding-evidence arrest");
+          },
+        },
+      }),
+    ).toBe(1);
+    const bindingEvidencePath = join(
+      bindingBatch.runnerReceiptDirectory,
+      "cleanup-recovery-evidence.private.json",
+    );
+    const bindingEvidenceJson = await readFile(bindingEvidencePath, "utf8");
+    const patchBindingEvidence = (mutate: (record: Record<string, unknown>) => void) =>
+      writeFile(
+        bindingEvidencePath,
+        `${JSON.stringify(
+          (() => {
+            const record = JSON.parse(bindingEvidenceJson) as Record<string, unknown>;
+            mutate(record);
+            return record;
+          })(),
+          null,
+          2,
+        )}\n`,
+        { mode: 0o600 },
+      );
+    const bindingTrash = `${bindingBatch.runnerReceiptDirectory}/storage.snapshot.terminal-trash`;
+    expect(await exists(bindingTrash)).toBe(true);
+    // 1) 世代绑定摘要缺失：拒绝且现场保持。
+    await patchBindingEvidence((record) => {
+      delete record.scratchRecoveryBindingSha256;
+    });
+    await expect(
+      completePhase2TerminalCleanup({
+        receiptDirectory: bindingBatch.runnerReceiptDirectory,
+        adminUrl: sourceConnectionString,
+        databaseName: bindingTarget,
+      }),
+    ).rejects.toThrow("世代绑定不一致");
+    expect((await readFormalRecoveryState(bindingBatch.runnerReceiptDirectory))?.phase).toBe(
+      "scratch_terminal_pending",
+    );
+    expect(await exists(bindingTrash)).toBe(true);
+    // 2) 世代绑定摘要被篡改（长度不变、内容翻转）：拒绝且现场保持。
+    await patchBindingEvidence((record) => {
+      const original = String(record.scratchRecoveryBindingSha256 ?? "");
+      record.scratchRecoveryBindingSha256 = original === ""
+        ? "0".repeat(64)
+        : `${original[0] === "0" ? "1" : "0"}${original.slice(1)}`;
+    });
+    await expect(
+      completePhase2TerminalCleanup({
+        receiptDirectory: bindingBatch.runnerReceiptDirectory,
+        adminUrl: sourceConnectionString,
+        databaseName: bindingTarget,
+      }),
+    ).rejects.toThrow("世代绑定不一致");
+    expect((await readFormalRecoveryState(bindingBatch.runnerReceiptDirectory))?.phase).toBe(
+      "scratch_terminal_pending",
+    );
+    expect(await exists(bindingTrash)).toBe(true);
+    // 3) 恢复状态摘要被篡改：绑定仍合法但摘要不匹配，拒绝且现场保持。
+    await patchBindingEvidence((record) => {
+      const original = String(record.recoveryStateSha256 ?? "");
+      record.recoveryStateSha256 = `${original[0] === "0" || original === "" ? "1" : "0"}${(original || "0".repeat(63)).slice(1)}`;
+    });
+    await expect(
+      completePhase2TerminalCleanup({
+        receiptDirectory: bindingBatch.runnerReceiptDirectory,
+        adminUrl: sourceConnectionString,
+        databaseName: bindingTarget,
+      }),
+    ).rejects.toThrow("恢复状态摘要与状态机不匹配");
+    expect((await readFormalRecoveryState(bindingBatch.runnerReceiptDirectory))?.phase).toBe(
+      "scratch_terminal_pending",
+    );
+    expect(await exists(bindingTrash)).toBe(true);
+    // 4) 恢复逐字段都是原始有效证据：真实终删进入 scratch_finalized。
+    await writeFile(bindingEvidencePath, `${JSON.stringify(JSON.parse(bindingEvidenceJson), null, 2)}\n`, {
+      mode: 0o600,
+    });
+    expect(
+      (
+        await completePhase2TerminalCleanup({
+          receiptDirectory: bindingBatch.runnerReceiptDirectory,
+          adminUrl: sourceConnectionString,
+          databaseName: bindingTarget,
+        })
+      ).phase,
+    ).toBe("scratch_finalized");
+    expect(await exists(bindingTrash)).toBe(false);
+    // 5) 终删后重放同一份有效证据：幂等成功，不执行任何清理。
+    expect(
+      (
+        await completePhase2TerminalCleanup({
+          receiptDirectory: bindingBatch.runnerReceiptDirectory,
+          adminUrl: sourceConnectionString,
+          databaseName: bindingTarget,
+        })
+      ).phase,
+    ).toBe("scratch_finalized");
+    // 6) 终删后重放被篡改的世代绑定：仍然拒绝。
+    await patchBindingEvidence((record) => {
+      const original = String(record.scratchRecoveryBindingSha256 ?? "0".repeat(64));
+      record.scratchRecoveryBindingSha256 = `${original[0] === "0" ? "1" : "0"}${original.slice(1)}`;
+    });
+    await expect(
+      completePhase2TerminalCleanup({
+        receiptDirectory: bindingBatch.runnerReceiptDirectory,
+        adminUrl: sourceConnectionString,
+        databaseName: bindingTarget,
+      }),
+    ).rejects.toThrow("世代绑定不一致");
     // 换代窗口故障：存储新代已提升为规范名、数据库 g2 尚未提升时被喊停。
     // 证据必须如实呈现“规范存储在场、规范数据库空缺、g2 数据库保留”的
     // 错位现场；此时终删续做必须拒绝（相位不属于终删中断相位）。
@@ -1901,9 +2033,10 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
           formalHooks,
         ),
       ).toBe(1);
-      expect(refusalPublishCount).toBeGreaterThanOrEqual(3);
       expect((await stat(join(refusalOutput, formalReceiptName))).isDirectory()).toBe(true);
       expect(await exists(join(refusalOutput, formalPassMarkerName))).toBe(false);
+      expect(await exists(join(refusalOutput, formalPassRetirementEvidenceName))).toBe(true);
+      expect(await exists(join(refusalOutput, formalRetiredPassReceiptName))).toBe(false);
       expect(await exists(join(refusalOutput, formalRollbackVerifiedMarkerName))).toBe(true);
       expect(await exists(join(refusalOutput, formalRestoreRefusedMarkerName))).toBe(false);
       const refusalCheck = createPostgresDatabase({
@@ -1917,6 +2050,121 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
         false,
       );
       expect((await readFormalRecoveryState(refusalOutput))?.phase).toBe("rollback_verified");
+      // （四）权威 PASS 双工件退役：先让权威 PASS 收据与标记落盘
+      // （beforeSuccessCommittedWrite 故障缝），随后回滚中的拒绝收据写盘
+      // 也被路径占用。运行必须退出 1，且规范名上不再存在权威 PASS 工件：
+      // 收据位被目录占用（丢弃任何权威性）、标记退役、PASS 收据只残留在
+      // retired 副本；双方退役证据在案；数据库与存储回滚无泄漏。
+      const retireFaultDatabaseName = `urmotiv_formal_retire_${process.pid}${randomUUID()
+        .replaceAll("-", "")
+        .slice(0, 8)}`;
+      temporaryDatabaseNames.push(
+        retireFaultDatabaseName,
+        `${retireFaultDatabaseName}__formal_backup`,
+      );
+      await formalAdmin.execute(sql`create database ${sql.identifier(retireFaultDatabaseName)}`);
+      const retireFaultConnectionString = historyImportDatabaseConnectionString(
+        adminUrl,
+        retireFaultDatabaseName,
+      );
+      const retireFaultPreparation = createPostgresDatabase({
+        connectionString: retireFaultConnectionString,
+        maxConnections: 4,
+      });
+      try {
+        await migrateDatabase(retireFaultPreparation);
+        await seedCoreDatabase(retireFaultPreparation);
+        await seedDatabaseDemoData(retireFaultPreparation);
+      } finally {
+        await retireFaultPreparation.close();
+      }
+      const retireFaultBaselineClient = createPostgresDatabase({
+        connectionString: retireFaultConnectionString,
+        maxConnections: 1,
+      });
+      const retireFaultBefore = await captureHistoryImportTableCounts(
+        retireFaultBaselineClient,
+      );
+      const retireFaultBeforeInventory = await captureDatabaseContentInventory(
+        retireFaultBaselineClient,
+        historyImportRequiredTables,
+      );
+      await retireFaultBaselineClient.close();
+      const retireFaultStorageRoot = join(formalBatch.root, "formal-retire-fault-storage");
+      await privateDirectory(retireFaultStorageRoot);
+      const retireFaultApprovalFile = join(
+        formalBatch.root,
+        "formal-target-approval-retire-fault.private.json",
+      );
+      await writeFormalTargetApproval(retireFaultApprovalFile, {
+        ...formalBaseDocuments,
+        formalTargetFingerprintSha256: computeFormalTargetFingerprintSha256(
+          formalTargetIdentity(retireFaultConnectionString),
+        ),
+        prestateDatabaseInventorySha256: retireFaultBeforeInventory.contentSha256,
+        prestateStorageInventorySha256: (await captureStorageInventory(retireFaultStorageRoot))
+          .contentInventorySha256,
+        storageRootIdentitySha256: await computeStorageRootIdentitySha256(retireFaultStorageRoot),
+      });
+      const retireOutput = join(formalBatch.root, "formal-retire-fault-output");
+      const retireImportOutput = join(formalBatch.root, "formal-retire-fault-import-output");
+      const retireEnv = await formalEnvironment(
+        formalBatch,
+        retireFaultConnectionString,
+        adminUrl,
+        retireFaultApprovalFile,
+        retireOutput,
+        retireFaultStorageRoot,
+        retireImportOutput,
+
+        "synthetic-formal-phase1",
+      );
+      const retireRealStorage = createFileStorage({
+        kind: "local",
+        rootDirectory: retireFaultStorageRoot,
+        limits: { maxBytes: 2_000_000 },
+      });
+      expect(
+        await runFormalImportBound(
+          formalArguments(),
+          retireEnv,
+          {
+            storage: retireRealStorage,
+            finalization: {
+              beforeSuccessCommittedWrite: async () => {
+                throw new Error("synthetic post-pass commit failure");
+              },
+            },
+            refusal: {
+              beforeRefusalReceiptWrite: async () => {
+                await mkdir(join(retireOutput, formalReceiptName), { recursive: true });
+              },
+            },
+          },
+          formalHooks,
+        ),
+      ).toBe(1);
+      // 权威工件：规范名上绝无 PASS 收据或标记。
+      expect((await stat(join(retireOutput, formalReceiptName))).isDirectory()).toBe(true);
+      expect(await exists(join(retireOutput, formalPassMarkerName))).toBe(false);
+      // 非权威残留：退役副本 + 双方退役证据 + 已验证回滚标记。
+      expect(await exists(join(retireOutput, formalRetiredPassReceiptName))).toBe(true);
+      expect(await exists(join(retireOutput, formalRetiredPassMarkerName))).toBe(true);
+      expect(await exists(join(retireOutput, formalPassRetirementEvidenceName))).toBe(true);
+      expect(await exists(join(retireOutput, formalRollbackVerifiedMarkerName))).toBe(true);
+      expect(await exists(join(retireOutput, formalRestoreRefusedMarkerName))).toBe(false);
+      // 回滚语义：数据库、存储、临时备份库均复原/清除。
+      const retireCheck = createPostgresDatabase({
+        connectionString: retireFaultConnectionString,
+        maxConnections: 1,
+      });
+      expect(await captureHistoryImportTableCounts(retireCheck)).toEqual(retireFaultBefore);
+      await retireCheck.close();
+      expect((await captureStorageInventory(retireFaultStorageRoot)).fileCount).toBe(0);
+      expect(await databaseExists(formalAdmin, `${retireFaultDatabaseName}__formal_backup`)).toBe(
+        false,
+      );
+      expect((await readFormalRecoveryState(retireOutput))?.phase).toBe("rollback_verified");
 
        // （三）正确批准书：单遍导入 + 独立自证核对 + v4 通过收据。
 

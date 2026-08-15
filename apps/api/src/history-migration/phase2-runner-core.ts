@@ -102,7 +102,7 @@ import {
 } from "./execution-provenance";
 import { preflightPassMarkerName } from "./pipeline-constants";
 import { resolveRunnerInputs, type RunnerInputs } from "./runner-inputs";
-import { preflightReceiptSchema } from "./runner-inputs";
+import { digestPattern, preflightReceiptSchema } from "./runner-inputs";
 import { importManifestName, targetApprovalTemplateName, cleanupRecoveryEvidenceName, runReceiptName, runPassMarkerName, recoveryMarkerName, cleanupMarkerName, cleanupRefusedMarkerName } from "./pipeline-constants";
 function isMissingFilesystemEntryError(error: unknown): boolean {
   return (
@@ -1181,7 +1181,11 @@ export async function completePhase2TerminalCleanup(args: {
   if (state === undefined) {
     throw new HistoryMigrationError("INVALID_METADATA", "恢复状态机尚未建立，无法续做终删。");
   }
-  if (state.phase !== "scratch_terminal_failed" && state.phase !== "scratch_terminal_pending") {
+  if (
+    state.phase !== "scratch_terminal_failed" &&
+    state.phase !== "scratch_terminal_pending" &&
+    state.phase !== "scratch_finalized"
+  ) {
     throw new HistoryMigrationError(
       "INVALID_METADATA",
       `恢复状态机相位 ${state.phase} 不允许续做第 2 阶段终删。`,
@@ -1205,11 +1209,52 @@ export async function completePhase2TerminalCleanup(args: {
   if (evidenceRecord.adminUrlSha256 !== sha256Hex(`admin-url-v1|${args.adminUrl}`)) {
     throw new HistoryMigrationError("INVALID_METADATA", "续做管理员连接与中断证据不匹配，拒绝续做。");
   }
-  if (evidenceRecord.recoveryPhase !== state.phase) {
+  const evidencePhase =
+    typeof evidenceRecord.recoveryPhase === "string" ? evidenceRecord.recoveryPhase : "";
+  const evidencePhaseValid =
+    evidencePhase === "scratch_terminal_pending" ||
+    evidencePhase === "scratch_terminal_failed" ||
+    evidencePhase === "scratch_finalized";
+  const evidencePhaseMatchesLive =
+    state.phase === "scratch_finalized"
+      ? evidencePhase === "scratch_terminal_pending" || evidencePhase === "scratch_terminal_failed"
+      : evidencePhase === state.phase;
+  if (!evidencePhaseValid || !evidencePhaseMatchesLive) {
     throw new HistoryMigrationError(
       "INVALID_METADATA",
       "终删中断证据的恢复相位与状态机不一致，拒绝续做。",
     );
+  }
+  // Gate 5：任何删除动作之前，先核对中断证据与活恢复状态机的世代绑定 —
+  // 世代绑定摘要与按当前绑定重构的恢复状态摘要都必须在案，缺失即拒绝。
+  if (
+    typeof evidenceRecord.scratchRecoveryBindingSha256 !== "string" ||
+    !digestPattern.test(evidenceRecord.scratchRecoveryBindingSha256) ||
+    evidenceRecord.scratchRecoveryBindingSha256 !== state.generationBindingSha256
+  ) {
+    throw new HistoryMigrationError(
+      "INVALID_METADATA",
+      "终删中断证据与当前恢复世代绑定不一致，拒绝续做。",
+    );
+  }
+  const expectedRecoveryDigest = recoveryStateSha256({
+    version: 1,
+    phase: evidencePhase as FormalRecoveryPhase,
+    generationBindingSha256: state.generationBindingSha256,
+    updatedAt: state.updatedAt,
+  });
+  if (
+    typeof evidenceRecord.recoveryStateSha256 !== "string" ||
+    evidenceRecord.recoveryStateSha256 !== expectedRecoveryDigest
+  ) {
+    throw new HistoryMigrationError(
+      "INVALID_METADATA",
+      "终删中断证据的恢复状态摘要与状态机不匹配，拒绝续做。",
+    );
+  }
+  // 已终删（scratch_finalized）重放：身份与世代绑定核对全部通过即幂等成功，
+  if (state.phase === "scratch_finalized") {
+    return { phase: "scratch_finalized" };
   }
   const expectedDatabaseSha =
     typeof evidenceRecord.executionDatabaseContentSha256 === "string"

@@ -10,7 +10,7 @@
  * 核对回滚结果，并保留只含聚合的安全标记/收据。回滚不可证明时机械拒绝。
  */
 import { appendFile, chmod, mkdir, open, readFile, realpath, rm } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+
 import { dirname, join } from "node:path";
 
 import { sql } from "drizzle-orm";
@@ -120,6 +120,9 @@ const digestPattern = /^[a-f0-9]{64}$/;
 const formalDatabaseNamePattern = /^[a-z][a-z0-9_]{0,47}$/;
 export const formalReceiptName = "formal-import-receipt.private.json";
 export const formalPassMarkerName = "FORMAL_IMPORT_PASS";
+export const formalRetiredPassReceiptName = "formal-import-receipt.retired-pass.private.json";
+export const formalRetiredPassMarkerName = "FORMAL_IMPORT_PASS.retired";
+export const formalPassRetirementEvidenceName = "formal-pass-retirement.private.json";
 export const formalBackupVerifiedMarkerName = "FORMAL_BACKUP_VERIFIED";
 export const formalRollbackVerifiedMarkerName = "FORMAL_ROLLBACK_VERIFIED";
 export const formalRestoreRefusedMarkerName = "FORMAL_RESTORE_REFUSED";
@@ -666,6 +669,9 @@ async function validateFormalGate(
   await mkdir(freshPreflightDirectory, { mode: 0o700, recursive: false });
   await assertNewOutputPath(join(inputs.outputDirectory, formalReceiptName));
   await assertNewOutputPath(join(inputs.outputDirectory, formalPassMarkerName));
+  await assertNewOutputPath(join(inputs.outputDirectory, formalRetiredPassReceiptName));
+  await assertNewOutputPath(join(inputs.outputDirectory, formalRetiredPassMarkerName));
+  await assertNewOutputPath(join(inputs.outputDirectory, formalPassRetirementEvidenceName));
   await assertNewOutputPath(join(inputs.outputDirectory, formalBackupVerifiedMarkerName));
   await assertNewOutputPath(join(inputs.outputDirectory, formalRollbackVerifiedMarkerName));
   await assertNewOutputPath(join(inputs.outputDirectory, formalRestoreRefusedMarkerName));
@@ -1538,8 +1544,7 @@ async function runFormalImportCore(
         "success_committed",
       );
     } catch {
-      await removePrivateRegularFile(join(inputs.outputDirectory, formalPassMarkerName))
-        .catch(() => undefined);
+      await retireFormalPassArtifacts(inputs.outputDirectory).catch(() => undefined);
       await advanceFormalRecoveryPhase(inputs.outputDirectory, "cleanup_pending", "rollback_pending");
       const rollback = await rollbackFormalMutation({
         admin,
@@ -1614,24 +1619,88 @@ async function runFormalImportCore(
   }
 }
 /**
- * PASS 承诺标记的安全退役：先安全删除；删除失败则用 no-replace 语义把标记
- * 原子改名成唯一 superseded 后缀（存在性检查的读取方不再视为 PASS）。两条
- * 路都失败时抛出 INTERNAL_ERROR，此后调用方绝不写 FAIL/REFUSED 证据或收据，
- * 因此任何被拒绝/失败的结论都不可能留下权威 PASS 标记。
+ * PASS 结论的全部权威工件退役：规范 PASS 标记与规范 PASS 收据都被原子改名
+ * 隔离到 retired 名字后，写退役证据。任何一步失败在明确检查后中止，调用方
+ * 绝不写 FAIL/REFUSED 收据，拒绝/失败的结论就不可能留下权威 PASS 工件。
  */
-async function retireFormalPassMarker(outputDirectory: string): Promise<void> {
-  const passMarkerPath = join(outputDirectory, formalPassMarkerName);
-  await removePrivateRegularFile(passMarkerPath).catch(() => undefined);
-  if (await privateRegularFileExists(passMarkerPath)) {
-    await movePrivateFileNoReplace(
-      passMarkerPath,
-      `${passMarkerPath}.superseded-${randomUUID()}`,
-    ).catch(() => undefined);
+
+async function quarantinePassArtifact(fromPath: string, toPath: string): Promise<boolean> {
+  if (!(await privateRegularFileExists(fromPath))) {
+    return true;
   }
-  if (await privateRegularFileExists(passMarkerPath)) {
+  if (await privateRegularFileExists(toPath)) {
+    await removePrivateRegularFile(toPath).catch(() => undefined);
+  }
+  if (await privateRegularFileExists(toPath)) {
+    return false;
+  }
+  await movePrivateFileNoReplace(fromPath, toPath);
+  return !(await privateRegularFileExists(fromPath));
+}
+async function retireFormalPassArtifacts(outputDirectory: string): Promise<void> {
+  const markerPath = join(outputDirectory, formalPassMarkerName);
+  const retiredMarkerPath = join(outputDirectory, formalRetiredPassMarkerName);
+  const receiptPath = join(outputDirectory, formalReceiptName);
+  const retiredReceiptPath = join(outputDirectory, formalRetiredPassReceiptName);
+
+  if (!(await quarantinePassArtifact(markerPath, retiredMarkerPath))) {
     throw new HistoryMigrationError(
       "INTERNAL_ERROR",
       "正式导入：PASS 承诺标记无法移除或改名，拒绝产出失败结论。",
+    );
+  }
+
+  let passReceiptRetired = false;
+  let passReceiptSha256 = "";
+  // 规范收据读取失败（缺失、被目录占用、损坏）都按“规范名上无权威 PASS”
+  // 处理并继续退役；只有确认存在权威 PASS 收据却无法隔离时才会中止结论。
+  const receiptRead = await readPrivateJsonWithDigest(receiptPath).catch(() => undefined);
+  if (receiptRead !== undefined) {
+    const receipt = (receiptRead.value ?? null) as { readonly verdict?: unknown } | null;
+    if (receipt !== null && receipt.verdict === "PASS") {
+      if (!(await quarantinePassArtifact(receiptPath, retiredReceiptPath))) {
+        throw new HistoryMigrationError(
+          "INTERNAL_ERROR",
+          "正式导入：权威 PASS 收据无法改名隔离，拒绝产出失败结论。",
+        );
+      }
+      passReceiptRetired = true;
+      passReceiptSha256 = receiptRead.sha256;
+    }
+  }
+  if (!passReceiptRetired && (await privateRegularFileExists(retiredReceiptPath))) {
+    try {
+      const retiredRead = await readPrivateJsonWithDigest(retiredReceiptPath);
+      const retiredReceipt = (retiredRead.value ?? null) as { readonly verdict?: unknown } | null;
+      if (retiredReceipt !== null && retiredReceipt.verdict === "PASS") {
+        passReceiptRetired = true;
+        passReceiptSha256 = retiredRead.sha256;
+      }
+    } catch {
+      // 退役副本不可读：标记退役状态无法确认，保留 markerRetired 证据继续。
+    }
+  }
+  try {
+    await writePrivateFile(
+      join(outputDirectory, formalPassRetirementEvidenceName),
+      `${JSON.stringify(
+        {
+          version: 1,
+          generatedAt: new Date().toISOString(),
+          markerRetired: true,
+          passReceiptRetired,
+          passReceiptSha256,
+          retirementReason: "refusal-conclusion-prologue",
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+  } catch {
+    throw new HistoryMigrationError(
+      "INTERNAL_ERROR",
+      "正式导入：PASS 工件已隔离但退役证据写盘失败，拒绝产出失败结论。",
     );
   }
 }
@@ -1661,13 +1730,14 @@ async function concludeRefusedRun(options: {
   const { outputDirectory } = coreOptions.inputs;
   const approval = coreOptions.targetApproval;
   const restoredAll = rollback.storageRestored && rollback.databaseRestored;
-  // 结论域内绝不出现「FAIL 收据 + PASS 标记」共存：标记退役失败时直接中止。
-  await retireFormalPassMarker(outputDirectory);
+  // 结论域内绝不出现「拒绝收据 + 权威 PASS」共存：标记与收据退役失败时直接中止。
+  await retireFormalPassArtifacts(outputDirectory);
   const terminalState = await advanceFormalRecoveryPhase(
     outputDirectory,
     "rollback_pending",
     restoredAll ? "rollback_verified" : "rollback_refused",
   );
+
   await writeNewPrivateJson(join(outputDirectory, formalRollbackEvidenceName), {
     version: 1,
     generatedAt: new Date().toISOString(),
@@ -1962,11 +2032,10 @@ export async function runFormalImportBound(
     return await runFormalImportCore(argv, env, hooks, seam);
   } catch (error: unknown) {
     if (error instanceof HistoryMigrationError) {
-      console.error(`正式导入拒绝: ${error.code}`);
+      console.error(`正式导入拒绝: ${error.code} | ${error.message}`);
       return error.code === "INVALID_ARGUMENTS" ? 2 : 1;
     }
     console.error("正式导入拒绝: UNCLASSIFIED");
     return 1;
   }
 }
-

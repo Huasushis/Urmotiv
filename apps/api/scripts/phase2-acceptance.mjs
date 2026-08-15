@@ -9,17 +9,31 @@
 //   2) 全 API 工作区测试：必跑，只有零失败才发放通过标记；
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
-import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { join, resolve } from "node:path";
 import { assessFormalShard, finalizeStatus, postRunDirtyReasons } from "./phase2-acceptance-verdict.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const apiDirectory = fileURLToPath(new URL("..", import.meta.url));
 const workspaceDirectory = join(repositoryRoot, "apps", "worker");
 const vitestBin = join(repositoryRoot, "node_modules", "vitest", "vitest.mjs");
-const acceptanceTestFile = "tests/history-phase2-runner-postgres.test.ts";
+const defaultAcceptanceTestFile = "tests/history-phase2-runner-postgres.test.ts";
+const childFixturePath = (process.env.URMOTIV_PHASE2_ACCEPTANCE_TEST_CHILD_FIXTURE ?? "").trim();
+const acceptanceTestFile =
+  childFixturePath.length === 0 ? defaultAcceptanceTestFile : resolve(childFixturePath);
+if (acceptanceTestFile !== defaultAcceptanceTestFile) {
+  // 测试专用缝（Gate 9）：仅当显式给出环境变量时启用；必须落在 api 目录内，
+  // 防止验收指向仓库外的任意文件。正常验收运行绝不设置该变量。
+  const apiPrefix = `${resolve(apiDirectory)}${process.platform === "win32" ? "\\" : "/"}`;
+  if (!acceptanceTestFile.startsWith(apiPrefix)) {
+    fail("URMOTIV_PHASE2_ACCEPTANCE_TEST_CHILD_FIXTURE 必须指向 apps/api 目录内的测试文件。");
+  }
+  if (!existsSync(acceptanceTestFile)) {
+    fail(`URMOTIV_PHASE2_ACCEPTANCE_TEST_CHILD_FIXTURE 指向的文件不存在。`);
+  }
+}
 const shardFileName = "shard-runner.private.json";
 const evidenceFileName = "phase2-acceptance-evidence.private.json";
 const fullCommitPattern = /^[0-9a-f]{40}$/;
@@ -237,7 +251,6 @@ function parseReport(reportFile) {
   evidence.fullApi = { exitCode, report: parsed };
 }
 
-// Phase-2 路由：在验收模式下运行测试，由测试自身把路线收据分片写进证据目录。
 console.log(`phase2-acceptance: HEAD=${head}`);
 const acceptance = spawnSync(process.execPath, [vitestBin, "run", acceptanceTestFile], {
   cwd: apiDirectory,
@@ -250,6 +263,21 @@ const acceptance = spawnSync(process.execPath, [vitestBin, "run", acceptanceTest
   },
 });
 evidence.runnerExitCode = acceptance.status ?? 1;
+const afterChildHookPath = (process.env.URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS ?? "").trim();
+if (afterChildHookPath.length !== 0) {
+  // 测试专用缝（Gate 9）：验收子进程结束之后、运行后卫生判定之前注入受控突变；
+  // 只读环境变量显式开启，正常验收运行绝不设置。
+  let hookModule;
+  try {
+    hookModule = await import(pathToFileURL(resolve(afterChildHookPath)).href);
+  } catch {
+    fail("URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS 指向的模块无法加载。");
+  }
+  if (typeof hookModule.inject !== "function") {
+    fail("URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS 模块缺少 inject 导出。");
+  }
+  await hookModule.inject({ repositoryRoot });
+}
 {
   const postRunHead = execFileSync("git", ["rev-parse", "HEAD"], {
     cwd: repositoryRoot,
