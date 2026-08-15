@@ -1268,6 +1268,12 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       denialEnv.PRINCIPAL = databaseDemoUserIds.denied;
       expect(await runFormalImportBound(formalArguments(), denialEnv, {}, formalHooks)).toBe(1);
       expect(await exists(denialOutput)).toBe(false);
+      const denialBaseCheck = createPostgresDatabase({
+        connectionString: formalConnectionString,
+        maxConnections: 1,
+      });
+      expect(await captureHistoryImportTableCounts(denialBaseCheck)).toEqual(formalBefore);
+      await denialBaseCheck.close();
       // nonce 零核销：本次拒绝不得产生核销声明，也不得把该 nonce 写入日志。
       const denialApproval = JSON.parse(
         await readFile(denialApprovalFile, "utf8"),
