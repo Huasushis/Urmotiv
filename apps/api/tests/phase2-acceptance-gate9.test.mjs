@@ -129,7 +129,10 @@ function readEvidence(evidenceDirectory, result) {
     }
   }
   expect(existsSync(path)).toBe(true);
-  return JSON.parse(readFileSync(path, "utf8"));
+  const evidence = JSON.parse(readFileSync(path, "utf8"));
+  console.log("GATE9 reasonCodes:", JSON.stringify(evidence.reasonCodes));
+  console.log("GATE9 dirtyCount:", evidence.dirtyCount);
+  return evidence;
 }
 function removeGate9Resources() {
   // 只动测试自己申请的一次性资源；任何一步失败都抛错，绝不让残留静默存活。
