@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { access, chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { connect, createServer, type Socket } from "node:net";
+import { spawnSync } from "node:child_process";
 
 import { sql } from "drizzle-orm";
 import { afterEach, describe, expect, it } from "vitest";
@@ -137,6 +139,121 @@ function assertNode24(): void {
   if (process.versions.node.split(".")[0] !== "24") {
     throw new Error("Phase-2 PostgreSQL 验收必须使用 Node 24。");
   }
+}
+
+// 例外：等待真实 PostgreSQL 容器的平台就绪，只有进程外探测可判定，
+// 无法用假定时器驱动。
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+interface TcpProxyHandle {
+  readonly url: string;
+  setTarget(port: number): void;
+  stop(): Promise<void>;
+}
+
+async function startTcpProxy(initialTargetPort: number): Promise<TcpProxyHandle> {
+  let targetPort = initialTargetPort;
+  const clients = new Set<Socket>();
+  const upstreams = new Set<Socket>();
+  const proxy = createServer((client) => {
+    clients.add(client);
+    const upstream = connect({ host: "127.0.0.1", port: targetPort });
+    upstreams.add(upstream);
+    const teardown = (): void => {
+      client.destroy();
+      upstream.destroy();
+      clients.delete(client);
+      upstreams.delete(upstream);
+    };
+    // 双端关闭联动：应用侧断开（含突然销毁）必须同步切断上游，
+    // 否则代理进程退场后仍有半开套接字把 PostgreSQL 后端会话钉在
+    // "idle" 状态，阻塞之后的 DROP DATABASE（55006）。
+    client.on("close", () => {
+      upstream.destroy();
+      clients.delete(client);
+      upstreams.delete(upstream);
+    });
+    upstream.on("close", () => teardown());
+    client.on("error", () => teardown());
+    upstream.on("error", () => teardown());
+    client.pipe(upstream);
+    upstream.pipe(client);
+  });
+  await new Promise<void>((resolve, reject) => {
+    proxy.once("error", reject);
+    proxy.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = proxy.address();
+  if (typeof address === "string" || address === null) {
+    throw new Error("活身份代理端口不可用。");
+  }
+  return {
+    url: `postgres://postgres:test-password@127.0.0.1:${address.port}/postgres`,
+    setTarget(port: number) {
+      targetPort = port;
+    },
+    async stop() {
+      for (const socket of clients) socket.destroy();
+      for (const socket of upstreams) socket.destroy();
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    },
+  };
+}
+
+async function postgresReady(connectionString: string, attempts: number): Promise<boolean> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const probe = createPostgresDatabase({
+        connectionString,
+        maxConnections: 1,
+        applicationName: "urmotiv-live-identity-probe",
+      });
+      await probe.query(sql`select 1 as one`);
+      await probe.close();
+      return true;
+    } catch {
+      await sleep(500);
+    }
+  }
+  return false;
+}
+
+async function freePort(): Promise<number> {
+  const reservation = createServer();
+  await new Promise<void>((resolve, reject) => {
+    reservation.once("error", reject);
+    reservation.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = reservation.address();
+  if (typeof address === "string" || address === null) throw new Error("无法分配活身份端口。");
+  const port = address.port;
+  await new Promise<void>((resolve) => reservation.close(() => resolve()));
+  return port;
+}
+
+function startSecondCluster(containerName: string, port: number): { url: string; stop(): void } {
+  spawnSync("docker", ["rm", "-f", containerName], { encoding: "utf8" });
+  // 环境不可达 docker.io 时可用本地镜像（如内网镜像源）覆盖。
+  const image =
+    process.env.URMOTIV_LIVEIDENT_PG_IMAGE ?? "docker.m.daocloud.io/library/postgres:17-alpine";
+  const run = spawnSync(
+    "docker",
+    ["run", "-d", "--rm", "--name", containerName, "-p", `127.0.0.1:${String(port)}:5432`,
+      "-e", "POSTGRES_USER=postgres", "-e", "POSTGRES_PASSWORD=test-password",
+      "-e", "POSTGRES_DB=postgres", image],
+    { encoding: "utf8" },
+  );
+  if (run.status !== 0) {
+    throw new Error(`无法启动第二活身份集群（docker 不可用或冲突）。${run.stderr}`);
+  }
+  return {
+    url: `postgres://postgres:test-password@127.0.0.1:${String(port)}/postgres`,
+    stop() {
+      spawnSync("docker", ["rm", "-f", containerName], { encoding: "utf8" });
+    },
+  };
 }
 
 function canonicalProblem(index: number): CanonicalProblem {
@@ -1414,6 +1531,161 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       }),
     ).rejects.toThrow("不允许续做");
   }, 300_000);
+  it(
+    "Gate 5 活身份绑定：文本不变的端点改指/集群替换被新活连接识破，零效果拒绝，同一活身份重放幂等",
+    { timeout: 600_000 },
+    async () => {
+      assertNode24();
+      if (adminUrl === undefined) throw new Error("缺少 PostgreSQL 管理连接配置。");
+      // 授权验收集群是 5434；另起一次性第二集群（不同 initdb 指纹、不同
+      // 监听端口），中间放一个可拨号的 TCP 代理：验收与管理连接串文本
+      // 从头到尾不变，只有代理背后的真实端点被改指 —— 文本哈希必然
+      // 通过，唯一能识破的就是新活连接采集的服务器端口/集群指纹。
+      const clusterPort = await freePort();
+      const containerName = `urmotiv-liveident-${process.pid}`;
+      const secondCluster = startSecondCluster(containerName, clusterPort);
+      const proxy = await startTcpProxy(5434);
+      try {
+        expect(await postgresReady(secondCluster.url, 60)).toBe(true);
+        const liveSourceName = scratchName("livsrc");
+        trackDatabaseFamily(liveSourceName);
+        await prepareHistoryImportDatabase(proxy.url, liveSourceName);
+        const liveSourceConnection = historyImportDatabaseConnectionString(
+          proxy.url,
+          liveSourceName,
+        );
+        const liveTarget = scratchName("liveident");
+        trackDatabaseFamily(liveTarget);
+        const liveBatch = await createSyntheticBatch(1);
+        const liveEnv = await runApprovedPreflight(
+          liveBatch,
+          liveSourceConnection,
+          "synthetic-live-identity-terminal",
+        );
+        liveEnv.ADMIN_URL = liveSourceConnection;
+        liveEnv.DATABASE_NAME = liveTarget;
+        expect(
+          await runPhase2Bound(runnerArguments(), liveEnv, {
+            ...provenanceHooks(),
+            cleanupFaults: {
+              afterTerminalDatabaseDrop: async () => {
+                throw new Error("synthetic live-identity arrest");
+              },
+            },
+          }),
+        ).toBe(1);
+        const liveEvidencePath = join(
+          liveBatch.runnerReceiptDirectory,
+          "cleanup-recovery-evidence.private.json",
+        );
+        const liveEvidenceJson = await readFile(liveEvidencePath, "utf8");
+        const patchLiveEvidence = (mutate: (record: Record<string, unknown>) => void) =>
+          writeFile(
+            liveEvidencePath,
+            `${JSON.stringify(
+              (() => {
+                const record = JSON.parse(liveEvidenceJson) as Record<string, unknown>;
+                mutate(record);
+                return record;
+              })(),
+              null,
+              2,
+            )}\n`,
+            { mode: 0o600 },
+          );
+        const liveEvidence = JSON.parse(liveEvidenceJson) as Record<string, unknown>;
+        // 文本门（管理员连接 sha256）必须通过 —— 证明本次拒绝只可能来自活身份。
+        expect(liveEvidence.adminUrlSha256).toBe(sha256Hex(`admin-url-v1|${liveSourceConnection}`));
+        const frozenIdentity = liveEvidence.maintenanceLiveIdentity as Record<string, unknown>;
+        expect(typeof frozenIdentity).toBe("object");
+        for (const field of ["serverAddress", "serverPort", "user", "database", "clusterIdentity"]) {
+          expect(typeof frozenIdentity[field]).toBe("string");
+          expect(String(frozenIdentity[field]).length).toBeGreaterThan(0);
+        }
+        expect(String(liveEvidence.cleanupRecoveryIdentitySha256 ?? "").length).toBe(64);
+        const liveTrash = `${liveBatch.runnerReceiptDirectory}/storage.snapshot.terminal-trash`;
+        expect(await exists(liveTrash)).toBe(true);
+        // 1) 端点被改指到第二集群（文本不变）：零效果拒绝。
+        proxy.setTarget(clusterPort);
+        await expect(
+          completePhase2TerminalCleanup({
+            receiptDirectory: liveBatch.runnerReceiptDirectory,
+            adminUrl: liveSourceConnection,
+            databaseName: liveTarget,
+          }),
+        ).rejects.toThrow("活身份");
+        expect(
+          (await readFormalRecoveryState(liveBatch.runnerReceiptDirectory))?.phase,
+        ).toBe("scratch_terminal_pending");
+        expect(await exists(liveTrash)).toBe(true);
+        const adminA = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
+        try {
+          expect(await databaseExists(adminA, liveTarget)).toBe(true);
+        } finally {
+          await adminA.close();
+        }
+        // 2) 指针摆回原集群（同一活身份）：续做成功，接着幂等重放成功。
+        proxy.setTarget(5434);
+        expect(
+          (
+            await completePhase2TerminalCleanup({
+              receiptDirectory: liveBatch.runnerReceiptDirectory,
+              adminUrl: liveSourceConnection,
+              databaseName: liveTarget,
+            })
+          ).phase,
+        ).toBe("scratch_finalized");
+        expect(await exists(liveTrash)).toBe(false);
+        expect(
+          (
+            await completePhase2TerminalCleanup({
+              receiptDirectory: liveBatch.runnerReceiptDirectory,
+              adminUrl: liveSourceConnection,
+              databaseName: liveTarget,
+            })
+          ).phase,
+        ).toBe("scratch_finalized");
+        // 3) 证据里活身份字段缺失/篡改：fail-closed 拒绝（终删后重放也要拒）。
+        await patchLiveEvidence((record) => {
+          const identity = record.maintenanceLiveIdentity as Record<string, unknown>;
+          identity.clusterIdentity = "";
+        });
+        await expect(
+          completePhase2TerminalCleanup({
+            receiptDirectory: liveBatch.runnerReceiptDirectory,
+            adminUrl: liveSourceConnection,
+            databaseName: liveTarget,
+          }),
+        ).rejects.toThrow("缺少字段 集群指纹");
+        await patchLiveEvidence((record) => {
+          const original = String(record.cleanupRecoveryIdentitySha256 ?? "");
+          record.cleanupRecoveryIdentitySha256 = original === ""
+            ? "0".repeat(64)
+            : `${original[0] === "0" ? "1" : "0"}${original.slice(1)}`;
+        });
+        await expect(
+          completePhase2TerminalCleanup({
+            receiptDirectory: liveBatch.runnerReceiptDirectory,
+            adminUrl: liveSourceConnection,
+            databaseName: liveTarget,
+          }),
+        ).rejects.toThrow("绑定摘要与中断证据不一致");
+        await writeFile(liveEvidencePath, liveEvidenceJson, { mode: 0o600 });
+        expect(
+          (
+            await completePhase2TerminalCleanup({
+              receiptDirectory: liveBatch.runnerReceiptDirectory,
+              adminUrl: liveSourceConnection,
+              databaseName: liveTarget,
+            })
+          ).phase,
+        ).toBe("scratch_finalized");
+      } finally {
+        await proxy.stop();
+        secondCluster.stop();
+      }
+    },
+  );
   it("正式导入：带外批准书门禁、伪造拒绝、v4 单遍收据与中途故障双向回滚", async () => {
     assertNode24();
     if (adminUrl === undefined) throw new Error("缺少 PostgreSQL 管理连接配置。");

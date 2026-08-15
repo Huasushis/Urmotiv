@@ -34,6 +34,15 @@ if (acceptanceTestFile !== defaultAcceptanceTestFile) {
     fail(`URMOTIV_PHASE2_ACCEPTANCE_TEST_CHILD_FIXTURE 指向的文件不存在。`);
   }
 }
+const afterChildHookPath = (process.env.URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS ?? "").trim();
+// 测试缝自起始环境一次性冻结：任何夹具/钩子在运行途中都没法改写它。
+// 只要任一缝处于激活状态，本运行就不可能是权威运行 —— 即使路由分片
+// 形似 REAL_PASS、即使钩子事后把检出恢复干净，也强制 INCONCLUSIVE。
+const seamState = Object.freeze({
+  childFixture: childFixturePath.length !== 0,
+  afterChildHook: afterChildHookPath.length !== 0,
+  active: childFixturePath.length !== 0 || afterChildHookPath.length !== 0,
+});
 const shardFileName = "shard-runner.private.json";
 const evidenceFileName = "phase2-acceptance-evidence.private.json";
 const fullCommitPattern = /^[0-9a-f]{40}$/;
@@ -263,20 +272,22 @@ const acceptance = spawnSync(process.execPath, [vitestBin, "run", acceptanceTest
   },
 });
 evidence.runnerExitCode = acceptance.status ?? 1;
-const afterChildHookPath = (process.env.URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS ?? "").trim();
-if (afterChildHookPath.length !== 0) {
+if (seamState.afterChildHook) {
   // 测试专用缝（Gate 9）：验收子进程结束之后、运行后卫生判定之前注入受控突变；
-  // 只读环境变量显式开启，正常验收运行绝不设置。
-  let hookModule;
-  try {
-    hookModule = await import(pathToFileURL(resolve(afterChildHookPath)).href);
-  } catch {
-    fail("URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS 指向的模块无法加载。");
+  // 钩子作为独立子进程执行，无法触碰本进程内存里的 seamState 或任何权威状态。
+  const hookPath = resolve(afterChildHookPath);
+  const apiPrefix = `${resolve(apiDirectory)}${process.platform === "win32" ? "\\" : "/"}`;
+  if (!hookPath.startsWith(apiPrefix) || !existsSync(hookPath)) {
+    fail("URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS 必须指向 apps/api 目录内存在的脚本。");
   }
-  if (typeof hookModule.inject !== "function") {
-    fail("URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS 模块缺少 inject 导出。");
+  const hookRun = spawnSync(process.execPath, [hookPath], {
+    cwd: apiDirectory,
+    stdio: "inherit",
+    env: process.env,
+  });
+  if ((hookRun.status ?? 1) !== 0) {
+    fail("URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS 钩子进程退出非零。");
   }
-  await hookModule.inject({ repositoryRoot });
 }
 {
   const postRunHead = execFileSync("git", ["rev-parse", "HEAD"], {
@@ -357,7 +368,10 @@ const hardFailures = [
   "POST_RUN_TREE_NOT_CLEAN",
 ];
 let candidate;
-if (codes.has("PHASE2_ROUTE_PASS") && !hardFailures.some((code) => codes.has(code))) {
+if (seamState.active) {
+  evidence.reasonCodes.push("TEST_SEAM_ACTIVE_NON_AUTHORITATIVE");
+  candidate = "INCONCLUSIVE";
+} else if (codes.has("PHASE2_ROUTE_PASS") && !hardFailures.some((code) => codes.has(code))) {
   candidate = "PASS";
 } else if (
   codes.has("PHASE2_ROUTE_SYNTHETIC_READINESS") &&
@@ -373,6 +387,9 @@ if (codes.has("PHASE2_ROUTE_PASS") && !hardFailures.some((code) => codes.has(cod
 }
 // 运行后整树突变（HEAD 漂移 / 树脏）对每个本可成功的定级都是硬失败。
 evidence.status = finalizeStatus({ candidate, reasonCodes: evidence.reasonCodes });
+if (seamState.active && (evidence.status === "PASS" || evidence.status === "IMPLEMENTATION_READY")) {
+  fail("测试缝激活的运行绝不能产出权威定级；终判定机失防，拒绝发放。");
+}
 const payload = `${JSON.stringify(evidence, null, 2)}\n`;
 writeFileSync(join(acceptanceDirectory, evidenceFileName), payload);
 console.log(`phase2-acceptance: 证据状态=${evidence.status}`);

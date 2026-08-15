@@ -1005,12 +1005,20 @@ async function executeBoundRunner(
         storageRecovery,
         execution.storageInventory,
       );
+      const maintenanceLiveIdentity = await captureLiveMaintenanceIdentity(inputs.adminUrl).catch(
+        () => null,
+      );
       await writeNewPrivateJson(join(inputs.receiptDirectory, cleanupRecoveryEvidenceName), {
         version: 1,
         generatedAt: new Date().toISOString(),
         databaseName: inputs.databaseName,
         adminUrlSha256: sha256Hex(`admin-url-v1|${inputs.adminUrl}`),
         scratchRecoveryBindingSha256,
+        maintenanceLiveIdentity,
+        cleanupRecoveryIdentitySha256:
+          maintenanceLiveIdentity === null
+            ? ""
+            : boundCleanupRecoveryIdentitySha256(scratchRecoveryBindingSha256, maintenanceLiveIdentity),
         recoveryPhase: stateAfter?.phase ?? stateBefore?.phase ?? "scratch_established",
         recoveryStateSha256: stateAfter === undefined ? "" : recoveryStateSha256(stateAfter),
         databaseSnapshotName: databaseSnapshotProbe.name,
@@ -1165,6 +1173,143 @@ export async function runPhase2Acceptance(
 }
 
 /**
+ * Gate 5 维护活身份：从活 PostgreSQL 服务器就地采集，任何字段缺失即拒
+ * （fail-closed，绝不空串放过）。地址/端口取服务器视角的
+ * inet_server_addr()/inet_server_port()，集群指纹取 initdb 生成的
+ * system_identifier —— 三者合力能在连接串文本不变的情况下识破
+ * 端点改指、端口改指、集群翻新与账户/库名变更。
+ */
+export interface Phase2LiveMaintenanceIdentity {
+  readonly serverAddress: string;
+  readonly serverPort: string;
+  readonly user: string;
+  readonly database: string;
+  readonly clusterIdentity: string;
+}
+
+export function phase2LiveIdentitySha256(identity: Phase2LiveMaintenanceIdentity): string {
+  return sha256Hex(
+    JSON.stringify([
+      "phase2-live-maintenance-v1",
+      identity.serverAddress,
+      identity.serverPort,
+      identity.user,
+      identity.database,
+      identity.clusterIdentity,
+    ]),
+  );
+}
+
+export function boundCleanupRecoveryIdentitySha256(
+  generationBindingSha256: string,
+  liveIdentity: Phase2LiveMaintenanceIdentity,
+): string {
+  return sha256Hex(
+    JSON.stringify([
+      "phase2-cleanup-recovery-v1",
+      generationBindingSha256,
+      phase2LiveIdentitySha256(liveIdentity),
+    ]),
+  );
+}
+
+export async function captureLiveMaintenanceIdentity(
+  adminUrl: string,
+): Promise<Phase2LiveMaintenanceIdentity> {
+  const database = createPostgresDatabase({
+    connectionString: adminUrl,
+    maxConnections: 1,
+    applicationName: "urmotiv-history-live-identity",
+  });
+  try {
+    const rows = await database.query<{
+      server_address: string | null;
+      server_port: number | null;
+      admin_user: string | null;
+      admin_database: string | null;
+      cluster_identifier: string | null;
+    }>(
+      sql`select inet_server_addr()::text as server_address, inet_server_port() as server_port,
+          current_user as admin_user, current_database() as admin_database,
+          system_identifier::text as cluster_identifier
+        from pg_control_system()`,
+    );
+    const row = rows[0];
+    if (
+      row === undefined ||
+      typeof row.server_address !== "string" ||
+      row.server_address.length === 0 ||
+      typeof row.server_port !== "number" ||
+      !Number.isInteger(row.server_port) ||
+      typeof row.admin_user !== "string" ||
+      row.admin_user.length === 0 ||
+      typeof row.admin_database !== "string" ||
+      row.admin_database.length === 0 ||
+      typeof row.cluster_identifier !== "string" ||
+      row.cluster_identifier.length === 0
+    ) {
+      throw new HistoryMigrationError("INVALID_METADATA", "维护连接的活身份字段不完整，拒绝续做。");
+    }
+    return {
+      serverAddress: row.server_address,
+      serverPort: String(row.server_port),
+      user: row.admin_user,
+      database: row.admin_database,
+      clusterIdentity: row.cluster_identifier,
+    };
+  } catch (error) {
+    if (error instanceof HistoryMigrationError) throw error;
+    throw new HistoryMigrationError("INVALID_METADATA", "维护连接的活身份无法采集，拒绝续做。");
+  } finally {
+    await database.close();
+  }
+}
+
+function verifyCleanupLiveIdentity(
+  evidenceRecord: Record<string, unknown>,
+  generationBindingSha256: string,
+  liveIdentity: Phase2LiveMaintenanceIdentity,
+): void {
+  const frozen = evidenceRecord.maintenanceLiveIdentity;
+  if (typeof frozen !== "object" || frozen === null || Array.isArray(frozen)) {
+    throw new HistoryMigrationError("INVALID_METADATA", "终删中断证据缺少维护活身份绑定，拒绝续做。");
+  }
+  const record = frozen as Record<string, unknown>;
+  const fields: readonly [keyof Phase2LiveMaintenanceIdentity, string][] = [
+    ["serverAddress", "服务器地址"],
+    ["serverPort", "服务器端口"],
+    ["user", "认证用户"],
+    ["database", "当前数据库"],
+    ["clusterIdentity", "集群指纹"],
+  ];
+  for (const [field, label] of fields) {
+    if (typeof record[field] !== "string" || (record[field] as string).length === 0) {
+      throw new HistoryMigrationError(
+        "INVALID_METADATA",
+        `中断证据维护活身份缺少字段 ${label}，拒绝续做。`,
+      );
+    }
+    if (record[field] !== liveIdentity[field]) {
+      throw new HistoryMigrationError(
+        "INVALID_METADATA",
+        `维护活身份字段 ${label} 与中断证据不一致，拒绝续做。`,
+      );
+    }
+  }
+  const frozenDigest =
+    typeof evidenceRecord.cleanupRecoveryIdentitySha256 === "string"
+      ? evidenceRecord.cleanupRecoveryIdentitySha256
+      : "";
+  const expectedDigest = boundCleanupRecoveryIdentitySha256(generationBindingSha256, liveIdentity);
+  if (frozenDigest.length === 0 || frozenDigest !== expectedDigest) {
+    throw new HistoryMigrationError(
+      "INVALID_METADATA",
+      "维护活身份绑定摘要与中断证据不一致，拒绝续做。",
+    );
+  }
+}
+
+/**
  * 第 2 阶段终删中断（scratch_terminal_failed / scratch_terminal_pending）的
  * 幂等续做。先按中断证据核对数据库名、管理员连接与记账代绑定，再以
  * 「存储隔离改名 -> 数据库快照删除 -> 隔离清理 -> 终态写盘」的顺序续做；
@@ -1252,7 +1397,13 @@ export async function completePhase2TerminalCleanup(args: {
       "终删中断证据的恢复状态摘要与状态机不匹配，拒绝续做。",
     );
   }
-  // 已终删（scratch_finalized）重放：身份与世代绑定核对全部通过即幂等成功，
+  // 任何删除动作之前建立新活连接并核对维护活身份（Gate 5）：服务器地址/
+  // 端口/用户/数据库/集群指纹逐字段与证据冻结值一致，且绑定摘要匹配；
+  // 错服务器、错端口、错用户、错库、端点改指、字段缺失或篡改一律零效果拒绝。
+  const liveIdentity = await captureLiveMaintenanceIdentity(args.adminUrl);
+  verifyCleanupLiveIdentity(evidenceRecord, state.generationBindingSha256, liveIdentity);
+  // 已终删（scratch_finalized）重放：身份、世代绑定与恢复状态摘要全部
+  // 核对通过（含活身份）才幂等成功。
   if (state.phase === "scratch_finalized") {
     return { phase: "scratch_finalized" };
   }

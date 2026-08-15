@@ -205,7 +205,7 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     }
   });
   it(
-    "脏树突变把本可成功的 IMPLEMENTATION_READY 压为 INCONCLUSIVE",
+    "缝激活 + 脏树突变：本可 IMPLEMENTATION_READY 的载荷仍被缝强制非权威，且突变仍被检出",
     { timeout: 1_800_000 },
     () => {
       const worktreeDirectory = makeWorktree();
@@ -216,17 +216,16 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
       });
       const evidence = readEvidence(evidenceDirectory, result);
       expect(evidence.status).toBe("INCONCLUSIVE");
+      expect(evidence.reasonCodes).toContain("TEST_SEAM_ACTIVE_NON_AUTHORITATIVE");
       expect(evidence.reasonCodes).toContain("POST_RUN_TREE_NOT_CLEAN");
       expect(evidence.reasonCodes).toContain("PHASE2_ROUTE_SYNTHETIC_READINESS");
-      expect(evidence.reasonCodes).toContain("WORKER_CURRENT_ZERO_FAIL");
-      expect(evidence.reasonCodes).toContain("FULL_API_PASS");
       expect(evidence.dirtyCount).toBeGreaterThan(0);
       expect(result.status).not.toBe(0);
     },
   );
 
   it(
-    "HEAD 漂移把本可通过的 REAL_PASS 压为 INCONCLUSIVE",
+    "缝激活 + HEAD 漂移：REAL_PASS 形似载荷仍被缝强制非权威，突变仍被检出",
     { timeout: 1_800_000 },
     () => {
       const worktreeDirectory = makeWorktree();
@@ -237,8 +236,47 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
       });
       const evidence = readEvidence(evidenceDirectory, result);
       expect(evidence.status).toBe("INCONCLUSIVE");
+      expect(evidence.reasonCodes).toContain("TEST_SEAM_ACTIVE_NON_AUTHORITATIVE");
       expect(evidence.reasonCodes).toContain("POST_RUN_HEAD_MOVED");
       expect(evidence.reasonCodes).toContain("PHASE2_ROUTE_PASS");
+      expect(result.status).not.toBe(0);
+    },
+  );
+
+  it(
+    "仅缝激活（clean 钩子、可成 IMPLEMENTATION_READY 的载荷）：强制非权威且树保持干净",
+    { timeout: 1_800_000 },
+    () => {
+      const worktreeDirectory = makeWorktree();
+      worktrees.push(worktreeDirectory);
+      const { result, evidenceDirectory } = runAcceptanceLauncher(worktreeDirectory, {
+        verdict: "SYNTHETIC_READINESS",
+        hookMode: "clean",
+      });
+      const evidence = readEvidence(evidenceDirectory, result);
+      expect(evidence.status).toBe("INCONCLUSIVE");
+      expect(evidence.reasonCodes).toContain("TEST_SEAM_ACTIVE_NON_AUTHORITATIVE");
+      expect(evidence.reasonCodes).toContain("PHASE2_ROUTE_SYNTHETIC_READINESS");
+      expect(evidence.dirtyCount).toBe(0);
+      expect(result.status).not.toBe(0);
+    },
+  );
+
+  it(
+    "仅缝激活（clean 钩子、REAL_PASS 形似载荷）：强制非权威，绝不发放权威定级",
+    { timeout: 1_800_000 },
+    () => {
+      const worktreeDirectory = makeWorktree();
+      worktrees.push(worktreeDirectory);
+      const { result, evidenceDirectory } = runAcceptanceLauncher(worktreeDirectory, {
+        verdict: "REAL_PASS",
+        hookMode: "clean",
+      });
+      const evidence = readEvidence(evidenceDirectory, result);
+      expect(evidence.status).toBe("INCONCLUSIVE");
+      expect(evidence.reasonCodes).toContain("TEST_SEAM_ACTIVE_NON_AUTHORITATIVE");
+      expect(evidence.reasonCodes).toContain("PHASE2_ROUTE_PASS");
+      expect(evidence.dirtyCount).toBe(0);
       expect(result.status).not.toBe(0);
     },
   );
