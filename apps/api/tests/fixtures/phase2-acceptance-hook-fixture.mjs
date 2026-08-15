@@ -9,7 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const fixtureDirectory = dirname(fileURLToPath(import.meta.url));
-const repositoryRoot = resolve(fixtureDirectory, "..", "..", "..");
+const repositoryRoot = resolve(fixtureDirectory, "..", "..", "..", "..");
 
 const mode = process.env.URMOTIV_PHASE2_ACCEPTANCE_HOOK_MODE;
 if (mode === "clean") {
