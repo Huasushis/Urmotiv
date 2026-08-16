@@ -81,7 +81,8 @@ function captureGitMetadataHiding() {
       maxBuffer: 64 * 1024 * 1024,
     });
   } catch {
-    lsFilesVerbose = "";
+    // ls-files 失败本身是异常状态——用哨兵值确保运行后差比一定触发。
+    lsFilesVerbose = "READ_ERROR_SENTINEL";
   }
   let excludesFileValue = "";
   try {
@@ -99,20 +100,29 @@ function captureGitMetadataHiding() {
         .update(readFileSync(excludesFileValue, "utf8"))
         .digest("hex");
     } catch {
-      excludesFileHash = "READ_ERROR";
+      // 读取失败用哨兵值——与任何真实哈希（64 位十六进制）都不同，
+      // 运行后即使恢复为可读也一定被检出为变化。
+      excludesFileHash = "READ_ERROR_SENTINEL";
     }
   }
   let infoExcludeHash = "";
+  let infoExcludeHasActiveRules = false;
   try {
     const excludePath = execFileSync("git", ["rev-parse", "--git-path", "info/exclude"], {
       cwd: repositoryRoot,
       encoding: "utf8",
     }).trim();
-    infoExcludeHash = createHash("sha256")
-      .update(readFileSync(excludePath, "utf8"))
-      .digest("hex");
+    const content = readFileSync(excludePath, "utf8");
+    infoExcludeHash = createHash("sha256").update(content).digest("hex");
+    // 预运行硬门：info/exclude 中的非注释非空行是活跃排除规则，
+    // 可能隐藏运行中产生的未跟踪工件。预运行必须拒绝。
+    infoExcludeHasActiveRules = content
+      .split("\n")
+      .some((line) => line.trim().length > 0 && !line.trim().startsWith("#"));
   } catch {
-    infoExcludeHash = "ABSENT";
+    // 读取失败用哨兵值——绝不静默为"不存在"。
+    infoExcludeHash = "READ_ERROR_SENTINEL";
+    infoExcludeHasActiveRules = false;
   }
   let sparseCheckout = false;
   try {
@@ -133,11 +143,26 @@ function captureGitMetadataHiding() {
   } catch {
     sparseCheckoutFilePresent = false;
   }
+  // 冻结被忽略文件集的哈希——运行前后比对可发现预存排除规则被用来
+  // 隐藏运行中新增的未跟踪工件（即使排除规则字节未变）。
+  let ignoredFilesHash = "";
+  try {
+    const ignored = execFileSync(
+      "git",
+      ["status", "--porcelain=v1", "--ignored", "--untracked-files=all"],
+      { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+    );
+    ignoredFilesHash = createHash("sha256").update(ignored).digest("hex");
+  } catch {
+    ignoredFilesHash = "READ_ERROR_SENTINEL";
+  }
   return {
     lsFilesVerbose,
     excludesFileValue,
     excludesFileHash,
     infoExcludeHash,
+    infoExcludeHasActiveRules,
+    ignoredFilesHash,
     sparseCheckout,
     sparseCheckoutFilePresent,
   };
@@ -175,18 +200,22 @@ if (status.trim().length !== 0) {
 // Gate 9 预运行硬门：porcelain 干净不够——assume-unchanged/skip-worktree、
 // sparse-checkout 等元数据能掩盖已跟踪文件改动，在任何验收检出上都不合法，
 // 启动前即拒绝。info/exclude 与 excludesFile 可有合法用途（如 worktree
-// node_modules 排除），不在此硬拒，但会在运行后做前后差比对。
+// node_modules 排除），不在此硬拒。但读取失败用哨兵值标记，绝不静默为
+// "不存在"。运行后做前后差比对（字节哈希 + 被忽略文件集）。
 const preRunMetadata = captureGitMetadataHiding();
 if (
   preRunMetadata.lsFilesVerbose.split("\n").some((line) => {
     const tag = line.charAt(0);
-    return tag === "h" || tag === "s";
+    return tag === "h" || tag === "S";
   }) ||
   preRunMetadata.sparseCheckout === true ||
   preRunMetadata.sparseCheckout === "true" ||
   preRunMetadata.sparseCheckoutFilePresent
 ) {
   fail("检出存在可隐藏已跟踪文件改动的 Git 元数据（assume-unchanged/skip-worktree/sparse-checkout）；拒绝发放验收。");
+}
+if (preRunMetadata.infoExcludeHash === "READ_ERROR_SENTINEL" || preRunMetadata.excludesFileHash === "READ_ERROR_SENTINEL") {
+  fail("Git 排除文件读取失败（哨兵值触发），无法建立安全的预运行元数据基线；拒绝发放验收。");
 }
 if (
   process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL === undefined ||
@@ -415,6 +444,8 @@ if (seamState.afterChildHook) {
       postMetadata.excludesFileHash !== preRunMetadata.excludesFileHash,
     infoExcludeHashChanged:
       postMetadata.infoExcludeHash !== preRunMetadata.infoExcludeHash,
+    ignoredFilesHashChanged:
+      postMetadata.ignoredFilesHash !== preRunMetadata.ignoredFilesHash,
     sparseCheckout: postMetadata.sparseCheckout,
     sparseCheckoutFilePresent: postMetadata.sparseCheckoutFilePresent,
   };

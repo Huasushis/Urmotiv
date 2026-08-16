@@ -304,6 +304,17 @@ describe("gitMetadataHidingReasons（Gate 9 元数据掩盖探测）", () => {
     expect(r.reasons).toContain("GIT_SPARSE_CHECKOUT_FILE_PRESENT");
     expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");
   });
+  it("被忽略文件集哈希变化即检出（排除规则字节未变但隐藏了新工件）", () => {
+    const r = gitMetadataHidingReasons({ ignoredFilesHashChanged: true });
+    expect(r.hiding).toBe(true);
+    expect(r.reasons).toContain("GIT_IGNORED_FILES_SET_CHANGED");
+    expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");
+  });
+  it("被忽略文件集哈希未变不算掩盖", () => {
+    const r = gitMetadataHidingReasons({ ignoredFilesHashChanged: false });
+    expect(r.hiding).toBe(false);
+    expect(r.reasons).toEqual([]);
+  });
   it("非对象输入安全返回无原因", () => {
     expect(gitMetadataHidingReasons(null)).toEqual({ reasons: [], hiding: false });
     expect(gitMetadataHidingReasons(42)).toEqual({ reasons: [], hiding: false });

@@ -5,7 +5,7 @@ import { connect, createServer, type Socket } from "node:net";
 import { spawnSync } from "node:child_process";
 
 import { sql } from "drizzle-orm";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
   createPostgresDatabase,
   migrateDatabase,
@@ -819,6 +819,15 @@ afterEach(async () => {
   }
 });
 
+afterAll(() => {
+  // 清理失败硬门：afterEach 保留的残留名必须在此暴露。
+  // 一个通过运行的最终状态必须是临时数据库列表完全清空。
+  if (temporaryDatabaseNames.length !== 0) {
+    throw new Error(
+      `PG 清理未完成，残留数据库: ${temporaryDatabaseNames.join(", ")}`,
+    );
+  }
+});
 describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
   it("137 个权威来源包精确导入并以 0/137 幂等重放", async () => {
     assertNode24();
@@ -2178,7 +2187,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       const cleanupFaultDatabaseName = `urmotiv_formal_cleanup_${process.pid}${randomUUID()
         .replaceAll("-", "")
         .slice(0, 8)}`;
-      temporaryDatabaseNames.push(`${cleanupFaultDatabaseName}__formal_backup`);
+      temporaryDatabaseNames.push(cleanupFaultDatabaseName, `${cleanupFaultDatabaseName}__formal_backup`);
       await formalAdmin.execute(
         sql`create database ${sql.identifier(cleanupFaultDatabaseName)}`,
       );

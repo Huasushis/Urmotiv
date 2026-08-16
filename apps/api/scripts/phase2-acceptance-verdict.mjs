@@ -174,6 +174,7 @@ export function assessFormalShard(shard, environment) {
  *   lsFilesVerbose?: unknown,
  *   excludesFileHashChanged?: unknown,
  *   infoExcludeHashChanged?: unknown,
+ *   ignoredFilesHashChanged?: unknown,
  *   sparseCheckout?: unknown,
  *   sparseCheckoutFilePresent?: unknown,
  * }} environment
@@ -207,6 +208,13 @@ export function gitMetadataHidingReasons(environment) {
   const infoExcludeHashChanged = env.infoExcludeHashChanged;
   if (infoExcludeHashChanged === true) {
     reasons.push("GIT_INFO_EXCLUDE_CHANGED");
+    hiding = true;
+  }
+  // 被忽略文件集哈希变化：预存排除规则被用来隐藏运行中新增的未跟踪
+  // 工件（排除规则字节未变，但被忽略的文件集变了）。
+  const ignoredFilesHashChanged = env.ignoredFilesHashChanged;
+  if (ignoredFilesHashChanged === true) {
+    reasons.push("GIT_IGNORED_FILES_SET_CHANGED");
     hiding = true;
   }
   // core.sparseCheckout=true 或 .git/info/sparse-checkout 存在：稀疏检出

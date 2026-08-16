@@ -16,9 +16,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire as nodeCreateRequire } from "node:module";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 const testsDirectory = fileURLToPath(new URL(".", import.meta.url));
@@ -36,42 +38,70 @@ function git(cwd, ...args) {
 
 const pgAdminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL ?? "";
 
+// 跟踪本测试运行拥有的 PG 数据库快照前集；清理只删运行中新出现的库，
+// 绝不碰预先存在的不相关恢复库。
+let preRunDatabaseNames = null;
+function pgRequire() {
+  const req = nodeCreateRequire(import.meta.url);
+  try {
+    return req("pg");
+  } catch {
+    const dbPkgPath = join(repositoryRoot, "packages", "database", "package.json");
+    return nodeCreateRequire(dbPkgPath)("pg");
+  }
+}
+
+async function snapshotOwnedDatabases() {
+  if (pgAdminUrl.trim().length === 0) return;
+  const mod = pgRequire();
+  const Client = mod.Client ?? mod.default?.Client;
+  const client = new Client({ connectionString: pgAdminUrl });
+  await client.connect();
+  try {
+    const result = await client.query(
+      "select datname from pg_database where datname like 'urmotiv_%'",
+    );
+    preRunDatabaseNames = new Set(result.rows.map((r) => r.datname));
+  } finally {
+    await client.end();
+  }
+}
+
 async function cleanupPgResidue() {
   if (pgAdminUrl.trim().length === 0) return;
-  // 用 createRequire 从 pnpm store 加载 pg（.mjs 无法直接 import 工作区包）。
-  const { createRequire } = await import("node:module");
-  const require = createRequire(import.meta.url);
-  let pgModule;
-  try {
-    pgModule = require("pg");
-  } catch {
-    // @urmotiv/database 依赖 pg，从它的位置解析。
-    const dbPkgPath = join(repositoryRoot, "packages", "database", "package.json");
-    const dbRequire = createRequire(dbPkgPath);
-    pgModule = dbRequire("pg");
+  if (!(preRunDatabaseNames instanceof Set)) {
+    throw new Error("cleanupPgResidue 在 snapshotOwnedDatabases 之前被调用。");
   }
-  const Client = pgModule.Client ?? pgModule.default?.Client;
+  const mod = pgRequire();
+  const Client = mod.Client ?? mod.default?.Client;
   const client = new Client({ connectionString: pgAdminUrl });
   await client.connect();
   try {
     const result = await client.query(
       "select datname from pg_database where datname like 'urmotiv_%' order by datname",
     );
+    // 只删本运行中新创建的库（快照前集中不存在的），绝不碰预先存在的不相关库。
+    const owned = result.rows
+      .map((r) => r.datname)
+      .filter((name) => !preRunDatabaseNames.has(name));
     const failed = [];
-    for (const row of result.rows) {
+    for (const name of owned) {
       try {
-        await client.query(`drop database "${row.datname}" with (force)`);
+        await client.query(`drop database "${name}" with (force)`);
       } catch {
-        failed.push(row.datname);
+        failed.push(name);
       }
     }
-    // 逐一断言已消失；残留名保留并报错。
+    // 逐一断言已删除的库已消失；未删的预先存在库不在断言范围内。
     const remaining = await client.query(
       "select datname from pg_database where datname like 'urmotiv_%'",
     );
-    if (remaining.rows.length !== 0 || failed.length !== 0) {
-      const names = remaining.rows.map((r) => r.datname).concat(failed);
-      throw new Error(`PG 残留数据库未清理: ${names.join(", ")}`);
+    const stillOwned = remaining.rows
+      .map((r) => r.datname)
+      .filter((name) => !preRunDatabaseNames.has(name));
+    if (stillOwned.length !== 0 || failed.length !== 0) {
+      const names = stillOwned.concat(failed);
+      throw new Error(`PG 残留数据库未清理（仅限本运行拥有）: ${names.join(", ")}`);
     }
   } finally {
     await client.end();
@@ -205,10 +235,14 @@ const gate9ExcludeLines = [
   "/apps/api/node_modules",
   "/apps/worker/node_modules",
 ];
-let sharedExcludeOriginal = "";
+// null = 尚未捕获；"" = 合法的零字节原始文件；非空串 = 捕获到的原始字节。
+// 三者必须严格区分，否则零字节原始文件与「未捕获」无法区分。
+let sharedExcludeOriginal = null;
+let sharedExcludeCaptured = false;
 
 function enableSharedExcludes() {
   sharedExcludeOriginal = readFileSync(sharedExcludePath, "utf8");
+  sharedExcludeCaptured = true;
   const existing = new Set(sharedExcludeOriginal.split("\n"));
   const additions = gate9ExcludeLines.filter((line) => !existing.has(line));
   if (additions.length !== 0) {
@@ -217,15 +251,24 @@ function enableSharedExcludes() {
 }
 
 function restoreSharedExcludes() {
-  if (sharedExcludeOriginal.length === 0) return;
+  // 未捕获（null）说明 enableSharedExcludes 从未成功执行——不是幂等
+  // 恢复，而是前置条件缺失，必须报错而非静默跳过。
+  if (!sharedExcludeCaptured || sharedExcludeOriginal === null) {
+    throw new Error("restoreSharedExcludes 在 enableSharedExcludes 之前被调用。");
+  }
   writeFileSync(sharedExcludePath, sharedExcludeOriginal);
-  sharedExcludeOriginal = "";
+  sharedExcludeOriginal = null;
+  sharedExcludeCaptured = false;
 }
 
 function verifySharedExcludesRestored() {
-  const current = readFileSync(sharedExcludePath, "utf8");
+  // fail-closed：快照未捕获也必须报错，不能假装验证通过。
   const snapshot = configSnapshot.get("__info_exclude_original__");
-  if (snapshot !== undefined && current !== snapshot) {
+  if (typeof snapshot !== "string") {
+    throw new Error("info/exclude 原始字节快照缺失，验证无法成立。");
+  }
+  const current = readFileSync(sharedExcludePath, "utf8");
+  if (current !== snapshot) {
     throw new Error("info/exclude 未恢复到测试前精确字节。");
   }
 }
@@ -284,11 +327,13 @@ function verifyGitConfigRestored() {
 }
 
 describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () => {
-  beforeAll(() => {
+  beforeAll(async () => {
     // 先快照 info/exclude 原始字节（不含测试追加的 node_modules 行），
     // 再启用排除行。afterAll 的 verifySharedExcludesRestored 与此比对。
     snapshotGitConfig();
     enableSharedExcludes();
+    // 快照当前 PG 数据库集，清理时只删本运行新创建的库。
+    await snapshotOwnedDatabases();
   });
 
   afterAll(async () => {
@@ -336,12 +381,32 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
   afterEach(async () => {
     // 每个测试的 hook 都可能改共享 git config 和 info/exclude；
     // 测试间必须恢复，避免泄露到后续测试或用户环境。
-    restoreGitConfig();
-    restoreSharedExcludes();
+    let cleanupError = null;
+    try {
+      restoreGitConfig();
+    } catch (error) {
+      cleanupError = error;
+    }
+    try {
+      restoreSharedExcludes();
+    } catch (error) {
+      cleanupError ??= error;
+    }
     // 重新启用排除行供下一个测试的 worktree 使用。
-    enableSharedExcludes();
+    try {
+      enableSharedExcludes();
+    } catch (error) {
+      cleanupError ??= error;
+    }
     // 清理本测试验收运行产生的 PG 数据库族残留。
-    await cleanupPgResidue();
+    try {
+      await cleanupPgResidue();
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    if (cleanupError !== null) {
+      throw cleanupError;
+    }
   });
   it(
     "缝激活 + 脏树突变：本可 IMPLEMENTATION_READY 的载荷仍被缝强制非权威，且突变仍被检出",
@@ -521,3 +586,66 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     },
   );
 });
+
+describe.skipIf(pgAdminUrl.trim().length === 0)(
+  "Gate 9 PG 清理资源归属边界（不碰不相关恢复库）",
+  () => {
+    afterEach(() => {
+      // 重置共享状态，避免污染主 Gate 9 describe 块的清理逻辑。
+      preRunDatabaseNames = null;
+    });
+    it("cleanupPgResidue 只删本运行拥有的库，保留预存的不相关恢复库", async () => {
+      // 1. 预存一个不相关的恢复库（模拟并发的恢复操作）。
+      const unrelatedName = `urmotiv_recovery_unrelated_${process.pid}${randomUUID()
+        .replaceAll("-", "")
+        .slice(0, 8)}`;
+      const mod = pgRequire();
+      const Client = mod.Client ?? mod.default?.Client;
+      const setupClient = new Client({ connectionString: pgAdminUrl });
+      await setupClient.connect();
+      try {
+        await setupClient.query(`create database "${unrelatedName}"`);
+      } finally {
+        await setupClient.end();
+      }
+
+      // 2. 快照当前库集——此时不相关恢复库已存在，会被快照记录。
+      await snapshotOwnedDatabases();
+
+      // 3. 创建一个本运行拥有的库（快照后新建）。
+      const ownedName = `urmotiv_owned_test_${process.pid}${randomUUID()
+        .replaceAll("-", "")
+        .slice(0, 8)}`;
+      const ownClient = new Client({ connectionString: pgAdminUrl });
+      await ownClient.connect();
+      try {
+        await ownClient.query(`create database "${ownedName}"`);
+      } finally {
+        await ownClient.end();
+      }
+
+      // 4. 清理——只应删除 ownedName，不应碰 unrelatedName。
+      await cleanupPgResidue();
+
+      // 5. 断言：ownedName 已消失，unrelatedName 仍存在。
+      const checkClient = new Client({ connectionString: pgAdminUrl });
+      await checkClient.connect();
+      try {
+        const ownedResult = await checkClient.query(
+          "select count(*) as n from pg_database where datname = $1",
+          [ownedName],
+        );
+        expect(Number(ownedResult.rows[0].n)).toBe(0);
+        const unrelatedResult = await checkClient.query(
+          "select count(*) as n from pg_database where datname = $1",
+          [unrelatedName],
+        );
+        expect(Number(unrelatedResult.rows[0].n)).toBe(1);
+      } finally {
+        // 6. 清理不相关恢复库（测试自身的清理，不依赖 cleanupPgResidue）。
+        await checkClient.query(`drop database "${unrelatedName}" with (force)`);
+        await checkClient.end();
+      }
+    }, 30_000);
+  },
+);
