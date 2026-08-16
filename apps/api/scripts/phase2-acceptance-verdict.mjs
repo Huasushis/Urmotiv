@@ -160,13 +160,20 @@ export function assessFormalShard(shard, environment) {
  * core.excludesFile 能隐藏未跟踪文件；sparse-checkout 配置与 worktree 局部
  * 元数据也可掩盖内容。这些都不出现在 porcelain 行中，必须逐项探测。
  *
- * 本函数只接收探测命令的原始 stdout 与配置值，不执行任何 git 命令（纯函数，
- * 可单元测试）。任一探测命中即返回 POST_RUN_GIT_METADATA_HIDING（硬失败），
- * 同时附上精确子码供证据归因。绝不输出路径或内容。
+ * 排除文件用字节哈希前后差比对：运行前冻结哈希，运行后逐字节比对，任何
+ * 字节变化即报掩盖。比布尔 delta 更强——不受「已有非空文件再添一行」
+ * 的遮蔽，也不依赖布尔语义（非空 vs 空）。预存的合法排除规则被冻结，
+ * 运行中新增/修改/删除排除规则一定被检出。
+ *
+ * ls-files -v 的 assume-unchanged(h)/skip-worktree(s) 与 sparse-checkout
+ * 是绝对非法的（预运行已拒，运行中出现即为掩盖突变），不做前后差比对。
+ *
+ * 本函数只接收探测命令的原始 stdout 与哈希差布尔值，不执行任何 git 命令
+ * （纯函数，可单元测试），绝不输出路径或内容。
  * @param {{
  *   lsFilesVerbose?: unknown,
- *   excludesFile?: unknown,
- *   infoExcludeNonEmpty?: unknown,
+ *   excludesFileHashChanged?: unknown,
+ *   infoExcludeHashChanged?: unknown,
  *   sparseCheckout?: unknown,
  *   sparseCheckoutFilePresent?: unknown,
  * }} environment
@@ -178,7 +185,7 @@ export function gitMetadataHidingReasons(environment) {
   const reasons = [];
   let hiding = false;
   // git ls-files -v：小写标记 h(assume-unchanged)/s(skip-worktree) 表示
-  // 已跟踪文件被元数据标记隐藏。大写 H/S/c 等是正常状态。
+  // 已跟踪文件被元数据标记隐藏。大写 H/S/c 等是正常状态。绝对非法。
   const lsFilesVerbose = env.lsFilesVerbose;
   if (typeof lsFilesVerbose === "string" && lsFilesVerbose.trim().length !== 0) {
     for (const line of lsFilesVerbose.split("\n")) {
@@ -190,20 +197,20 @@ export function gitMetadataHidingReasons(environment) {
       }
     }
   }
- // core.excludesFile 被显式设置：可指向检出外文件隐藏未跟踪内容。
-  const excludesFile = env.excludesFile;
-  if (typeof excludesFile === "string" && excludesFile.trim().length !== 0) {
-    reasons.push("GIT_CORE_EXCLUDES_FILE_SET");
+  // core.excludesFile 字节哈希变化：运行中修改了排除文件内容。
+  const excludesFileHashChanged = env.excludesFileHashChanged;
+  if (excludesFileHashChanged === true) {
+    reasons.push("GIT_CORE_EXCLUDES_FILE_CHANGED");
     hiding = true;
   }
-  // .git/info/exclude 非空：worktree 局部排除规则，可隐藏未跟踪文件。
-  const infoExcludeNonEmpty = env.infoExcludeNonEmpty;
-  if (infoExcludeNonEmpty === true) {
-    reasons.push("GIT_INFO_EXCLUDE_NON_EMPTY");
+  // .git/info/exclude 字节哈希变化：运行中修改了 info/exclude 内容。
+  const infoExcludeHashChanged = env.infoExcludeHashChanged;
+  if (infoExcludeHashChanged === true) {
+    reasons.push("GIT_INFO_EXCLUDE_CHANGED");
     hiding = true;
   }
   // core.sparseCheckout=true 或 .git/info/sparse-checkout 存在：稀疏检出
-  // 可掩盖整片目录内容。
+  // 可掩盖整片目录内容。绝对非法（预运行已拒）。
   const sparseCheckout = env.sparseCheckout;
   if (sparseCheckout === true || sparseCheckout === "true") {
     reasons.push("GIT_SPARSE_CHECKOUT_ENABLED");

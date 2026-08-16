@@ -75,7 +75,9 @@ import {
 import {
   captureDatabaseContentInventory,
   captureStorageInventory,
+  dropScratchSnapshot,
   restoreStorageDirectory,
+  snapshotScratchDatabase,
 } from "../src/history-migration/history-import-snapshot";
 import {
   captureHistoryImportTableCounts,
@@ -760,26 +762,56 @@ async function databaseExists(database: DatabaseHandle, name: string): Promise<b
   );
   return Number(rows[0]?.total ?? 0) === 1;
 }
+async function databaseExistsByName(database: DatabaseHandle, name: string): Promise<boolean> {
+  return databaseExists(database, name);
+}
 
 function trackDatabaseFamily(name: string): void {
+  // 跟踪数据库族的每个可能成员，包括世代快照。
+  // 清理时逐一断言删除成功，绝不遗漏或预先删除。
   temporaryDatabaseNames.push(
     name,
     `${name}__snapshot`,
+    `${name}__snapshot_g1`,
+    `${name}__snapshot_g2`,
     `${name}__restore`,
     `${name}__failed`,
   );
 }
 
 afterEach(async () => {
+  // Gate 6 残留保证：清理不得在删除成功前丢弃名称（splice 会遗忘失败的
+  // 删除，被下一轮随机覆盖）。先快照待清理列表，逐一删除，删除后断言
+  // 该库在 pg_database 中已消失；全部断言通过后才从跟踪列表移除。
   if (adminUrl !== undefined) {
-    for (const name of temporaryDatabaseNames.splice(0).reverse()) {
-      if (/^urmotiv_formal_/u.test(name)) {
-        const admin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
-        await admin.execute(sql`drop database if exists ${sql.identifier(name)} with (force)`);
-        await admin.close();
-      } else {
-        await dropHistoryImportDatabase(adminUrl, name);
+    const pending = [...temporaryDatabaseNames].reverse();
+    const remaining: string[] = [];
+    for (const name of pending) {
+      try {
+        if (/^urmotiv_formal_/u.test(name)) {
+          const admin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
+          await admin.execute(sql`drop database if exists ${sql.identifier(name)} with (force)`);
+          await admin.close();
+        } else {
+          await dropHistoryImportDatabase(adminUrl, name);
+        }
+      } catch {
+        // 删除失败：保留名称，不遗忘，让后续断言报错。
+        remaining.push(name);
       }
+      // 断言该库已消失：即使 drop 报错也检查，确保残留被暴露。
+      const checkAdmin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
+      const stillExists = await databaseExistsByName(checkAdmin, name);
+      await checkAdmin.close();
+      if (stillExists) {
+        remaining.push(name);
+      }
+    }
+    // 只在全部清理成功后清空跟踪列表；残留则保留供下一轮重试。
+    if (remaining.length === 0) {
+      temporaryDatabaseNames.splice(0);
+    } else {
+      temporaryDatabaseNames.splice(0, temporaryDatabaseNames.length, ...remaining);
     }
   }
   for (const directory of temporaryDirectories.splice(0)) {
@@ -2730,4 +2762,65 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
   }
     expect(formalDropped).toBe(true);
   }, 300_000);
+  it("Gate 6 延迟终止与残留验证：活动连接异步回收后快照成功，清理后全部族成员消失", async () => {
+    assertNode24();
+    if (adminUrl === undefined) throw new Error("缺少 PostgreSQL 管理连接配置。");
+    const g6Name = scratchName("g6src");
+    trackDatabaseFamily(g6Name);
+    await prepareHistoryImportDatabase(adminUrl, g6Name);
+    const scratchConnStr = historyImportDatabaseConnectionString(adminUrl, g6Name);
+
+    // 先捕获空 scratch 库的实际内容清单作为快照比对基线。
+    const baselineDb = createPostgresDatabase({ connectionString: scratchConnStr, maxConnections: 1 });
+    const baselineInventory = await captureDatabaseContentInventory(
+      baselineDb,
+      historyImportRequiredTables,
+    );
+    await baselineDb.close();
+
+    // 在 scratch 库上打开一个长连接，模拟异步后端：先查询保持会话存活，
+    // 然后在 setTimeout 后关闭。snapshotScratchDatabase 内部的
+    // terminateConnections 应轮询 pg_stat_activity 直到归零后再建快照。
+    const holdDb = createPostgresDatabase({ connectionString: scratchConnStr, maxConnections: 1 });
+    // 抑制 pg_terminate_backend 引起的预期连接错误事件，避免 unhandled rejection。
+    holdDb.client.on("error", () => { /* 预期被终止 */ });
+    await holdDb.execute(sql`select 1`);
+    // 延迟 800ms 关闭——超过 3 个轮询周期（250ms × 3），验证轮询确实等待。
+    const holdClose = new Promise<void>((resolve) => {
+      setTimeout(() => { holdDb.close().then(() => resolve()).catch(() => resolve()); }, 800);
+    });
+
+    // 快照应成功：terminateConnections 轮询等待活动连接归零。
+    const snapshotInventory = await snapshotScratchDatabase(
+      adminUrl,
+      g6Name,
+      historyImportRequiredTables,
+      baselineInventory,
+    );
+    expect(snapshotInventory.tableCount).toBe(historyImportRequiredTables.length);
+    await holdClose;
+
+    // 断言快照库存在。
+    const checkAdmin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
+    expect(await databaseExists(checkAdmin, `${g6Name}__snapshot`)).toBe(true);
+    await checkAdmin.close();
+
+    // 清理：删除快照和 scratch 库，然后断言全部族成员消失。
+    await dropScratchSnapshot(adminUrl, g6Name);
+    await dropHistoryImportDatabase(adminUrl, g6Name);
+
+    // Gate 6 残留断言：逐一检查每个跟踪的族成员在 pg_database 中已消失。
+    const verifyAdmin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
+    for (const member of [
+      g6Name,
+      `${g6Name}__snapshot`,
+      `${g6Name}__snapshot_g1`,
+      `${g6Name}__snapshot_g2`,
+      `${g6Name}__restore`,
+      `${g6Name}__failed`,
+    ]) {
+      expect(await databaseExists(verifyAdmin, member)).toBe(false);
+    }
+    await verifyAdmin.close();
+  }, 120_000);
 });

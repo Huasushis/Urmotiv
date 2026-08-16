@@ -56,11 +56,21 @@ function sha256Hex(content) {
   return createHash("sha256").update(content).digest("hex");
 }
 
+
 /**
  * Gate 9 Git 元数据掩盖探测：收集可隐藏检出突变的元数据状态。
  * porcelain status 无法识破 assume-unchanged/skip-worktree、info/exclude、
- * core.excludesFile、sparse-checkout 等。本函数只采集原始 git 输出，
- * 不解析内容、不输出路径。判定在 verdict 模块的纯函数完成。
+ * core.excludesFile、sparse-checkout 等。本函数只采集原始 git 输出与
+ * 排除文件的字节哈希，不解析内容、不输出路径。判定在 verdict 模块的
+ * 纯函数完成。
+ *
+ * 排除文件用字节哈希（sha256）而非布尔值：运行前冻结哈希，运行后逐字节
+ * 比对，任何字节变化即报 POST_RUN_GIT_METADATA_HIDING。这样预存的合法
+ * 排除规则（如 worktree node_modules 软链排除）被冻结，运行中新增的规则
+ * 一定被检出——比布尔 delta 更强，不受「已有非空文件再添一行」的遮蔽。
+ *
+ * git-path 解析用 git rev-parse --git-path，正确处理链接型 worktree
+ * （.git 是 gitdir 指针文件而非目录）。
  */
 function captureGitMetadataHiding() {
   let lsFilesVerbose = "";
@@ -73,28 +83,36 @@ function captureGitMetadataHiding() {
   } catch {
     lsFilesVerbose = "";
   }
-  let excludesFile = "";
+  let excludesFileValue = "";
   try {
-    excludesFile = execFileSync("git", ["config", "--get", "core.excludesFile"], {
+    excludesFileValue = execFileSync("git", ["config", "--get", "core.excludesFile"], {
       cwd: repositoryRoot,
       encoding: "utf8",
     }).trim();
   } catch {
-    excludesFile = "";
+    excludesFileValue = "";
   }
-  let infoExcludeNonEmpty = false;
+  let excludesFileHash = "";
+  if (excludesFileValue.length !== 0) {
+    try {
+      excludesFileHash = createHash("sha256")
+        .update(readFileSync(excludesFileValue, "utf8"))
+        .digest("hex");
+    } catch {
+      excludesFileHash = "READ_ERROR";
+    }
+  }
+  let infoExcludeHash = "";
   try {
     const excludePath = execFileSync("git", ["rev-parse", "--git-path", "info/exclude"], {
       cwd: repositoryRoot,
       encoding: "utf8",
     }).trim();
-    const content = readFileSync(excludePath, "utf8");
-    infoExcludeNonEmpty = content.split("\n").some((line) => {
-      const trimmed = line.trim();
-      return trimmed.length !== 0 && !trimmed.startsWith("#");
-    });
+    infoExcludeHash = createHash("sha256")
+      .update(readFileSync(excludePath, "utf8"))
+      .digest("hex");
   } catch {
-    infoExcludeNonEmpty = false;
+    infoExcludeHash = "ABSENT";
   }
   let sparseCheckout = false;
   try {
@@ -117,8 +135,9 @@ function captureGitMetadataHiding() {
   }
   return {
     lsFilesVerbose,
-    excludesFile,
-    infoExcludeNonEmpty,
+    excludesFileValue,
+    excludesFileHash,
+    infoExcludeHash,
     sparseCheckout,
     sparseCheckoutFilePresent,
   };
@@ -388,16 +407,14 @@ if (seamState.afterChildHook) {
   const postMetadata = captureGitMetadataHiding();
   // 运行后元数据探测：skip-worktree/assume-unchanged/sparse 是绝对非法的
   // （预运行已拒，运行中出现即为掩盖突变）。info/exclude 与 excludesFile 用
-  // 前后差比对——运行中新增的排除规则才算掩盖，预运行已有的合法项不计。
-  const preExcludeCount = preRunMetadata.infoExcludeNonEmpty ? 1 : 0;
-  const postExcludeCount = postMetadata.infoExcludeNonEmpty ? 1 : 0;
-  const preExcludesFile = preRunMetadata.excludesFile;
-  const postExcludesFile = postMetadata.excludesFile;
+  // 字节哈希前后差比对——预存的合法排除规则被冻结（哈希不变即无变化），
+  // 运行中任何字节变化（新增/修改/删除排除规则）一定被检出。
   const metadataForVerdict = {
     lsFilesVerbose: postMetadata.lsFilesVerbose,
-    excludesFile:
-      postExcludesFile !== preExcludesFile ? postExcludesFile : "",
-    infoExcludeNonEmpty: postExcludeCount > preExcludeCount,
+    excludesFileHashChanged:
+      postMetadata.excludesFileHash !== preRunMetadata.excludesFileHash,
+    infoExcludeHashChanged:
+      postMetadata.infoExcludeHash !== preRunMetadata.infoExcludeHash,
     sparseCheckout: postMetadata.sparseCheckout,
     sparseCheckoutFilePresent: postMetadata.sparseCheckoutFilePresent,
   };

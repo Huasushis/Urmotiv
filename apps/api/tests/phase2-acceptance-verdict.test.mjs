@@ -257,16 +257,26 @@ describe("gitMetadataHidingReasons（Gate 9 元数据掩盖探测）", () => {
     expect(r.hiding).toBe(false);
     expect(r.reasons).toEqual([]);
   });
-  it("core.excludesFile 被设置即检出", () => {
-    const r = gitMetadataHidingReasons({ excludesFile: "/home/u/.gitignore" });
+  it("core.excludesFile 字节哈希变化即检出", () => {
+    const r = gitMetadataHidingReasons({ excludesFileHashChanged: true });
     expect(r.hiding).toBe(true);
-    expect(r.reasons).toContain("GIT_CORE_EXCLUDES_FILE_SET");
+    expect(r.reasons).toContain("GIT_CORE_EXCLUDES_FILE_CHANGED");
     expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");
   });
-  it("info/exclude 非空即检出", () => {
-    const r = gitMetadataHidingReasons({ infoExcludeNonEmpty: true });
+  it("info/exclude 字节哈希变化即检出", () => {
+    const r = gitMetadataHidingReasons({ infoExcludeHashChanged: true });
     expect(r.hiding).toBe(true);
-    expect(r.reasons).toContain("GIT_INFO_EXCLUDE_NON_EMPTY");
+    expect(r.reasons).toContain("GIT_INFO_EXCLUDE_CHANGED");
+  });
+  it("info/exclude 字节哈希未变不算掩盖", () => {
+    const r = gitMetadataHidingReasons({ infoExcludeHashChanged: false });
+    expect(r.hiding).toBe(false);
+    expect(r.reasons).toEqual([]);
+  });
+  it("core.excludesFile 字节哈希未变不算掩盖", () => {
+    const r = gitMetadataHidingReasons({ excludesFileHashChanged: false });
+    expect(r.hiding).toBe(false);
+    expect(r.reasons).toEqual([]);
   });
   it("sparse-checkout 启用即检出", () => {
     const r = gitMetadataHidingReasons({ sparseCheckout: true });
@@ -281,15 +291,15 @@ describe("gitMetadataHidingReasons（Gate 9 元数据掩盖探测）", () => {
   it("多种掩盖同时出现，原因全记录", () => {
     const r = gitMetadataHidingReasons({
       lsFilesVerbose: "h f1\n",
-      excludesFile: "/tmp/exc",
-      infoExcludeNonEmpty: true,
+      excludesFileHashChanged: true,
+      infoExcludeHashChanged: true,
       sparseCheckout: true,
       sparseCheckoutFilePresent: true,
     });
     expect(r.hiding).toBe(true);
     expect(r.reasons).toContain("GIT_LS_FILES_ASSUMUNCHANGED_OR_SKIPWORKTREE");
-    expect(r.reasons).toContain("GIT_CORE_EXCLUDES_FILE_SET");
-    expect(r.reasons).toContain("GIT_INFO_EXCLUDE_NON_EMPTY");
+    expect(r.reasons).toContain("GIT_CORE_EXCLUDES_FILE_CHANGED");
+    expect(r.reasons).toContain("GIT_INFO_EXCLUDE_CHANGED");
     expect(r.reasons).toContain("GIT_SPARSE_CHECKOUT_ENABLED");
     expect(r.reasons).toContain("GIT_SPARSE_CHECKOUT_FILE_PRESENT");
     expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");

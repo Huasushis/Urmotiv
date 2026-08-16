@@ -61,13 +61,57 @@ if (mode === "assume-unchanged") {
 if (mode === "info-exclude") {
   // 元数据掩盖缝：创建一个未跟踪文件，再在 .git/info/exclude 里加
   // 排除规则隐藏它。porcelain 不会显示该未跟踪文件。
+  // 用 git rev-parse --git-path 正确解析链接型 worktree 的共享排除文件。
   writeFileSync(
     join(repositoryRoot, "apps", "api", "GATE9_HIDDEN.untracked"),
     "synthetic-info-exclude-mutation\n",
   );
-  const excludePath = join(repositoryRoot, ".git", "info", "exclude");
+  const excludePath = execFileSync("git", ["rev-parse", "--git-path", "info/exclude"], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  }).trim();
   const existing = readFileSync(excludePath, "utf8");
   writeFileSync(excludePath, `${existing}apps/api/GATE9_HIDDEN.untracked\n`);
+  process.exit(0);
+}
+if (mode === "excludes-file") {
+  writeFileSync(
+    join(repositoryRoot, "apps", "api", "GATE9_EXCL.untracked"),
+    "synthetic-excludes-file-mutation\n",
+  );
+  const excPath = join(repositoryRoot, "apps", "api", "GATE9_EXCLUDEFILE.tmp");
+  writeFileSync(excPath, "apps/api/GATE9_EXCL.untracked\n");
+  execFileSync("git", ["config", "core.excludesFile", excPath], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  process.exit(0);
+}
+if (mode === "pre-existing-info-exclude") {
+  writeFileSync(
+    join(repositoryRoot, "apps", "api", "GATE9_PRE_HIDDEN.untracked"),
+    "synthetic-pre-existing-exclude-mutation\n",
+  );
+  const excludePath = execFileSync("git", ["rev-parse", "--git-path", "info/exclude"], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  }).trim();
+  const existing = readFileSync(excludePath, "utf8");
+  writeFileSync(excludePath, `${existing}apps/api/GATE9_PRE_HIDDEN.untracked\n`);
+  process.exit(0);
+}
+if (mode === "sparse-checkout") {
+  execFileSync("git", ["config", "core.sparseCheckout", "true"], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  const sparsePath = execFileSync("git", ["rev-parse", "--git-path", "info/sparse-checkout"], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  }).trim();
+  writeFileSync(sparsePath, "/*\n!apps/api\n");
   process.exit(0);
 }
 process.exit(2);

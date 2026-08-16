@@ -327,7 +327,57 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
       const evidence = readEvidence(evidenceDirectory, result);
       expect(evidence.status).toBe("INCONCLUSIVE");
       expect(evidence.reasonCodes).toContain("POST_RUN_GIT_METADATA_HIDING");
-      expect(evidence.reasonCodes).toContain("GIT_INFO_EXCLUDE_NON_EMPTY");
+      expect(evidence.reasonCodes).toContain("GIT_INFO_EXCLUDE_CHANGED");
+      expect(result.status).not.toBe(0);
+    },
+  );
+  it(
+    "元数据掩盖缝（excludes-file）：运行中设置 core.excludesFile 隐藏未跟踪文件，字节哈希差检出",
+    { timeout: 1_800_000 },
+    () => {
+      const worktreeDirectory = makeWorktree();
+      worktrees.push(worktreeDirectory);
+      const { result, evidenceDirectory } = runAcceptanceLauncher(worktreeDirectory, {
+        verdict: "REAL_PASS",
+        hookMode: "excludes-file",
+      });
+      const evidence = readEvidence(evidenceDirectory, result);
+      expect(evidence.status).toBe("INCONCLUSIVE");
+      expect(evidence.reasonCodes).toContain("POST_RUN_GIT_METADATA_HIDING");
+      expect(evidence.reasonCodes).toContain("GIT_CORE_EXCLUDES_FILE_CHANGED");
+      expect(result.status).not.toBe(0);
+    },
+  );
+  it(
+    "元数据掩盖缝（pre-existing-info-exclude）：已有非注释排除规则上再添一行，字节哈希仍检出",
+    { timeout: 1_800_000 },
+    () => {
+      const worktreeDirectory = makeWorktree();
+      worktrees.push(worktreeDirectory);
+      const { result, evidenceDirectory } = runAcceptanceLauncher(worktreeDirectory, {
+        verdict: "SYNTHETIC_READINESS",
+        hookMode: "pre-existing-info-exclude",
+      });
+      const evidence = readEvidence(evidenceDirectory, result);
+      expect(evidence.status).toBe("INCONCLUSIVE");
+      expect(evidence.reasonCodes).toContain("POST_RUN_GIT_METADATA_HIDING");
+      expect(evidence.reasonCodes).toContain("GIT_INFO_EXCLUDE_CHANGED");
+      expect(result.status).not.toBe(0);
+    },
+  );
+  it(
+    "元数据掩盖缝（sparse-checkout）：运行中启用稀疏检出，绝对非法即报",
+    { timeout: 1_800_000 },
+    () => {
+      const worktreeDirectory = makeWorktree();
+      worktrees.push(worktreeDirectory);
+      const { result, evidenceDirectory } = runAcceptanceLauncher(worktreeDirectory, {
+        verdict: "REAL_PASS",
+        hookMode: "sparse-checkout",
+      });
+      const evidence = readEvidence(evidenceDirectory, result);
+      expect(evidence.status).toBe("INCONCLUSIVE");
+      expect(evidence.reasonCodes).toContain("POST_RUN_GIT_METADATA_HIDING");
       expect(result.status).not.toBe(0);
     },
   );
