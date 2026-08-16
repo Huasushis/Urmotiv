@@ -19,7 +19,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 const testsDirectory = fileURLToPath(new URL(".", import.meta.url));
 const apiDirectory = resolve(testsDirectory, "..");
@@ -177,20 +177,82 @@ function restoreSharedExcludes() {
   sharedExcludeOriginal = "";
 }
 
+// Gate 9 hook 模式可能在共享 git config 中设置 core.excludesFile 或
+// core.sparseCheckout。测试必须保存测试前的原始值（含「未设置」状态），
+// 无论成功失败都精确恢复，并验证恢复后字节一致。绝不篡改用户预存配置。
+const configKeysToSnapshot = ["core.excludesFile", "core.sparseCheckout"];
+const configSnapshot = new Map();
+
+function snapshotGitConfig() {
+  for (const key of configKeysToSnapshot) {
+    try {
+      const value = git(repositoryRoot, "config", "--get", key).trimEnd();
+      configSnapshot.set(key, { wasSet: true, value });
+    } catch {
+      configSnapshot.set(key, { wasSet: false, value: "" });
+    }
+  }
+}
+
+function restoreGitConfig() {
+  for (const key of configKeysToSnapshot) {
+    const snap = configSnapshot.get(key);
+    if (snap === undefined) continue;
+    if (snap.wasSet) {
+      git(repositoryRoot, "config", key, snap.value);
+    } else {
+      try {
+        git(repositoryRoot, "config", "--unset", key);
+      } catch {
+        // 已未设置，无需操作。
+      }
+    }
+  }
+}
+
+function verifyGitConfigRestored() {
+  for (const key of configKeysToSnapshot) {
+    const snap = configSnapshot.get(key);
+    if (snap === undefined) continue;
+    let currentValue = "";
+    let currentSet = false;
+    try {
+      currentValue = git(repositoryRoot, "config", "--get", key).trimEnd();
+      currentSet = true;
+    } catch {
+      currentSet = false;
+    }
+    if (currentSet !== snap.wasSet || currentValue !== snap.value) {
+      throw new Error(`git config ${key} 未恢复到测试前状态。`);
+    }
+  }
+}
+
 describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () => {
   beforeAll(() => {
     enableSharedExcludes();
+    snapshotGitConfig();
   });
 
   afterAll(() => {
     let failure = null;
     try {
-      restoreSharedExcludes();
+      restoreGitConfig();
     } catch (error) {
       failure = error;
     }
     try {
+      restoreSharedExcludes();
+    } catch (error) {
+      failure ??= error;
+    }
+    try {
       removeGate9Resources();
+    } catch (error) {
+      failure ??= error;
+    }
+    try {
+      verifyGitConfigRestored();
     } catch (error) {
       failure ??= error;
     }
@@ -203,6 +265,10 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     if (failure !== null) {
       throw failure;
     }
+  });
+  afterEach(() => {
+    // 每个测试的 hook 都可能改共享 git config；测试间必须恢复，避免泄露。
+    restoreGitConfig();
   });
   it(
     "缝激活 + 脏树突变：本可 IMPLEMENTATION_READY 的载荷仍被缝强制非权威，且突变仍被检出",
