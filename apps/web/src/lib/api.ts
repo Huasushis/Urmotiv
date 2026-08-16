@@ -15,6 +15,7 @@ import {
   problemListResponseSchema,
   problemAccessListResponseSchema,
   problemSchema,
+  profileViewSchema,
   reviewItemListResponseSchema,
   reviewPolicyViewSchema,
   reviewSuggestionViewSchema,
@@ -26,6 +27,8 @@ import {
   tagDeactivationPreviewSchema,
   okResponseSchema,
   tagSchema,
+  updateProfileInputSchema,
+  type ProfileView,
   type AdminPlugin,
   type AdminPluginListResponse,
   type CreateProblemInput,
@@ -69,6 +72,7 @@ import {
   type UpdateTagCatalogItemInput,
   type UpdateContestInput,
   type UpdatePluginRequest,
+  type UpdateProfileInput,
   type UpdateReviewPolicyInput,
   type UpdateProblemInput
 } from "@urmotiv/contracts";
@@ -170,9 +174,9 @@ async function request<T>(path: string, init: RequestInit, schema: RuntimeSchema
   return parsed.data;
 }
 
-function json(body: unknown): RequestInit {
+function json(body: unknown, method: "POST" | "PATCH" = "POST"): RequestInit {
   return {
-    method: "POST",
+    method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   };
@@ -221,6 +225,35 @@ export function verifyEmail(token: string): Promise<{ ok: true }> {
 
 export function logout(): Promise<{ ok: true }> {
   return request("/auth/logout", json({}), okResponseSchema);
+}
+
+export function getMyProfile(): Promise<ProfileView> {
+  return request("/me", { method: "GET" }, profileViewSchema);
+}
+
+export function updateMyProfile(input: UpdateProfileInput): Promise<ProfileView> {
+  return request("/me", json(input, "PATCH"), profileViewSchema);
+}
+
+export function uploadMyAvatar(file: Blob): Promise<ProfileView> {
+  return request(
+    "/me/avatar",
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: file
+    },
+    profileViewSchema
+  );
+}
+
+export function deleteMyAvatar(): Promise<ProfileView> {
+  return request("/me/avatar", { method: "DELETE" }, profileViewSchema);
+}
+
+/** 站内头像地址（受权限检查）；无头像时该地址返回 404，由客户端显示默认头像。 */
+export function avatarUrlFor(userId: string): string {
+  return `/api/v1/users/${encodeURIComponent(userId)}/avatar`;
 }
 
 export function listAdminPlugins(): Promise<AdminPluginListResponse> {

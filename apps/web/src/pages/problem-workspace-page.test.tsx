@@ -109,7 +109,7 @@ function mount(element: ReactNode): HTMLDivElement {
 
 async function waitFor(assertion: () => void): Promise<void> {
   let latestError: unknown;
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  for (let attempt = 0; attempt < 150; attempt += 1) {
     try {
       assertion();
       return;

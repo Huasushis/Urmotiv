@@ -12,6 +12,7 @@ import { CreateProblemPage } from "./pages/create-problem-page";
 import { ContestPage } from "./pages/contest-page";
 import { ProblemListPage } from "./pages/problem-list-page";
 import { ProblemWorkspacePage } from "./pages/problem-workspace-page";
+import { ProfilePage } from "./pages/profile-page";
 import { TransferPage } from "./pages/transfer-page";
 import { VerifyEmailPage } from "./pages/verify-email-page";
 
@@ -78,6 +79,7 @@ function App() {
         <Route path="/reviews" element={<ProblemListPage fixedStatus="pending_review" />} />
         <Route path="/contests" element={<ContestPage />} />
         <Route path="/transfer" element={<TransferPage />} />
+        <Route path="/profile" element={<ProfilePage />} />
         <Route path="/admin" element={<AdminPage session={sessionData.user} />} />
         <Route path="*" element={<Navigate to="/problems" replace />} />
       </Routes>

@@ -6,11 +6,12 @@ import {
   ListChecks,
   Settings
 } from "lucide-react";
+import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { NavLink } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type { SessionResponse } from "@urmotiv/contracts";
-import { logout } from "../lib/api";
+import { avatarUrlFor, logout } from "../lib/api";
 import { clearProblemDrafts } from "../lib/client-security";
 
 type AppShellProps = {
@@ -54,6 +55,30 @@ function buildNavItems(session: NonNullable<SessionResponse["user"]>) {
   return items;
 }
 
+function HeaderAvatar({ user }: { user: NonNullable<SessionResponse["user"]> }) {
+  const [broken, setBroken] = useState(false);
+  useEffect(() => {
+    setBroken(false);
+  }, [user.id]);
+  if (!broken) {
+    return (
+      <img
+        className="header-avatar"
+        src={avatarUrlFor(user.id)}
+        alt=""
+        onError={() => setBroken(true)}
+      />
+    );
+  }
+  const trimmed = user.nickname.trim();
+  const initial = trimmed ? Array.from(trimmed)[0]! : "?";
+  return (
+    <span className="header-avatar header-avatar-initial" aria-hidden="true">
+      {initial}
+    </span>
+  );
+}
+
 export function AppShell({ session, demoEnabled, children }: AppShellProps) {
   const navItems = buildNavItems(session);
   const client = useQueryClient();
@@ -87,10 +112,13 @@ export function AppShell({ session, demoEnabled, children }: AppShellProps) {
           ))}
         </nav>
         <div className="user-context">
-          <div className="user-name">
-            <strong>{session.nickname}</strong>
-            <span>{session.roles.join("、") || "已登录"}</span>
-          </div>
+          <NavLink className="user-profile-link" to="/profile" aria-label="个人资料">
+            <HeaderAvatar user={session} />
+            <div className="user-name">
+              <strong>{session.nickname}</strong>
+              <span>{session.roles.join("、") || "已登录"}</span>
+            </div>
+          </NavLink>
           {demoEnabled ? (
             <NavLink to="/demo-login" className="quiet-link">
               切换演示账号
