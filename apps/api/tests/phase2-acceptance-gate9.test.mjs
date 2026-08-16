@@ -34,6 +34,48 @@ function git(cwd, ...args) {
   return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
 }
 
+const pgAdminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL ?? "";
+
+async function cleanupPgResidue() {
+  if (pgAdminUrl.trim().length === 0) return;
+  // 用 createRequire 从 pnpm store 加载 pg（.mjs 无法直接 import 工作区包）。
+  const { createRequire } = await import("node:module");
+  const require = createRequire(import.meta.url);
+  let pgModule;
+  try {
+    pgModule = require("pg");
+  } catch {
+    // @urmotiv/database 依赖 pg，从它的位置解析。
+    const dbRequire = createRequire(require.resolve("@urmotiv/database"));
+    pgModule = dbRequire("pg");
+  }
+  const client = new Client({ connectionString: pgAdminUrl });
+  await client.connect();
+  try {
+    const result = await client.query(
+      "select datname from pg_database where datname like 'urmotiv_%' order by datname",
+    );
+    const failed = [];
+    for (const row of result.rows) {
+      try {
+        await client.query(`drop database "${row.datname}" with (force)`);
+      } catch {
+        failed.push(row.datname);
+      }
+    }
+    // 逐一断言已消失；残留名保留并报错。
+    const remaining = await client.query(
+      "select datname from pg_database where datname like 'urmotiv_%'",
+    );
+    if (remaining.rows.length !== 0 || failed.length !== 0) {
+      const names = remaining.rows.map((r) => r.datname).concat(failed);
+      throw new Error(`PG 残留数据库未清理: ${names.join(", ")}`);
+    }
+  } finally {
+    await client.end();
+  }
+}
+
 function defaultBaseWorkerFile() {
   const override = process.env.URMOTIV_PHASE2_GATE9_BASE_WORKER_FILE;
   if (typeof override === "string" && override.trim().length !== 0) {
@@ -173,8 +215,17 @@ function enableSharedExcludes() {
 }
 
 function restoreSharedExcludes() {
+  if (sharedExcludeOriginal.length === 0) return;
   writeFileSync(sharedExcludePath, sharedExcludeOriginal);
   sharedExcludeOriginal = "";
+}
+
+function verifySharedExcludesRestored() {
+  const current = readFileSync(sharedExcludePath, "utf8");
+  const snapshot = configSnapshot.get("__info_exclude_original__");
+  if (snapshot !== undefined && current !== snapshot) {
+    throw new Error("info/exclude 未恢复到测试前精确字节。");
+  }
 }
 
 // Gate 9 hook 模式可能在共享 git config 中设置 core.excludesFile 或
@@ -192,6 +243,8 @@ function snapshotGitConfig() {
       configSnapshot.set(key, { wasSet: false, value: "" });
     }
   }
+  // 同时快照 info/exclude 原始字节，用于 afterAll 逐字节验证恢复。
+  configSnapshot.set("__info_exclude_original__", readFileSync(sharedExcludePath, "utf8"));
 }
 
 function restoreGitConfig() {
@@ -234,7 +287,7 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     snapshotGitConfig();
   });
 
-  afterAll(() => {
+  afterAll(async () => {
     let failure = null;
     try {
       restoreGitConfig();
@@ -257,6 +310,16 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
       failure ??= error;
     }
     try {
+      verifySharedExcludesRestored();
+    } catch (error) {
+      failure ??= error;
+    }
+    try {
+      await cleanupPgResidue();
+    } catch (error) {
+      failure ??= error;
+    }
+    try {
       const status = git(repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all");
       expect(status.trim()).toBe("");
     } catch (error) {
@@ -266,9 +329,15 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
       throw failure;
     }
   });
-  afterEach(() => {
-    // 每个测试的 hook 都可能改共享 git config；测试间必须恢复，避免泄露。
+  afterEach(async () => {
+    // 每个测试的 hook 都可能改共享 git config 和 info/exclude；
+    // 测试间必须恢复，避免泄露到后续测试或用户环境。
     restoreGitConfig();
+    restoreSharedExcludes();
+    // 重新启用排除行供下一个测试的 worktree 使用。
+    enableSharedExcludes();
+    // 清理本测试验收运行产生的 PG 数据库族残留。
+    await cleanupPgResidue();
   });
   it(
     "缝激活 + 脏树突变：本可 IMPLEMENTATION_READY 的载荷仍被缝强制非权威，且突变仍被检出",
