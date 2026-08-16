@@ -11,5 +11,5 @@ export const preflightReceiptName = "history-import-preflight.private.json";
 export const preflightPassMarkerName = "PREFLIGHT_PASS";
 
 /** 指定批次的正式导入数量：生产入口只接受与该数值精确一致的正式批。 */
-export const designatedRealFormalImportCount = 137;
+export const designatedRealFormalImportCount = 156;
 

@@ -246,13 +246,13 @@ describe("正式导入入口：参数校验与机械拒绝", () => {
     expect(() =>
       assertProductionFormalImportCount(designatedRealFormalImportCount),
     ).not.toThrow();
-    for (const count of [0, 1, 136, 138]) {
+    for (const count of [0, 1, 155, 157]) {
       expect(() => assertProductionFormalImportCount(count)).toThrowError(
         expect.objectContaining({ code: "INVALID_METADATA" }),
       );
     }
   });
   it("数量闸门绑定唯一生产常数，防止误改", () => {
-    expect(designatedRealFormalImportCount).toBe(137);
+    expect(designatedRealFormalImportCount).toBe(156);
   });
 });
