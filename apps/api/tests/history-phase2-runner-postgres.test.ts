@@ -86,26 +86,16 @@ import {
   expectedTableDeltas,
   type HistoryImportCountRow,
 } from "../src/history-migration/phase2-postcheck";
-import {
-  registerOwnedDatabase,
-  quoteIdentifier,
-} from "./phase2-database-lifecycle.mjs";
+// 不再需要 registerOwnedDatabase——隔离集群方案中子进程在一次性容器内
+// 自由创建/删除数据库，父进程拆除整个容器即可。无需逐库登记。
 const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
 const acceptanceMode = process.env.URMOTIV_PHASE2_RUNNER_ACCEPTANCE === "1";
 const acceptanceCommit = process.env.URMOTIV_PHASE2_ACCEPTANCE_COMMIT;
 const describePostgres = adminUrl === undefined && !acceptanceMode ? describe.skip : describe;
 const temporaryDirectories: string[] = [];
 const temporaryDatabaseNames: string[] = [];
-// Fix A（Sol HOLD 重做）：受信生命周期登记册。
-// 子进程通过 URMOTIV_TEST_PG_LIFECYCLE_DIR 获取私有目录路径，
-// 在创建数据库后调用 registerOwnedDatabase 登记（含 HMAC 标签）。
-// 外层 gate9 清理时只按已验证 HMAC 的确切库名删除，绝不按令牌子串推断归属权。
-const pgLifecycleDir = process.env.URMOTIV_TEST_PG_LIFECYCLE_DIR;
 function registerDatabase(name: string): void {
   temporaryDatabaseNames.push(name);
-  if (pgLifecycleDir !== undefined && pgLifecycleDir.length > 0) {
-    registerOwnedDatabase(pgLifecycleDir, name);
-  }
 }
 // 独立于 temporaryDatabaseNames 的持久失败标记。
 // 即使后续 afterEach 成功删除了残留库并清空了列表，
@@ -2049,11 +2039,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
         productionDenialDatabaseName,
         `${productionDenialDatabaseName}__formal_backup`,
       );
-      // Fix A：formaldenial_* 也必须通过受信登记册登记。
-      if (pgLifecycleDir !== undefined && pgLifecycleDir.length > 0) {
-        registerOwnedDatabase(pgLifecycleDir, productionDenialDatabaseName);
-        registerOwnedDatabase(pgLifecycleDir, `${productionDenialDatabaseName}__formal_backup`);
-      }
+      // formaldenial_* 数据库在隔离集群内创建，无需登记——容器拆除即清理。
       await formalAdmin.execute(
         sql`create database ${sql.identifier(productionDenialDatabaseName)}`,
       );

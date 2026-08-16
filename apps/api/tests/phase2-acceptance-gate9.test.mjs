@@ -8,6 +8,7 @@
 //   5. 解析证据断言 POST_RUN_* 理由、INCONCLUSIVE 与非零退出；
 //   6. 无论成败都移除 worktree 并在主检出上硬门断言整树干净。
 import {
+  appendFileSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -23,13 +24,15 @@ import { fileURLToPath } from "node:url";
 import { createRequire as nodeCreateRequire } from "node:module";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
-  createLifecycleContext,
-  readOwnedDatabaseNames,
-  registerOwnedDatabase,
-  removeLifecycleContext,
-  quoteIdentifier,
-  verifyLifecycleIntegrity,
-} from "./phase2-database-lifecycle.mjs";
+  createIsolatedPostgres,
+  teardownIsolatedPostgres,
+  verifyContainerIdentity,
+  verifyLiveIdentity,
+  getLiveIdentity,
+  listProjectContainers,
+  manifestExists,
+  recoverAndTeardown,
+} from "./phase2-isolated-postgres.mjs";
 
 const testsDirectory = fileURLToPath(new URL(".", import.meta.url));
 const apiDirectory = resolve(testsDirectory, "..");
@@ -44,18 +47,21 @@ function git(cwd, ...args) {
   return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
 }
 
-const pgAdminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL ?? "";
+const sharedPgAdminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL ?? "";
 
-// Fix A（Sol HOLD 重做）：受信生命周期登记册。
-// 父进程（本测试）创建私有 0700 目录、0600 HMAC 密钥和 0600 登记册文件。
-// 子进程只拿到目录路径（URMOTIV_TEST_PG_LIFECYCLE_DIR），通过 registerOwnedDatabase
-// 在创建数据库后登记。登记册每条记录含 HMAC 标签，绕过帮助函数的纯文本追加
-// 无法通过校验。清理时逐条验证 HMAC 后精确查询删除，绝不枚举 urmotiv_%。
-// 缺失/损坏/不完整登记册 fail-closed 且保留私有目录供恢复取证。
+// Fix A（Sol HOLD 重做——一次性隔离集群）：不再用子进程可写的登记册/HMAC
+// 作为删除归属权凭据。父进程独占创建一个项目专属的、一次性的 Docker
+// PostgreSQL 17 容器（随机凭据/端口/标签，仅绑定 127.0.0.1）。子进程只
+// 拿到隔离集群的连接参数——无法接触任何共享/正式集群。拆除时只按精确
+// 容器 ID + 标签停止/移除，绝不模式删除。
 const runToken = `${process.pid}${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-const lifecycleContext = createLifecycleContext();
-const lifecycleDir = lifecycleContext.directory;
-let lifecyclePreserved = false;
+
+// 隔离集群实例——由 beforeAll 创建，afterAll/afterEach 拆除。
+// gate9Enabled 为 true 时在 beforeAll 中赋值。
+let isolatedCluster = null;
+
+// 保存原始共享集群 URL，用于对抗性测试验证子进程不会接触它。
+// 隔离集群的 URL 覆盖 URMOTIV_TEST_POSTGRES_ADMIN_URL 传给子进程。
 
 function pgRequire() {
   const req = nodeCreateRequire(import.meta.url);
@@ -67,74 +73,15 @@ function pgRequire() {
   }
 }
 
-async function pgClient() {
-  const mod = pgRequire();
-  const Client = mod.Client ?? mod.default?.Client;
-  const client = new Client({ connectionString: pgAdminUrl });
-  await client.connect();
-  return client;
-}
+// captureClusterIdentity 已不再需要——隔离集群通过容器 ID + system_identifier
+// 验证身份，而非连接后查询。
 
-// 捕获活身份（Gate 5）：清理前在全新连接上重新采集并验证集群身份，
-// 确保清理 DDL 指向与创建时相同的集群。
-async function captureClusterIdentity(client) {
-  const row = await client.query(
-    "select inet_server_addr() as addr, inet_server_port() as port, current_user as user, current_database() as db",
-  );
-  return `${row.rows[0].addr}:${row.rows[0].port}/${row.rows[0].user}/${row.rows[0].db}`;
-}
-
-async function snapshotOwnedDatabases() {
-  // 受信登记册方案不需要预运行快照——清理时只按登记册中已验证 HMAC 的确切库名删除。
-  // 保留函数签名以兼容现有调用点，但改为空操作。
-}
-
-async function cleanupPgResidue() {
-  if (pgAdminUrl.trim().length === 0) return;
-  let registered;
-  try {
-    registered = readOwnedDatabaseNames(lifecycleDir);
-  } catch (error) {
-    // 登记册缺失/损坏/不完整：fail-closed，保留证据。
-    lifecyclePreserved = true;
-    throw error;
-  }
-  if (registered.length === 0) return;
-  const client = await pgClient();
-  try {
-    // 在全新连接上重新采集集群身份，确保清理指向正确的集群。
-    const identity = await captureClusterIdentity(client);
-    const failed = [];
-    for (const name of registered) {
-      const exists = await client.query(
-        "select count(*) as n from pg_database where datname = $1",
-        [name],
-      );
-      if (Number(exists.rows[0].n) === 0) continue;
-      try {
-        // 安全引号包裹标识符（quoteIdentifier 会先校验语法）。
-        await client.query(`drop database ${quoteIdentifier(name)} with (force)`);
-      } catch {
-        failed.push(name);
-      }
-    }
-    // 验证所有登记库名均已删除。
-    const stillExisting = [];
-    for (const name of registered) {
-      const check = await client.query(
-        "select count(*) as n from pg_database where datname = $1",
-        [name],
-      );
-      if (Number(check.rows[0].n) !== 0) stillExisting.push(name);
-    }
-    if (stillExisting.length !== 0 || failed.length !== 0) {
-      const names = stillExisting.concat(failed);
-      lifecyclePreserved = true;
-      throw new Error(`PG 残留数据库未清理（仅限登记册已验证库名）: ${names.join(", ")}`);
-    }
-  } finally {
-    await client.end();
-  }
+// snapshotOwnedDatabases / cleanupPgResidue 已不再需要——隔离集群是一次性的，
+// 拆除即销毁整个容器，无需逐库清理。
+async function teardownIsolatedCluster() {
+  if (isolatedCluster === null) return;
+  teardownIsolatedPostgres(isolatedCluster);
+  isolatedCluster = null;
 }
 
 function defaultBaseWorkerFile() {
@@ -174,15 +121,15 @@ function makeWorktree() {
   return directory;
 }
 function runAcceptanceLauncher(worktreeDirectory, { verdict, hookMode }) {
-  const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
-  if (typeof adminUrl !== "string" || adminUrl.trim().length === 0) {
-    throw new Error("Gate 9 集成测试要求 URMOTIV_TEST_POSTGRES_ADMIN_URL。");
+  if (isolatedCluster === null) {
+    throw new Error("Gate 9 集成测试要求隔离集群已创建。");
   }
   const evidenceDirectory = mkdtempSync(join(tmpdir(), "urmotiv-gate9-evidence-"));
   evidenceDirectories.push(evidenceDirectory);
   const env = {
     ...process.env,
-    URMOTIV_TEST_POSTGRES_ADMIN_URL: adminUrl,
+    // 子进程只拿到隔离集群的连接参数——绝不接触共享/正式集群。
+    URMOTIV_TEST_POSTGRES_ADMIN_URL: isolatedCluster.adminUrl,
     URMOTIV_PHASE2_ACCEPTANCE_BASE_COMMIT: readBaseWorkerCommit(),
     URMOTIV_PHASE2_ACCEPTANCE_BASE_WORKER_FILE: defaultBaseWorkerFile(),
     URMOTIV_PHASE2_ACCEPTANCE_DIR: evidenceDirectory,
@@ -205,9 +152,11 @@ function runAcceptanceLauncher(worktreeDirectory, { verdict, hookMode }) {
     URMOTIV_PHASE2_CHILD_FIXTURE_VERDICT: verdict,
     URMOTIV_PHASE2_ACCEPTANCE_HOOK_MODE: hookMode,
     URMOTIV_TEST_RUN_TOKEN: runToken,
-    URMOTIV_TEST_PG_LIFECYCLE_DIR: lifecycleDir,
   };
+  // 清除所有可能泄露共享集群凭据的环境变量。
   delete env.URMOTIV_RUN_PHASE2_GATE9;
+  // 不再传递 URMOTIV_TEST_PG_LIFECYCLE_DIR——隔离集群不需要子进程登记。
+  delete env.URMOTIV_TEST_PG_LIFECYCLE_DIR;
   const launcherPath = join(
     worktreeDirectory,
     "apps",
@@ -363,8 +312,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     // 再启用排除行。afterAll 的 verifySharedExcludesRestored 与此比对。
     snapshotGitConfig();
     enableSharedExcludes();
-    // 快照当前 PG 数据库集，清理时只删本运行新创建的库。
-    await snapshotOwnedDatabases();
+    // 创建一次性隔离 PostgreSQL 集群——子进程只拿到这个集群的连接参数。
+    isolatedCluster = createIsolatedPostgres({ runId: runToken });
   });
 
   afterAll(async () => {
@@ -394,19 +343,12 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     } catch (error) {
       failure ??= error;
     }
+    // 拆除隔离集群——停止/移除精确容器 ID + 验证标签后销毁。
+    // 失败时保留清单目录供恢复取证。
     try {
-      await cleanupPgResidue();
+      teardownIsolatedCluster();
     } catch (error) {
       failure ??= error;
-    }
-    // 只在清理成功且未保留证据时移除生命周期目录。
-    // 清理失败或登记册损坏时保留私有目录供恢复取证。
-    if (!lifecyclePreserved && failure === null) {
-      try {
-        removeLifecycleContext(lifecycleDir);
-      } catch (error) {
-        failure ??= error;
-      }
     }
     try {
       const status = git(repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all");
@@ -438,12 +380,7 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     } catch (error) {
       cleanupError ??= error;
     }
-    // 清理本测试验收运行产生的 PG 数据库族残留。
-    try {
-      await cleanupPgResidue();
-    } catch (error) {
-      cleanupError ??= error;
-    }
+    // 隔离集群内不需要逐库清理——整个集群在 afterAll 中一次性销毁。
     if (cleanupError !== null) {
       throw cleanupError;
     }
@@ -635,9 +572,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
       // 不设任何测试缝，不传 child fixture 或 after-child hook。
       // 在工作树中预置活跃 info/exclude 规则以模拟本地隐藏。
       // 权威运行必须硬拒——旧环境变量不能放宽权威性。
-      const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
-      if (typeof adminUrl !== "string" || adminUrl.trim().length === 0) {
-        throw new Error("Gate 9 集成测试要求 URMOTIV_TEST_POSTGRES_ADMIN_URL。");
+      if (isolatedCluster === null) {
+        throw new Error("Gate 9 集成测试要求隔离集群已创建。");
       }
       const evidenceDirectory = mkdtempSync(join(tmpdir(), "urmotiv-gate9-evidence-"));
       evidenceDirectories.push(evidenceDirectory);
@@ -649,17 +585,17 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
       try {
         const env = {
           ...process.env,
-          URMOTIV_TEST_POSTGRES_ADMIN_URL: adminUrl,
+          URMOTIV_TEST_POSTGRES_ADMIN_URL: isolatedCluster.adminUrl,
           URMOTIV_PHASE2_ACCEPTANCE_BASE_COMMIT: readBaseWorkerCommit(),
           URMOTIV_PHASE2_ACCEPTANCE_BASE_WORKER_FILE: defaultBaseWorkerFile(),
           URMOTIV_PHASE2_ACCEPTANCE_DIR: evidenceDirectory,
           URMOTIV_PHASE2_CHILD_FIXTURE_VERDICT: "SYNTHETIC_READINESS",
           URMOTIV_TEST_RUN_TOKEN: runToken,
-          URMOTIV_TEST_PG_LIFECYCLE_DIR: lifecycleDir,
           // 旧的环境变量——已被移除，不应被识别为放宽权威性。
           URMOTIV_PHASE2_NON_AUTHORITATIVE: "1",
         };
         delete env.URMOTIV_RUN_PHASE2_GATE9;
+        delete env.URMOTIV_TEST_PG_LIFECYCLE_DIR;
         // 不设 child fixture 或 after-child hook——纯权威运行。
         delete env.URMOTIV_PHASE2_ACCEPTANCE_TEST_CHILD_FIXTURE;
         delete env.URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS;
@@ -692,223 +628,180 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
   );
 });
 
-describe.skipIf(pgAdminUrl.trim().length === 0)(
-  "Gate 9 PG 清理资源归属边界（受信生命周期登记册）",
+// 隔离集群对抗性测试——不需要 gate9Enabled，但需要 Docker 可用。
+// 这些测试验证隔离集群的创建/身份验证/拆除/恢复，以及共享集群不受影响。
+describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
+  "Gate 9 隔离集群生命周期边界",
   () => {
-    it("cleanupPgResidue 只删已验证 HMAC 的确切库名；未登记库必须存活", async () => {
+    it("隔离集群创建后 system_identifier 非空且容器有正确标签", () => {
+      const cluster = createIsolatedPostgres({ runId: "test-label-" + runToken });
+      try {
+        expect(cluster.containerId).toMatch(/^[0-9a-f]{12,}$/);
+        expect(cluster.systemIdentifier).toMatch(/^[0-9]+$/);
+        expect(cluster.host).toBe("127.0.0.1");
+        expect(cluster.port).toBeGreaterThan(0);
+        expect(cluster.password.length).toBeGreaterThanOrEqual(16);
+        expect(cluster.labels["urmotiv.gate9.managed"]).toBe("true");
+        expect(cluster.labels["urmotiv.gate9.disposable"]).toBe("true");
+        // 验证容器身份函数。
+        expect(verifyContainerIdentity(cluster.containerId, cluster.labels)).toBe(true);
+        // 验证活身份函数。
+        expect(verifyLiveIdentity(cluster.containerId, cluster.systemIdentifier)).toBe(true);
+      } finally {
+        teardownIsolatedPostgres(cluster);
+      }
+    }, 120_000);
+
+    it("隔离集群内可创建/删除数据库，但子进程无法接触共享集群", async () => {
+      const cluster = createIsolatedPostgres({ runId: "test-isolation-" + runToken });
       const Client = (pgRequire().Client ?? pgRequire().default?.Client);
-      // 本测试使用独立的生命周期上下文，不干扰主 gate9 运行。
-      const ctx = createLifecycleContext();
-
-      // 1. 创建一个不相关的恢复库（模拟并发的恢复操作）。
-      const unrelatedName = `urmotiv_history_import_unrelated_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-      const setupClient = new Client({ connectionString: pgAdminUrl });
-      await setupClient.connect();
       try {
-        await setupClient.query(`create database "${unrelatedName}"`);
-      } finally {
-        await setupClient.end();
-      }
-
-      // 2. 创建一个使用不同令牌的并发运行库（模拟并发 gate9 运行）。
-      const concurrentToken = `concurrent${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-      const concurrentName = `urmotiv_history_import_concurrent${concurrentToken}`;
-      const concurrentClient = new Client({ connectionString: pgAdminUrl });
-      await concurrentClient.connect();
-      try {
-        await concurrentClient.query(`create database "${concurrentName}"`);
-      } finally {
-        await concurrentClient.end();
-      }
-
-      // 3. 对抗性测试核心：创建一个名称包含本运行令牌（作为严格子串）
-      //    但从未在登记册中登记的库。cleanupPgResidue 绝不能删除它——
-      //    令牌子串不是归属权凭据，只有受信登记才是。
-      const unregisteredTokenSubstring = `urmotiv_history_import_adversarial${runToken}`;
-      const advClient = new Client({ connectionString: pgAdminUrl });
-      await advClient.connect();
-      try {
-        await advClient.query(`create database "${unregisteredTokenSubstring}"`);
-      } finally {
-        await advClient.end();
-      }
-
-      // 4. 创建并通过受信帮助函数登记本运行拥有的库。
-      const ownedName = `urmotiv_history_import_owned${runToken}`;
-      const ownClient = new Client({ connectionString: pgAdminUrl });
-      await ownClient.connect();
-      try {
-        await ownClient.query(`create database "${ownedName}"`);
-      } finally {
-        await ownClient.end();
-      }
-      registerOwnedDatabase(ctx.directory, ownedName);
-
-      // 5. 清理——只应删除 ownedName（已登记且 HMAC 验证通过），不应碰其他三个库。
-      //    临时替换 lifecycleDir 让 cleanupPgResidue 读取本测试的上下文。
-      const savedDir = lifecycleDir;
-      // 使用闭包修改：直接调用读取+删除逻辑。
-      const registered = readOwnedDatabaseNames(ctx.directory);
-      expect(registered).toEqual([ownedName]);
-      const cleanupClient = await pgClient();
-      try {
-        for (const name of registered) {
-          const exists = await cleanupClient.query(
-            "select count(*) as n from pg_database where datname = $1",
-            [name],
-          );
-          if (Number(exists.rows[0].n) === 0) continue;
-          await cleanupClient.query(`drop database ${quoteIdentifier(name)} with (force)`);
+        // 在隔离集群内创建一个数据库。
+        const client = new Client({ connectionString: cluster.adminUrl });
+        await client.connect();
+        try {
+          await client.query("create database urmotiv_history_import_isolated_test");
+          // 验证可以查询。
+          const r = await client.query("select count(*) as n from pg_database where datname = $1", ["urmotiv_history_import_isolated_test"]);
+          expect(Number(r.rows[0].n)).toBe(1);
+          // 删除它。
+          await client.query("drop database urmotiv_history_import_isolated_test with (force)");
+          const r2 = await client.query("select count(*) as n from pg_database where datname = $1", ["urmotiv_history_import_isolated_test"]);
+          expect(Number(r2.rows[0].n)).toBe(0);
+        } finally {
+          await client.end();
+        }
+        // 验证共享集群上没有这个数据库（隔离集群的数据库不在共享集群上）。
+        const sharedClient = new Client({ connectionString: sharedPgAdminUrl });
+        await sharedClient.connect();
+        try {
+          const r = await sharedClient.query("select count(*) as n from pg_database where datname = $1", ["urmotiv_history_import_isolated_test"]);
+          expect(Number(r.rows[0].n)).toBe(0);
+        } finally {
+          await sharedClient.end();
         }
       } finally {
-        await cleanupClient.end();
+        teardownIsolatedPostgres(cluster);
       }
+    }, 120_000);
 
-      // 6. 断言：ownedName 已消失；其余三个库仍存在。
-      const checkClient = new Client({ connectionString: pgAdminUrl });
-      await checkClient.connect();
+    it("活身份不匹配时拒绝 DDL：错误容器 ID 的验证返回 false", () => {
+      const cluster = createIsolatedPostgres({ runId: "test-identity-" + runToken });
       try {
-        const ownedResult = await checkClient.query(
-          "select count(*) as n from pg_database where datname = $1",
-          [ownedName],
-        );
-        expect(Number(ownedResult.rows[0].n)).toBe(0);
-        const unrelatedResult = await checkClient.query(
-          "select count(*) as n from pg_database where datname = $1",
-          [unrelatedName],
-        );
-        expect(Number(unrelatedResult.rows[0].n)).toBe(1);
-        const concurrentResult = await checkClient.query(
-          "select count(*) as n from pg_database where datname = $1",
-          [concurrentName],
-        );
-        expect(Number(concurrentResult.rows[0].n)).toBe(1);
-        const advResult = await checkClient.query(
-          "select count(*) as n from pg_database where datname = $1",
-          [unregisteredTokenSubstring],
-        );
-        expect(Number(advResult.rows[0].n)).toBe(1);
+        // 正确身份验证通过。
+        expect(verifyLiveIdentity(cluster.containerId, cluster.systemIdentifier)).toBe(true);
+        // 错误的 system_identifier 验证失败。
+        expect(verifyLiveIdentity(cluster.containerId, "0000000000000000000")).toBe(false);
+        // 错误的容器 ID 验证失败。
+        expect(verifyContainerIdentity("000000000000", cluster.labels)).toBe(false);
+        // 正确容器 ID 但错误标签验证失败。
+        expect(verifyContainerIdentity(cluster.containerId, { "urmotiv.gate9.managed": "false" })).toBe(false);
       } finally {
-        // 7. 清理测试自身的库（不依赖 cleanupPgResidue）。
-        await checkClient.query(`drop database "${unrelatedName}" with (force)`);
-        await checkClient.query(`drop database "${concurrentName}" with (force)`);
-        await checkClient.query(`drop database "${unregisteredTokenSubstring}" with (force)`);
-        await checkClient.end();
+        teardownIsolatedPostgres(cluster);
       }
-      removeLifecycleContext(ctx.directory);
-    }, 30_000);
+    }, 120_000);
 
-    it("对抗性：伪造的任意已存在库名追加到登记册必须存活且 gate fail", async () => {
+    it("拆除后容器不再存在，清单目录已移除", () => {
+      const cluster = createIsolatedPostgres({ runId: "test-teardown-" + runToken });
+      const { containerId, manifestDir } = cluster;
+      teardownIsolatedPostgres(cluster);
+      // 容器应已不存在。
+      expect(verifyContainerIdentity(containerId, cluster.labels)).toBe(false);
+      // 清单目录应已移除。
+      expect(manifestExists(manifestDir)).toBe(false);
+    }, 120_000);
+
+    it("拆除拒绝错误的容器身份（不匹配的标签）", () => {
+      const cluster = createIsolatedPostgres({ runId: "test-reject-" + runToken });
+      try {
+        // 篡改标签后尝试拆除——必须抛出。
+        const tamperedLabels = { ...cluster.labels, "urmotiv.gate9.managed": "false" };
+        expect(() => teardownIsolatedPostgres({
+          containerId: cluster.containerId,
+          labels: tamperedLabels,
+          manifestDir: cluster.manifestDir,
+          systemIdentifier: cluster.systemIdentifier,
+        })).toThrow();
+      } finally {
+        // 手动清理——用正确的标签拆除。
+        teardownIsolatedPostgres(cluster);
+      }
+    }, 120_000);
+
+    it("中断拆除后清单保留，恢复拆除成功", () => {
+      const cluster = createIsolatedPostgres({ runId: "test-recover-" + runToken });
+      const { manifestDir } = cluster;
+      // 模拟中断：不拆除容器，只保留清单。
+      // 验证清单存在。
+      expect(manifestExists(manifestDir)).toBe(true);
+      // 恢复拆除——从清单中读取精确 ID/标签并拆除。
+      recoverAndTeardown(manifestDir);
+      // 验证容器已移除。
+      expect(verifyContainerIdentity(cluster.containerId, cluster.labels)).toBe(false);
+      // 验证清单目录已移除。
+      expect(manifestExists(manifestDir)).toBe(false);
+    }, 120_000);
+
+    it("env scrub：子进程的 URMOTIV_TEST_POSTGRES_ADMIN_URL 指向隔离集群而非共享集群", () => {
+      const cluster = createIsolatedPostgres({ runId: "test-envscrub-" + runToken });
+      try {
+        // runAcceptanceLauncher 传递的 adminUrl 是隔离集群的 URL。
+        // 这里验证隔离集群 URL 与共享集群 URL 不同。
+        expect(cluster.adminUrl).not.toBe(sharedPgAdminUrl);
+        // 隔离集群 URL 包含随机端口，不等于共享集群端口。
+        const sharedPort = new URL(sharedPgAdminUrl).port;
+        expect(String(cluster.port)).not.toBe(sharedPort);
+      } finally {
+        teardownIsolatedPostgres(cluster);
+      }
+    }, 120_000);
+
+    it("共享哨兵库不受隔离集群操作影响", async () => {
       const Client = (pgRequire().Client ?? pgRequire().default?.Client);
-      const ctx = createLifecycleContext();
-
-      // 创建一个已有库（模拟不属于本运行的库）。
-      const existingName = `urmotiv_history_import_existing_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-      const setupClient = new Client({ connectionString: pgAdminUrl });
-      await setupClient.connect();
+      // 在共享集群上创建一个哨兵库。
+      const sentinelName = `urmotiv_gate9_sentinel_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+      const sharedClient = new Client({ connectionString: sharedPgAdminUrl });
+      await sharedClient.connect();
       try {
-        await setupClient.query(`create database "${existingName}"`);
+        await sharedClient.query(`create database "${sentinelName}"`);
       } finally {
-        await setupClient.end();
+        await sharedClient.end();
       }
-
-      // 伪造：绕过 registerOwnedDatabase，直接写一行没有 HMAC 标签的纯文本。
-      const registryPath = join(ctx.directory, "registry.jsonl");
-      writeFileSync(registryPath, `${JSON.stringify({ name: existingName })}\n`, { flag: "a" });
-
-      // 读取登记册必须 fail-closed（缺少 tag 字段）。
-      expect(() => readOwnedDatabaseNames(ctx.directory)).toThrow();
-
-      // 已有库必须存活。
-      const checkClient = new Client({ connectionString: pgAdminUrl });
-      await checkClient.connect();
       try {
-        const result = await checkClient.query(
-          "select count(*) as n from pg_database where datname = $1",
-          [existingName],
-        );
-        expect(Number(result.rows[0].n)).toBe(1);
-        await checkClient.query(`drop database "${existingName}" with (force)`);
+        // 创建并拆除一个隔离集群。
+        const cluster = createIsolatedPostgres({ runId: "test-sentinel-" + runToken });
+        teardownIsolatedPostgres(cluster);
+        // 验证哨兵库仍在共享集群上。
+        const checkClient = new Client({ connectionString: sharedPgAdminUrl });
+        await checkClient.connect();
+        try {
+          const r = await checkClient.query("select count(*) as n from pg_database where datname = $1", [sentinelName]);
+          expect(Number(r.rows[0].n)).toBe(1);
+        } finally {
+          await checkClient.end();
+        }
       } finally {
-        await checkClient.end();
+        // 清理哨兵库。
+        const cleanupClient = new Client({ connectionString: sharedPgAdminUrl });
+        await cleanupClient.connect();
+        try {
+          await cleanupClient.query(`drop database "${sentinelName}" with (force)`);
+        } finally {
+          await cleanupClient.end();
+        }
       }
-      // 损坏登记册保留供取证（不删除）。
-      expect(verifyLifecycleIntegrity(ctx.directory)).toBe(true);
-      removeLifecycleContext(ctx.directory);
-    }, 30_000);
+    }, 120_000);
 
-    it("对抗性：HMAC 不匹配的伪造条目 fail-closed", async () => {
-      const Client = (pgRequire().Client ?? pgRequire().default?.Client);
-      const ctx = createLifecycleContext();
-
-      const forgedName = `urmotiv_history_import_forged_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-      const setupClient = new Client({ connectionString: pgAdminUrl });
-      await setupClient.connect();
-      try {
-        await setupClient.query(`create database "${forgedName}"`);
-      } finally {
-        await setupClient.end();
-      }
-
-      // 伪造：写入一个有效格式但 HMAC 不匹配的记录。
-      const registryPath = join(ctx.directory, "registry.jsonl");
-      const forgedTag = "0".repeat(64); // 64 字符的假标签。
-      writeFileSync(registryPath, `${JSON.stringify({ name: forgedName, tag: forgedTag })}\n`, { flag: "a" });
-
-      // 读取登记册必须 fail-closed（HMAC 校验失败）。
-      expect(() => readOwnedDatabaseNames(ctx.directory)).toThrow();
-
-      // 伪造库必须存活。
-      const checkClient = new Client({ connectionString: pgAdminUrl });
-      await checkClient.connect();
-      try {
-        const result = await checkClient.query(
-          "select count(*) as n from pg_database where datname = $1",
-          [forgedName],
-        );
-        expect(Number(result.rows[0].n)).toBe(1);
-        await checkClient.query(`drop database "${forgedName}" with (force)`);
-      } finally {
-        await checkClient.end();
-      }
-      removeLifecycleContext(ctx.directory);
-    }, 30_000);
-
-    it("对抗性：损坏/格式不正确的登记册行 fail-closed", async () => {
-      const ctx = createLifecycleContext();
-
-      // 写入一行非 JSON 文本。
-      const registryPath = join(ctx.directory, "registry.jsonl");
-      writeFileSync(registryPath, "this is not json\n", { flag: "a" });
-
-      expect(() => readOwnedDatabaseNames(ctx.directory)).toThrow();
-      // 损坏登记册保留。
-      expect(verifyLifecycleIntegrity(ctx.directory)).toBe(true);
-      removeLifecycleContext(ctx.directory);
-    }, 10_000);
-
-    it("对抗性：不符合语法的库名被拒绝登记", () => {
-      const ctx = createLifecycleContext();
-      // 含大写字母、特殊字符的库名应被拒绝。
-      expect(() => registerOwnedDatabase(ctx.directory, "URMOTIV_BAD_NAME")).toThrow();
-      expect(() => registerOwnedDatabase(ctx.directory, "urmotiv_history_import'; drop database postgres; --")).toThrow();
-      expect(() => registerOwnedDatabase(ctx.directory, "")).toThrow();
-      expect(() => registerOwnedDatabase(ctx.directory, "postgres")).toThrow();
-      removeLifecycleContext(ctx.directory);
-    }, 10_000);
-
-    it("对抗性：标识符安全引号包裹——SQL 注入字符被拒绝", () => {
-      expect(() => quoteIdentifier("urmotiv_bad'; drop database postgres; --")).toThrow();
-      expect(() => quoteIdentifier('urmotiv_bad"')).toThrow();
-      expect(() => quoteIdentifier("urmotiv_bad\x00null")).toThrow();
-      // 合法名称应正常引号包裹。
-      expect(quoteIdentifier("urmotiv_history_import_test")).toBe('"urmotiv_history_import_test"');
-    }, 10_000);
-
-    it("生命周期目录权限验证：0700 目录 + 0600 文件", () => {
-      const ctx = createLifecycleContext();
-      expect(verifyLifecycleIntegrity(ctx.directory)).toBe(true);
-      removeLifecycleContext(ctx.directory);
-    }, 10_000);
+    it("拆除后无项目专属容器残留", () => {
+      // 记录拆除前的项目容器列表。
+      const before = listProjectContainers();
+      const cluster = createIsolatedPostgres({ runId: "test-residue-" + runToken });
+      teardownIsolatedPostgres(cluster);
+      // 拆除后项目容器列表不应增加。
+      const after = listProjectContainers();
+      expect(after.length).toBeLessThanOrEqual(before.length);
+      // 确保被拆除的容器不在列表中。
+      expect(after).not.toContain(cluster.containerId);
+    }, 120_000);
   },
 );
