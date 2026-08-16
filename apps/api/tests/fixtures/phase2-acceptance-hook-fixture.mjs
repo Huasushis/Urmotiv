@@ -3,7 +3,7 @@
 // URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS 以独立进程执行，
 // 在验收路由子进程结束后、运行后整树卫生判定之前注入受控突变。
 // 生产验收运行绝不加载该脚本；任何缝激活的运行都已强制非权威。
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -114,6 +114,7 @@ if (mode === "sparse-checkout") {
     cwd: repositoryRoot,
     encoding: "utf8",
   }).trim();
+  mkdirSync(dirname(sparsePath), { recursive: true });
   writeFileSync(sparsePath, "/*\n");
   process.exit(0);
 }
