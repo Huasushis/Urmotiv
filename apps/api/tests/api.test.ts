@@ -379,7 +379,7 @@ describe("题目 API", () => {
     expect(leaderView.statusCode).toBe(200);
     expect(leaderView.json()).toEqual(
       expect.objectContaining({
-        capabilities: expect.objectContaining({ canEditFrozen: false, canEditTitle: true })
+        capabilities: expect.objectContaining({ canEditFrozen: true, canEditTitle: true })
       })
     );
 
@@ -454,6 +454,203 @@ describe("题目 API", () => {
     expect(normalUpdate.json()).toEqual(
       expect.objectContaining({ status: "pending_review", revision: 5 })
     );
+  });
+
+  it("持有冻结编辑权限的组长可改基础题面题解，无权限者与显式拒绝者仍被拦截", async () => {
+    const app = await makeApp();
+    const authorCookie = await login(app, "author");
+    const problem = await createDraft(app, authorCookie);
+    const problemId = problem.id as string;
+    const submit = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${problemId}/submit`,
+      headers: { cookie: authorCookie, origin: localOrigin },
+      payload: { expectedRevision: 1 }
+    });
+    expect(submit.statusCode).toBe(200);
+
+    // 组长持 problem.frozen.edit，待审核状态下可修改冻结的基础题面。
+    const leaderCookie = await login(app, "leader");
+    const leaderFrozenEdit = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: leaderCookie, origin: localOrigin },
+      payload: {
+        expectedRevision: 2,
+        content: { ...fullContent, basicStatement: "组长在审核中补充的题面" }
+      }
+    });
+    expect(leaderFrozenEdit.statusCode).toBe(200);
+    expect(leaderFrozenEdit.json()).toEqual(
+      expect.objectContaining({
+        status: "pending_review",
+        revision: 3,
+        content: expect.objectContaining({ basicStatement: "组长在审核中补充的题面" })
+      })
+    );
+
+    // 审题人没有题目编辑权限，整个修改被拒绝（403）。
+    const reviewerCookie = await login(app, "reviewer");
+    const reviewerFrozenEdit = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: reviewerCookie, origin: localOrigin },
+      payload: {
+        expectedRevision: 3,
+        content: { ...fullContent, basicSolution: "审题人不能改的题解" }
+      }
+    });
+    expect(reviewerFrozenEdit.statusCode).toBe(403);
+
+    // 命题组成员有编辑权限但没有冻结编辑权限，改基础题解被冻结规则拒绝（409）。
+    const memberCookie = await login(app, "member");
+    const memberFrozenEdit = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: memberCookie, origin: localOrigin },
+      payload: {
+        expectedRevision: 3,
+        content: { ...fullContent, basicSolution: "成员不能改的题解" }
+      }
+    });
+    expect(memberFrozenEdit.statusCode).toBe(409);
+    expect(memberFrozenEdit.json()).toEqual({
+      error: expect.objectContaining({
+        code: "CONFLICT",
+        fieldErrors: expect.objectContaining({ "content.basicSolution": expect.any(Array) })
+      })
+    });
+
+    // 显式 deny 优先于角色权限，被拒绝的组长同样被拦截。
+    const deniedLeaderCookie = await login(app, "frozenDeniedLeader");
+    const deniedFrozenEdit = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: deniedLeaderCookie, origin: localOrigin },
+      payload: {
+        expectedRevision: 3,
+        content: { ...fullContent, basicStatement: "被拒绝的组长不能改" }
+      }
+    });
+    expect(deniedFrozenEdit.statusCode).toBe(409);
+    expect(deniedFrozenEdit.json()).toEqual({
+      error: expect.objectContaining({
+        code: "CONFLICT",
+        fieldErrors: expect.objectContaining({ "content.basicStatement": expect.any(Array) })
+      })
+    });
+
+    // 作者仍无冻结编辑权限。
+    const authorFrozenEdit = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: authorCookie, origin: localOrigin },
+      payload: {
+        expectedRevision: 3,
+        content: { ...fullContent, basicStatement: "作者不能改的题面" }
+      }
+    });
+    expect(authorFrozenEdit.statusCode).toBe(409);
+  });
+
+  it("已通过题目只有冻结编辑权限持有者可修改基础字段", async () => {
+    const app = await makeApp();
+    const authorCookie = await login(app, "author");
+    const problem = await createDraft(app, authorCookie);
+    const problemId = problem.id as string;
+    const submit = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${problemId}/submit`,
+      headers: { cookie: authorCookie, origin: localOrigin },
+      payload: { expectedRevision: 1 }
+    });
+    expect(submit.statusCode).toBe(200);
+
+    const reviewBody = {
+      verdict: "approve",
+      codeforcesDifficulty: 1200,
+      qualityLevel: 3,
+      originalityLevel: 3,
+      thinkingLevel: 2,
+      codingLevel: 1,
+      tagIds: ["algorithm.implementation"],
+      improvements: "可以补充边界情况说明。",
+      expectedRound: 1
+    };
+    const robotCookie = await login(app, "robot");
+    const reviewerCookie = await login(app, "reviewer");
+    const memberCookie = await login(app, "member");
+    const [robotReview, reviewerReview, memberReview] = await Promise.all([
+      app.inject({
+        method: "POST",
+        url: `/api/v1/problems/${problemId}/reviews`,
+        headers: { cookie: robotCookie, origin: localOrigin },
+        payload: reviewBody
+      }),
+      app.inject({
+        method: "POST",
+        url: `/api/v1/problems/${problemId}/reviews`,
+        headers: { cookie: reviewerCookie, origin: localOrigin },
+        payload: reviewBody
+      }),
+      app.inject({
+        method: "POST",
+        url: `/api/v1/problems/${problemId}/reviews`,
+        headers: { cookie: memberCookie, origin: localOrigin },
+        payload: reviewBody
+      })
+    ]);
+    expect(robotReview.statusCode).toBe(200);
+    expect(reviewerReview.statusCode).toBe(200);
+    expect(memberReview.statusCode).toBe(200);
+
+    const approved = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: authorCookie }
+    });
+    expect(approved.statusCode).toBe(200);
+    const approvedBody = approved.json() as Record<string, unknown>;
+    expect(approvedBody).toEqual(expect.objectContaining({ status: "approved" }));
+    const approvedRevision = approvedBody.revision as number;
+
+    // 组长可修改已通过题目的基础题解。
+    const leaderCookie = await login(app, "leader");
+    const leaderFrozenEdit = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: leaderCookie, origin: localOrigin },
+      payload: {
+        expectedRevision: approvedRevision,
+        content: { ...fullContent, basicSolution: "组长修正的已通过题解" }
+      }
+    });
+    expect(leaderFrozenEdit.statusCode).toBe(200);
+    expect(leaderFrozenEdit.json()).toEqual(
+      expect.objectContaining({
+        status: "approved",
+        revision: approvedRevision + 1,
+        content: expect.objectContaining({ basicSolution: "组长修正的已通过题解" })
+      })
+    );
+
+    // 作者对已通过题目的基础题面仍被冻结。
+    const authorFrozenEdit = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: authorCookie, origin: localOrigin },
+      payload: {
+        expectedRevision: approvedRevision + 1,
+        content: { ...fullContent, basicStatement: "作者不能在通过后改题面" }
+      }
+    });
+    expect(authorFrozenEdit.statusCode).toBe(409);
+    expect(authorFrozenEdit.json()).toEqual({
+      error: expect.objectContaining({
+        code: "CONFLICT",
+        fieldErrors: expect.objectContaining({ "content.basicStatement": expect.any(Array) })
+      })
+    });
   });
 
   it("审核意见按当前轮次聚合，并在两个通过意见后更新状态", async () => {

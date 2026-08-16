@@ -37,6 +37,7 @@ const memberGrants = [
 const leaderGrants = [
   ...memberGrants,
   allow("problem.status.change"),
+  allow("problem.frozen.edit"),
   allow("problem.access.grant"),
   allow("problem.import"),
   allow("problem.export.all"),
@@ -64,13 +65,14 @@ function demoUser(
   nickname: string,
   roles: string[],
   grants: PermissionGrant[],
-  accountType: StoredUser["accountType"] = "human"
+  accountType: StoredUser["accountType"] = "human",
+  disabled = false
 ): StoredUser {
   return {
     id,
     nickname,
     accountType,
-    disabled: false,
+    disabled,
     roles,
     grants,
     isRoot: false
@@ -95,7 +97,17 @@ export function createDemoUsers(): StoredUser[] {
       "明确拒绝演示账号",
       ["审题人", "受限账号"],
       [...reviewerGrants, deny("problem.view.all")]
-    )
+    ),
+    demoUser(
+      "frozenDeniedLeader",
+      "冻结字段被拒绝的组长演示账号",
+      ["组长"],
+      [
+        ...leaderGrants.filter((grant) => grant.permission !== "problem.frozen.edit"),
+        deny("problem.frozen.edit")
+      ]
+    ),
+    demoUser("disabled", "已停用演示账号", ["投稿人"], contributorGrants, "human", true)
   ];
 }
 

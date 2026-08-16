@@ -205,8 +205,12 @@ function aggregateFrozenReviewSuggestions(
 
 function frozenFieldErrors(
   current: StoredProblem,
-  input: UpdateProblemInput
+  input: UpdateProblemInput,
+  mayEditFrozen: boolean
 ): FieldErrors | undefined {
+  if (mayEditFrozen) {
+    return undefined;
+  }
   if (current.status !== "pending_review" && current.status !== "approved") {
     return undefined;
   }
@@ -437,7 +441,8 @@ export class ProblemService {
       throw forbidden();
     }
     this.assertExpectedRevision(current, input.expectedRevision);
-    const frozenErrors = frozenFieldErrors(current, input);
+    const mayEditFrozen = hasPermission(user, "problem.frozen.edit", target, this.now());
+    const frozenErrors = frozenFieldErrors(current, input, mayEditFrozen);
     if (frozenErrors !== undefined) {
       throw conflict("题目正在审核或已通过，两个基础审核字段已冻结。", frozenErrors);
     }
@@ -1542,7 +1547,7 @@ export class ProblemService {
       canView: true,
       canEdit,
       canEditTitle: canEdit,
-      canEditFrozen: false,
+      canEditFrozen: hasPermission(user, "problem.frozen.edit", target, this.now()),
       canSubmit,
       canWithdraw,
       canReview:

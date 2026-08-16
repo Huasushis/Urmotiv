@@ -39,6 +39,7 @@ import {
   updatePluginInputSchema,
   updateContestInputSchema,
   updateProblemInputSchema,
+  updateProfileInputSchema,
   updateReviewPolicyInputSchema,
   updateTagAliasInputSchema,
   updateTagCatalogItemInputSchema,
@@ -106,6 +107,8 @@ import {
 } from "./plugin-host";
 import { computeProblemContentHash } from "./database-store";
 import { resolveClientAddress } from "./client-address";
+import { avatarMaxBytes } from "./avatar";
+import * as profile from "./profile-service";
 import {
   DatabaseRobotStore,
   digestRobotOperationPayload,
@@ -168,6 +171,8 @@ export interface ApiAppOptions {
   robots?: DatabaseRobotStore;
   tagCatalog?: DatabaseTagCatalogService;
   trustedProxyCidrs?: readonly string[];
+  /** 对外抓取（如 QQ 头像 CDN）使用的实现；默认 globalThis.fetch，测试可注入。 */
+  fetchImpl?: typeof fetch;
   now?: () => Date;
 }
 
@@ -194,6 +199,7 @@ interface AppDependencies {
   robots?: DatabaseRobotStore;
   tagCatalog?: DatabaseTagCatalogService;
   trustedProxyCidrs: readonly string[];
+  fetchImpl: typeof fetch;
 }
 
 function formatZodErrors(error: ZodError): Record<string, string[]> {
@@ -535,6 +541,7 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     demoUserIds: new Set(options.demoUserIds ?? defaultDemoUsers.map((user) => user.id)),
     demoLoginUserIds: new Map(Object.entries(options.demoLoginUserIds ?? {})),
     pluginHost,
+    fetchImpl: options.fetchImpl ?? globalThis.fetch,
     now
   };
 }
@@ -552,6 +559,11 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     origin: dependencies.allowedOrigins,
   });
   await app.register(cookie);
+  // 原始字节上传（题目文件、传输包、头像）都依赖该透传解析器；无条件注册。
+  app.addContentTypeParser(
+    "application/octet-stream",
+    (_request, payload, done) => done(null, payload)
+  );
   // 全局缓存头：所有 API 响应默认不可缓存。端点如需更强的策略可自行覆盖，
   // 此钩子只在未设置 cache-control 时回填 no-store，保证认证/错误/敏感 JSON 统一覆盖。
   app.addHook("onSend", (request, reply, payload, done) => {
@@ -1059,6 +1071,82 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     return { ok: true };
   });
 
+  const userIdParamSchema = z.string().max(120);
+  function parseUserIdParam(request: FastifyRequest): string {
+    const params = request.params as { userId?: unknown };
+    const result = userIdParamSchema.safeParse(params.userId);
+    if (!result.success) {
+      throw notFound();
+    }
+    return result.data;
+  }
+
+  app.get("/api/v1/me", async (request) => {
+    const user = await requireUser(request);
+    return profile.readProfileView(user, dependencies.store);
+  });
+
+  app.patch("/api/v1/me", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireUser(request);
+    const input = updateProfileInputSchema.parse(request.body);
+    return profile.updateOwnProfile(user, input, dependencies.store);
+  });
+
+  app.put("/api/v1/me/avatar", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireUser(request);
+    if (!isByteStream(request.body)) {
+      throw new ApiError(422, "UNSUPPORTED_AVATAR_BODY", "头像必须作为文件内容上传。");
+    }
+    if (requestContentLengthExceeds(request, avatarMaxBytes)) {
+      throw new ApiError(413, "FILE_TOO_LARGE", "头像图片不能超过 512 KB。");
+    }
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    let tooLarge = false;
+    for await (const chunk of request.body) {
+      totalBytes += chunk.byteLength;
+      if (totalBytes > avatarMaxBytes) {
+        tooLarge = true;
+        break;
+      }
+      chunks.push(chunk);
+    }
+    if (tooLarge) {
+      throw new ApiError(413, "FILE_TOO_LARGE", "头像图片不能超过 512 KB。");
+    }
+    const content = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      content.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return profile.uploadOwnAvatar(user, content, dependencies.store);
+  });
+
+  app.delete("/api/v1/me/avatar", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireUser(request);
+    return profile.clearOwnAvatar(user, dependencies.store);
+  });
+
+  app.get("/api/v1/users/:userId/avatar", async (request, reply) => {
+    const user = await requireUser(request);
+    void user;
+    const result = await profile.resolveAvatarResponse(
+      parseUserIdParam(request),
+      dependencies.store,
+      dependencies.fetchImpl
+    );
+    reply.header("cache-control", "private, max-age=3600");
+    if (result.kind === "none") {
+      throw notFound();
+    }
+    reply.header("content-type", result.mediaType);
+    return Buffer.from(result.content);
+  });
+
   app.get("/api/v1/tags", async (request) => {
     await requireUser(request);
     if (dependencies.tagCatalog !== undefined) {
@@ -1497,12 +1585,6 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   const problemFiles = dependencies.problemFiles;
   const transfer = dependencies.transfer;
-  if (problemFiles !== undefined || transfer !== undefined) {
-    app.addContentTypeParser(
-      "application/octet-stream",
-      (_request, payload, done) => done(null, payload)
-    );
-  }
 
   if (problemFiles !== undefined) {
     app.get("/api/v1/problems/:problemId/files", async (request) => {

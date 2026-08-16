@@ -36,6 +36,8 @@ interface UserRow extends Record<string, unknown> {
   id: string;
   nickname: string;
   account_type: "human" | "robot";
+  qq: string | null;
+  avatar_source: "none" | "qq" | "uploaded";
   disabled: boolean;
 }
 
@@ -276,6 +278,8 @@ export async function loadUsers(
         u.id::text AS id,
         u.nickname,
         u.account_type,
+        u.qq,
+        u.avatar_source,
         (u.disabled_at IS NOT NULL) AS disabled
       FROM users u
       ${userFilter}
@@ -368,6 +372,8 @@ export async function loadUsers(
     roles: rolesByUser.get(row.id) ?? [],
     grants: grantsByUser.get(row.id) ?? [],
     isRoot: row.id === "0",
+    qq: row.qq,
+    avatarSource: row.avatar_source,
   }));
 }
 
@@ -1284,6 +1290,151 @@ export class DatabaseDataStore implements DataStore {
 
   public async listUsers(): Promise<StoredUser[]> {
     return loadUsers(this.handle);
+  }
+
+  public async getPrimaryEmail(
+    userId: string
+  ): Promise<{ readonly address: string; readonly verified: boolean } | undefined> {
+    const id = parseDatabaseId(userId);
+    if (id === undefined) {
+      return undefined;
+    }
+    const rows = await this.handle.query<{ address: string; verified_at: string | null }>(sql`
+      SELECT address, verified_at
+      FROM user_emails
+      WHERE user_id = ${id} AND is_primary = true
+      LIMIT 1
+    `);
+    const row = rows[0];
+    if (row === undefined) {
+      return undefined;
+    }
+    return { address: row.address, verified: row.verified_at !== null };
+  }
+
+  public async listUserIdentifiers(
+    userId: string
+  ): Promise<readonly { readonly attribute: string; readonly value: string }[]> {
+    const id = parseDatabaseId(userId);
+    if (id === undefined) {
+      return [];
+    }
+    const rows = await this.handle.query<{ source: string; value: string }>(sql`
+      SELECT source, value
+      FROM user_identifiers
+      WHERE user_id = ${id} AND kind = 'student_id'
+      ORDER BY source, value
+    `);
+    return rows.map((row) => ({ attribute: row.source, value: row.value }));
+  }
+
+  public async updateUserProfile(
+    userId: string,
+    patch: {
+      readonly nickname?: string;
+      readonly qq?: string | null;
+      readonly avatarSource?: "none" | "qq" | "uploaded";
+    }
+  ): Promise<StoredUser | undefined> {
+    const id = parseDatabaseId(userId);
+    if (id === undefined) {
+      return undefined;
+    }
+    return this.handle.transaction(async (transaction) => {
+      if (patch.nickname !== undefined) {
+        await transaction.execute(sql`
+          UPDATE users SET nickname = ${patch.nickname}, updated_at = now()
+          WHERE id = ${id}
+        `);
+      }
+      if (patch.qq !== undefined) {
+        await transaction.execute(sql`
+          UPDATE users SET qq = ${patch.qq}, updated_at = now()
+          WHERE id = ${id}
+        `);
+      }
+      if (patch.avatarSource !== undefined) {
+        await transaction.execute(sql`
+          UPDATE users
+          SET avatar_source = ${patch.avatarSource},
+              avatar = CASE
+                WHEN ${patch.avatarSource} = 'uploaded' THEN avatar
+                ELSE NULL
+              END,
+              avatar_media_type = CASE
+                WHEN ${patch.avatarSource} = 'uploaded' THEN avatar_media_type
+                ELSE NULL
+              END,
+              updated_at = now()
+          WHERE id = ${id}
+        `);
+      }
+      return (await loadUsers(transaction, [id]))[0];
+    });
+  }
+
+  public async setUserAvatar(
+    userId: string,
+    mediaType: string,
+    content: Uint8Array
+  ): Promise<StoredUser | undefined> {
+    const id = parseDatabaseId(userId);
+    if (id === undefined) {
+      return undefined;
+    }
+    return this.handle.transaction(async (transaction) => {
+      await transaction.execute(sql`
+        UPDATE users
+        SET avatar = ${content}, avatar_media_type = ${mediaType},
+            avatar_updated_at = now(), avatar_source = 'uploaded',
+            updated_at = now()
+        WHERE id = ${id}
+      `);
+      return (await loadUsers(transaction, [id]))[0];
+    });
+  }
+
+  public async getUserAvatar(
+    userId: string
+  ): Promise<{ readonly mediaType: string; readonly content: Uint8Array; readonly updatedAt: string } | undefined> {
+    const id = parseDatabaseId(userId);
+    if (id === undefined) {
+      return undefined;
+    }
+    const rows = await this.handle.query<{
+      avatar: Uint8Array;
+      avatar_media_type: string;
+      avatar_updated_at: string | null;
+    }>(sql`
+      SELECT avatar, avatar_media_type, avatar_updated_at
+      FROM users
+      WHERE id = ${id} AND account_type IN ('human', 'robot')
+    `);
+    const row = rows[0];
+    if (row === undefined || row.avatar === null || row.avatar_media_type === null) {
+      return undefined;
+    }
+    return {
+      mediaType: row.avatar_media_type,
+      content: row.avatar,
+      updatedAt: row.avatar_updated_at ?? new Date(0).toISOString()
+    };
+  }
+
+  public async clearUserAvatar(userId: string): Promise<StoredUser | undefined> {
+    const id = parseDatabaseId(userId);
+    if (id === undefined) {
+      return undefined;
+    }
+    return this.handle.transaction(async (transaction) => {
+      await transaction.execute(sql`
+        UPDATE users
+        SET avatar = NULL, avatar_media_type = NULL, avatar_source = 'none',
+            updated_at = now()
+        WHERE id = ${id}
+      `);
+      return (await loadUsers(transaction, [id]))[0];
+    });
   }
 
   public async findEmailCredential(normalizedEmail: string): Promise<EmailCredential | undefined> {

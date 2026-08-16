@@ -182,6 +182,7 @@ const roleDefinitions = [
       "contest.edit.own",
       "contest.risk.read",
       "problem.status.change",
+      "problem.frozen.edit",
       "problem.access.grant",
       "problem.import",
       "problem.export.all",

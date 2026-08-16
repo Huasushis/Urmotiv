@@ -5,6 +5,7 @@ import {
   boolean,
   char,
   check,
+  customType,
   foreignKey,
   index,
   integer,
@@ -19,6 +20,16 @@ import {
   uuid,
   varchar
 } from "drizzle-orm/pg-core";
+
+/**
+ * PostgreSQL bytea 列（二进制字节）。当前 drizzle 版本未内置 bytea 构建器，
+ * 用 customType 声明为驱动层直接透传的 Uint8Array。
+ */
+export const bytea = customType<{ data: Uint8Array }>({
+  dataType() {
+    return "bytea";
+  }
+});
 
 export type JsonObject = Record<string, unknown>;
 export type JsonValue = boolean | number | string | null | JsonObject | JsonValue[];
@@ -156,6 +167,13 @@ export const users = pgTable(
     passwordChangedAt: timestamp("password_changed_at", { withTimezone: true }),
     disabledAt: timestamp("disabled_at", { withTimezone: true }),
     disabledReason: varchar("disabled_reason", { length: 500 }),
+    qq: varchar("qq", { length: 20 }),
+    avatarSource: varchar("avatar_source", { length: 10 })
+      .notNull()
+      .default("none"),
+    avatar: bytea("avatar"),
+    avatarMediaType: varchar("avatar_media_type", { length: 40 }),
+    avatarUpdatedAt: timestamp("avatar_updated_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
   },
@@ -166,8 +184,23 @@ export const users = pgTable(
       "users_root_is_human_ck",
       sql`${table.id} <> 0 OR ${table.accountType} = 'human'`
     ),
+    check(
+      "users_qq_format_ck",
+      sql`${table.qq} IS NULL OR ${table.qq} ~ '^[1-9][0-9]{4,10}$'`
+    ),
+    check(
+      "users_avatar_source_ck",
+      sql`${table.avatarSource} IN ('none', 'qq', 'uploaded')`
+    ),
+    check(
+      "users_avatar_source_bytes_ck",
+      sql`(${table.avatarSource} = 'none' AND ${table.avatar} IS NULL AND ${table.avatarMediaType} IS NULL)
+        OR (${table.avatarSource} = 'uploaded' AND ${table.avatar} IS NOT NULL AND ${table.avatarMediaType} IS NOT NULL)
+        OR (${table.avatarSource} = 'qq' AND ${table.avatar} IS NULL AND ${table.avatarMediaType} IS NULL AND ${table.qq} IS NOT NULL)`
+    ),
     index("users_account_type_idx").on(table.accountType),
-    index("users_active_idx").on(table.disabledAt)
+    index("users_active_idx").on(table.disabledAt),
+    index("users_qq_idx").on(table.qq).where(sql`${table.qq} IS NOT NULL`)
   ]
 );
 
