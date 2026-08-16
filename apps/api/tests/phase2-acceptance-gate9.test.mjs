@@ -285,8 +285,10 @@ function verifyGitConfigRestored() {
 
 describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () => {
   beforeAll(() => {
-    enableSharedExcludes();
+    // 先快照 info/exclude 原始字节（不含测试追加的 node_modules 行），
+    // 再启用排除行。afterAll 的 verifySharedExcludesRestored 与此比对。
     snapshotGitConfig();
+    enableSharedExcludes();
   });
 
   afterAll(async () => {
