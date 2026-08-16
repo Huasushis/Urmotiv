@@ -18,6 +18,7 @@ import { DatabaseProblemPackageJobStore } from "../src/problem-package-job-store
 import { DatabaseProblemPackageAuditWriter } from "../src/problem-package-audit";
 import { DatabaseImportedProblemWriter } from "../src/problem-package-runtime";
 import { ProblemFileStore } from "../src/problem-file-store";
+import { registerOwnedDatabase } from "./phase2-database-lifecycle.mjs";
 
 const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
 const describePostgres = adminUrl === undefined ? describe.skip : describe;
@@ -99,6 +100,11 @@ describePostgres("题目包导入权限的真实 PostgreSQL 竞态", () => {
     });
     try {
       await admin.execute(sql`CREATE DATABASE ${sql.identifier(databaseName)}`);
+      // Fix A：通过受信生命周期登记册登记本测试创建的库。
+      const lifecycleDir = process.env.URMOTIV_TEST_PG_LIFECYCLE_DIR;
+      if (lifecycleDir !== undefined && lifecycleDir.length > 0) {
+        registerOwnedDatabase(lifecycleDir, databaseName);
+      }
     } finally {
       await admin.close();
     }

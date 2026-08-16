@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { access, chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { connect, createServer, type Socket } from "node:net";
@@ -86,20 +86,25 @@ import {
   expectedTableDeltas,
   type HistoryImportCountRow,
 } from "../src/history-migration/phase2-postcheck";
+import {
+  registerOwnedDatabase,
+  quoteIdentifier,
+} from "./phase2-database-lifecycle.mjs";
 const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
 const acceptanceMode = process.env.URMOTIV_PHASE2_RUNNER_ACCEPTANCE === "1";
 const acceptanceCommit = process.env.URMOTIV_PHASE2_ACCEPTANCE_COMMIT;
 const describePostgres = adminUrl === undefined && !acceptanceMode ? describe.skip : describe;
 const temporaryDirectories: string[] = [];
 const temporaryDatabaseNames: string[] = [];
-// Fix A：精确创建登记册。gate9 测试创建一个本运行私有的 JSONL 文件，
-// 每次创建数据库时在 push 到 temporaryDatabaseNames 的同时登记到该文件。
-// 外层 gate9 清理时只按登记册中的确切库名删除，绝不按令牌子串推断归属权。
-const pgRegistryPath = process.env.URMOTIV_TEST_PG_REGISTRY_PATH;
+// Fix A（Sol HOLD 重做）：受信生命周期登记册。
+// 子进程通过 URMOTIV_TEST_PG_LIFECYCLE_DIR 获取私有目录路径，
+// 在创建数据库后调用 registerOwnedDatabase 登记（含 HMAC 标签）。
+// 外层 gate9 清理时只按已验证 HMAC 的确切库名删除，绝不按令牌子串推断归属权。
+const pgLifecycleDir = process.env.URMOTIV_TEST_PG_LIFECYCLE_DIR;
 function registerDatabase(name: string): void {
   temporaryDatabaseNames.push(name);
-  if (pgRegistryPath !== undefined && pgRegistryPath.length > 0) {
-    appendFileSync(pgRegistryPath, `${JSON.stringify(name)}\n`);
+  if (pgLifecycleDir !== undefined && pgLifecycleDir.length > 0) {
+    registerOwnedDatabase(pgLifecycleDir, name);
   }
 }
 // 独立于 temporaryDatabaseNames 的持久失败标记。
@@ -2044,6 +2049,11 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
         productionDenialDatabaseName,
         `${productionDenialDatabaseName}__formal_backup`,
       );
+      // Fix A：formaldenial_* 也必须通过受信登记册登记。
+      if (pgLifecycleDir !== undefined && pgLifecycleDir.length > 0) {
+        registerOwnedDatabase(pgLifecycleDir, productionDenialDatabaseName);
+        registerOwnedDatabase(pgLifecycleDir, `${productionDenialDatabaseName}__formal_backup`);
+      }
       await formalAdmin.execute(
         sql`create database ${sql.identifier(productionDenialDatabaseName)}`,
       );

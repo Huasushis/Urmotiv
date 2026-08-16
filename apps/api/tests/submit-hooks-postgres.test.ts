@@ -21,6 +21,7 @@ import { DatabaseDataStore } from "../src/database-store";
 import { DatabasePluginStore } from "../src/database-plugin-store";
 import { TrustedPluginHost } from "../src/plugin-host";
 import { DatabaseReviewItemStore } from "../src/review-item-store";
+import { registerOwnedDatabase } from "./phase2-database-lifecycle.mjs";
 
 const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
 const describePostgres = adminUrl === undefined ? describe.skip : describe;
@@ -130,6 +131,11 @@ describePostgres("手动原题检索的真实 PostgreSQL 撤权竞态", () => {
     });
     try {
       await admin.execute(sql`CREATE DATABASE ${sql.identifier(databaseName)}`);
+      // Fix A：通过受信生命周期登记册登记本测试创建的库。
+      const lifecycleDir = process.env.URMOTIV_TEST_PG_LIFECYCLE_DIR;
+      if (lifecycleDir !== undefined && lifecycleDir.length > 0) {
+        registerOwnedDatabase(lifecycleDir, databaseName);
+      }
     } finally {
       await admin.close();
     }

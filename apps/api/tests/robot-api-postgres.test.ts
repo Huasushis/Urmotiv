@@ -26,6 +26,7 @@ import { DatabaseReviewItemStore } from "../src/review-item-store";
 import { DatabaseRobotStore, digestRobotToken } from "../src/robot-store";
 import { DatabaseServiceAccountTokenStore } from "../src/service-account-store";
 import { DatabaseTagCatalogService } from "../src/tag-catalog-service";
+import { registerOwnedDatabase } from "./phase2-database-lifecycle.mjs";
 
 const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
 const describePostgres = adminUrl === undefined ? describe.skip : describe;
@@ -53,6 +54,11 @@ describePostgres("机器人租约的真实 PostgreSQL 并发边界", () => {
     });
     try {
       await admin.execute(sql`CREATE DATABASE ${sql.identifier(databaseName)}`);
+      // Fix A：通过受信生命周期登记册登记本测试创建的库。
+      const lifecycleDir = process.env.URMOTIV_TEST_PG_LIFECYCLE_DIR;
+      if (lifecycleDir !== undefined && lifecycleDir.length > 0) {
+        registerOwnedDatabase(lifecycleDir, databaseName);
+      }
     } finally {
       await admin.close();
     }

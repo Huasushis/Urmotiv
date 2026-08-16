@@ -11,6 +11,7 @@ import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo"
 import { DatabaseDataStore } from "../src/database-store";
 import { ProblemService } from "../src/service";
 import { DatabaseTagCatalogService } from "../src/tag-catalog-service";
+import { registerOwnedDatabase } from "./phase2-database-lifecycle.mjs";
 
 const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
 const describePostgres = adminUrl === undefined ? describe.skip : describe;
@@ -74,6 +75,11 @@ describePostgres("知识点目录服务的真实 PostgreSQL 竞态", () => {
     });
     try {
       await admin.execute(sql`CREATE DATABASE ${sql.identifier(databaseName)}`);
+      // Fix A：通过受信生命周期登记册登记本测试创建的库。
+      const lifecycleDir = process.env.URMOTIV_TEST_PG_LIFECYCLE_DIR;
+      if (lifecycleDir !== undefined && lifecycleDir.length > 0) {
+        registerOwnedDatabase(lifecycleDir, databaseName);
+      }
     } finally {
       await admin.close();
     }

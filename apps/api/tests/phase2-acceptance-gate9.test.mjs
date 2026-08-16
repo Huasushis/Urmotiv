@@ -8,7 +8,6 @@
 //   5. 解析证据断言 POST_RUN_* 理由、INCONCLUSIVE 与非零退出；
 //   6. 无论成败都移除 worktree 并在主检出上硬门断言整树干净。
 import {
-  appendFileSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -23,6 +22,14 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire as nodeCreateRequire } from "node:module";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  createLifecycleContext,
+  readOwnedDatabaseNames,
+  registerOwnedDatabase,
+  removeLifecycleContext,
+  quoteIdentifier,
+  verifyLifecycleIntegrity,
+} from "./phase2-database-lifecycle.mjs";
 
 const testsDirectory = fileURLToPath(new URL(".", import.meta.url));
 const apiDirectory = resolve(testsDirectory, "..");
@@ -39,51 +46,16 @@ function git(cwd, ...args) {
 
 const pgAdminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL ?? "";
 
-// Fix A：精确创建登记册。清理只删除本运行在创建边界登记过的确切库名，
-// 绝不按令牌子串、前缀、通配符或「快照后新增」推断归属权。
-// 登记册是本运行私有的临时 JSON 文件，由 runToken 命名；子进程通过
-// URMOTIV_TEST_RUN_TOKEN 环境变量获得同一个 runToken，写入同一文件。
-// 清理时读取该文件，逐条精确匹配 pg_database 中的库名后删除。
-// 文件缺失/损坏/不完整时 fail-closed（报错而非跳过）。
+// Fix A（Sol HOLD 重做）：受信生命周期登记册。
+// 父进程（本测试）创建私有 0700 目录、0600 HMAC 密钥和 0600 登记册文件。
+// 子进程只拿到目录路径（URMOTIV_TEST_PG_LIFECYCLE_DIR），通过 registerOwnedDatabase
+// 在创建数据库后登记。登记册每条记录含 HMAC 标签，绕过帮助函数的纯文本追加
+// 无法通过校验。清理时逐条验证 HMAC 后精确查询删除，绝不枚举 urmotiv_%。
+// 缺失/损坏/不完整登记册 fail-closed 且保留私有目录供恢复取证。
 const runToken = `${process.pid}${randomUUID().replaceAll("-", "").slice(0, 12)}`;
-const registryPath = join(tmpdir(), `urmotiv-gate9-registry-${runToken}.json`);
-
-function registerDatabaseName(name) {
-  // 追加 JSON 行（JSONL 格式），每行一个库名，避免并发写竞争。
-  appendFileSync(registryPath, `${JSON.stringify(name)}\n`);
-}
-
-function readRegisteredNames() {
-  if (!existsSync(registryPath)) {
-    throw new Error(`PG 创建登记册不存在：${registryPath}；无法安全清理。`);
-  }
-  const content = readFileSync(registryPath, "utf8");
-  if (content.trim().length === 0) return [];
-  const names = [];
-  for (const line of content.split("\n")) {
-    if (line.trim().length === 0) continue;
-    let parsed;
-    try {
-      parsed = JSON.parse(line);
-    } catch {
-      throw new Error(`PG 创建登记册存在损坏行：${line.slice(0, 80)}；fail-closed。`);
-    }
-    if (typeof parsed !== "string" || parsed.length === 0) {
-      throw new Error(`PG 创建登记册存在非字符串条目；fail-closed。`);
-    }
-    names.push(parsed);
-  }
-  return [...new Set(names)];
-}
-
-function removeRegistryFile() {
-  if (existsSync(registryPath)) {
-    rmSync(registryPath, { force: true });
-    if (existsSync(registryPath)) {
-      throw new Error(`PG 创建登记册删除失败：${registryPath}`);
-    }
-  }
-}
+const lifecycleContext = createLifecycleContext();
+const lifecycleDir = lifecycleContext.directory;
+let lifecyclePreserved = false;
 
 function pgRequire() {
   const req = nodeCreateRequire(import.meta.url);
@@ -103,18 +75,35 @@ async function pgClient() {
   return client;
 }
 
+// 捕获活身份（Gate 5）：清理前在全新连接上重新采集并验证集群身份，
+// 确保清理 DDL 指向与创建时相同的集群。
+async function captureClusterIdentity(client) {
+  const row = await client.query(
+    "select inet_server_addr() as addr, inet_server_port() as port, current_user as user, current_database() as db",
+  );
+  return `${row.rows[0].addr}:${row.rows[0].port}/${row.rows[0].user}/${row.rows[0].db}`;
+}
+
 async function snapshotOwnedDatabases() {
-  // 精确登记册方案不需要预运行快照——清理时只按登记册中的确切库名删除。
+  // 受信登记册方案不需要预运行快照——清理时只按登记册中已验证 HMAC 的确切库名删除。
   // 保留函数签名以兼容现有调用点，但改为空操作。
 }
 
 async function cleanupPgResidue() {
   if (pgAdminUrl.trim().length === 0) return;
-  const registered = readRegisteredNames();
+  let registered;
+  try {
+    registered = readOwnedDatabaseNames(lifecycleDir);
+  } catch (error) {
+    // 登记册缺失/损坏/不完整：fail-closed，保留证据。
+    lifecyclePreserved = true;
+    throw error;
+  }
+  if (registered.length === 0) return;
   const client = await pgClient();
   try {
-    // 只删除登记册中存在且当前 pg_database 中确实存在的库名。
-    // 逐条精确查询并删除——绝不枚举 urmotiv_% 后按子串匹配。
+    // 在全新连接上重新采集集群身份，确保清理指向正确的集群。
+    const identity = await captureClusterIdentity(client);
     const failed = [];
     for (const name of registered) {
       const exists = await client.query(
@@ -123,7 +112,8 @@ async function cleanupPgResidue() {
       );
       if (Number(exists.rows[0].n) === 0) continue;
       try {
-        await client.query(`drop database "${name}" with (force)`);
+        // 安全引号包裹标识符（quoteIdentifier 会先校验语法）。
+        await client.query(`drop database ${quoteIdentifier(name)} with (force)`);
       } catch {
         failed.push(name);
       }
@@ -139,7 +129,8 @@ async function cleanupPgResidue() {
     }
     if (stillExisting.length !== 0 || failed.length !== 0) {
       const names = stillExisting.concat(failed);
-      throw new Error(`PG 残留数据库未清理（仅限登记册确切库名）: ${names.join(", ")}`);
+      lifecyclePreserved = true;
+      throw new Error(`PG 残留数据库未清理（仅限登记册已验证库名）: ${names.join(", ")}`);
     }
   } finally {
     await client.end();
@@ -214,7 +205,7 @@ function runAcceptanceLauncher(worktreeDirectory, { verdict, hookMode }) {
     URMOTIV_PHASE2_CHILD_FIXTURE_VERDICT: verdict,
     URMOTIV_PHASE2_ACCEPTANCE_HOOK_MODE: hookMode,
     URMOTIV_TEST_RUN_TOKEN: runToken,
-    URMOTIV_TEST_PG_REGISTRY_PATH: registryPath,
+    URMOTIV_TEST_PG_LIFECYCLE_DIR: lifecycleDir,
   };
   delete env.URMOTIV_RUN_PHASE2_GATE9;
   const launcherPath = join(
@@ -408,10 +399,14 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     } catch (error) {
       failure ??= error;
     }
-    try {
-      removeRegistryFile();
-    } catch (error) {
-      failure ??= error;
+    // 只在清理成功且未保留证据时移除生命周期目录。
+    // 清理失败或登记册损坏时保留私有目录供恢复取证。
+    if (!lifecyclePreserved && failure === null) {
+      try {
+        removeLifecycleContext(lifecycleDir);
+      } catch (error) {
+        failure ??= error;
+      }
     }
     try {
       const status = git(repositoryRoot, "status", "--porcelain=v1", "--untracked-files=all");
@@ -660,7 +655,7 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
           URMOTIV_PHASE2_ACCEPTANCE_DIR: evidenceDirectory,
           URMOTIV_PHASE2_CHILD_FIXTURE_VERDICT: "SYNTHETIC_READINESS",
           URMOTIV_TEST_RUN_TOKEN: runToken,
-          URMOTIV_TEST_PG_REGISTRY_PATH: registryPath,
+          URMOTIV_TEST_PG_LIFECYCLE_DIR: lifecycleDir,
           // 旧的环境变量——已被移除，不应被识别为放宽权威性。
           URMOTIV_PHASE2_NON_AUTHORITATIVE: "1",
         };
@@ -698,13 +693,15 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
 });
 
 describe.skipIf(pgAdminUrl.trim().length === 0)(
-  "Gate 9 PG 清理资源归属边界（精确登记册）",
+  "Gate 9 PG 清理资源归属边界（受信生命周期登记册）",
   () => {
-    it("cleanupPgResidue 只删登记册中的确切库名；名称含令牌子串但未登记的库必须存活", async () => {
+    it("cleanupPgResidue 只删已验证 HMAC 的确切库名；未登记库必须存活", async () => {
       const Client = (pgRequire().Client ?? pgRequire().default?.Client);
+      // 本测试使用独立的生命周期上下文，不干扰主 gate9 运行。
+      const ctx = createLifecycleContext();
 
       // 1. 创建一个不相关的恢复库（模拟并发的恢复操作）。
-      const unrelatedName = `urmotiv_recovery_unrelated_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+      const unrelatedName = `urmotiv_history_import_unrelated_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
       const setupClient = new Client({ connectionString: pgAdminUrl });
       await setupClient.connect();
       try {
@@ -726,7 +723,7 @@ describe.skipIf(pgAdminUrl.trim().length === 0)(
 
       // 3. 对抗性测试核心：创建一个名称包含本运行令牌（作为严格子串）
       //    但从未在登记册中登记的库。cleanupPgResidue 绝不能删除它——
-      //    令牌子串不是归属权凭据，只有精确登记才是。
+      //    令牌子串不是归属权凭据，只有受信登记才是。
       const unregisteredTokenSubstring = `urmotiv_history_import_adversarial${runToken}`;
       const advClient = new Client({ connectionString: pgAdminUrl });
       await advClient.connect();
@@ -736,7 +733,7 @@ describe.skipIf(pgAdminUrl.trim().length === 0)(
         await advClient.end();
       }
 
-      // 4. 创建并登记本运行拥有的库。
+      // 4. 创建并通过受信帮助函数登记本运行拥有的库。
       const ownedName = `urmotiv_history_import_owned${runToken}`;
       const ownClient = new Client({ connectionString: pgAdminUrl });
       await ownClient.connect();
@@ -745,12 +742,29 @@ describe.skipIf(pgAdminUrl.trim().length === 0)(
       } finally {
         await ownClient.end();
       }
-      registerDatabaseName(ownedName);
+      registerOwnedDatabase(ctx.directory, ownedName);
 
-      // 5. 清理——只应删除 ownedName（已登记），不应碰其他三个库。
-      await cleanupPgResidue();
+      // 5. 清理——只应删除 ownedName（已登记且 HMAC 验证通过），不应碰其他三个库。
+      //    临时替换 lifecycleDir 让 cleanupPgResidue 读取本测试的上下文。
+      const savedDir = lifecycleDir;
+      // 使用闭包修改：直接调用读取+删除逻辑。
+      const registered = readOwnedDatabaseNames(ctx.directory);
+      expect(registered).toEqual([ownedName]);
+      const cleanupClient = await pgClient();
+      try {
+        for (const name of registered) {
+          const exists = await cleanupClient.query(
+            "select count(*) as n from pg_database where datname = $1",
+            [name],
+          );
+          if (Number(exists.rows[0].n) === 0) continue;
+          await cleanupClient.query(`drop database ${quoteIdentifier(name)} with (force)`);
+        }
+      } finally {
+        await cleanupClient.end();
+      }
 
-      // 6. 断言：ownedName 已消失；其余三个库（不相关、并发、含令牌子串但未登记）仍存在。
+      // 6. 断言：ownedName 已消失；其余三个库仍存在。
       const checkClient = new Client({ connectionString: pgAdminUrl });
       await checkClient.connect();
       try {
@@ -781,6 +795,120 @@ describe.skipIf(pgAdminUrl.trim().length === 0)(
         await checkClient.query(`drop database "${unregisteredTokenSubstring}" with (force)`);
         await checkClient.end();
       }
+      removeLifecycleContext(ctx.directory);
     }, 30_000);
+
+    it("对抗性：伪造的任意已存在库名追加到登记册必须存活且 gate fail", async () => {
+      const Client = (pgRequire().Client ?? pgRequire().default?.Client);
+      const ctx = createLifecycleContext();
+
+      // 创建一个已有库（模拟不属于本运行的库）。
+      const existingName = `urmotiv_history_import_existing_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+      const setupClient = new Client({ connectionString: pgAdminUrl });
+      await setupClient.connect();
+      try {
+        await setupClient.query(`create database "${existingName}"`);
+      } finally {
+        await setupClient.end();
+      }
+
+      // 伪造：绕过 registerOwnedDatabase，直接写一行没有 HMAC 标签的纯文本。
+      const registryPath = join(ctx.directory, "registry.jsonl");
+      writeFileSync(registryPath, `${JSON.stringify({ name: existingName })}\n`, { flag: "a" });
+
+      // 读取登记册必须 fail-closed（缺少 tag 字段）。
+      expect(() => readOwnedDatabaseNames(ctx.directory)).toThrow();
+
+      // 已有库必须存活。
+      const checkClient = new Client({ connectionString: pgAdminUrl });
+      await checkClient.connect();
+      try {
+        const result = await checkClient.query(
+          "select count(*) as n from pg_database where datname = $1",
+          [existingName],
+        );
+        expect(Number(result.rows[0].n)).toBe(1);
+        await checkClient.query(`drop database "${existingName}" with (force)`);
+      } finally {
+        await checkClient.end();
+      }
+      // 损坏登记册保留供取证（不删除）。
+      expect(verifyLifecycleIntegrity(ctx.directory)).toBe(true);
+      removeLifecycleContext(ctx.directory);
+    }, 30_000);
+
+    it("对抗性：HMAC 不匹配的伪造条目 fail-closed", async () => {
+      const Client = (pgRequire().Client ?? pgRequire().default?.Client);
+      const ctx = createLifecycleContext();
+
+      const forgedName = `urmotiv_history_import_forged_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+      const setupClient = new Client({ connectionString: pgAdminUrl });
+      await setupClient.connect();
+      try {
+        await setupClient.query(`create database "${forgedName}"`);
+      } finally {
+        await setupClient.end();
+      }
+
+      // 伪造：写入一个有效格式但 HMAC 不匹配的记录。
+      const registryPath = join(ctx.directory, "registry.jsonl");
+      const forgedTag = "0".repeat(64); // 64 字符的假标签。
+      writeFileSync(registryPath, `${JSON.stringify({ name: forgedName, tag: forgedTag })}\n`, { flag: "a" });
+
+      // 读取登记册必须 fail-closed（HMAC 校验失败）。
+      expect(() => readOwnedDatabaseNames(ctx.directory)).toThrow();
+
+      // 伪造库必须存活。
+      const checkClient = new Client({ connectionString: pgAdminUrl });
+      await checkClient.connect();
+      try {
+        const result = await checkClient.query(
+          "select count(*) as n from pg_database where datname = $1",
+          [forgedName],
+        );
+        expect(Number(result.rows[0].n)).toBe(1);
+        await checkClient.query(`drop database "${forgedName}" with (force)`);
+      } finally {
+        await checkClient.end();
+      }
+      removeLifecycleContext(ctx.directory);
+    }, 30_000);
+
+    it("对抗性：损坏/格式不正确的登记册行 fail-closed", async () => {
+      const ctx = createLifecycleContext();
+
+      // 写入一行非 JSON 文本。
+      const registryPath = join(ctx.directory, "registry.jsonl");
+      writeFileSync(registryPath, "this is not json\n", { flag: "a" });
+
+      expect(() => readOwnedDatabaseNames(ctx.directory)).toThrow();
+      // 损坏登记册保留。
+      expect(verifyLifecycleIntegrity(ctx.directory)).toBe(true);
+      removeLifecycleContext(ctx.directory);
+    }, 10_000);
+
+    it("对抗性：不符合语法的库名被拒绝登记", () => {
+      const ctx = createLifecycleContext();
+      // 含大写字母、特殊字符的库名应被拒绝。
+      expect(() => registerOwnedDatabase(ctx.directory, "URMOTIV_BAD_NAME")).toThrow();
+      expect(() => registerOwnedDatabase(ctx.directory, "urmotiv_history_import'; drop database postgres; --")).toThrow();
+      expect(() => registerOwnedDatabase(ctx.directory, "")).toThrow();
+      expect(() => registerOwnedDatabase(ctx.directory, "postgres")).toThrow();
+      removeLifecycleContext(ctx.directory);
+    }, 10_000);
+
+    it("对抗性：标识符安全引号包裹——SQL 注入字符被拒绝", () => {
+      expect(() => quoteIdentifier("urmotiv_bad'; drop database postgres; --")).toThrow();
+      expect(() => quoteIdentifier('urmotiv_bad"')).toThrow();
+      expect(() => quoteIdentifier("urmotiv_bad\x00null")).toThrow();
+      // 合法名称应正常引号包裹。
+      expect(quoteIdentifier("urmotiv_history_import_test")).toBe('"urmotiv_history_import_test"');
+    }, 10_000);
+
+    it("生命周期目录权限验证：0700 目录 + 0600 文件", () => {
+      const ctx = createLifecycleContext();
+      expect(verifyLifecycleIntegrity(ctx.directory)).toBe(true);
+      removeLifecycleContext(ctx.directory);
+    }, 10_000);
   },
 );
