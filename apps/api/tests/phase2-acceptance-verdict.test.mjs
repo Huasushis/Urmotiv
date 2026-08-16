@@ -242,18 +242,18 @@ describe("gitMetadataHidingReasons（Gate 9 元数据掩盖探测）", () => {
     expect(gitMetadataHidingReasons({})).toEqual({ reasons: [], hiding: false });
   });
   it("ls-files -v 含小写 h（assume-unchanged）即检出", () => {
-    const r = gitMetadataHidingReasons({ lsFilesVerbose: "H file1\nh file2\nS file3\n" });
+    const r = gitMetadataHidingReasons({ lsFilesVerbose: "H file1\nh file2\n" });
     expect(r.hiding).toBe(true);
     expect(r.reasons).toContain("GIT_LS_FILES_ASSUMUNCHANGED_OR_SKIPWORKTREE");
     expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");
   });
-  it("ls-files -v 含小写 s（skip-worktree）即检出", () => {
-    const r = gitMetadataHidingReasons({ lsFilesVerbose: "H file1\ns file2\n" });
+  it("ls-files -v 含大写 S（skip-worktree）即检出", () => {
+    const r = gitMetadataHidingReasons({ lsFilesVerbose: "H file1\nS file2\n" });
     expect(r.hiding).toBe(true);
     expect(r.reasons).toContain("GIT_LS_FILES_ASSUMUNCHANGED_OR_SKIPWORKTREE");
   });
-  it("ls-files -v 全大写标记不算掩盖", () => {
-    const r = gitMetadataHidingReasons({ lsFilesVerbose: "H file1\nS file2\nM file3\n" });
+  it("ls-files -v 全大写 H/M 标记不算掩盖（S 是 skip-worktree 仍算）", () => {
+    const r = gitMetadataHidingReasons({ lsFilesVerbose: "H file1\nM file3\n" });
     expect(r.hiding).toBe(false);
     expect(r.reasons).toEqual([]);
   });

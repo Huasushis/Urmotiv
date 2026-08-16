@@ -102,6 +102,9 @@ if (mode === "pre-existing-info-exclude") {
   process.exit(0);
 }
 if (mode === "sparse-checkout") {
+  // 元数据掩盖缝：运行中启用 sparse-checkout 并写入 sparse-checkout 文件。
+  // 用 /* 模式（包含所有内容）避免破坏 worktree 文件导致后续 git 命令崩溃；
+  // 检测只看 core.sparseCheckout=true 和 sparse-checkout 文件存在，不看模式。
   execFileSync("git", ["config", "core.sparseCheckout", "true"], {
     cwd: repositoryRoot,
     encoding: "utf8",
@@ -111,7 +114,7 @@ if (mode === "sparse-checkout") {
     cwd: repositoryRoot,
     encoding: "utf8",
   }).trim();
-  writeFileSync(sparsePath, "/*\n!apps/api\n");
+  writeFileSync(sparsePath, "/*\n");
   process.exit(0);
 }
 process.exit(2);

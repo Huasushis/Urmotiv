@@ -184,13 +184,13 @@ export function gitMetadataHidingReasons(environment) {
     typeof environment === "object" && environment !== null ? environment : {};
   const reasons = [];
   let hiding = false;
-  // git ls-files -v：小写标记 h(assume-unchanged)/s(skip-worktree) 表示
-  // 已跟踪文件被元数据标记隐藏。大写 H/S/c 等是正常状态。绝对非法。
+  // git ls-files -v：h(assume-unchanged)/S(skip-worktree) 表示已跟踪文件
+  // 被元数据标记隐藏。大写 H 是正常缓存状态。绝对非法。
   const lsFilesVerbose = env.lsFilesVerbose;
   if (typeof lsFilesVerbose === "string" && lsFilesVerbose.trim().length !== 0) {
     for (const line of lsFilesVerbose.split("\n")) {
       const tag = line.charAt(0);
-      if (tag === "h" || tag === "s") {
+      if (tag === "h" || tag === "S") {
         reasons.push("GIT_LS_FILES_ASSUMUNCHANGED_OR_SKIPWORKTREE");
         hiding = true;
         break;
