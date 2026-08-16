@@ -46,9 +46,11 @@ async function cleanupPgResidue() {
     pgModule = require("pg");
   } catch {
     // @urmotiv/database 依赖 pg，从它的位置解析。
-    const dbRequire = createRequire(require.resolve("@urmotiv/database"));
+    const dbPkgPath = join(repositoryRoot, "packages", "database", "package.json");
+    const dbRequire = createRequire(dbPkgPath);
     pgModule = dbRequire("pg");
   }
+  const Client = pgModule.Client ?? pgModule.default?.Client;
   const client = new Client({ connectionString: pgAdminUrl });
   await client.connect();
   try {
