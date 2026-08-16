@@ -199,9 +199,13 @@ if (status.trim().length !== 0) {
 }
 // Gate 9 预运行硬门：porcelain 干净不够——assume-unchanged/skip-worktree、
 // sparse-checkout 等元数据能掩盖已跟踪文件改动，在任何验收检出上都不合法，
-// 启动前即拒绝。info/exclude 与 excludesFile 可有合法用途（如 worktree
-// node_modules 排除），不在此硬拒。但读取失败用哨兵值标记，绝不静默为
-// "不存在"。运行后做前后差比对（字节哈希 + 被忽略文件集）。
+// 启动前即拒绝。读取失败用哨兵值标记，绝不静默为"不存在"。
+//
+// 权威运行（默认）额外硬拒 info/exclude 中的活跃排除规则和 core.excludesFile：
+// 这些规则能隐藏运行中产生的未跟踪工件。测试缝可显式声明非权威
+// （URMOTIV_PHASE2_NON_AUTHORITATIVE=1）以绕过此硬拒，但仍做运行后差比对。
+const isNonAuthoritative =
+  process.env.URMOTIV_PHASE2_NON_AUTHORITATIVE === "1";
 const preRunMetadata = captureGitMetadataHiding();
 if (
   preRunMetadata.lsFilesVerbose.split("\n").some((line) => {
@@ -214,8 +218,24 @@ if (
 ) {
   fail("检出存在可隐藏已跟踪文件改动的 Git 元数据（assume-unchanged/skip-worktree/sparse-checkout）；拒绝发放验收。");
 }
-if (preRunMetadata.infoExcludeHash === "READ_ERROR_SENTINEL" || preRunMetadata.excludesFileHash === "READ_ERROR_SENTINEL") {
-  fail("Git 排除文件读取失败（哨兵值触发），无法建立安全的预运行元数据基线；拒绝发放验收。");
+// 所有读取失败哨兵值都必须在启动前拒绝——包括 lsFilesVerbose 和 ignoredFilesHash。
+// 相同哨兵值前后比对应判为不通过（哨兵值不是合法状态）。
+if (
+  preRunMetadata.infoExcludeHash === "READ_ERROR_SENTINEL" ||
+  preRunMetadata.excludesFileHash === "READ_ERROR_SENTINEL" ||
+  preRunMetadata.lsFilesVerbose === "READ_ERROR_SENTINEL" ||
+  preRunMetadata.ignoredFilesHash === "READ_ERROR_SENTINEL"
+) {
+  fail("Git 元数据探测存在读取失败哨兵值，无法建立安全的预运行基线；拒绝发放验收。");
+}
+if (!isNonAuthoritative) {
+  // 权威运行：硬拒 info/exclude 活跃规则和 core.excludesFile。
+  if (preRunMetadata.infoExcludeHasActiveRules) {
+    fail("权威运行拒绝 info/exclude 中的活跃排除规则（非注释非空行）；请清除或声明非权威模式。");
+  }
+  if (preRunMetadata.excludesFileValue.length !== 0) {
+    fail("权威运行拒绝 core.excludesFile 设置；请清除或声明非权威模式。");
+  }
 }
 if (
   process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL === undefined ||
@@ -438,13 +458,23 @@ if (seamState.afterChildHook) {
   // （预运行已拒，运行中出现即为掩盖突变）。info/exclude 与 excludesFile 用
   // 字节哈希前后差比对——预存的合法排除规则被冻结（哈希不变即无变化），
   // 运行中任何字节变化（新增/修改/删除排除规则）一定被检出。
+  // 哨兵值（读取失败）在预运行已被拒绝。运行后出现哨兵值本身即为异常——
+  // 相同哨兵值前后比对应判为掩盖（哨兵值不是合法状态，不能通过）。
+  const hasPostSentinel =
+    postMetadata.infoExcludeHash === "READ_ERROR_SENTINEL" ||
+    postMetadata.excludesFileHash === "READ_ERROR_SENTINEL" ||
+    postMetadata.lsFilesVerbose === "READ_ERROR_SENTINEL" ||
+    postMetadata.ignoredFilesHash === "READ_ERROR_SENTINEL";
   const metadataForVerdict = {
     lsFilesVerbose: postMetadata.lsFilesVerbose,
     excludesFileHashChanged:
+      hasPostSentinel ||
       postMetadata.excludesFileHash !== preRunMetadata.excludesFileHash,
     infoExcludeHashChanged:
+      hasPostSentinel ||
       postMetadata.infoExcludeHash !== preRunMetadata.infoExcludeHash,
     ignoredFilesHashChanged:
+      hasPostSentinel ||
       postMetadata.ignoredFilesHash !== preRunMetadata.ignoredFilesHash,
     sparseCheckout: postMetadata.sparseCheckout,
     sparseCheckoutFilePresent: postMetadata.sparseCheckoutFilePresent,

@@ -38,9 +38,12 @@ function git(cwd, ...args) {
 
 const pgAdminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL ?? "";
 
-// 跟踪本测试运行拥有的 PG 数据库快照前集；清理只删运行中新出现的库，
-// 绝不碰预先存在的不相关恢复库。
-let preRunDatabaseNames = null;
+// 每次运行生成不可伪造的令牌前缀；所有由本运行创建的 PG 数据库
+// 必须以 urmotiv_g9_<token>_ 为前缀。清理时只删除匹配此前缀的库，
+// 绝不碰任何其他库（包括运行快照后由其他进程创建的匹配 urmotiv_% 的库）。
+const runToken = `${process.pid}${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+
+
 function pgRequire() {
   const req = nodeCreateRequire(import.meta.url);
   try {
@@ -51,39 +54,33 @@ function pgRequire() {
   }
 }
 
-async function snapshotOwnedDatabases() {
-  if (pgAdminUrl.trim().length === 0) return;
+async function pgClient() {
   const mod = pgRequire();
   const Client = mod.Client ?? mod.default?.Client;
   const client = new Client({ connectionString: pgAdminUrl });
   await client.connect();
-  try {
-    const result = await client.query(
-      "select datname from pg_database where datname like 'urmotiv_%'",
-    );
-    preRunDatabaseNames = new Set(result.rows.map((r) => r.datname));
-  } finally {
-    await client.end();
-  }
+  return client;
+}
+
+async function snapshotOwnedDatabases() {
+  // 令牌命名空间方案不需要预运行快照——清理时只按前缀匹配。
+  // 保留函数签名以兼容现有调用点，但改为空操作。
 }
 
 async function cleanupPgResidue() {
   if (pgAdminUrl.trim().length === 0) return;
-  if (!(preRunDatabaseNames instanceof Set)) {
-    throw new Error("cleanupPgResidue 在 snapshotOwnedDatabases 之前被调用。");
-  }
-  const mod = pgRequire();
-  const Client = mod.Client ?? mod.default?.Client;
-  const client = new Client({ connectionString: pgAdminUrl });
-  await client.connect();
+  const client = await pgClient();
   try {
+    // 查询所有 urmotiv_% 库，只删除名称中包含本运行不可伪造令牌的库。
+    // 令牌由 randomUUID 生成，并发进程不可能猜中。
+    // 这比前缀匹配更灵活——scratchName 和 formalDbName 产生不同前缀
+    // 但都嵌入同一个令牌。
     const result = await client.query(
       "select datname from pg_database where datname like 'urmotiv_%' order by datname",
     );
-    // 只删本运行中新创建的库（快照前集中不存在的），绝不碰预先存在的不相关库。
     const owned = result.rows
       .map((r) => r.datname)
-      .filter((name) => !preRunDatabaseNames.has(name));
+      .filter((name) => name.includes(runToken));
     const failed = [];
     for (const name of owned) {
       try {
@@ -92,16 +89,15 @@ async function cleanupPgResidue() {
         failed.push(name);
       }
     }
-    // 逐一断言已删除的库已消失；未删的预先存在库不在断言范围内。
     const remaining = await client.query(
       "select datname from pg_database where datname like 'urmotiv_%'",
     );
     const stillOwned = remaining.rows
       .map((r) => r.datname)
-      .filter((name) => !preRunDatabaseNames.has(name));
+      .filter((name) => name.includes(runToken));
     if (stillOwned.length !== 0 || failed.length !== 0) {
       const names = stillOwned.concat(failed);
-      throw new Error(`PG 残留数据库未清理（仅限本运行拥有）: ${names.join(", ")}`);
+      throw new Error(`PG 残留数据库未清理（仅限本运行令牌）: ${names.join(", ")}`);
     }
   } finally {
     await client.end();
@@ -175,6 +171,8 @@ function runAcceptanceLauncher(worktreeDirectory, { verdict, hookMode }) {
     ),
     URMOTIV_PHASE2_CHILD_FIXTURE_VERDICT: verdict,
     URMOTIV_PHASE2_ACCEPTANCE_HOOK_MODE: hookMode,
+    URMOTIV_TEST_RUN_TOKEN: runToken,
+    URMOTIV_PHASE2_NON_AUTHORITATIVE: "1",
   };
   delete env.URMOTIV_RUN_PHASE2_GATE9;
   const launcherPath = join(
@@ -591,16 +589,14 @@ describe.skipIf(pgAdminUrl.trim().length === 0)(
   "Gate 9 PG 清理资源归属边界（不碰不相关恢复库）",
   () => {
     afterEach(() => {
-      // 重置共享状态，避免污染主 Gate 9 describe 块的清理逻辑。
-      preRunDatabaseNames = null;
+      // 无共享状态需要重置——令牌命名空间方案不依赖模块级快照。
     });
-    it("cleanupPgResidue 只删本运行拥有的库，保留预存的不相关恢复库", async () => {
-      // 1. 预存一个不相关的恢复库（模拟并发的恢复操作）。
-      const unrelatedName = `urmotiv_recovery_unrelated_${process.pid}${randomUUID()
-        .replaceAll("-", "")
-        .slice(0, 8)}`;
-      const mod = pgRequire();
-      const Client = mod.Client ?? mod.default?.Client;
+    it("cleanupPgResidue 只删名称含本运行令牌的库，保留不相关库（含快照后创建的）", async () => {
+      const Client = (pgRequire().Client ?? pgRequire().default?.Client);
+
+      // 1. 创建一个不相关的恢复库（模拟并发的恢复操作）。
+      //    它匹配 urmotiv_% 但不包含本运行令牌。
+      const unrelatedName = `urmotiv_recovery_unrelated_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
       const setupClient = new Client({ connectionString: pgAdminUrl });
       await setupClient.connect();
       try {
@@ -609,13 +605,20 @@ describe.skipIf(pgAdminUrl.trim().length === 0)(
         await setupClient.end();
       }
 
-      // 2. 快照当前库集——此时不相关恢复库已存在，会被快照记录。
-      await snapshotOwnedDatabases();
+      // 2. 创建一个使用不同令牌的并发运行库（模拟并发 gate9 运行）。
+      //    它匹配 urmotiv_history_import_ 但包含不同的令牌。
+      const concurrentToken = `concurrent${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+      const concurrentName = `urmotiv_history_import_concurrent${concurrentToken}`;
+      const concurrentClient = new Client({ connectionString: pgAdminUrl });
+      await concurrentClient.connect();
+      try {
+        await concurrentClient.query(`create database "${concurrentName}"`);
+      } finally {
+        await concurrentClient.end();
+      }
 
-      // 3. 创建一个本运行拥有的库（快照后新建）。
-      const ownedName = `urmotiv_owned_test_${process.pid}${randomUUID()
-        .replaceAll("-", "")
-        .slice(0, 8)}`;
+      // 3. 创建一个本运行拥有的库（名称包含本运行令牌）。
+      const ownedName = `urmotiv_history_import_owned${runToken}`;
       const ownClient = new Client({ connectionString: pgAdminUrl });
       await ownClient.connect();
       try {
@@ -624,10 +627,10 @@ describe.skipIf(pgAdminUrl.trim().length === 0)(
         await ownClient.end();
       }
 
-      // 4. 清理——只应删除 ownedName，不应碰 unrelatedName。
+      // 4. 清理——只应删除 ownedName，不应碰 unrelatedName 或 concurrentName。
       await cleanupPgResidue();
 
-      // 5. 断言：ownedName 已消失，unrelatedName 仍存在。
+      // 5. 断言：ownedName 已消失，unrelatedName 和 concurrentName 仍存在。
       const checkClient = new Client({ connectionString: pgAdminUrl });
       await checkClient.connect();
       try {
@@ -641,9 +644,15 @@ describe.skipIf(pgAdminUrl.trim().length === 0)(
           [unrelatedName],
         );
         expect(Number(unrelatedResult.rows[0].n)).toBe(1);
+        const concurrentResult = await checkClient.query(
+          "select count(*) as n from pg_database where datname = $1",
+          [concurrentName],
+        );
+        expect(Number(concurrentResult.rows[0].n)).toBe(1);
       } finally {
-        // 6. 清理不相关恢复库（测试自身的清理，不依赖 cleanupPgResidue）。
+        // 6. 清理不相关库（测试自身的清理，不依赖 cleanupPgResidue）。
         await checkClient.query(`drop database "${unrelatedName}" with (force)`);
+        await checkClient.query(`drop database "${concurrentName}" with (force)`);
         await checkClient.end();
       }
     }, 30_000);

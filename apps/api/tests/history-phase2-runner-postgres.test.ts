@@ -91,6 +91,10 @@ const acceptanceCommit = process.env.URMOTIV_PHASE2_ACCEPTANCE_COMMIT;
 const describePostgres = adminUrl === undefined && !acceptanceMode ? describe.skip : describe;
 const temporaryDirectories: string[] = [];
 const temporaryDatabaseNames: string[] = [];
+// 独立于 temporaryDatabaseNames 的持久失败标记。
+// 即使后续 afterEach 成功删除了残留库并清空了列表，
+// 此标记仍保持 true，确保 afterAll 报告失败。
+let cleanupEverFailed = false;
 const encoder = new TextEncoder();
 const tagId = "catalog.tag.01.01";
 const evidenceRoot = permittedPhase2EvidenceRoot();
@@ -111,8 +115,21 @@ interface SyntheticBatch {
 }
 
 function scratchName(label: string): string {
-  const suffix = `${label}${process.pid}${randomUUID().replaceAll("-", "").slice(0, 8)}`.slice(0, 20);
+  const runToken = process.env.URMOTIV_TEST_RUN_TOKEN;
+  const idPart =
+    runToken !== undefined && runToken.length > 0
+      ? runToken
+      : `${process.pid}${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+  const suffix = `${label}${idPart}`.slice(0, 57);
   return `urmotiv_history_import_${suffix}`;
+}
+function formalDbName(label: string): string {
+  const runToken = process.env.URMOTIV_TEST_RUN_TOKEN;
+  const idPart =
+    runToken !== undefined && runToken.length > 0
+      ? runToken
+      : `${process.pid}${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+  return `urmotiv_formal_${label}_${idPart}`;
 }
 
 function candidateIdForSource(index: number): string {
@@ -798,6 +815,7 @@ afterEach(async () => {
       } catch {
         // 删除失败：保留名称，不遗忘，让后续断言报错。
         remaining.push(name);
+        cleanupEverFailed = true;
       }
       // 断言该库已消失：即使 drop 报错也检查，确保残留被暴露。
       const checkAdmin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
@@ -805,6 +823,7 @@ afterEach(async () => {
       await checkAdmin.close();
       if (stillExists) {
         remaining.push(name);
+        cleanupEverFailed = true;
       }
     }
     // 只在全部清理成功后清空跟踪列表；残留则保留供下一轮重试。
@@ -820,11 +839,16 @@ afterEach(async () => {
 });
 
 afterAll(() => {
-  // 清理失败硬门：afterEach 保留的残留名必须在此暴露。
-  // 一个通过运行的最终状态必须是临时数据库列表完全清空。
+  // 清理失败硬门：即使后续 afterEach 成功删除了残留库并清空了列表，
+  // cleanupEverFailed 仍保持 true，确保曾经发生的清理失败不被遗忘。
   if (temporaryDatabaseNames.length !== 0) {
     throw new Error(
       `PG 清理未完成，残留数据库: ${temporaryDatabaseNames.join(", ")}`,
+    );
+  }
+  if (cleanupEverFailed) {
+    throw new Error(
+      "PG 清理过程中曾发生删除失败（cleanupEverFailed），即使后续恢复仍判定为失败。",
     );
   }
 });
@@ -1824,9 +1848,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
     if (adminUrl === undefined) throw new Error("缺少 PostgreSQL 管理连接配置。");
     // 正式目标库：名称不能落入临时验收范围，结构与种子与验收库一致；
     // 名称同时满足合成正式测试缝范围，让 hook/故障注入只能在测试内生效。
-    const formalDatabaseName = `urmotiv_formal_${process.pid}${randomUUID()
-      .replaceAll("-", "")
-      .slice(0, 8)}`;
+    const formalDatabaseName = formalDbName("main");
     temporaryDatabaseNames.push(`${formalDatabaseName}__formal_backup`);
     const formalAdmin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
     let formalDropped = false;
@@ -2184,9 +2206,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       // 的收尾失败只能进入 cleanup_incomplete（退出 0、PASS 标记保留、恢复副本
       // 保留、待清证据写盘），已提交数据绝不回退；随后由
       // completeFormalFinalizationCleanup 幂等续做完成副本销毁。
-      const cleanupFaultDatabaseName = `urmotiv_formal_cleanup_${process.pid}${randomUUID()
-        .replaceAll("-", "")
-        .slice(0, 8)}`;
+      const cleanupFaultDatabaseName = formalDbName("cleanup");
       temporaryDatabaseNames.push(cleanupFaultDatabaseName, `${cleanupFaultDatabaseName}__formal_backup`);
       await formalAdmin.execute(
         sql`create database ${sql.identifier(cleanupFaultDatabaseName)}`,
@@ -2341,9 +2361,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       // （二 c）拒绝收据故障缝：写盘前把收据路径占为目录。运行必须拒绝
       // 产出任何结论文本：无收据、无 PASS 标记、阶段停留在 rollback_verified、
       // 数据库行与存储处处零残留、临时备份库不存在。
-      const refusalFaultDatabaseName = `urmotiv_formal_refusal_${process.pid}${randomUUID()
-        .replaceAll("-", "")
-        .slice(0, 8)}`;
+      const refusalFaultDatabaseName = formalDbName("refusal");
       temporaryDatabaseNames.push(
         refusalFaultDatabaseName,
         `${refusalFaultDatabaseName}__formal_backup`,
@@ -2460,9 +2478,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       // 也被路径占用。运行必须退出 1，且规范名上不再存在权威 PASS 工件：
       // 收据位被目录占用（丢弃任何权威性）、标记退役、PASS 收据只残留在
       // retired 副本；双方退役证据在案；数据库与存储回滚无泄漏。
-      const retireFaultDatabaseName = `urmotiv_formal_retire_${process.pid}${randomUUID()
-        .replaceAll("-", "")
-        .slice(0, 8)}`;
+      const retireFaultDatabaseName = formalDbName("retire");
       temporaryDatabaseNames.push(
         retireFaultDatabaseName,
         `${retireFaultDatabaseName}__formal_backup`,
@@ -2833,3 +2849,33 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
     await verifyAdmin.close();
   }, 120_000);
 });
+
+const faultInjectDescribe =
+  process.env.URMOTIV_TEST_PG_FAULT_INJECT === "1" && adminUrl !== undefined
+    ? describe
+    : describe.skip;
+faultInjectDescribe(
+  "PG 清理持久失败验证（故障注入：首次删除失败，后续恢复，套件仍失败）",
+  () => {
+    it("首次删除失败设置 cleanupEverFailed，后续恢复后列表清空但标记仍为 true", async () => {
+      const faultDbName = scratchName("fault_inject");
+      temporaryDatabaseNames.push(faultDbName);
+      const faultAdmin = createPostgresDatabase({ connectionString: adminUrl!, maxConnections: 1 });
+      await faultAdmin.execute(sql`create database ${sql.identifier(faultDbName)}`);
+      await faultAdmin.close();
+
+      // 模拟首次删除失败：不实际删除，直接标记失败。
+      cleanupEverFailed = true;
+
+      // 模拟后续恢复：手动删除数据库并清空列表。
+      await dropHistoryImportDatabase(adminUrl!, faultDbName);
+      const idx = temporaryDatabaseNames.indexOf(faultDbName);
+      if (idx !== -1) temporaryDatabaseNames.splice(idx, 1);
+
+      // 列表已清空，但 cleanupEverFailed 仍为 true。
+      // afterAll 将因此抛出——这是预期行为。
+      expect(temporaryDatabaseNames.length).toBe(0);
+      expect(cleanupEverFailed).toBe(true);
+    }, 30_000);
+  },
+);

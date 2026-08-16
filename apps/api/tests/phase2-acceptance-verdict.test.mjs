@@ -331,6 +331,69 @@ describe("gitMetadataHidingReasons（Gate 9 元数据掩盖探测）", () => {
   });
 });
 
+describe("Gate 9 哨兵值与权威运行 adversarial 测试", () => {
+  it("运行后出现哨兵值导致 excludesFileHashChanged=true 即检出掩盖", () => {
+    const r = gitMetadataHidingReasons({ excludesFileHashChanged: true });
+    expect(r.hiding).toBe(true);
+    expect(r.reasons).toContain("GIT_CORE_EXCLUDES_FILE_CHANGED");
+  });
+  it("运行后出现哨兵值导致 infoExcludeHashChanged=true 即检出掩盖", () => {
+    const r = gitMetadataHidingReasons({ infoExcludeHashChanged: true });
+    expect(r.hiding).toBe(true);
+    expect(r.reasons).toContain("GIT_INFO_EXCLUDE_CHANGED");
+  });
+  it("运行后出现哨兵值导致 ignoredFilesHashChanged=true 即检出掩盖", () => {
+    const r = gitMetadataHidingReasons({ ignoredFilesHashChanged: true });
+    expect(r.hiding).toBe(true);
+    expect(r.reasons).toContain("GIT_IGNORED_FILES_SET_CHANGED");
+  });
+  it("postRunDirtyReasons 集成哨兵值导致 metadata 全部 changed=true", () => {
+    const r = postRunDirtyReasons({
+      headBefore: "a".repeat(40),
+      headAfter: "a".repeat(40),
+      statusOutput: "",
+      metadata: {
+        excludesFileHashChanged: true,
+        infoExcludeHashChanged: true,
+        ignoredFilesHashChanged: true,
+      },
+    });
+    expect(r.dirtyCount).toBe(0);
+    expect(r.reasons).toContain("GIT_CORE_EXCLUDES_FILE_CHANGED");
+    expect(r.reasons).toContain("GIT_INFO_EXCLUDE_CHANGED");
+    expect(r.reasons).toContain("GIT_IGNORED_FILES_SET_CHANGED");
+    expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");
+  });
+  it("预存 info/exclude 规则不变化但被忽略文件集变化仍检出", () => {
+    const r = postRunDirtyReasons({
+      headBefore: "a".repeat(40),
+      headAfter: "a".repeat(40),
+      statusOutput: "",
+      metadata: {
+        excludesFileHashChanged: false,
+        infoExcludeHashChanged: false,
+        ignoredFilesHashChanged: true,
+      },
+    });
+    expect(r.reasons).toContain("GIT_IGNORED_FILES_SET_CHANGED");
+    expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");
+  });
+  it("core.excludesFile 稳定不变且被忽略文件集也不变不检出", () => {
+    const r = postRunDirtyReasons({
+      headBefore: "a".repeat(40),
+      headAfter: "a".repeat(40),
+      statusOutput: "",
+      metadata: {
+        excludesFileHashChanged: false,
+        infoExcludeHashChanged: false,
+        ignoredFilesHashChanged: false,
+      },
+    });
+    expect(r.reasons).not.toContain("POST_RUN_GIT_METADATA_HIDING");
+    expect(r.dirtyCount).toBe(0);
+  });
+});
+
 describe("finalizeStatus：元数据掩盖硬失败", () => {
   it("POST_RUN_GIT_METADATA_HIDING 把 IMPLEMENTATION_READY 压为 INCONCLUSIVE", () => {
     expect(
