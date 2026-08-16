@@ -202,10 +202,9 @@ if (status.trim().length !== 0) {
 // 启动前即拒绝。读取失败用哨兵值标记，绝不静默为"不存在"。
 //
 // 权威运行（默认）额外硬拒 info/exclude 中的活跃排除规则和 core.excludesFile：
-// 这些规则能隐藏运行中产生的未跟踪工件。测试缝可显式声明非权威
-// （URMOTIV_PHASE2_NON_AUTHORITATIVE=1）以绕过此硬拒，但仍做运行后差比对。
-const isNonAuthoritative =
-  process.env.URMOTIV_PHASE2_NON_AUTHORITATIVE === "1";
+// 这些规则能隐藏运行中产生的未跟踪工件。唯一的放宽途径是内部测试缝
+// （seamState.active），其存在无条件强制终判定 INCONCLUSIVE——
+// 没有任何 CLI 环境变量（包括 URMOTIV_PHASE2_NON_AUTHORITATIVE）能放宽权威性。
 const preRunMetadata = captureGitMetadataHiding();
 if (
   preRunMetadata.lsFilesVerbose.split("\n").some((line) => {
@@ -228,13 +227,13 @@ if (
 ) {
   fail("Git 元数据探测存在读取失败哨兵值，无法建立安全的预运行基线；拒绝发放验收。");
 }
-if (!isNonAuthoritative) {
+if (!seamState.active) {
   // 权威运行：硬拒 info/exclude 活跃规则和 core.excludesFile。
   if (preRunMetadata.infoExcludeHasActiveRules) {
-    fail("权威运行拒绝 info/exclude 中的活跃排除规则（非注释非空行）；请清除或声明非权威模式。");
+    fail("权威运行拒绝 info/exclude 中的活跃排除规则（非注释非空行）；请清除后重试。");
   }
   if (preRunMetadata.excludesFileValue.length !== 0) {
-    fail("权威运行拒绝 core.excludesFile 设置；请清除或声明非权威模式。");
+    fail("权威运行拒绝 core.excludesFile 设置；请清除后重试。");
   }
 }
 if (

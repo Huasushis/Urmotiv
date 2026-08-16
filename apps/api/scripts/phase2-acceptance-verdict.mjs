@@ -187,8 +187,13 @@ export function gitMetadataHidingReasons(environment) {
   let hiding = false;
   // git ls-files -v：h(assume-unchanged)/S(skip-worktree) 表示已跟踪文件
   // 被元数据标记隐藏。大写 H 是正常缓存状态。绝对非法。
+  // Fix C2：lsFilesVerbose 为 READ_ERROR_SENTINEL 时显式判为掩盖——
+  // 读取失败不是合法状态，相同哨兵前后不能通过。
   const lsFilesVerbose = env.lsFilesVerbose;
-  if (typeof lsFilesVerbose === "string" && lsFilesVerbose.trim().length !== 0) {
+  if (lsFilesVerbose === "READ_ERROR_SENTINEL") {
+    reasons.push("GIT_LS_FILES_READ_ERROR_SENTINEL");
+    hiding = true;
+  } else if (typeof lsFilesVerbose === "string" && lsFilesVerbose.trim().length !== 0) {
     for (const line of lsFilesVerbose.split("\n")) {
       const tag = line.charAt(0);
       if (tag === "h" || tag === "S") {

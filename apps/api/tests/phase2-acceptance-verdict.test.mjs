@@ -406,3 +406,51 @@ describe("finalizeStatus：元数据掩盖硬失败", () => {
     ).toBe("INCONCLUSIVE");
   });
 });
+
+describe("Fix C2：运行后 lsFilesVerbose 哨兵值显式判为掩盖", () => {
+  it("lsFilesVerbose=READ_ERROR_SENTINEL 检出 GIT_LS_FILES_READ_ERROR_SENTINEL", () => {
+    const r = gitMetadataHidingReasons({ lsFilesVerbose: "READ_ERROR_SENTINEL" });
+    expect(r.hiding).toBe(true);
+    expect(r.reasons).toContain("GIT_LS_FILES_READ_ERROR_SENTINEL");
+    expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");
+  });
+  it("postRunDirtyReasons 集成 lsFilesVerbose 哨兵值导致 POST_RUN_GIT_METADATA_HIDING", () => {
+    const r = postRunDirtyReasons({
+      headBefore: "a".repeat(40),
+      headAfter: "a".repeat(40),
+      statusOutput: "",
+      metadata: {
+        lsFilesVerbose: "READ_ERROR_SENTINEL",
+        excludesFileHashChanged: false,
+        infoExcludeHashChanged: false,
+        ignoredFilesHashChanged: false,
+      },
+    });
+    expect(r.reasons).toContain("GIT_LS_FILES_READ_ERROR_SENTINEL");
+    expect(r.reasons).toContain("POST_RUN_GIT_METADATA_HIDING");
+  });
+  it("lsFilesVerbose 哨兵值把 IMPLEMENTATION_READY 压为 INCONCLUSIVE", () => {
+    expect(
+      finalizeStatus({
+        candidate: "IMPLEMENTATION_READY",
+        reasonCodes: ["GIT_LS_FILES_READ_ERROR_SENTINEL", "POST_RUN_GIT_METADATA_HIDING"],
+      }),
+    ).toBe("INCONCLUSIVE");
+  });
+  it("预运行成功但运行后 lsFilesVerbose 哨兵值仍硬失败（不能通过）", () => {
+    // 预运行 lsFilesVerbose 正常（H 开头），运行后变为哨兵值。
+    // 相同哨兵值前后不能通过——哨兵值不是合法状态。
+    const r = gitMetadataHidingReasons({
+      lsFilesVerbose: "READ_ERROR_SENTINEL",
+      excludesFileHashChanged: false,
+      infoExcludeHashChanged: false,
+      ignoredFilesHashChanged: false,
+    });
+    expect(r.hiding).toBe(true);
+    // 即使没有任何哈希变化，哨兵值本身也触发掩盖。
+    expect(r.reasons).not.toContain("GIT_CORE_EXCLUDES_FILE_CHANGED");
+    expect(r.reasons).not.toContain("GIT_INFO_EXCLUDE_CHANGED");
+    expect(r.reasons).not.toContain("GIT_IGNORED_FILES_SET_CHANGED");
+    expect(r.reasons).toContain("GIT_LS_FILES_READ_ERROR_SENTINEL");
+  });
+});

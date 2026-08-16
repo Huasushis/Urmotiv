@@ -8,6 +8,7 @@
 //   5. 解析证据断言 POST_RUN_* 理由、INCONCLUSIVE 与非零退出；
 //   6. 无论成败都移除 worktree 并在主检出上硬门断言整树干净。
 import {
+  appendFileSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -38,11 +39,51 @@ function git(cwd, ...args) {
 
 const pgAdminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL ?? "";
 
-// 每次运行生成不可伪造的令牌前缀；所有由本运行创建的 PG 数据库
-// 必须以 urmotiv_g9_<token>_ 为前缀。清理时只删除匹配此前缀的库，
-// 绝不碰任何其他库（包括运行快照后由其他进程创建的匹配 urmotiv_% 的库）。
+// Fix A：精确创建登记册。清理只删除本运行在创建边界登记过的确切库名，
+// 绝不按令牌子串、前缀、通配符或「快照后新增」推断归属权。
+// 登记册是本运行私有的临时 JSON 文件，由 runToken 命名；子进程通过
+// URMOTIV_TEST_RUN_TOKEN 环境变量获得同一个 runToken，写入同一文件。
+// 清理时读取该文件，逐条精确匹配 pg_database 中的库名后删除。
+// 文件缺失/损坏/不完整时 fail-closed（报错而非跳过）。
 const runToken = `${process.pid}${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+const registryPath = join(tmpdir(), `urmotiv-gate9-registry-${runToken}.json`);
 
+function registerDatabaseName(name) {
+  // 追加 JSON 行（JSONL 格式），每行一个库名，避免并发写竞争。
+  appendFileSync(registryPath, `${JSON.stringify(name)}\n`);
+}
+
+function readRegisteredNames() {
+  if (!existsSync(registryPath)) {
+    throw new Error(`PG 创建登记册不存在：${registryPath}；无法安全清理。`);
+  }
+  const content = readFileSync(registryPath, "utf8");
+  if (content.trim().length === 0) return [];
+  const names = [];
+  for (const line of content.split("\n")) {
+    if (line.trim().length === 0) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      throw new Error(`PG 创建登记册存在损坏行：${line.slice(0, 80)}；fail-closed。`);
+    }
+    if (typeof parsed !== "string" || parsed.length === 0) {
+      throw new Error(`PG 创建登记册存在非字符串条目；fail-closed。`);
+    }
+    names.push(parsed);
+  }
+  return [...new Set(names)];
+}
+
+function removeRegistryFile() {
+  if (existsSync(registryPath)) {
+    rmSync(registryPath, { force: true });
+    if (existsSync(registryPath)) {
+      throw new Error(`PG 创建登记册删除失败：${registryPath}`);
+    }
+  }
+}
 
 function pgRequire() {
   const req = nodeCreateRequire(import.meta.url);
@@ -63,41 +104,42 @@ async function pgClient() {
 }
 
 async function snapshotOwnedDatabases() {
-  // 令牌命名空间方案不需要预运行快照——清理时只按前缀匹配。
+  // 精确登记册方案不需要预运行快照——清理时只按登记册中的确切库名删除。
   // 保留函数签名以兼容现有调用点，但改为空操作。
 }
 
 async function cleanupPgResidue() {
   if (pgAdminUrl.trim().length === 0) return;
+  const registered = readRegisteredNames();
   const client = await pgClient();
   try {
-    // 查询所有 urmotiv_% 库，只删除名称中包含本运行不可伪造令牌的库。
-    // 令牌由 randomUUID 生成，并发进程不可能猜中。
-    // 这比前缀匹配更灵活——scratchName 和 formalDbName 产生不同前缀
-    // 但都嵌入同一个令牌。
-    const result = await client.query(
-      "select datname from pg_database where datname like 'urmotiv_%' order by datname",
-    );
-    const owned = result.rows
-      .map((r) => r.datname)
-      .filter((name) => name.includes(runToken));
+    // 只删除登记册中存在且当前 pg_database 中确实存在的库名。
+    // 逐条精确查询并删除——绝不枚举 urmotiv_% 后按子串匹配。
     const failed = [];
-    for (const name of owned) {
+    for (const name of registered) {
+      const exists = await client.query(
+        "select count(*) as n from pg_database where datname = $1",
+        [name],
+      );
+      if (Number(exists.rows[0].n) === 0) continue;
       try {
         await client.query(`drop database "${name}" with (force)`);
       } catch {
         failed.push(name);
       }
     }
-    const remaining = await client.query(
-      "select datname from pg_database where datname like 'urmotiv_%'",
-    );
-    const stillOwned = remaining.rows
-      .map((r) => r.datname)
-      .filter((name) => name.includes(runToken));
-    if (stillOwned.length !== 0 || failed.length !== 0) {
-      const names = stillOwned.concat(failed);
-      throw new Error(`PG 残留数据库未清理（仅限本运行令牌）: ${names.join(", ")}`);
+    // 验证所有登记库名均已删除。
+    const stillExisting = [];
+    for (const name of registered) {
+      const check = await client.query(
+        "select count(*) as n from pg_database where datname = $1",
+        [name],
+      );
+      if (Number(check.rows[0].n) !== 0) stillExisting.push(name);
+    }
+    if (stillExisting.length !== 0 || failed.length !== 0) {
+      const names = stillExisting.concat(failed);
+      throw new Error(`PG 残留数据库未清理（仅限登记册确切库名）: ${names.join(", ")}`);
     }
   } finally {
     await client.end();
@@ -172,7 +214,7 @@ function runAcceptanceLauncher(worktreeDirectory, { verdict, hookMode }) {
     URMOTIV_PHASE2_CHILD_FIXTURE_VERDICT: verdict,
     URMOTIV_PHASE2_ACCEPTANCE_HOOK_MODE: hookMode,
     URMOTIV_TEST_RUN_TOKEN: runToken,
-    URMOTIV_PHASE2_NON_AUTHORITATIVE: "1",
+    URMOTIV_TEST_PG_REGISTRY_PATH: registryPath,
   };
   delete env.URMOTIV_RUN_PHASE2_GATE9;
   const launcherPath = join(
@@ -363,6 +405,11 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     }
     try {
       await cleanupPgResidue();
+    } catch (error) {
+      failure ??= error;
+    }
+    try {
+      removeRegistryFile();
     } catch (error) {
       failure ??= error;
     }
@@ -583,19 +630,80 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
       expect(result.status).not.toBe(0);
     },
   );
+  it(
+    "Fix C1 对抗性：仅设 URMOTIV_PHASE2_NON_AUTHORITATIVE=1 且有活跃 info/exclude 隐藏，仍硬拒且不能产生 PASS/IMPLEMENTATION_READY",
+    { timeout: 1_800_000 },
+    () => {
+      const worktreeDirectory = makeWorktree();
+      worktrees.push(worktreeDirectory);
+      // 模拟生产 CLI 环境：仅设置旧的环境变量（已不再被识别），
+      // 不设任何测试缝，不传 child fixture 或 after-child hook。
+      // 在工作树中预置活跃 info/exclude 规则以模拟本地隐藏。
+      // 权威运行必须硬拒——旧环境变量不能放宽权威性。
+      const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
+      if (typeof adminUrl !== "string" || adminUrl.trim().length === 0) {
+        throw new Error("Gate 9 集成测试要求 URMOTIV_TEST_POSTGRES_ADMIN_URL。");
+      }
+      const evidenceDirectory = mkdtempSync(join(tmpdir(), "urmotiv-gate9-evidence-"));
+      evidenceDirectories.push(evidenceDirectory);
+      // 预置活跃 info/exclude 规则到工作树（通过 commondir 影响主仓库的 exclude）。
+      // 但工作树通过 commondir 共享主仓库 .git，所以直接写主仓库的 info/exclude。
+      const infoExcludePath = join(repositoryRoot, ".git", "info", "exclude");
+      const originalExclude = readFileSync(infoExcludePath, "utf8");
+      appendFileSync(infoExcludePath, "\n# adversarial-test-rule\nhidden-artifact-*.txt\n");
+      try {
+        const env = {
+          ...process.env,
+          URMOTIV_TEST_POSTGRES_ADMIN_URL: adminUrl,
+          URMOTIV_PHASE2_ACCEPTANCE_BASE_COMMIT: readBaseWorkerCommit(),
+          URMOTIV_PHASE2_ACCEPTANCE_BASE_WORKER_FILE: defaultBaseWorkerFile(),
+          URMOTIV_PHASE2_ACCEPTANCE_DIR: evidenceDirectory,
+          URMOTIV_PHASE2_CHILD_FIXTURE_VERDICT: "SYNTHETIC_READINESS",
+          URMOTIV_TEST_RUN_TOKEN: runToken,
+          URMOTIV_TEST_PG_REGISTRY_PATH: registryPath,
+          // 旧的环境变量——已被移除，不应被识别为放宽权威性。
+          URMOTIV_PHASE2_NON_AUTHORITATIVE: "1",
+        };
+        delete env.URMOTIV_RUN_PHASE2_GATE9;
+        // 不设 child fixture 或 after-child hook——纯权威运行。
+        delete env.URMOTIV_PHASE2_ACCEPTANCE_TEST_CHILD_FIXTURE;
+        delete env.URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS;
+        delete env.URMOTIV_PHASE2_ACCEPTANCE_HOOK_MODE;
+        const launcherPath = join(
+          worktreeDirectory,
+          "apps",
+          "api",
+          "scripts",
+          "phase2-acceptance.mjs",
+        );
+        const result = spawnSync(process.execPath, [launcherPath], {
+          env,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          maxBuffer: 256 * 1024 * 1024,
+        });
+        // 权威运行必须在预运行硬门就 fail（exit code 2），因为有活跃 info/exclude 规则。
+        // 旧环境变量不能绕过此硬拒。
+        expect(result.status).toBe(2);
+        expect(result.stderr).toContain("权威运行拒绝 info/exclude");
+        // 不应产生证据文件（在预运行就失败）。
+        const evidencePath = join(evidenceDirectory, "phase2-acceptance-evidence.private.json");
+        expect(existsSync(evidencePath)).toBe(false);
+      } finally {
+        // 恢复 info/exclude 到原始内容。
+        writeFileSync(infoExcludePath, originalExclude);
+      }
+    },
+  );
 });
 
 describe.skipIf(pgAdminUrl.trim().length === 0)(
-  "Gate 9 PG 清理资源归属边界（不碰不相关恢复库）",
+  "Gate 9 PG 清理资源归属边界（精确登记册）",
   () => {
-    afterEach(() => {
-      // 无共享状态需要重置——令牌命名空间方案不依赖模块级快照。
-    });
-    it("cleanupPgResidue 只删名称含本运行令牌的库，保留不相关库（含快照后创建的）", async () => {
+    it("cleanupPgResidue 只删登记册中的确切库名；名称含令牌子串但未登记的库必须存活", async () => {
       const Client = (pgRequire().Client ?? pgRequire().default?.Client);
 
       // 1. 创建一个不相关的恢复库（模拟并发的恢复操作）。
-      //    它匹配 urmotiv_% 但不包含本运行令牌。
       const unrelatedName = `urmotiv_recovery_unrelated_${randomUUID().replaceAll("-", "").slice(0, 12)}`;
       const setupClient = new Client({ connectionString: pgAdminUrl });
       await setupClient.connect();
@@ -606,7 +714,6 @@ describe.skipIf(pgAdminUrl.trim().length === 0)(
       }
 
       // 2. 创建一个使用不同令牌的并发运行库（模拟并发 gate9 运行）。
-      //    它匹配 urmotiv_history_import_ 但包含不同的令牌。
       const concurrentToken = `concurrent${randomUUID().replaceAll("-", "").slice(0, 12)}`;
       const concurrentName = `urmotiv_history_import_concurrent${concurrentToken}`;
       const concurrentClient = new Client({ connectionString: pgAdminUrl });
@@ -617,7 +724,19 @@ describe.skipIf(pgAdminUrl.trim().length === 0)(
         await concurrentClient.end();
       }
 
-      // 3. 创建一个本运行拥有的库（名称包含本运行令牌）。
+      // 3. 对抗性测试核心：创建一个名称包含本运行令牌（作为严格子串）
+      //    但从未在登记册中登记的库。cleanupPgResidue 绝不能删除它——
+      //    令牌子串不是归属权凭据，只有精确登记才是。
+      const unregisteredTokenSubstring = `urmotiv_history_import_adversarial${runToken}`;
+      const advClient = new Client({ connectionString: pgAdminUrl });
+      await advClient.connect();
+      try {
+        await advClient.query(`create database "${unregisteredTokenSubstring}"`);
+      } finally {
+        await advClient.end();
+      }
+
+      // 4. 创建并登记本运行拥有的库。
       const ownedName = `urmotiv_history_import_owned${runToken}`;
       const ownClient = new Client({ connectionString: pgAdminUrl });
       await ownClient.connect();
@@ -626,11 +745,12 @@ describe.skipIf(pgAdminUrl.trim().length === 0)(
       } finally {
         await ownClient.end();
       }
+      registerDatabaseName(ownedName);
 
-      // 4. 清理——只应删除 ownedName，不应碰 unrelatedName 或 concurrentName。
+      // 5. 清理——只应删除 ownedName（已登记），不应碰其他三个库。
       await cleanupPgResidue();
 
-      // 5. 断言：ownedName 已消失，unrelatedName 和 concurrentName 仍存在。
+      // 6. 断言：ownedName 已消失；其余三个库（不相关、并发、含令牌子串但未登记）仍存在。
       const checkClient = new Client({ connectionString: pgAdminUrl });
       await checkClient.connect();
       try {
@@ -649,10 +769,16 @@ describe.skipIf(pgAdminUrl.trim().length === 0)(
           [concurrentName],
         );
         expect(Number(concurrentResult.rows[0].n)).toBe(1);
+        const advResult = await checkClient.query(
+          "select count(*) as n from pg_database where datname = $1",
+          [unregisteredTokenSubstring],
+        );
+        expect(Number(advResult.rows[0].n)).toBe(1);
       } finally {
-        // 6. 清理不相关库（测试自身的清理，不依赖 cleanupPgResidue）。
+        // 7. 清理测试自身的库（不依赖 cleanupPgResidue）。
         await checkClient.query(`drop database "${unrelatedName}" with (force)`);
         await checkClient.query(`drop database "${concurrentName}" with (force)`);
+        await checkClient.query(`drop database "${unregisteredTokenSubstring}" with (force)`);
         await checkClient.end();
       }
     }, 30_000);

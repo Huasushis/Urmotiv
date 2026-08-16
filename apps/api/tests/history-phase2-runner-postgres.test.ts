@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { appendFileSync, existsSync } from "node:fs";
 import { access, chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { connect, createServer, type Socket } from "node:net";
@@ -91,6 +92,16 @@ const acceptanceCommit = process.env.URMOTIV_PHASE2_ACCEPTANCE_COMMIT;
 const describePostgres = adminUrl === undefined && !acceptanceMode ? describe.skip : describe;
 const temporaryDirectories: string[] = [];
 const temporaryDatabaseNames: string[] = [];
+// Fix A：精确创建登记册。gate9 测试创建一个本运行私有的 JSONL 文件，
+// 每次创建数据库时在 push 到 temporaryDatabaseNames 的同时登记到该文件。
+// 外层 gate9 清理时只按登记册中的确切库名删除，绝不按令牌子串推断归属权。
+const pgRegistryPath = process.env.URMOTIV_TEST_PG_REGISTRY_PATH;
+function registerDatabase(name: string): void {
+  temporaryDatabaseNames.push(name);
+  if (pgRegistryPath !== undefined && pgRegistryPath.length > 0) {
+    appendFileSync(pgRegistryPath, `${JSON.stringify(name)}\n`);
+  }
+}
 // 独立于 temporaryDatabaseNames 的持久失败标记。
 // 即使后续 afterEach 成功删除了残留库并清空了列表，
 // 此标记仍保持 true，确保 afterAll 报告失败。
@@ -786,14 +797,12 @@ async function databaseExistsByName(database: DatabaseHandle, name: string): Pro
 function trackDatabaseFamily(name: string): void {
   // 跟踪数据库族的每个可能成员，包括世代快照。
   // 清理时逐一断言删除成功，绝不遗漏或预先删除。
-  temporaryDatabaseNames.push(
-    name,
-    `${name}__snapshot`,
-    `${name}__snapshot_g1`,
-    `${name}__snapshot_g2`,
-    `${name}__restore`,
-    `${name}__failed`,
-  );
+  registerDatabase(name);
+  registerDatabase(`${name}__snapshot`);
+  registerDatabase(`${name}__snapshot_g1`);
+  registerDatabase(`${name}__snapshot_g2`);
+  registerDatabase(`${name}__restore`);
+  registerDatabase(`${name}__failed`);
 }
 
 afterEach(async () => {
@@ -1849,7 +1858,8 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
     // 正式目标库：名称不能落入临时验收范围，结构与种子与验收库一致；
     // 名称同时满足合成正式测试缝范围，让 hook/故障注入只能在测试内生效。
     const formalDatabaseName = formalDbName("main");
-    temporaryDatabaseNames.push(`${formalDatabaseName}__formal_backup`);
+    registerDatabase(formalDatabaseName);
+    registerDatabase(`${formalDatabaseName}__formal_backup`);
     const formalAdmin = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
     let formalDropped = false;
     const extraProductionDrops: string[] = [];
@@ -2207,7 +2217,8 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       // 保留、待清证据写盘），已提交数据绝不回退；随后由
       // completeFormalFinalizationCleanup 幂等续做完成副本销毁。
       const cleanupFaultDatabaseName = formalDbName("cleanup");
-      temporaryDatabaseNames.push(cleanupFaultDatabaseName, `${cleanupFaultDatabaseName}__formal_backup`);
+      registerDatabase(cleanupFaultDatabaseName);
+      registerDatabase(`${cleanupFaultDatabaseName}__formal_backup`);
       await formalAdmin.execute(
         sql`create database ${sql.identifier(cleanupFaultDatabaseName)}`,
       );
@@ -2362,10 +2373,8 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       // 产出任何结论文本：无收据、无 PASS 标记、阶段停留在 rollback_verified、
       // 数据库行与存储处处零残留、临时备份库不存在。
       const refusalFaultDatabaseName = formalDbName("refusal");
-      temporaryDatabaseNames.push(
-        refusalFaultDatabaseName,
-        `${refusalFaultDatabaseName}__formal_backup`,
-      );
+      registerDatabase(refusalFaultDatabaseName);
+      registerDatabase(`${refusalFaultDatabaseName}__formal_backup`);
       await formalAdmin.execute(sql`create database ${sql.identifier(refusalFaultDatabaseName)}`);
       const refusalFaultConnectionString = historyImportDatabaseConnectionString(
         adminUrl,
@@ -2479,10 +2488,8 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       // 收据位被目录占用（丢弃任何权威性）、标记退役、PASS 收据只残留在
       // retired 副本；双方退役证据在案；数据库与存储回滚无泄漏。
       const retireFaultDatabaseName = formalDbName("retire");
-      temporaryDatabaseNames.push(
-        retireFaultDatabaseName,
-        `${retireFaultDatabaseName}__formal_backup`,
-      );
+      registerDatabase(retireFaultDatabaseName);
+      registerDatabase(`${retireFaultDatabaseName}__formal_backup`);
       await formalAdmin.execute(sql`create database ${sql.identifier(retireFaultDatabaseName)}`);
       const retireFaultConnectionString = historyImportDatabaseConnectionString(
         adminUrl,
@@ -2857,25 +2864,51 @@ const faultInjectDescribe =
 faultInjectDescribe(
   "PG 清理持久失败验证（故障注入：首次删除失败，后续恢复，套件仍失败）",
   () => {
-    it("首次删除失败设置 cleanupEverFailed，后续恢复后列表清空但标记仍为 true", async () => {
+    it("通过真实 drop/catch 路径注入首次删除失败，后续尽力删除成功，套件仍失败且最终残留为零", async () => {
       const faultDbName = scratchName("fault_inject");
-      temporaryDatabaseNames.push(faultDbName);
+      registerDatabase(faultDbName);
       const faultAdmin = createPostgresDatabase({ connectionString: adminUrl!, maxConnections: 1 });
       await faultAdmin.execute(sql`create database ${sql.identifier(faultDbName)}`);
       await faultAdmin.close();
 
-      // 模拟首次删除失败：不实际删除，直接标记失败。
-      cleanupEverFailed = true;
+      // 故障注入：保持一个连接到目标库。dropHistoryImportDatabase 使用
+      // DROP DATABASE IF EXISTS（无 WITH (FORCE)），存在活动连接时会失败。
+      // 这让真实 afterEach 清理路径的 catch 块被触发。
+      const holdConn = createPostgresDatabase({
+        connectionString: historyImportDatabaseConnectionString(adminUrl!, faultDbName),
+        maxConnections: 1,
+      });
+      // 强制连接池立即建立连接并保持，使 DROP DATABASE 因活动连接而失败。
+      await holdConn.execute(sql`select 1 as keepalive`);
+      // 真实清理路径（与 afterEach 相同）：dropHistoryImportDatabase 失败 → catch。
+      try {
+        await dropHistoryImportDatabase(adminUrl!, faultDbName);
+      } catch {
+        cleanupEverFailed = true;
+      }
+      // stillExists 检查（与 afterEach 相同）。
+      const checkAdmin = createPostgresDatabase({ connectionString: adminUrl!, maxConnections: 1 });
+      const stillExists = await databaseExistsByName(checkAdmin, faultDbName);
+      await checkAdmin.close();
+      if (stillExists) {
+        cleanupEverFailed = true;
+      }
+      expect(cleanupEverFailed).toBe(true);
 
-      // 模拟后续恢复：手动删除数据库并清空列表。
+      // 释放连接后尽力删除（后续恢复）。
+      await holdConn.close();
       await dropHistoryImportDatabase(adminUrl!, faultDbName);
       const idx = temporaryDatabaseNames.indexOf(faultDbName);
       if (idx !== -1) temporaryDatabaseNames.splice(idx, 1);
 
-      // 列表已清空，但 cleanupEverFailed 仍为 true。
-      // afterAll 将因此抛出——这是预期行为。
+      // 最终状态：残留为零，列表清空，但 cleanupEverFailed 仍为 true。
+      const finalCheck = createPostgresDatabase({ connectionString: adminUrl!, maxConnections: 1 });
+      const finalExists = await databaseExistsByName(finalCheck, faultDbName);
+      await finalCheck.close();
+      expect(finalExists).toBe(false);
       expect(temporaryDatabaseNames.length).toBe(0);
       expect(cleanupEverFailed).toBe(true);
-    }, 30_000);
+      // afterAll 将因 cleanupEverFailed === true 抛出——预期行为。
+    }, 60_000);
   },
 );
