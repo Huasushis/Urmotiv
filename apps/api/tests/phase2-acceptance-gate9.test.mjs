@@ -433,6 +433,26 @@ function verifyGitConfigRestored() {
   }
 }
 
+// 每测试后把共享 worktree 恢复成隔离前状态：清除 index 标记（skip-worktree /
+// assume-unchanged），把 HEAD/树回滚到主检出 HEAD，删除测试缝注入的未跟踪突变文件。
+// 必需：afterEach 只恢复 git config 与共享排除规则，不恢复这些 worktree 突变，
+// 否则下一测试的「整树必须干净」预检被上一测试残留击穿。
+function resetWorktreeState(worktreeDirectory) {
+  const mainHead = git(repositoryRoot, "rev-parse", "HEAD").trim();
+  for (const rel of ["apps/api/package.json", "apps/api/tsconfig.json"]) {
+    for (const flag of ["--no-skip-worktree", "--no-assume-unchanged"]) {
+      try {
+        git(worktreeDirectory, "update-index", flag, rel);
+      } catch {
+        // 该文件上没有这个标记（Git 对未设置的位返回非零），继续。
+      }
+    }
+  }
+  git(worktreeDirectory, "checkout", "--quiet", "--detach", mainHead);
+  git(worktreeDirectory, "reset", "--hard");
+  git(worktreeDirectory, "clean", "-fd");
+}
+
 describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () => {
   beforeAll(async () => {
     snapshotGitConfig();
@@ -550,6 +570,16 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     }
     try {
       enableSharedExcludes();
+    } catch (error) {
+      cleanupError ??= error;
+    }
+    try {
+      // 最后再重置 worktree：git clean 必须在原始排除规则 / config 恢复后执行，
+      // 否则测试缝临时加入的 info/exclude 或 core.excludesFile 会把突变文件
+      // 视为已忽略而跳过清理，残留给下一测试的「整树必须干净」预检。
+      for (const worktreeDirectory of worktrees) {
+        resetWorktreeState(worktreeDirectory);
+      }
     } catch (error) {
       cleanupError ??= error;
     }
