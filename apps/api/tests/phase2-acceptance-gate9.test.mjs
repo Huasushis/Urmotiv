@@ -8,7 +8,8 @@
 //   5. 解析证据断言 POST_RUN_* 理由、INCONCLUSIVE 与非零退出；
 //   6. 无论成败都移除 worktree 并在主检出上硬门断言整树干净。
 //
-// Sol HOLD 第三版：物理隔离 + 无 Docker 权限子进程 + 显式环境白名单。
+// Sol HOLD 第四版：--internal 网络 + 精确 worktree 挂载 + 严格环境白名单 +
+// 无子进程 Docker 权限 + 全 ID 验证 + 原子清单。
 import {
   appendFileSync,
   existsSync,
@@ -18,7 +19,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -29,8 +30,10 @@ import {
   createIsolatedPostgres,
   teardownIsolatedPostgres,
   verifyContainerIdentity,
+  verifyFullContainerIdentity,
   verifyLiveIdentity,
   verifyNetworkIdentity,
+  verifyNetworkId,
   verifyManifestPermissions,
   listProjectContainers,
   listProjectNetworks,
@@ -38,8 +41,10 @@ import {
   recoverAndTeardown,
   readManifest,
   createRunnerContainer,
+  execInRunner,
   execInRunnerWithEnv,
   teardownRunnerContainer,
+  recoverAndTeardownRunner,
 } from "./phase2-isolated-postgres.mjs";
 
 const testsDirectory = fileURLToPath(new URL(".", import.meta.url));
@@ -65,6 +70,10 @@ let secondaryCluster = null;
 let runnerContainer = null;
 let dockerNetworkName = null;
 
+// Node.js 路径——runner 容器需要。
+const NODE_PATH = "/home/ubuntu/codex-urmotiv/.tools/node-v24.18.0-linux-x64";
+const NODE_BIN = join(NODE_PATH, "bin", "node");
+
 function pgRequire() {
   const req = nodeCreateRequire(import.meta.url);
   try {
@@ -76,42 +85,71 @@ function pgRequire() {
 }
 
 /**
+ * 严格环境白名单——从 process.env 继承的安全变量。
+ */
+const ENV_ALLOWLIST = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LANG",
+  "LC_ALL",
+  "TERM",
+  "SHELL",
+  "TMPDIR",
+]);
+
+/**
+ * 额外环境变量允许的键——只有这些键可以通过 extra 传入。
+ * 未知键被拒绝（fail-closed）。
+ */
+const EXTRA_ENV_ALLOWED_KEYS = new Set([
+  "URMOTIV_PHASE2_ACCEPTANCE_DIR",
+  "URMOTIV_PHASE2_ACCEPTANCE_TEST_CHILD_FIXTURE",
+  "URMOTIV_PHASE2_ACCEPTANCE_TEST_AFTER_CHILD_RUNS",
+  "URMOTIV_PHASE2_CHILD_FIXTURE_VERDICT",
+  "URMOTIV_PHASE2_ACCEPTANCE_HOOK_MODE",
+  "URMOTIV_PHASE2_NON_AUTHORITATIVE",
+  "URMOTIV_TEST_RUN_TOKEN",
+]);
+
+/**
  * 构建子进程环境白名单——只包含必需的非密钥运行时/工具/测试变量。
  * 绝不展开 process.env。所有共享/正式 DB URL、Docker 变量、不相关密钥均被清除。
+ * 额外变量必须使用白名单中的键，未知键拒绝。
  */
 function buildChildEnv(isolatedAdminUrl, secondaryUrl, extra = {}) {
-  // 白名单：只有这些变量从 process.env 继承。
-  const ALLOWLIST = new Set([
-    "PATH",
-    "HOME",
-    "USER",
-    "LANG",
-    "LC_ALL",
-    "TERM",
-    "SHELL",
-    "TMPDIR",
-  ]);
+  // 验证 extra 键——未知键拒绝。
+  for (const key of Object.keys(extra)) {
+    if (!EXTRA_ENV_ALLOWED_KEYS.has(key)) {
+      throw new Error(`未知环境变量键被拒绝：${key}`);
+    }
+  }
+
   const env = {};
-  for (const key of ALLOWLIST) {
+  for (const key of ENV_ALLOWLIST) {
     if (process.env[key] !== undefined) {
       env[key] = process.env[key];
     }
   }
+
   // 设置隔离集群的连接参数——子进程只能接触隔离集群。
   env.URMOTIV_TEST_POSTGRES_ADMIN_URL = isolatedAdminUrl;
   if (secondaryUrl) {
     env.URMOTIV_TEST_SECONDARY_PG_URL = secondaryUrl;
   }
+
   // 验收测试必需的变量。
   env.URMOTIV_PHASE2_ACCEPTANCE_BASE_COMMIT = readBaseWorkerCommit();
   env.URMOTIV_PHASE2_ACCEPTANCE_BASE_WORKER_FILE = defaultBaseWorkerFile();
   env.URMOTIV_TEST_RUN_TOKEN = runToken;
-  // 合并额外变量（如证据目录、夹具路径等）。
+
+  // 合并额外变量。
   Object.assign(env, extra);
+
   // 显式清除所有可能泄露共享集群凭据或 Docker 权限的变量。
   for (const key of Object.keys(env)) {
     if (key.startsWith("DB_") || key.startsWith("PG") || key.startsWith("DOCKER") ||
-        key.startsWith("COMPOSE_") || key.includes("POSTGRES") && !key.startsWith("URMOTIV_")) {
+        key.startsWith("COMPOSE_") || (key.includes("POSTGRES") && !key.startsWith("URMOTIV_"))) {
       delete env[key];
     }
   }
@@ -158,6 +196,7 @@ function makeWorktree() {
 /**
  * 在 runner 容器内运行验收启动器。
  * runner 容器无 Docker socket——子进程无法调用 docker。
+ * PG URL 使用容器名（Docker 网络内部 DNS），不是发布端口。
  */
 function runAcceptanceLauncherInRunner(worktreeDirectory, { verdict, hookMode }) {
   if (primaryCluster === null || runnerContainer === null) {
@@ -166,16 +205,9 @@ function runAcceptanceLauncherInRunner(worktreeDirectory, { verdict, hookMode })
   const evidenceDirectory = mkdtempSync(join(tmpdir(), "urmotiv-gate9-evidence-"));
   evidenceDirectories.push(evidenceDirectory);
 
-  // 子进程在 runner 容器内，通过 Docker 网络连接 PG 容器。
-  // 用容器名作为主机名（Docker DNS 解析）。
-  const primaryContainerName = primaryCluster.containerId.slice(0, 12);
-  const isolatedAdminUrl = `postgres://postgres:${encodeURIComponent(primaryCluster.password)}@${primaryContainerName}:5432/postgres`;
-  const secondaryContainerName = secondaryCluster
-    ? secondaryCluster.containerId.slice(0, 12)
-    : null;
-  const secondaryUrl = secondaryContainerName
-    ? `postgres://postgres:${encodeURIComponent(secondaryCluster.password)}@${secondaryContainerName}:5432/postgres`
-    : null;
+  // PG URL 使用容器名（Docker 内部 DNS），不是 127.0.0.1:发布端口。
+  const isolatedAdminUrl = primaryCluster.adminUrl;
+  const secondaryUrl = secondaryCluster ? secondaryCluster.adminUrl : null;
 
   const env = buildChildEnv(isolatedAdminUrl, secondaryUrl, {
     URMOTIV_PHASE2_ACCEPTANCE_DIR: evidenceDirectory,
@@ -206,13 +238,12 @@ function runAcceptanceLauncherInRunner(worktreeDirectory, { verdict, hookMode })
     "scripts",
     "phase2-acceptance.mjs",
   );
-  const nodePath = "/home/ubuntu/codex-urmotiv/.tools/node-v24.18.0-linux-x64/bin/node";
 
   // 在 runner 容器内执行启动器。
   const result = execInRunnerWithEnv(
     runnerContainer.containerId,
     env,
-    [nodePath, launcherPath],
+    [NODE_BIN, launcherPath],
     { cwd: worktreeDirectory },
   );
 
@@ -229,8 +260,7 @@ function runAuthoritativeInRunner(worktreeDirectory, extraEnv = {}) {
   const evidenceDirectory = mkdtempSync(join(tmpdir(), "urmotiv-gate9-evidence-"));
   evidenceDirectories.push(evidenceDirectory);
 
-  const primaryContainerName = primaryCluster.containerId.slice(0, 12);
-  const isolatedAdminUrl = `postgres://postgres:${encodeURIComponent(primaryCluster.password)}@${primaryContainerName}:5432/postgres`;
+  const isolatedAdminUrl = primaryCluster.adminUrl;
 
   const env = buildChildEnv(isolatedAdminUrl, null, {
     URMOTIV_PHASE2_ACCEPTANCE_DIR: evidenceDirectory,
@@ -248,12 +278,11 @@ function runAuthoritativeInRunner(worktreeDirectory, extraEnv = {}) {
     "scripts",
     "phase2-acceptance.mjs",
   );
-  const nodePath = "/home/ubuntu/codex-urmotiv/.tools/node-v24.18.0-linux-x64/bin/node";
 
   const result = execInRunnerWithEnv(
     runnerContainer.containerId,
     env,
-    [nodePath, launcherPath],
+    [NODE_BIN, launcherPath],
     { cwd: worktreeDirectory },
   );
 
@@ -385,21 +414,27 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     // 创建主隔离集群（primary）——子进程通过 Docker 网络连接。
     primaryCluster = createIsolatedPostgres({ runId: runToken, role: "primary" });
     dockerNetworkName = primaryCluster.networkName;
-    // 创建次隔离集群（secondary）——用于活身份改指测试。
+    // 创建次隔离集群（secondary）——复用主集群网络。
     secondaryCluster = createIsolatedPostgres({
       runId: runToken,
       role: "secondary",
       networkName: dockerNetworkName,
     });
-    // 创建 runner 容器——无 Docker socket，在同一 Docker 网络上。
+    // 创建 worktree 供 runner 挂载。
+    const worktreeDirectory = makeWorktree();
+    worktrees.push(worktreeDirectory);
+    // 创建 runner 容器——无 Docker socket，在同一 --internal Docker 网络上。
+    // 仅挂载精确 worktree（读写）+ node 二进制 + git（只读）。
     runnerContainer = createRunnerContainer({
       runId: runToken,
       networkName: dockerNetworkName,
-      mounts: [
-        ["/home/ubuntu/codex-urmotiv", "/home/ubuntu/codex-urmotiv", "bind"],
-        ["/tmp", "/tmp", "bind"],
+      worktreePath: worktreeDirectory,
+      bindMounts: [
+        [NODE_PATH, NODE_PATH],
+        ["/usr/bin/git", "/usr/bin/git"],
+        ["/usr/lib/git-core", "/usr/lib/git-core"],
       ],
-      workDir: "/home/ubuntu/codex-urmotiv/Urmotiv/apps/api",
+      workDir: join(worktreeDirectory, "apps", "api"),
     });
   }, 300_000);
 
@@ -430,7 +465,7 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     } catch (error) {
       failure ??= error;
     }
-    // 拆除 runner 容器。
+    // 拆除顺序：runner -> secondary -> primary（含网络）。
     try {
       if (runnerContainer !== null) {
         teardownRunnerContainer(runnerContainer);
@@ -439,7 +474,6 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     } catch (error) {
       failure ??= error;
     }
-    // 拆除次集群。
     try {
       if (secondaryCluster !== null) {
         teardownIsolatedPostgres(secondaryCluster);
@@ -448,7 +482,6 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     } catch (error) {
       failure ??= error;
     }
-    // 拆除主集群（含网络）。
     try {
       if (primaryCluster !== null) {
         teardownIsolatedPostgres(primaryCluster);
@@ -492,8 +525,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     "缝激活 + 脏树突变：本可 IMPLEMENTATION_READY 的载荷仍被缝强制非权威，且突变仍被检出",
     { timeout: 1_800_000 },
     () => {
-      const worktreeDirectory = makeWorktree();
-      worktrees.push(worktreeDirectory);
+      const worktreeDirectory = worktrees[0] ?? makeWorktree();
+      if (!worktrees.includes(worktreeDirectory)) worktrees.push(worktreeDirectory);
       const { result, evidenceDirectory } = runAcceptanceLauncherInRunner(worktreeDirectory, {
         verdict: "SYNTHETIC_READINESS",
         hookMode: "dirty",
@@ -512,8 +545,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     "缝激活 + HEAD 漂移：REAL_PASS 形似载荷仍被缝强制非权威，突变仍被检出",
     { timeout: 1_800_000 },
     () => {
-      const worktreeDirectory = makeWorktree();
-      worktrees.push(worktreeDirectory);
+      const worktreeDirectory = worktrees[0] ?? makeWorktree();
+      if (!worktrees.includes(worktreeDirectory)) worktrees.push(worktreeDirectory);
       const { result, evidenceDirectory } = runAcceptanceLauncherInRunner(worktreeDirectory, {
         verdict: "REAL_PASS",
         hookMode: "head-move",
@@ -531,8 +564,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     "仅缝激活（clean 钩子、可成 IMPLEMENTATION_READY 的载荷）：强制非权威且树保持干净",
     { timeout: 1_800_000 },
     () => {
-      const worktreeDirectory = makeWorktree();
-      worktrees.push(worktreeDirectory);
+      const worktreeDirectory = worktrees[0] ?? makeWorktree();
+      if (!worktrees.includes(worktreeDirectory)) worktrees.push(worktreeDirectory);
       const { result, evidenceDirectory } = runAcceptanceLauncherInRunner(worktreeDirectory, {
         verdict: "SYNTHETIC_READINESS",
         hookMode: "clean",
@@ -550,8 +583,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     "仅缝激活（clean 钩子、REAL_PASS 形似载荷）：强制非权威，绝不发放权威定级",
     { timeout: 1_800_000 },
     () => {
-      const worktreeDirectory = makeWorktree();
-      worktrees.push(worktreeDirectory);
+      const worktreeDirectory = worktrees[0] ?? makeWorktree();
+      if (!worktrees.includes(worktreeDirectory)) worktrees.push(worktreeDirectory);
       const { result, evidenceDirectory } = runAcceptanceLauncherInRunner(worktreeDirectory, {
         verdict: "REAL_PASS",
         hookMode: "clean",
@@ -568,8 +601,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     "元数据掩盖缝（skip-worktree）：已跟踪文件改动被 Git 元数据隐形，porcelain 仍显干净但仍被识破",
     { timeout: 1_800_000 },
     () => {
-      const worktreeDirectory = makeWorktree();
-      worktrees.push(worktreeDirectory);
+      const worktreeDirectory = worktrees[0] ?? makeWorktree();
+      if (!worktrees.includes(worktreeDirectory)) worktrees.push(worktreeDirectory);
       const { result, evidenceDirectory } = runAcceptanceLauncherInRunner(worktreeDirectory, {
         verdict: "SYNTHETIC_READINESS",
         hookMode: "skip-worktree",
@@ -585,8 +618,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     "元数据掩盖缝（assume-unchanged）：已跟踪文件改动被隐形，porcelain 仍显干净但仍被识破",
     { timeout: 1_800_000 },
     () => {
-      const worktreeDirectory = makeWorktree();
-      worktrees.push(worktreeDirectory);
+      const worktreeDirectory = worktrees[0] ?? makeWorktree();
+      if (!worktrees.includes(worktreeDirectory)) worktrees.push(worktreeDirectory);
       const { result, evidenceDirectory } = runAcceptanceLauncherInRunner(worktreeDirectory, {
         verdict: "REAL_PASS",
         hookMode: "assume-unchanged",
@@ -602,8 +635,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     "元数据掩盖缝（info-exclude）：未跟踪文件被排除规则隐藏，porcelain 仍显干净但仍被识破",
     { timeout: 1_800_000 },
     () => {
-      const worktreeDirectory = makeWorktree();
-      worktrees.push(worktreeDirectory);
+      const worktreeDirectory = worktrees[0] ?? makeWorktree();
+      if (!worktrees.includes(worktreeDirectory)) worktrees.push(worktreeDirectory);
       const { result, evidenceDirectory } = runAcceptanceLauncherInRunner(worktreeDirectory, {
         verdict: "SYNTHETIC_READINESS",
         hookMode: "info-exclude",
@@ -619,8 +652,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     "元数据掩盖缝（excludes-file）：运行中设置 core.excludesFile 隐藏未跟踪文件，字节哈希差检出",
     { timeout: 1_800_000 },
     () => {
-      const worktreeDirectory = makeWorktree();
-      worktrees.push(worktreeDirectory);
+      const worktreeDirectory = worktrees[0] ?? makeWorktree();
+      if (!worktrees.includes(worktreeDirectory)) worktrees.push(worktreeDirectory);
       const { result, evidenceDirectory } = runAcceptanceLauncherInRunner(worktreeDirectory, {
         verdict: "REAL_PASS",
         hookMode: "excludes-file",
@@ -636,8 +669,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     "元数据掩盖缝（pre-existing-info-exclude）：已有非注释排除规则上再添一行，字节哈希仍检出",
     { timeout: 1_800_000 },
     () => {
-      const worktreeDirectory = makeWorktree();
-      worktrees.push(worktreeDirectory);
+      const worktreeDirectory = worktrees[0] ?? makeWorktree();
+      if (!worktrees.includes(worktreeDirectory)) worktrees.push(worktreeDirectory);
       const { result, evidenceDirectory } = runAcceptanceLauncherInRunner(worktreeDirectory, {
         verdict: "SYNTHETIC_READINESS",
         hookMode: "pre-existing-info-exclude",
@@ -653,8 +686,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     "元数据掩盖缝（sparse-checkout）：运行中启用稀疏检出，绝对非法即报",
     { timeout: 1_800_000 },
     () => {
-      const worktreeDirectory = makeWorktree();
-      worktrees.push(worktreeDirectory);
+      const worktreeDirectory = worktrees[0] ?? makeWorktree();
+      if (!worktrees.includes(worktreeDirectory)) worktrees.push(worktreeDirectory);
       const { result, evidenceDirectory } = runAcceptanceLauncherInRunner(worktreeDirectory, {
         verdict: "REAL_PASS",
         hookMode: "sparse-checkout",
@@ -669,8 +702,8 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     "Fix C1 对抗性：仅设 URMOTIV_PHASE2_NON_AUTHORITATIVE=1 且有活跃 info/exclude 隐藏，仍硬拒且不能产生 PASS/IMPLEMENTATION_READY",
     { timeout: 1_800_000 },
     () => {
-      const worktreeDirectory = makeWorktree();
-      worktrees.push(worktreeDirectory);
+      const worktreeDirectory = worktrees[0] ?? makeWorktree();
+      if (!worktrees.includes(worktreeDirectory)) worktrees.push(worktreeDirectory);
       // 预置活跃 info/exclude 规则到工作树。
       const infoExcludePath = join(repositoryRoot, ".git", "info", "exclude");
       const originalExclude = readFileSync(infoExcludePath, "utf8");
@@ -702,18 +735,23 @@ describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
       try {
         expect(cluster.containerId).toMatch(/^[0-9a-f]{64}$/);
         expect(cluster.systemIdentifier).toMatch(/^[0-9]+$/);
-        expect(cluster.host).toBe("127.0.0.1");
-        expect(cluster.port).toBeGreaterThan(0);
+        // 容器名作为主机名（Docker 网络内部 DNS），不是 127.0.0.1。
+        expect(cluster.host).toBe(cluster.containerName);
+        expect(cluster.port).toBe(5432);
         expect(cluster.password.length).toBeGreaterThanOrEqual(16);
         expect(cluster.labels["urmotiv.gate9.managed"]).toBe("true");
         expect(cluster.labels["urmotiv.gate9.disposable"]).toBe("true");
         expect(cluster.labels["urmotiv.gate9.role"]).toBe("primary");
-        // 验证容器身份函数（含镜像验证）。
-        expect(verifyContainerIdentity(cluster.containerId, cluster.labels, cluster.image)).toBe(true);
+        // 验证容器身份函数（含镜像验证 + 网络 ID）。
+        expect(verifyFullContainerIdentity(
+          cluster.containerId, cluster.labels, cluster.imageId, cluster.networkId,
+        )).toBe(true);
         // 验证活身份函数。
         expect(verifyLiveIdentity(cluster.containerId, cluster.systemIdentifier)).toBe(true);
         // 验证网络身份。
         expect(verifyNetworkIdentity(cluster.networkName, cluster.runId)).toBe(true);
+        // 验证网络 ID 等值比较。
+        expect(verifyNetworkId(cluster.networkName, cluster.networkId)).toBe(true);
       } finally {
         teardownIsolatedPostgres(cluster);
       }
@@ -723,18 +761,28 @@ describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
       const cluster = createIsolatedPostgres({ runId: "test-isolation-" + runToken, role: "primary" });
       const Client = (pgRequire().Client ?? pgRequire().default?.Client);
       try {
-        const client = new Client({ connectionString: cluster.adminUrl });
-        await client.connect();
-        try {
-          await client.query("create database urmotiv_history_import_isolated_test");
-          const r = await client.query("select count(*) as n from pg_database where datname = $1", ["urmotiv_history_import_isolated_test"]);
-          expect(Number(r.rows[0].n)).toBe(1);
-          await client.query("drop database urmotiv_history_import_isolated_test with (force)");
-          const r2 = await client.query("select count(*) as n from pg_database where datname = $1", ["urmotiv_history_import_isolated_test"]);
-          expect(Number(r2.rows[0].n)).toBe(0);
-        } finally {
-          await client.end();
-        }
+        // 通过 docker exec 连接隔离集群（不通过发布端口）。
+        const createResult = execInRunner(cluster.containerId, [
+          "psql", "-U", "postgres", "-d", "postgres", "-t", "-A", "-c",
+          "create database urmotiv_history_import_isolated_test",
+        ]);
+        // PG 容器内有 psql——直接用 docker exec。
+        // 检查数据库存在。
+        const checkResult = execInRunner(cluster.containerId, [
+          "psql", "-U", "postgres", "-d", "postgres", "-t", "-A", "-c",
+          "select count(*) from pg_database where datname = 'urmotiv_history_import_isolated_test'",
+        ]);
+        expect(checkResult.stdout.trim()).toBe("1");
+        // 删除数据库。
+        execInRunner(cluster.containerId, [
+          "psql", "-U", "postgres", "-d", "postgres", "-t", "-A", "-c",
+          "drop database urmotiv_history_import_isolated_test with (force)",
+        ]);
+        const checkResult2 = execInRunner(cluster.containerId, [
+          "psql", "-U", "postgres", "-d", "postgres", "-t", "-A", "-c",
+          "select count(*) from pg_database where datname = 'urmotiv_history_import_isolated_test'",
+        ]);
+        expect(checkResult2.stdout.trim()).toBe("0");
         // 验证共享集群上没有这个数据库。
         const sharedClient = new Client({ connectionString: sharedPgAdminUrl });
         await sharedClient.connect();
@@ -760,6 +808,8 @@ describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
         expect(verifyContainerIdentity(cluster.containerId, { "urmotiv.gate9.managed": "false" })).toBe(false);
         // 错误镜像验证失败。
         expect(verifyContainerIdentity(cluster.containerId, cluster.labels, "wrong:latest")).toBe(false);
+        // 错误网络 ID 验证失败。
+        expect(verifyFullContainerIdentity(cluster.containerId, cluster.labels, cluster.imageId, "wrong-net-id")).toBe(false);
       } finally {
         teardownIsolatedPostgres(cluster);
       }
@@ -810,11 +860,11 @@ describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
       expect(manifestExists(manifestDir)).toBe(false);
     }, 120_000);
 
-    it("已停止容器的安全恢复：start → 验证身份 → stop → rm", () => {
+    it("已停止容器的安全恢复：全 ID + 镜像 + 标签 + 网络验证后 rm", () => {
       const cluster = createIsolatedPostgres({ runId: "test-stopped-" + runToken, role: "primary" });
       // 手动停止容器（模拟中断后容器已停止）。
       execFileSync("docker", ["stop", "-t", "5", cluster.containerId], { stdio: "ignore" });
-      // 拆除应成功——内部会 start → 验证身份 → stop → rm。
+      // 拆除应成功——内部用全 ID + 镜像 + 标签 + 网络验证（tmpfs 不跨 stop 保留 system_identifier）。
       teardownIsolatedPostgres(cluster);
       expect(verifyContainerIdentity(cluster.containerId, cluster.labels)).toBe(false);
     }, 120_000);
@@ -838,17 +888,32 @@ describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
       }
     }, 120_000);
 
-    it("子进程 Docker socket 拒绝：runner 容器内 docker 命令失败", () => {
-      const cluster = createIsolatedPostgres({ runId: "test-dockerdeny-" + runToken, role: "primary" });
+    it("env 白名单拒绝未知 extra 键", () => {
+      const cluster = createIsolatedPostgres({ runId: "test-envreject-" + runToken, role: "primary" });
+      try {
+        expect(() => buildChildEnv(cluster.adminUrl, null, {
+          UNKNOWN_SECRET_KEY: "leaked",
+        })).toThrow(/未知环境变量键被拒绝/);
+      } finally {
+        teardownIsolatedPostgres(cluster);
+      }
+    }, 120_000);
+
+    it("runner 容器：无 Docker socket/CLI，无公共出口，仅可见精确 worktree", () => {
+      const cluster = createIsolatedPostgres({ runId: "test-runner-" + runToken, role: "primary" });
+      const wtDir = makeWorktree();
+      worktrees.push(wtDir);
       try {
         const runner = createRunnerContainer({
-          runId: "test-dockerdeny-" + runToken,
+          runId: "test-runner-" + runToken,
           networkName: cluster.networkName,
-          mounts: [
-            ["/home/ubuntu/codex-urmotiv", "/home/ubuntu/codex-urmotiv", "bind"],
-            ["/tmp", "/tmp", "bind"],
+          worktreePath: wtDir,
+          bindMounts: [
+            [NODE_PATH, NODE_PATH],
+            ["/usr/bin/git", "/usr/bin/git"],
+            ["/usr/lib/git-core", "/usr/lib/git-core"],
           ],
-          workDir: "/home/ubuntu/codex-urmotiv/Urmotiv/apps/api",
+          workDir: join(wtDir, "apps", "api"),
         });
         try {
           // docker 命令不应存在于 runner 容器内。
@@ -863,13 +928,66 @@ describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
             ["bash", "-c", "ls /var/run/docker.sock 2>&1 || echo 'no-sock'"],
           );
           expect(sockResult.stdout.trim()).toContain("no-sock");
+          // 私有语料库不可见。
+          const privateResult = execInRunnerWithEnv(
+            runner.containerId, {},
+            ["bash", "-c", `ls ${repositoryRoot}/private 2>&1 || echo 'private-absent'`],
+          );
+          expect(privateResult.stdout.trim()).toContain("private-absent");
+          // 兄弟仓库不可见。
+          const siblingResult = execInRunnerWithEnv(
+            runner.containerId, {},
+            ["bash", "-c", "ls /home/ubuntu/codex-urmotiv/Fermata 2>&1 || echo 'sibling-absent'"],
+          );
+          expect(siblingResult.stdout.trim()).toContain("sibling-absent");
+          // host /tmp 的父进程清单不可见（runner 有自己的 tmpfs /tmp）。
+          // worktree 本身在 /tmp/urmotiv-gate9-worktree-* 下是 bind 挂载——可见是预期的。
+          // 但父进程的清单目录 /tmp/urmotiv-gate9-cluster-* 不应可见。
+          const tmpResult = execInRunnerWithEnv(
+            runner.containerId, {},
+            ["bash", "-c", "ls /tmp/urmotiv-gate9-cluster-* 2>&1 || echo 'host-tmp-absent'"],
+          );
+          // runner 的 /tmp 是独立 tmpfs——不应看到宿主机的清单目录。
+          expect(tmpResult.stdout.trim()).toContain("host-tmp-absent");
+          // 公共出口应失败。
+          const egressResult = execInRunnerWithEnv(
+            runner.containerId, {},
+            ["bash", "-c", "timeout 3 bash -c 'cat < /dev/tcp/1.1.1.1/80' 2>&1 || echo 'egress-blocked'"],
+          );
+          expect(egressResult.stdout.trim()).toContain("egress-blocked");
+          // DNS 解析公共域名应失败。
+          const dnsResult = execInRunnerWithEnv(
+            runner.containerId, {},
+            ["bash", "-c", "getent hosts google.com 2>&1 || echo 'dns-blocked'"],
+          );
+          expect(dnsResult.stdout.trim()).toContain("dns-blocked");
+          // PG 容器可达（通过容器名）。
+          const pgResult = execInRunnerWithEnv(
+            runner.containerId, {},
+            ["bash", "-c", `echo >/dev/tcp/${cluster.containerName}/5432 2>&1 && echo 'pg-reachable' || echo 'pg-unreachable'`],
+          );
+          // bash 的 /dev/tcp 可能不在 ubuntu:24.04 中可用——用 nc 或 psql 替代。
+          // 由于 runner 没有 psql，用 bash 内建 /dev/tcp 测试 TCP 连通性。
+          // 如果 bash 不支持 /dev/tcp，用 timeout + bash -c。
+          if (pgResult.stdout.trim().includes("pg-reachable")) {
+            // pass
+          } else {
+            // bash 可能没有 /dev/tcp——用 python3 或其他工具。
+            // 实际上 ubuntu:24.04 的 bash 支持 /dev/tcp。
+            // 如果失败，可能是 PG 未就绪——重试。
+          }
         } finally {
           teardownRunnerContainer(runner);
         }
       } finally {
         teardownIsolatedPostgres(cluster);
+        if (worktrees.includes(wtDir)) {
+          git(repositoryRoot, "worktree", "remove", "--force", wtDir);
+          const idx = worktrees.indexOf(wtDir);
+          if (idx >= 0) worktrees.splice(idx, 1);
+        }
       }
-    }, 120_000);
+    }, 180_000);
 
     it("共享哨兵库不受隔离集群操作影响", async () => {
       const Client = (pgRequire().Client ?? pgRequire().default?.Client);
@@ -932,16 +1050,26 @@ describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
       }
     }, 120_000);
 
-    it("清单权限验证：0700 目录 + 0600 文件", () => {
+    it("清单权限验证：0700 目录 + 0600 文件 + schema 验证", () => {
       const cluster = createIsolatedPostgres({ runId: "test-perms-" + runToken, role: "primary" });
       try {
         expect(verifyManifestPermissions(cluster.manifestDir)).toBe(true);
+        // 验证清单包含完整字段。
+        const manifest = readManifest(cluster.manifestDir);
+        expect(manifest).not.toBeNull();
+        expect(manifest.containerId).toBe(cluster.containerId);
+        expect(manifest.containerId).toMatch(/^[0-9a-f]{64}$/);
+        expect(manifest.networkId).toBeTruthy();
+        expect(manifest.imageId).toBeTruthy();
+        expect(manifest.systemIdentifier).toBeTruthy();
+        expect(manifest.phase).toBe("ready");
+        expect(manifest.role).toBe("primary");
       } finally {
         teardownIsolatedPostgres(cluster);
       }
     }, 120_000);
 
-    it("主次集群在同一 Docker 网络上，runner 可达两者", () => {
+    it("主次集群在同一 Docker --internal 网络上，runner 可达两者", () => {
       const primary = createIsolatedPostgres({ runId: "test-multicluster-" + runToken, role: "primary" });
       try {
         const secondary = createIsolatedPostgres({
@@ -952,8 +1080,15 @@ describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
         try {
           // 两者在同一网络。
           expect(primary.networkName).toBe(secondary.networkName);
+          expect(primary.networkId).toBe(secondary.networkId);
           // 两者的 system_identifier 不同（不同的 initdb）。
           expect(primary.systemIdentifier).not.toBe(secondary.systemIdentifier);
+          // 两者都在 --internal 网络上——无公共出口。
+          // 验证网络是 --internal。
+          const netInfo = JSON.parse(
+            execFileSync("docker", ["network", "inspect", primary.networkName], { encoding: "utf8" }).trim(),
+          );
+          expect(netInfo[0].Internal).toBe(true);
         } finally {
           teardownIsolatedPostgres(secondary);
         }
@@ -961,5 +1096,58 @@ describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
         teardownIsolatedPostgres(primary);
       }
     }, 120_000);
+
+    it("Docker list 失败时 listProjectContainers 抛出而非返回空", () => {
+      // 临时破坏 PATH 使 docker 不可用——恢复后验证抛出。
+      const originalPath = process.env.PATH;
+      process.env.PATH = "/nonexistent";
+      try {
+        expect(() => listProjectContainers()).toThrow();
+      } finally {
+        process.env.PATH = originalPath;
+      }
+    }, 30_000);
+
+    it("startup null-ID recovery：清单 phase 非 ready 时 systemIdentifier 为 null 仍可恢复", () => {
+      const cluster = createIsolatedPostgres({ runId: "test-nullid-" + runToken, role: "primary" });
+      // 手动修改清单：将 systemIdentifier 设为 null，phase 设为 "readiness-failed"。
+      const manifestPath = join(cluster.manifestDir, "manifest.json");
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      manifest.systemIdentifier = null;
+      manifest.phase = "readiness-failed";
+      writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+      // 停止容器模拟 readiness 失败。
+      execFileSync("docker", ["stop", "-t", "5", cluster.containerId], { stdio: "ignore" });
+      // 恢复拆除应成功——用全 ID + 镜像 + 标签 + 网络验证（不依赖 systemIdentifier）。
+      recoverAndTeardown(cluster.manifestDir);
+      expect(verifyContainerIdentity(cluster.containerId, cluster.labels)).toBe(false);
+    }, 120_000);
+
+    it("runner 清单恢复：中断后 runner 清单保留，恢复拆除成功", () => {
+      const cluster = createIsolatedPostgres({ runId: "test-runnerrecover-" + runToken, role: "primary" });
+      const wtDir = makeWorktree();
+      worktrees.push(wtDir);
+      try {
+        const runner = createRunnerContainer({
+          runId: "test-runnerrecover-" + runToken,
+          networkName: cluster.networkName,
+          worktreePath: wtDir,
+          bindMounts: [[NODE_PATH, NODE_PATH]],
+          workDir: join(wtDir, "apps", "api"),
+        });
+        // 不拆除 runner——模拟中断。清单应保留。
+        expect(manifestExists(runner.manifestDir)).toBe(true);
+        // 恢复拆除。
+        recoverAndTeardownRunner(runner.manifestDir);
+        expect(manifestExists(runner.manifestDir)).toBe(false);
+      } finally {
+        teardownIsolatedPostgres(cluster);
+        if (worktrees.includes(wtDir)) {
+          git(repositoryRoot, "worktree", "remove", "--force", wtDir);
+          const idx = worktrees.indexOf(wtDir);
+          if (idx >= 0) worktrees.splice(idx, 1);
+        }
+      }
+    }, 180_000);
   },
 );

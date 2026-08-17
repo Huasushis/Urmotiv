@@ -237,6 +237,8 @@ async function startTcpProxy(initialTargetPort: number): Promise<TcpProxyHandle>
         targetHost = portOrHost;
         targetPort = port;
       } else if (typeof portOrHost === "number") {
+        // 端口重置时同时恢复主机名——避免改指到次集群后主机名残留。
+        targetHost = proxyHost;
         targetPort = portOrHost;
       }
     },
@@ -289,39 +291,29 @@ function parseClusterEndpoint(url: string): { host: string; port: number } {
 }
 
 /**
- * 获取第二集群：如果父进程提供了 URMOTIV_TEST_SECONDARY_PG_URL，直接使用
- * （gate9 隔离模式——子进程无 Docker 权限）。否则自行创建 Docker 容器
- * （独立运行模式——需要 Docker 访问权限）。
+ * 获取第二集群：父进程必须通过 URMOTIV_TEST_SECONDARY_PG_URL 提供次集群 URL。
+ * 子进程无 Docker 权限——缺失/无效时硬失败（fail-closed）。
+ * 不再有任何 Docker 回退逻辑。
  */
-function startSecondCluster(containerName: string, port: number): { url: string; stop(): void } {
+function startSecondCluster(): { url: string; stop(): void } {
   const secondaryUrl = process.env.URMOTIV_TEST_SECONDARY_PG_URL;
-  if (secondaryUrl !== undefined) {
-    // 父进程已创建次集群——子进程只使用 URL，不调用 docker。
-    return {
-      url: secondaryUrl,
-      stop() {
-        // 无操作——父进程负责拆除。
-      },
-    };
+  if (typeof secondaryUrl !== "string" || secondaryUrl.trim().length === 0) {
+    throw new Error(
+      "活身份改指测试要求 URMOTIV_TEST_SECONDARY_PG_URL——子进程无 Docker 权限，" +
+      "父进程必须提供次集群 URL。",
+    );
   }
-  // 独立运行模式：自行创建 Docker 容器。
-  spawnSync("docker", ["rm", "-f", containerName], { encoding: "utf8" });
-  const image =
-    process.env.URMOTIV_LIVEIDENT_PG_IMAGE ?? "docker.m.daocloud.io/library/postgres:17-alpine";
-  const run = spawnSync(
-    "docker",
-    ["run", "-d", "--rm", "--name", containerName, "-p", `127.0.0.1:${String(port)}:5432`,
-      "-e", "POSTGRES_USER=postgres", "-e", "POSTGRES_PASSWORD=test-password",
-      "-e", "POSTGRES_DB=postgres", image],
-    { encoding: "utf8" },
-  );
-  if (run.status !== 0) {
-    throw new Error(`无法启动第二活身份集群（docker 不可用或冲突）。${run.stderr}`);
+  // 验证 URL 可解析。
+  try {
+    // eslint-disable-next-line no-new
+    new URL(secondaryUrl);
+  } catch {
+    throw new Error(`URMOTIV_TEST_SECONDARY_PG_URL 无效：${secondaryUrl}`);
   }
   return {
-    url: `postgres://postgres:test-password@127.0.0.1:${String(port)}/postgres`,
+    url: secondaryUrl,
     stop() {
-      spawnSync("docker", ["rm", "-f", containerName], { encoding: "utf8" });
+      // 无操作——父进程负责拆除。
     },
   };
 }
@@ -1655,12 +1647,10 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       // 监听端口），中间放一个可拨号的 TCP 代理：验收与管理连接串文本
       // 从头到尾不变，只有代理背后的真实端点被改指 —— 文本哈希必然
       // 通过，唯一能识破的就是新活连接采集的服务器端口/集群指纹。
-      const clusterPort = await freePort();
-      const containerName = `urmotiv-liveident-${process.pid}`;
-      const secondCluster = startSecondCluster(containerName, clusterPort);
+      const secondCluster = startSecondCluster();
       const proxy = await startTcpProxy(primaryPort);
       try {
-        expect(await postgresReady(secondCluster.url, 60)).toBe(true);
+        // 父进程已验证次集群就绪——子进程无法从宿主机解析 Docker 网络容器名。
         const liveSourceName = scratchName("livsrc");
         trackDatabaseFamily(liveSourceName);
         await prepareHistoryImportDatabase(proxy.url, liveSourceName);
@@ -1806,12 +1796,10 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
     async () => {
       assertNode24();
       if (adminUrl === undefined) throw new Error("缺少 PostgreSQL 管理连接配置。");
-      const clusterPort = await freePort();
-      const containerName = `urmotiv-livebound-${process.pid}`;
-      const secondCluster = startSecondCluster(containerName, clusterPort);
+      const secondCluster = startSecondCluster();
       const proxy = await startTcpProxy(primaryPort);
       try {
-        expect(await postgresReady(secondCluster.url, 60)).toBe(true);
+        // 父进程已验证次集群就绪——子进程无法从宿主机解析 Docker 网络容器名。
         const liveSourceName = scratchName("lbsrc");
         trackDatabaseFamily(liveSourceName);
         // B 上预先建好同名库：复核连接能在 B 成功打开，身份复核本身
