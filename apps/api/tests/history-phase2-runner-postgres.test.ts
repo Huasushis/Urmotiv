@@ -184,7 +184,12 @@ interface TcpProxyHandle {
 
 /**
  * 启动 TCP 代理：连接串文本不变，只有代理背后的真实端点被改指。
- * 密码和主机从 adminUrl 解析——不再硬编码 test-password/127.0.0.1:5434。
+ * 密码和上游主机从 adminUrl 解析——不再硬编码 test-password/127.0.0.1:5434。
+ *
+ * 监听主机与上游主机必须分离：adminUrl 的主机名是主集群容器 DNS 名
+ * （Docker --internal 网络内可见），但代理进程跑在 runner 容器里——
+ * 与主集群是不同的网络命名空间绑定面。监听必须绑 runner 本地回环
+ * 127.0.0.1，返回的连接串也用回环；上游连接才指向主集群容器地址。
  */
 async function startTcpProxy(initialTargetPort: number): Promise<TcpProxyHandle> {
   const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
@@ -193,8 +198,12 @@ async function startTcpProxy(initialTargetPort: number): Promise<TcpProxyHandle>
   }
   const parsed = new URL(adminUrl);
   const proxyPassword = decodeURIComponent(parsed.password);
-  const proxyHost = parsed.hostname;
-  let targetHost = proxyHost;
+  // 上游主机：主集群容器 DNS 名（adminUrl 主机名）。
+  const upstreamHost = parsed.hostname;
+  // 监听主机：runner 本地回环——代理进程与主集群在不同网络命名空间，
+  // 不能把监听套接字绑到主集群容器地址。
+  const listenerHost = "127.0.0.1";
+  let targetHost = upstreamHost;
   let targetPort = initialTargetPort;
   const clients = new Set<Socket>();
   const upstreams = new Set<Socket>();
@@ -224,21 +233,22 @@ async function startTcpProxy(initialTargetPort: number): Promise<TcpProxyHandle>
   });
   await new Promise<void>((resolve, reject) => {
     proxy.once("error", reject);
-    proxy.listen(0, proxyHost, () => resolve());
+    proxy.listen(0, listenerHost, () => resolve());
   });
   const address = proxy.address();
   if (typeof address === "string" || address === null) {
     throw new Error("活身份代理端口不可用。");
   }
   return {
-    url: `postgres://postgres:${encodeURIComponent(proxyPassword)}@${proxyHost}:${address.port}/postgres`,
+    url: `postgres://postgres:${encodeURIComponent(proxyPassword)}@${listenerHost}:${address.port}/postgres`,
     setTarget(portOrHost: number | string, port?: number) {
       if (typeof portOrHost === "string" && typeof port === "number") {
         targetHost = portOrHost;
         targetPort = port;
       } else if (typeof portOrHost === "number") {
-        // 端口重置时同时恢复主机名——避免改指到次集群后主机名残留。
-        targetHost = proxyHost;
+        // 端口重置时同时恢复主机名——改指到次集群后上游主机名不能残留，
+        // 应回到主集群容器地址（上游），而非监听回环。
+        targetHost = upstreamHost;
         targetPort = portOrHost;
       }
     },
