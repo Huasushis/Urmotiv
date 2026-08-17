@@ -19,6 +19,10 @@ import {
   type QaStateStore,
 } from "../src/history-migration/qa-gate";
 import { HistoryNormalizationError } from "../src/history-migration/errors";
+import {
+  createDeepSeekReviewClient,
+  qaReviewThinkingBudgetTokens,
+} from "../src/history-migration/qa-review-client";
 
 const sourceMappingHex = sha256Hex("synthetic-mapping");
 
@@ -352,6 +356,7 @@ describe("runQaGate 有界并发与重试", () => {
       verdict: "ANOMALY",
       attemptCount: 0,
       secondReviewCount: 0,
+      disposition: null,
     };
     const items = [makeItem(1, makeCandidate(1)), makeItem(2, makeCandidate(2)), makeItem(3, makeCandidate(3))];
     const spy = createReviewerSpy(() => resultFor("PASS"));
@@ -366,6 +371,258 @@ describe("runQaGate 有界并发与重试", () => {
     expect(result.anomaly).toBe(1);
   });
 });
+
+describe("runQaGate 风险标记项处置与防臆造", () => {
+  /** 构造带 possible-fabricated-solution 风险的题号项。 */
+  function makeFabricatedRiskItem(id: number): QaItem {
+    const source = sourceTextFor(id);
+    return makeItemForSource(id, source, makeCandidateForSource(source, id, { solution: "候选臆造的题解" }));
+  }
+
+  it("风险标记项不再短路：请求携带 deterministicRisks，处置写入终态", async () => {
+    const requests: QaReviewRequest[] = [];
+    const reviewer: QaReviewer = async (request) => {
+      requests.push(request);
+      return { verdict: "PASS", reasons: ["人工式核对后确认误报。"], disposition: "verified-false-positive" };
+    };
+    const item = makeFabricatedRiskItem(21);
+    const store = memoryStore();
+    const result = await runQaGate([item], reviewer, store, fastOptions);
+    expect(result.error).toBe(0);
+    expect(result.account.map((entry) => entry.verdict)).toEqual(["PASS"]);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.deterministicRisks).toContain("possible-fabricated-solution");
+    const persisted = await store.read(21);
+    expect(persisted?.verdict).toBe("PASS");
+    expect(persisted?.disposition).toBe("verified-false-positive");
+  });
+
+  it("二次评审保留主评审处置：secondary 未给处置时不抹掉", async () => {
+    const reviewer: QaReviewer = async (request) => {
+      if (request.secondAttempt) {
+        return { verdict: "ANOMALY", reasons: ["复核仍异常。"] };
+      }
+      return { verdict: "ANOMALY", reasons: ["主评审异常。"], disposition: "corrected" };
+    };
+    const store = memoryStore();
+    const result = await runQaGate([makeFabricatedRiskItem(22)], reviewer, store, fastOptions);
+    expect(result.anomaly).toBe(1);
+    const persisted = await store.read(22);
+    expect(persisted?.disposition).toBe("corrected");
+    expect(persisted?.secondReviewCount).toBe(1);
+  });
+
+  it("二次评审提供了处置时覆盖主评审处置", async () => {
+    const reviewer: QaReviewer = async (request) => {
+      if (request.secondAttempt) {
+        return { verdict: "ANOMALY", reasons: ["复核确认缺失。"], disposition: "genuinely-unresolved-preserved-missing" };
+      }
+      return { verdict: "ANOMALY", reasons: ["主评审异常。"], disposition: "corrected" };
+    };
+    const store = memoryStore();
+    await runQaGate([makeFabricatedRiskItem(24)], reviewer, store, fastOptions);
+    const persisted = await store.read(24);
+    expect(persisted?.disposition).toBe("genuinely-unresolved-preserved-missing");
+  });
+
+  it("clean 项不带 risks 也不要求处置：终态 disposition 为 null", async () => {
+    const requests: QaReviewRequest[] = [];
+    const reviewer: QaReviewer = async (request) => {
+      requests.push(request);
+      return resultFor("PASS");
+    };
+    const store = memoryStore();
+    await runQaGate([makeItem(25, makeCandidate(25))], reviewer, store, fastOptions);
+    expect(requests[0]?.deterministicRisks).toBeUndefined();
+    const persisted = await store.read(25);
+    expect(persisted?.verdict).toBe("PASS");
+    expect(persisted?.disposition).toBeNull();
+  });
+
+  it("防臆造：QA 门只记 verdict/处置，不写候选内容；候选原文不落库", async () => {
+    const candidate = makeCandidate(26);
+    const store = memoryStore();
+    await runQaGate([makeItem(26, candidate)], createStaticReviewer("PASS"), store, fastOptions);
+    const persisted = await store.read(26);
+    expect(persisted).toBeDefined();
+    const keys = persisted ? Object.keys(persisted) : [];
+    expect(keys).not.toContain("candidateText");
+    expect(keys).not.toContain("problem");
+    expect(persisted?.id).toBe(26);
+  });
+
+  it("非重试型 schema 失败不重放：只调用一次并整门失败，状态保持未终态", async () => {
+    const item = makeFabricatedRiskItem(27);
+    const spy = createReviewerSpy(() => {
+      throw new HistoryNormalizationError("schema", "评审输出 schema 不符。");
+    });
+    const store = memoryStore();
+    await expect(runQaGate([item], spy.reviewer, store, {
+      ...fastOptions,
+      concurrency: 1,
+      maximumAttempts: 3,
+    })).rejects.toThrow("评审输出 schema 不符");
+    expect(spy.calls).toHaveLength(1);
+    expect(await store.read(27)).toBeNull();
+  });
+});
+
+describe("两阶段真实客户端 + 有界重试（传输注入）", () => {
+  function sseChunk(payload: unknown): string {
+    return `data: ${JSON.stringify(payload)}\n\n`;
+  }
+  function sseDelta(payload: unknown): string {
+    return sseChunk({ choices: [{ delta: payload }] });
+  }
+  function sseDone(): string {
+    return sseChunk({ choices: [] });
+  }
+  function streamResponse(chunks: readonly string[]): Response {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+        controller.close();
+      },
+    });
+    return new Response(body) as Response;
+  }
+  function transportClient(fetchImpl: (input: URL, init: RequestInit) => Promise<Response>): {
+    readonly reviewer: QaReviewer;
+    readonly fetchCalls: () => number;
+  } {
+    let calls = 0;
+    const reviewer = createDeepSeekReviewClient({
+      baseUrl: "https://example.test/v1/",
+      apiKey: "test-key",
+      model: "deepseek-v4-flash",
+      fetch: async (input, init) => {
+        calls += 1;
+        return fetchImpl(input, init);
+      },
+    });
+    return { reviewer, fetchCalls: () => calls };
+  }
+
+  it("零字节后重试成功：第 1 次空流，第 2 次起正常，最终 PASS 且不重复完成", async () => {
+    const item = makeItem(31, makeCandidate(31));
+    let fetchCount = 0;
+    const { reviewer, fetchCalls } = transportClient(async (_input: URL, init: RequestInit) => {
+      fetchCount += 1;
+      const body = JSON.parse(init.body as string) as { readonly thinking: { readonly type: string } };
+      if (fetchCount === 1 || body.thinking.type === "enabled") {
+        if (fetchCount === 1) return streamResponse([]);
+        return streamResponse([sseDelta({ reasoning_content: "复评推理。", content: "正文" }), sseDone()]);
+      }
+      return streamResponse([
+        sseDelta({ content: '{"verdict":"PASS","reasons":["复评通过。"]}' }),
+        sseDone(),
+      ]);
+    });
+    const store = memoryStore();
+    const result = await runQaGate([item], reviewer, store, {
+      ...fastOptions,
+      concurrency: 1,
+      maximumAttempts: 3,
+    });
+    expect(result.pass).toBe(1);
+    expect(result.error).toBe(0);
+    expect(result.total).toBe(1);
+    expect(fetchCalls()).toBe(3);
+    const persisted = await store.read(31);
+    expect(persisted?.verdict).toBe("PASS");
+    expect(persisted?.attemptCount).toBe(1);
+  });
+
+  it("零字节持续失败：到达尝试上限后整门失败，不重复记账", async () => {
+    const item = makeItem(32, makeCandidate(32));
+    const { reviewer, fetchCalls } = transportClient(async () => streamResponse([]));
+    const store = memoryStore();
+    await expect(
+      runQaGate([item], reviewer, store, { ...fastOptions, concurrency: 1, maximumAttempts: 3 }),
+    ).rejects.toMatchObject({ failureKind: "connection" });
+    expect(fetchCalls()).toBe(3);
+    expect(await store.read(32)).toBeNull();
+  });
+
+  it("部分字节失败只尝试一次：阶段一有字节后阶段二输出非法，不重放", async () => {
+    const item = makeItem(33, makeCandidate(33));
+    let stage1Calls = 0;
+    const { reviewer, fetchCalls } = transportClient(async (_input: URL, init: RequestInit) => {
+      if (JSON.parse(init.body as string).thinking.type === "enabled") {
+        stage1Calls += 1;
+        return streamResponse([sseDelta({ reasoning_content: "部分推理。" }), sseDone()]);
+      }
+      return streamResponse([sseDelta({ content: "{not json" }), sseDone()]);
+    });
+    const store = memoryStore();
+    await expect(
+      runQaGate([item], reviewer, store, { ...fastOptions, concurrency: 1, maximumAttempts: 3 }),
+    ).rejects.toMatchObject({ failureKind: "invalid_json" });
+    expect(stage1Calls).toBe(1);
+    expect(fetchCalls()).toBe(2);
+    expect(await store.read(33)).toBeNull();
+  });
+
+  it("429 到达尝试上限后整门失败，每次评审只记一次完成", async () => {
+    const item = makeItem(34, makeCandidate(34));
+    const { reviewer, fetchCalls } = transportClient(async (_input: URL, _init: RequestInit) =>
+      new Response("", { status: 429 }) as Response,
+    );
+    const store = memoryStore();
+    await expect(
+      runQaGate([item], reviewer, store, { ...fastOptions, concurrency: 1, maximumAttempts: 3 }),
+    ).rejects.toMatchObject({ failureKind: "http_429" });
+    expect(fetchCalls()).toBe(3);
+    expect(await store.read(34)).toBeNull();
+  });
+
+  it("不泄露原始响应：persisted state 与结果只含结构化字段", async () => {
+    const candidate = makeCandidate(35);
+    const item = makeItem(35, candidate);
+    const { reviewer } = transportClient(async (_input: URL, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as { readonly thinking: { readonly type: string } };
+      if (body.thinking.type === "enabled") {
+        return streamResponse([sseDelta({ reasoning_content: "评审推理与原始材料。", content: candidate }),
+          sseDone()]);
+      }
+      return streamResponse([
+        sseDelta({ content: '{"verdict":"PASS","disposition":"verified-false-positive","reasons":["复评通过。"]}' }),
+        sseDone(),
+      ]);
+    });
+    const store = memoryStore();
+    await runQaGate([item], reviewer, store, { ...fastOptions, concurrency: 1 });
+    const persisted = await store.read(35);
+    expect(persisted?.verdict).toBe("PASS");
+    expect(persisted?.disposition).toBe("verified-false-positive");
+    for (const key of ["sourceText", "candidateText", "problem", "content"]) {
+      expect(JSON.stringify(persisted)).not.toContain(`"${key}":`);
+    }
+    expect(JSON.stringify(persisted)).not.toContain("评审推理与原始材料");
+  });
+
+  it("阶段一请求保持最大推理序列化形态（thinking 启用、含预算、无 response_format）", async () => {
+    const item = makeItem(36, makeCandidate(36));
+    const stageOneBodies: Record<string, unknown>[] = [];
+    const { reviewer } = transportClient(async (_input: URL, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as Record<string, unknown>;
+      if ((body.thinking as { readonly type: string }).type === "enabled") {
+        stageOneBodies.push(body);
+        return streamResponse([sseDelta({ reasoning_content: "推理", content: "正文" }), sseDone()]);
+      }
+      return streamResponse([sseDelta({ content: '{"verdict":"PASS","reasons":["通过。"]}' }), sseDone()]);
+    });
+    await runQaGate([item], reviewer, memoryStore(), { ...fastOptions, concurrency: 1 });
+    expect(stageOneBodies).toHaveLength(1);
+    expect(stageOneBodies[0]?.response_format).toBeUndefined();
+    expect(stageOneBodies[0]?.thinking).toEqual({ type: "enabled", budget_tokens: qaReviewThinkingBudgetTokens });
+  });
+});
+
+function createStaticReviewer(verdict: "PASS" | "ANOMALY" | "ERROR"): QaReviewer {
+  return async () => resultFor(verdict);
+}
 
 describe("createFileQaStateStore 文件后端", () => {
   let directory: string;
@@ -382,6 +639,7 @@ describe("createFileQaStateStore 文件后端", () => {
       verdict: "PASS",
       attemptCount: 0,
       secondReviewCount: 0,
+      disposition: null,
     };
     await store.write(state);
     expect(await store.read(17)).toEqual(state);
@@ -405,6 +663,7 @@ describe("createFileQaStateStore 文件后端", () => {
       verdict: "ERROR",
       attemptCount: 0,
       secondReviewCount: 0,
+      disposition: null,
     };
     await fileStore.write(firstState);
     await expect(readFile(join(directory, qaStateFileName(5)), "utf8")).resolves.toContain("ERROR");

@@ -12,6 +12,8 @@ export {
   collectMarkdownRefs,
   qaStateFileName,
   qaCliConcurrencyMinimum,
+  qaCliConcurrencyDefault,
+  qaCliConcurrencyMaximum,
 } from "../src/history-migration/qa-gate";
 export type {
   QaItem,
@@ -23,13 +25,12 @@ export type {
   QaStateStore,
   RunQaGateOptions,
   RunQaGateResult,
+  QaRunProgress,
 } from "../src/history-migration/qa-gate";
 export { createDeepSeekReviewClient } from "../src/history-migration/qa-review-client";
 export type {
   DeepSeekReviewClientOptions,
 } from "../src/history-migration/qa-review-client";
-
-const qaCliMaximum = 16;
 
 interface CliItemManifestEntry {
   readonly id: number;
@@ -60,7 +61,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 async function main(argv: readonly string[], env: NodeJS.ProcessEnv): Promise<number> {
   const outcome = await runCliGate({
     manifestPath: readArg(argv, "--items-manifest"),
-    requestedConcurrency: Number(readArg(argv, "--concurrency", String(qaCliConcurrencyMinimum))),
+    requestedConcurrency: Number(readArg(argv, "--concurrency", String(qaCliConcurrencyDefault))),
     stateDirectory: readArg(argv, "--state", "state"),
     env,
   });
@@ -96,7 +97,24 @@ async function runCliGate(options: {
     expectedSourceId: entry.expectedSourceId,
     sourceMappingSha256: entry.sourceMappingSha256,
   }));
-  const result = await runQaGate(items, reviewer, store, { concurrency });
+  const startMs = Date.now();
+  let lastPrinted = 0;
+  const result = await runQaGate(items, reviewer, store, {
+    concurrency,
+    onProgress(progress) {
+      const elapsedMs = Date.now() - startMs;
+      const done = progress.completed > 0 ? progress.completed : 1;
+      const etaMs = (elapsedMs / done) * progress.notStarted;
+      if (Date.now() - lastPrinted < 5_000 && progress.inFlight > 0) return;
+      lastPrinted = Date.now();
+      const etaS = Math.max(1, Math.round(etaMs / 1000));
+      console.log(
+        `[${new Date().toISOString()}] 已完成 ${progress.completed}/${progress.total}，` +
+        `进行中 ${progress.inFlight}，退避重试 ${progress.retryWaiting}，` +
+        `ERROR ${progress.terminalFailed}，未启动 ${progress.notStarted}，ETA 约 ${etaS}s。`,
+      );
+    },
+  });
   return {
     ok: result.error === 0,
     total: result.total,
@@ -115,8 +133,8 @@ function requireEnv(env: NodeJS.ProcessEnv, name: string): string {
 }
 
 function sanitizeConcurrency(value: number): number {
-  if (!Number.isInteger(value) || value < qaCliConcurrencyMinimum || value > qaCliMaximum) {
-    throw new TypeError(`--concurrency 必须在 ${qaCliConcurrencyMinimum}..${qaCliMaximum} 之间。`);
+  if (!Number.isInteger(value) || value < qaCliConcurrencyMinimum || value > qaCliConcurrencyMaximum) {
+    throw new TypeError(`--concurrency 必须在 ${qaCliConcurrencyMinimum}..${qaCliConcurrencyMaximum} 之间。`);
   }
   return value;
 }

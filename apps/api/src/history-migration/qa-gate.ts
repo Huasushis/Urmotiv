@@ -15,10 +15,18 @@ import {
 
 export type QaVerdict = "PASS" | "ANOMALY" | "ERROR";
 
+/** 确定性风险项经语义复评后的结构化处置结论。 */
+export type QaDisposition =
+  | "corrected"
+  | "verified-false-positive"
+  | "genuinely-unresolved-preserved-missing";
+
 export const qaCoreMinimumConcurrency = 1;
-export const qaCoreMaximumConcurrency = 16;
+export const qaCoreMaximumConcurrency = 20;
 export const qaDefaultConcurrency = 14;
 export const qaCliConcurrencyMinimum = 12;
+export const qaCliConcurrencyDefault = 16;
+export const qaCliConcurrencyMaximum = 20;
 
 export interface QaItem {
   /** 题号（1..N），财务验收按题号计数。 */
@@ -42,12 +50,16 @@ export interface QaReviewRequest {
   readonly candidateText: string;
   /** true 表示 ANOMALY 后的第二次评审；false 表示首次源对候选评审。 */
   readonly secondAttempt: boolean;
+  /** 确定性检查发现的风险标记，供语义复评参考。 */
+  readonly deterministicRisks?: readonly string[];
 }
 
 export interface QaReviewResult {
   readonly verdict: QaVerdict;
   /** 只含安全评审原因，不含模型原始输出正文。 */
   readonly reasons: readonly string[];
+  /** 风险项复评后的结构化处置；无风险项可缺省。 */
+  readonly disposition?: QaDisposition;
 }
 
 export type QaReviewer = (request: QaReviewRequest) => Promise<QaReviewResult>;
@@ -64,6 +76,8 @@ export interface QaPersistedState {
   readonly verdict: QaVerdict | null;
   readonly attemptCount: number;
   readonly secondReviewCount: number;
+  /** 风险项复评后的结构化处置；无风险或未复评时为 null。 */
+  readonly disposition: QaDisposition | null;
 }
 
 export interface QaStateStore {
@@ -71,15 +85,33 @@ export interface QaStateStore {
   write(state: QaPersistedState): Promise<void>;
 }
 
+export interface QaRunProgress {
+  readonly total: number;
+  /** 已终态（含恢复跳过）并计入结果表的题号数。 */
+  readonly completed: number;
+  /** 正在执行评审的题号数。 */
+  readonly inFlight: number;
+  /** 正在等待可重试失败退避的题号数。 */
+  readonly retryWaiting: number;
+  /** 终态为 ERROR 的题号数。 */
+  readonly terminalFailed: number;
+  /** 已到达终态且为 PASS/ANOMALY 的题号数。 */
+  readonly settled: number;
+  /** 尚未被并发槽拾取的题号数。 */
+  readonly notStarted: number;
+}
+
 export interface RunQaGateOptions {
-  /** 并发上限。CLI 强制 12..16；核心范围 1..16，默认 14。 */
+  /** 并发上限。CLI 默认 16、上限 20；核心范围 1..20，默认 14。 */
   readonly concurrency?: number;
   /** 每次评审尝试上限；只有可重试失败才消耗。默认 3。 */
   readonly maximumAttempts?: number;
   /** 是否启用 ANOMALY 专属第二次评审。默认 true。 */
   readonly secondReviewEnabled?: boolean;
   /** 重试退避基准毫秒数。默认 3000。 */
-  readonly retryBaseDelayMs?: number;
+  readonly retryDelayMs?: number;
+  /** 每次聚合状态变化后的进度回调（CLI 用来计算 ETA）。 */
+  readonly onProgress?: (progress: QaRunProgress) => void;
   /** 只供合成测试注入的等待函数，避免真实延迟。 */
   readonly sleep?: (ms: number) => Promise<void>;
   /** 只供合成测试注入的抖动，使测试确定性。 */
@@ -294,6 +326,7 @@ export async function runQaGate(
         verdict: null,
         attemptCount: 0,
         secondReviewCount: 0,
+        disposition: null,
       };
       return { item, state: initial };
     }),
@@ -306,6 +339,34 @@ export async function runQaGate(
       .map((entry) => [entry.item.id, entry.state.verdict as QaVerdict]),
   );
 
+  // 进度聚合：completed=已终态；retryWaiting=正在退避等待。
+  let completed = results.size;
+  let inFlight = 0;
+  let retryWaiting = 0;
+  const emitProgress = (): void => {
+    if (options.onProgress === undefined) return;
+    let terminalFailed = 0;
+    let settled = 0;
+    for (const verdict of results.values()) {
+      if (verdict === "ERROR") terminalFailed += 1;
+      else settled += 1;
+    }
+    options.onProgress({
+      total: ids.length,
+      completed,
+      inFlight,
+      retryWaiting,
+      terminalFailed,
+      settled,
+      notStarted: ids.length - completed - inFlight,
+    });
+  };
+  const onRetryWait = (waiting: boolean): void => {
+    retryWaiting += waiting ? 1 : -1;
+    emitProgress();
+  };
+  emitProgress();
+
   const active: Promise<void>[] = [];
   let cursor = 0;
   const pump = async (): Promise<void> => {
@@ -314,19 +375,29 @@ export async function runQaGate(
       cursor += 1;
       const queued = queue[next];
       if (queued === undefined) return;
-      await runOneQueuedItem(
-        queued.item,
-        reviewer,
-        store,
-        {
-          maximumAttempts,
-          secondReviewEnabled,
-          retryBaseDelayMs: options.retryBaseDelayMs ?? 3_000,
-          sleep,
-          jitter,
-        },
-        results,
-      );
+      inFlight += 1;
+      emitProgress();
+      try {
+        await runOneQueuedItem(
+          queued.item,
+          reviewer,
+          store,
+          {
+            maximumAttempts,
+            secondReviewEnabled,
+            retryBaseDelayMs: options.retryDelayMs ?? 3_000,
+            sleep,
+            jitter,
+            onRetryWait,
+          },
+          results,
+        );
+      } finally {
+        inFlight -= 1;
+        completed += 1;
+        emitProgress();
+      }
+      if (results.size >= ids.length) return;
     }
   };
   for (let slot = 0; slot < Math.min(concurrency, queue.length); slot += 1) {
@@ -361,7 +432,7 @@ export async function runQaGate(
 function clampConcurrency(value: number): number {
   if (!Number.isInteger(value) || value < qaCoreMinimumConcurrency ||
       value > qaCoreMaximumConcurrency) {
-    throw new HistoryMigrationError("INVALID_ARGUMENTS", "QA 并发数必须在 1..16 之间。");
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "QA 并发数必须在 1..20 之间。");
   }
   return value;
 }
@@ -383,6 +454,7 @@ async function runOneQueuedItem(
     readonly retryBaseDelayMs: number;
     readonly sleep: (ms: number) => Promise<void>;
     readonly jitter: () => number;
+    readonly onRetryWait: (waiting: boolean) => void;
   },
   results: Map<number, QaVerdict>,
 ): Promise<void> {
@@ -396,6 +468,7 @@ async function runOneQueuedItem(
       verdict: null,
       attemptCount: 0,
       secondReviewCount: 0,
+      disposition: null,
     };
   }
   if (state.verdict !== null) {
@@ -405,8 +478,8 @@ async function runOneQueuedItem(
 
   const deterministic = runQaDeterministicChecks(item);
   state = { ...state, deterministicErrors: deterministic.errors, deterministicRisks: deterministic.risks };
-  if (deterministic.errors.length > 0 || deterministic.risks.length > 0) {
-    state = { ...state, verdict: deterministic.errors.length > 0 ? "ERROR" : "ANOMALY" };
+  if (deterministic.errors.length > 0) {
+    state = { ...state, verdict: "ERROR" };
     await store.write(state);
     results.set(item.id, state.verdict as QaVerdict);
     return;
@@ -418,23 +491,43 @@ async function runOneQueuedItem(
     return;
   }
 
-  const primary = await reviewWithRetries(reviewer, buildReviewRequest(item, false), item.id, options, "primary");
-  state = { ...state, attemptCount: state.attemptCount + 1, verdict: primary.verdict };
+  // 有确定性风险（如 possible-fabricated-solution、attachment-refs-dropped）
+  // 时不再短路：把风险标记随请求交给语义复评，得到结构化处置后记账。
+  const reviewRequest = buildReviewRequest(item, false, deterministic.risks);
+  const primary = await reviewWithRetries(reviewer, reviewRequest, item.id, options, "primary");
+  state = {
+    ...state,
+    attemptCount: state.attemptCount + 1,
+    verdict: primary.verdict,
+    disposition: primary.disposition ?? null,
+  };
   if (state.verdict === "ANOMALY" && options.secondReviewEnabled) {
-    const second = await reviewWithRetries(reviewer, buildReviewRequest(item, true), item.id, options, "second");
-    state = { ...state, verdict: second.verdict, secondReviewCount: state.secondReviewCount + 1 };
+    const second = await reviewWithRetries(reviewer, buildReviewRequest(item, true, deterministic.risks), item.id, options, "second");
+    state = {
+      ...state,
+      verdict: second.verdict,
+      disposition: second.disposition ?? state.disposition,
+      secondReviewCount: state.secondReviewCount + 1,
+    };
   }
   await store.write(state);
   results.set(item.id, state.verdict as QaVerdict);
 }
 
-function buildReviewRequest(item: QaItem, secondAttempt: boolean): QaReviewRequest {
+function buildReviewRequest(
+  item: QaItem,
+  secondAttempt: boolean,
+  deterministicRisks?: readonly string[],
+): QaReviewRequest {
   return {
     id: item.id,
     sourceText: item.sourceText,
     sourceSha256: item.sourceSha256,
     candidateText: item.candidateText as string,
     secondAttempt,
+    ...(deterministicRisks !== undefined && deterministicRisks.length > 0
+      ? { deterministicRisks }
+      : {}),
   };
 }
 
@@ -447,6 +540,7 @@ async function reviewWithRetries(
     readonly retryBaseDelayMs: number;
     readonly sleep: (ms: number) => Promise<void>;
     readonly jitter: () => number;
+    readonly onRetryWait?: (waiting: boolean) => void;
   },
   purpose: "primary" | "second",
 ): Promise<QaReviewResult> {
@@ -458,7 +552,12 @@ async function reviewWithRetries(
         throw wrapNonRetryable(error, id, purpose);
       }
       const delay = Math.floor(options.retryBaseDelayMs * attempt * (0.5 + options.jitter()));
-      await options.sleep(delay);
+      options.onRetryWait?.(true);
+      try {
+        await options.sleep(delay);
+      } finally {
+        options.onRetryWait?.(false);
+      }
     }
   }
   throw new HistoryMigrationError("INTERNAL_ERROR", `${id} 评审重试循环异常结束。`);
@@ -543,6 +642,18 @@ function structuredQaStateCheck(value: unknown):
   if (typeof record.attemptCount !== "number" || typeof record.secondReviewCount !== "number") {
     return { ok: false };
   }
+  // 兼容旧版状态文件（无 disposition 字段）：一律视为 null。
+  let disposition: QaDisposition | null = null;
+  const dispositionField = record.disposition;
+  if (dispositionField !== undefined && dispositionField !== null &&
+      dispositionField !== "corrected" &&
+      dispositionField !== "verified-false-positive" &&
+      dispositionField !== "genuinely-unresolved-preserved-missing") {
+    return { ok: false };
+  }
+  if (typeof dispositionField === "string") {
+    disposition = dispositionField as QaDisposition;
+  }
   return {
     ok: true,
     value: {
@@ -553,6 +664,7 @@ function structuredQaStateCheck(value: unknown):
       verdict: verdictField as QaVerdict | null,
       attemptCount: record.attemptCount as number,
       secondReviewCount: record.secondReviewCount as number,
+      disposition,
     },
   };
 }
