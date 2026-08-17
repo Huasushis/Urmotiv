@@ -47,6 +47,11 @@ import {
   execInRunnerWithEnv,
   teardownRunnerContainer,
   recoverAndTeardownRunner,
+  GATE9_RESOURCE_LIMITS,
+  buildLimitArgs,
+  assertContainerResourceLimits,
+  buildContainerRemovalArgs,
+  buildNetworkRemovalArgs,
 } from "./phase2-isolated-postgres.mjs";
 
 const testsDirectory = fileURLToPath(new URL(".", import.meta.url));
@@ -1242,3 +1247,83 @@ describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
     }, 180_000);
   },
 );
+
+// Gate 9 资源安全：聚焦单元边界。全部使用注入假数据，不依赖 Docker。
+describe("Gate 9 资源限制构造与验证（单元边界）", () => {
+  it("buildLimitArgs 生成精确的 docker create 资源限制参数", () => {
+    expect(buildLimitArgs(GATE9_RESOURCE_LIMITS.postgres)).toEqual([
+      `--memory=${768 * 1024 * 1024}`,
+      `--memory-swap=${768 * 1024 * 1024}`,
+      "--cpus=1",
+      "--pids-limit=128",
+    ]);
+    expect(buildLimitArgs(GATE9_RESOURCE_LIMITS.runner)).toEqual([
+      `--memory=${3 * 1024 * 1024 * 1024}`,
+      `--memory-swap=${3 * 1024 * 1024 * 1024}`,
+      "--cpus=2",
+      "--pids-limit=256",
+    ]);
+  });
+
+  it("assertContainerResourceLimits：实时 HostConfig 完全匹配时通过（注入假数据）", () => {
+    const fakeGetter = () => ({
+      Memory: 768 * 1024 * 1024,
+      MemorySwap: 768 * 1024 * 1024,
+      NanoCpus: 1_000_000_000,
+      PidsLimit: 128,
+    });
+    expect(() => assertContainerResourceLimits(
+      "a".repeat(64),
+      GATE9_RESOURCE_LIMITS.postgres,
+      fakeGetter,
+    )).not.toThrow();
+  });
+
+  it("assertContainerResourceLimits：四个限制字段各自不匹配都失败（注入假数据）", () => {
+    const matching = () => ({
+      Memory: 768 * 1024 * 1024,
+      MemorySwap: 768 * 1024 * 1024,
+      NanoCpus: 1_000_000_000,
+      PidsLimit: 128,
+    });
+    const cases = [
+      ["memory", { Memory: 512 * 1024 * 1024 }, /memoryBytes/],
+      ["memory-swap", { MemorySwap: 1 * 1024 * 1024 * 1024 }, /memorySwapBytes/],
+      ["cpu", { NanoCpus: 500_000_000 }, /nanoCpus/],
+      ["pid", { PidsLimit: 64 }, /pidsLimit/],
+    ];
+    for (const [label, patch, pattern] of cases) {
+      const fakeGetter = () => ({ ...matching(), ...patch });
+      expect(() => assertContainerResourceLimits(
+        "a".repeat(64),
+        GATE9_RESOURCE_LIMITS.postgres,
+        fakeGetter,
+      )).toThrow(pattern);
+    }
+  });
+
+  it("assertContainerResourceLimits：docker 默认值 0 也是不匹配，必须 fail-closed", () => {
+    const fakeGetter = () => ({ Memory: 0, MemorySwap: 0, NanoCpus: 0, PidsLimit: 0 });
+    expect(() => assertContainerResourceLimits(
+      "a".repeat(64),
+      GATE9_RESOURCE_LIMITS.postgres,
+      fakeGetter,
+    )).toThrow();
+  });
+
+  it("清理目标必须是精确全 64 字符 ID，拒绝前缀/模式/非 hex", () => {
+    const exact = "ab".repeat(32);
+    expect(buildContainerRemovalArgs(exact)).toEqual(["rm", "-f", exact]);
+    for (const bad of [exact.slice(0, 12), "urmotiv-gate9-runner-*", "ab".repeat(31) + "zz", "", 42]) {
+      expect(() => buildContainerRemovalArgs(bad)).toThrow(/全 64 字符 ID/);
+    }
+  });
+
+  it("网络清理目标必须是精确创建的网络名称，拒绝宽泛名称/切片/空白", () => {
+    const name = `urmotiv-gate9-net-${"abcd1234".repeat(3)}`;
+    expect(buildNetworkRemovalArgs(name)).toEqual(["network", "rm", name]);
+    for (const bad of ["urmotiv-gate9-net-*", "urmotiv-gate9-net-", "a b", "net/foo", "", 42]) {
+      expect(() => buildNetworkRemovalArgs(bad)).toThrow(/精确名称/);
+    }
+  });
+});

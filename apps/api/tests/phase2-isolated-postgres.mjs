@@ -39,6 +39,74 @@ const RUNNER_IMAGE = "docker.m.daocloud.io/library/ubuntu:24.04";
 const LABEL_PREFIX = "urmotiv.gate9";
 const MANIFEST_PREFIX = "urmotiv-gate9-cluster-";
 
+// 16 GiB 宿主机资源预算：runner ≤3 GiB / 2 CPU / 256 PIDs；
+// 每个 PostgreSQL ≤768 MiB / 1 CPU / 128 PIDs。
+// memorySwapBytes 等于 memoryBytes——memory-swap 为总量（memory+swap），
+// 相等即禁止容器使用额外 swap。
+// 聚合声明上限 3 GiB + 2×768 MiB = 4.5 GiB，留 ≥4 GiB 给宿主/Codex/OMP。
+export const GATE9_RESOURCE_LIMITS = Object.freeze({
+  runner: Object.freeze({
+    memoryBytes: 3 * 1024 * 1024 * 1024,
+    memorySwapBytes: 3 * 1024 * 1024 * 1024,
+    nanoCpus: 2_000_000_000,
+    pidsLimit: 256,
+  }),
+  postgres: Object.freeze({
+    memoryBytes: 768 * 1024 * 1024,
+    memorySwapBytes: 768 * 1024 * 1024,
+    nanoCpus: 1_000_000_000,
+    pidsLimit: 128,
+  }),
+});
+
+/**
+ * 从声明的限制生成 docker create 参数——单一构造入口，测试断言其精确输出。
+ */
+export function buildLimitArgs(limits) {
+  return [
+    `--memory=${limits.memoryBytes}`,
+    `--memory-swap=${limits.memorySwapBytes}`,
+    `--cpus=${(limits.nanoCpus / 1_000_000_000).toString()}`,
+    `--pids-limit=${limits.pidsLimit}`,
+  ];
+}
+
+/**
+ * 读取容器实时 HostConfig 资源限制字段。
+ */
+export function inspectHostConfigLimits(containerId) {
+  return JSON.parse(docker(["inspect", "-f", "{{json .HostConfig}}", containerId]));
+}
+
+/**
+ * 对照声明限制做 fail-closed 实时验证：任一字段与声明不符即抛错。
+ * 在 docker start 之前对已 create 的容器调用——HostConfig 在 create 时
+ * 已固定，无需启动即可检查。
+ *
+ * @param {string} containerId
+ * @param {object} limits - GATE9_RESOURCE_LIMITS 中的一组
+ * @param {function} [hostConfigGetter] - 默认读实时 HostConfig；单测可注入
+ *   假数据，避免单位边界依赖 Docker。返回 {Memory, MemorySwap, NanoCpus, PidsLimit}。
+ */
+export function assertContainerResourceLimits(containerId, limits, hostConfigGetter = inspectHostConfigLimits) {
+  const actual = hostConfigGetter(containerId);
+  const summary = {
+    memoryBytes: Number(actual.Memory ?? 0),
+    memorySwapBytes: Number(actual.MemorySwap ?? 0),
+    nanoCpus: Number(actual.NanoCpus ?? 0),
+    pidsLimit: Number(actual.PidsLimit ?? 0),
+  };
+  const diffs = [];
+  for (const key of ["memoryBytes", "memorySwapBytes", "nanoCpus", "pidsLimit"]) {
+    if (summary[key] !== limits[key]) {
+      diffs.push(`${key}=${summary[key]}（要求 ${limits[key]}）`);
+    }
+  }
+  if (diffs.length > 0) {
+    throw new Error(`容器资源限制验证失败：${containerId}，差异：${diffs.join("；")}`);
+  }
+}
+
 /**
  * 生成随机密码（base64url，PostgreSQL 接受）。
  */
@@ -56,6 +124,32 @@ function docker(args, opts = {}) {
     stdio: ["ignore", "pipe", "pipe"],
     ...opts,
   }).trim();
+}
+
+/**
+ * 精确容器拆除命令——只接受全 64 位十六进制 ID，绝无名称模式/prune。
+ * 供设置失败清理使用，是聚焦断言的对象（单测注入假数据，无须 Docker）。
+ */
+export function buildContainerRemovalArgs(containerId) {
+  if (typeof containerId !== "string" || !/^[0-9a-f]{64}$/.test(containerId)) {
+    throw new Error(`容器拆除目标必须是全 64 字符 ID：${containerId}`);
+  }
+  return ["rm", "-f", containerId];
+}
+
+/**
+ * 精确网络拆除命令——只接受已创建网络的精确名称，绝无宽泛模式/prune。
+ * 供设置失败清理使用，是聚焦断言的对象（单测注入假数据，无须 Docker）。
+ */
+export function buildNetworkRemovalArgs(networkName) {
+  const PREFIX = "urmotiv-gate9-net-";
+  if (typeof networkName !== "string" ||
+      !networkName.startsWith(PREFIX) ||
+      networkName.length === PREFIX.length ||
+      !/^[A-Za-z0-9_.-]+$/.test(networkName.slice(PREFIX.length))) {
+    throw new Error(`网络拆除目标必须是已创建的精确名称：${networkName}`);
+  }
+  return ["network", "rm", networkName];
 }
 
 /**
@@ -232,12 +326,13 @@ function verifyContainerNetworkMembership(containerId, networkId) {
  * @param {string} opts.runId
  * @param {string} opts.role - "primary" 或 "secondary"
  * @param {string} [opts.networkName] - 共享网络名（次集群复用主集群的网络）
+ * @param {string} [opts.password] - 固定密码；不传则每次随机生成（默认行为不变）
  * @returns {ClusterInfo}
  */
-export function createIsolatedPostgres({ runId, role, networkName }) {
+export function createIsolatedPostgres({ runId, role, networkName, password }) {
   const labels = deriveLabels(runId, role);
   const labelArgs = Object.entries(labels).flatMap(([k, v]) => ["--label", `${k}=${v}`]);
-  const password = randomPassword();
+  const resolvedPassword = password ?? randomPassword();
   const imageId = getImageId(PG_IMAGE);
 
   // 1. 创建专用 --internal 网络（或复用已有网络）。
@@ -257,22 +352,43 @@ export function createIsolatedPostgres({ runId, role, networkName }) {
     netId = getNetworkId(netName);
   }
 
-  // 2. 创建容器（tmpfs，无卷，无发布端口）。
+  // 2. 创建容器（tmpfs，无卷，无发布端口，显式硬资源限制）。
   //    容器仅在 --internal 网络上——无公共出口。
+  //    硬限制来自单一构造入口 buildLimitArgs。restart 策略为 no——
+  //    容器重启不留存，限制不因重启而丢失。
   const containerName = `urmotiv-gate9-${role}-${runId}`;
   const createArgs = [
     "create",
     "--name", containerName,
     ...labelArgs,
     "--network", netName,
+    ...buildLimitArgs(GATE9_RESOURCE_LIMITS.postgres),
     "--tmpfs", "/var/lib/postgresql/data",
-    "-e", `POSTGRES_PASSWORD=${password}`,
+    "-e", `POSTGRES_PASSWORD=${resolvedPassword}`,
     "-e", "POSTGRES_USER=postgres",
     "-e", "POSTGRES_DB=postgres",
     "--restart=no",
     PG_IMAGE,
   ];
-  const fullId = docker(createArgs);
+  let fullId = "";
+  try {
+    fullId = docker(createArgs);
+    // 2b. 启动前 fail-closed 验证实时 HostConfig——限制必须与声明完全一致。
+    //     任何不符（含 Docker 默认 0）都在启动前抛错。
+    assertContainerResourceLimits(fullId, GATE9_RESOURCE_LIMITS.postgres);
+  } catch (error) {
+    // 设置失败清理：只按精确全 ID 拆除本调用刚创建的容器，
+    // 只按精确名称 + 网络 ID + run-id 标签移除本调用刚创建的网络——
+    // 绝不用宽泛名称模式或 prune。原始错误优先，清理失败不掩盖。
+    if (fullId.length === 64) {
+      dockerTry(buildContainerRemovalArgs(fullId));
+    }
+    if (netCreated && netId.length !== 0 &&
+        verifyNetworkId(netName, netId) && verifyNetworkIdentity(netName, runId)) {
+      dockerTry(buildNetworkRemovalArgs(netName));
+    }
+    throw error;
+  }
 
   // 3. O_EXCL 清单写入 0700 目录（在 start 之前）。
   const manifestDir = join(tmpdir(), `${MANIFEST_PREFIX}${runId}-${role}`);
@@ -291,7 +407,7 @@ export function createIsolatedPostgres({ runId, role, networkName }) {
     image: PG_IMAGE,
     imageId,
     user: "postgres",
-    password,
+    password: resolvedPassword,
     database: "postgres",
     labels,
     systemIdentifier: null,
@@ -334,7 +450,7 @@ export function createIsolatedPostgres({ runId, role, networkName }) {
   atomicWrite(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
 
   // 子进程通过容器名在 Docker 网络上连接（无发布端口）。
-  const adminUrl = `postgres://postgres:${encodeURIComponent(password)}@${containerName}:5432/postgres`;
+  const adminUrl = `postgres://postgres:${encodeURIComponent(resolvedPassword)}@${containerName}:5432/postgres`;
 
   return {
     containerId: fullId,
@@ -344,7 +460,7 @@ export function createIsolatedPostgres({ runId, role, networkName }) {
     host: containerName,
     port: 5432,
     user: "postgres",
-    password,
+    password: resolvedPassword,
     database: "postgres",
     adminUrl,
     labels,
@@ -685,6 +801,7 @@ export function createRunnerContainer({ runId, networkName, worktreePath, gitCom
     "--cap-drop", "ALL",
     "--security-opt", "no-new-privileges",
     "--read-only",
+    ...buildLimitArgs(GATE9_RESOURCE_LIMITS.runner),
     "--tmpfs", "/tmp:rw,size=128m,mode=1777",
     "--tmpfs", "/home:rw,size=256m,mode=1777",
     "--tmpfs", "/run:rw,size=16m,mode=1777",
@@ -719,7 +836,20 @@ export function createRunnerContainer({ runId, networkName, worktreePath, gitCom
     RUNNER_IMAGE,
     "sleep", "3600",
   ];
-  const fullId = docker(createArgs);
+  let fullId = "";
+  try {
+    fullId = docker(createArgs);
+    // 启动前 fail-closed 验证实时 HostConfig——runner 限制必须与声明完全一致。
+    // 不符合（含默认 0）就在 start 前抛错。
+    assertContainerResourceLimits(fullId, GATE9_RESOURCE_LIMITS.runner);
+  } catch (error) {
+    // 设置失败清理：只按精确全 ID 拆除本调用刚创建的 runner 容器——
+    // runner 不创建网络，绝不用宽泛名称模式或 prune。原始错误优先。
+    if (fullId.length === 64) {
+      dockerTry(buildContainerRemovalArgs(fullId));
+    }
+    throw error;
+  }
 
   // 原子写入 runner 清单（在 start 之前）。
   const manifestDir = join(tmpdir(), `${MANIFEST_PREFIX}${runId}-runner`);
