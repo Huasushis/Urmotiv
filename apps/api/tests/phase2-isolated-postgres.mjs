@@ -668,18 +668,18 @@ export function verifyManifestPermissions(manifestDir) {
  * @param {object} opts
  * @param {string} opts.runId
  * @param {string} opts.networkName
- * @param {string} opts.worktreePath - 精确的 Git worktree 路径
+ * @param {string} opts.gitCommonDir - 链接型 worktree 的共享 Git 公共目录（挂载后 git 命令可在容器内运行）
+ * @param {string} opts.evidencePath - 每运行可写的证据根目录（挂载后验收证据可见）
  * @param {Array<[string, string]>} opts.bindMounts - 额外的只读 bind 挂载 [hostPath, containerPath]
  * @param {string} opts.workDir
  * @returns {RunnerContainer}
  */
-export function createRunnerContainer({ runId, networkName, worktreePath, bindMounts = [], workDir }) {
+export function createRunnerContainer({ runId, networkName, worktreePath, gitCommonDir, evidencePath, bindMounts = [], workDir }) {
   const labels = deriveLabels(runId, "runner");
   const labelArgs = Object.entries(labels).flatMap(([k, v]) => ["--label", `${k}=${v}`]);
   const runnerImageId = getImageId(RUNNER_IMAGE);
 
-  // 安全标志：unprivileged uid:gid, cap-drop ALL, read-only, no-new-privileges。
-  // 额外 tmpfs 供 apt/git 写临时文件。
+  // 安全标志：unprivileged uid:gid, no new privileges, read-only rootfs, private tmp.
   const securityArgs = [
     "--user", `${process.getuid()}:${process.getgid()}`,
     "--cap-drop", "ALL",
@@ -688,15 +688,20 @@ export function createRunnerContainer({ runId, networkName, worktreePath, bindMo
     "--tmpfs", "/tmp:rw,size=128m,mode=1777",
     "--tmpfs", "/home:rw,size=256m,mode=1777",
     "--tmpfs", "/run:rw,size=16m,mode=1777",
-    "--tmpfs", "/var/cache/apt:rw,size=64m,mode=1777",
-    "--tmpfs", "/var/lib/apt:rw,size=64m,mode=1777",
     "--tmpfs", "/var/tmp:rw,size=64m,mode=1777",
   ];
 
-  // 挂载：仅 worktree（读写，供脏树测试）+ 只读 bind 挂载。
+  // 挂载：精确 worktree（读写，供脏树测试）+ git 公共目录（读写，git 元数据
+  // 测试需要写共享索引）+ 可选可写证据根目录（读写）+ 只读 bind 挂载。
   const mountArgs = [
     "--mount", `type=bind,source=${worktreePath},target=${worktreePath}`,
   ];
+  if (gitCommonDir) {
+    mountArgs.push("--mount", `type=bind,source=${gitCommonDir},target=${gitCommonDir}`);
+  }
+  if (evidencePath) {
+    mountArgs.push("--mount", `type=bind,source=${evidencePath},target=${evidencePath}`);
+  }
   for (const [hostPath, containerPath] of bindMounts) {
     mountArgs.push("--mount", `type=bind,source=${hostPath},target=${containerPath},readonly`);
   }
@@ -747,13 +752,12 @@ export function createRunnerContainer({ runId, networkName, worktreePath, bindMo
     throw new Error(`Runner 容器启动失败：${error.message}（清单已保留：${manifestPath}）`);
   }
 
-  // 安装 git（runner 需要运行 git 命令）。
-  // read-only rootfs 下需要写 /var/lib/apt 和 /var/cache/apt——已挂载 tmpfs。
-  const installResult = dockerTry(["exec", fullId, "bash", "-c",
-    "apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq git >/dev/null 2>&1"]);
-  if (!installResult.ok) {
-    updateManifestPhase(manifestPath, "install-failed");
-    // 不抛——git 安装失败不致命，验收可能不需要 git。
+  // 工具就绪必须由受信父进程验证——任何失败都是致命并记录到清单，
+  // 绝不吞掉后标 ready。git 二进制通过只读 bind 挂载提供，无需 apt。
+  const gitCheck = docker(["exec", fullId, "bash", "-c", "command -v git && git --version"]);
+  if (!/git version \d/.test(gitCheck)) {
+    updateManifestPhase(manifestPath, "tool-failed");
+    throw new Error(`Runner 容器内 git 不可用（输出：${gitCheck}）（清单已保留：${manifestPath}）`);
   }
 
   updateManifestPhase(manifestPath, "ready");
@@ -769,6 +773,8 @@ export function createRunnerContainer({ runId, networkName, worktreePath, bindMo
     manifestDir,
     manifestPath,
     worktreePath,
+    gitCommonDir,
+    evidencePath,
     workDir,
   };
 }

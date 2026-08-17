@@ -398,8 +398,15 @@ function parseReport(reportFile) {
 
 // 全 API 单元测试：必跑。只有零失败（numFailedTests === 0）才发放 FULL_API_PASS；
 // 失败标签集合仅用于净差证据，绝不输出任何错误正文。
+// 内部全量测试显式排除父进程专用的 Gate9/Docker 生命周期套件——
+// runner 容器内无 Docker 权限，不应触碰 Docker 资源管理测试。
 {
-  const { result, reportFile } = runVitestReport(["--exclude", acceptanceTestFile], apiDirectory);
+  const { result, reportFile } = runVitestReport([
+    "--exclude", acceptanceTestFile,
+    "--exclude", "tests/phase2-acceptance-gate9.test.mjs",
+    "--exclude", "tests/phase2-isolated-postgres.mjs",
+    "--exclude", "tests/phase2-isolated-postgres.d.ts",
+  ], apiDirectory);
   const exitCode = result.status ?? 1;
   const parsed = [0, 1].includes(exitCode) ? parseReport(reportFile) : null;
   if (exitCode === 0 && parsed !== null && parsed.numFailedTests === 0) {

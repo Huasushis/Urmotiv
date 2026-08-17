@@ -13,6 +13,7 @@
 import {
   appendFileSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -174,21 +175,46 @@ function readBaseWorkerCommit() {
 
 const worktrees = [];
 const evidenceDirectories = [];
+// 挂载进 runner 的可写证据根目录（beforeAll 创建，runner 容器创建时传入）。
+let evidenceRoot = null;
+
+/**
+ * 主检出上所有需以只读 bind 挂载进 runner 的 node_modules 目录。
+ * 返回值：映射表—— worktree 相对路径 -> 主检出绝对路径。
+ * 容器内目标目录必须存在（worktree 内预建空目录作为挂载点），
+ * 不能是链接——链接在容器内会指向未挂载的宿主路径。
+ */
+function workspaceNodeModulesMounts() {
+  const rels = ["node_modules"];
+  for (const dir of ["apps/api", "apps/web", "apps/worker", "packages/auth", "packages/contracts",
+    "packages/database", "packages/jobs", "packages/plugin-sdk", "packages/problem-package",
+    "packages/storage", "plugins/anklang", "plugins/fermata-control", "plugins/hydro-format",
+    "plugins/review-default"]) {
+    if (existsSync(join(repositoryRoot, dir, "node_modules"))) {
+      rels.push(join(dir, "node_modules"));
+    }
+  }
+  return rels;
+}
+
+/** 主检出 .git 公共目录（链接 worktree 的 git 元数据所在地）——绝对路径。 */
+function resolveGitCommonDir() {
+  const common = git(repositoryRoot, "rev-parse", "--git-common-dir").trim();
+  // --git-common-dir 可能返回相对路径（".git"）——转为绝对路径供 bind 挂载。
+  return resolve(join(repositoryRoot, common));
+}
+
 function makeWorktree() {
   const directory = mkdtempSync(join(tmpdir(), "urmotiv-gate9-worktree-"));
   git(repositoryRoot, "worktree", "add", "--detach", directory, "HEAD");
-  const bridges = [
-    ["node_modules", "node_modules"],
-    [join("apps", "api", "node_modules"), join("apps", "api", "node_modules")],
-    [join("apps", "worker", "node_modules"), join("apps", "worker", "node_modules")],
-  ];
-  for (const [targetRel, linkRel] of bridges) {
-    const target = join(repositoryRoot, targetRel);
+  // 预建空 node_modules 目录作为挂载点（git 不跟踪空目录，不影响干净性）。
+  for (const rel of workspaceNodeModulesMounts()) {
+    const target = join(repositoryRoot, rel);
     if (!existsSync(target)) {
       rmSync(directory, { recursive: true, force: true });
       throw new Error(`测试要求主检出存在 ${target}：先安装依赖再运行 Gate 9 集成测试。`);
     }
-    symlinkSync(target, join(directory, linkRel), "dir");
+    mkdirSync(join(directory, rel), { recursive: true });
   }
   return directory;
 }
@@ -199,10 +225,10 @@ function makeWorktree() {
  * PG URL 使用容器名（Docker 网络内部 DNS），不是发布端口。
  */
 function runAcceptanceLauncherInRunner(worktreeDirectory, { verdict, hookMode }) {
-  if (primaryCluster === null || runnerContainer === null) {
+  if (primaryCluster === null || runnerContainer === null || evidenceRoot === null) {
     throw new Error("Gate 9 集成测试要求隔离集群和 runner 容器已创建。");
   }
-  const evidenceDirectory = mkdtempSync(join(tmpdir(), "urmotiv-gate9-evidence-"));
+  const evidenceDirectory = mkdtempSync(join(evidenceRoot, "urmotiv-gate9-evidence-"));
   evidenceDirectories.push(evidenceDirectory);
 
   // PG URL 使用容器名（Docker 内部 DNS），不是 127.0.0.1:发布端口。
@@ -257,7 +283,7 @@ function runAuthoritativeInRunner(worktreeDirectory, extraEnv = {}) {
   if (primaryCluster === null || runnerContainer === null) {
     throw new Error("Gate 9 集成测试要求隔离集群和 runner 容器已创建。");
   }
-  const evidenceDirectory = mkdtempSync(join(tmpdir(), "urmotiv-gate9-evidence-"));
+  const evidenceDirectory = mkdtempSync(join(evidenceRoot ?? tmpdir(), "urmotiv-gate9-evidence-"));
   evidenceDirectories.push(evidenceDirectory);
 
   const isolatedAdminUrl = primaryCluster.adminUrl;
@@ -424,15 +450,25 @@ describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () =>
     const worktreeDirectory = makeWorktree();
     worktrees.push(worktreeDirectory);
     // 创建 runner 容器——无 Docker socket，在同一 --internal Docker 网络上。
-    // 仅挂载精确 worktree（读写）+ node 二进制 + git（只读）。
+    // 挂载：精确 worktree（读写）+ git 公共目录（读写）+ 证据根（读写）
+    // + 全部 workspace node_modules（只读）+ node/git 二进制（只读）。
+    evidenceRoot = mkdtempSync(join(tmpdir(), "urmotiv-gate9-evidence-root-"));
+    evidenceDirectories.push(evidenceRoot);
     runnerContainer = createRunnerContainer({
       runId: runToken,
       networkName: dockerNetworkName,
       worktreePath: worktreeDirectory,
+      gitCommonDir: resolveGitCommonDir(),
+      evidencePath: evidenceRoot,
       bindMounts: [
         [NODE_PATH, NODE_PATH],
         ["/usr/bin/git", "/usr/bin/git"],
         ["/usr/lib/git-core", "/usr/lib/git-core"],
+        [defaultBaseWorkerFile(), defaultBaseWorkerFile()],
+        ...workspaceNodeModulesMounts().map((rel) => [
+          join(repositoryRoot, rel),
+          join(worktreeDirectory, rel),
+        ]),
       ],
       workDir: join(worktreeDirectory, "apps", "api"),
     });
@@ -908,10 +944,15 @@ describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
           runId: "test-runner-" + runToken,
           networkName: cluster.networkName,
           worktreePath: wtDir,
+          gitCommonDir: resolveGitCommonDir(),
           bindMounts: [
             [NODE_PATH, NODE_PATH],
             ["/usr/bin/git", "/usr/bin/git"],
             ["/usr/lib/git-core", "/usr/lib/git-core"],
+            ...workspaceNodeModulesMounts().map((rel) => [
+              join(repositoryRoot, rel),
+              join(wtDir, rel),
+            ]),
           ],
           workDir: join(wtDir, "apps", "api"),
         });
@@ -1132,7 +1173,16 @@ describe.skipIf(sharedPgAdminUrl.trim().length === 0)(
           runId: "test-runnerrecover-" + runToken,
           networkName: cluster.networkName,
           worktreePath: wtDir,
-          bindMounts: [[NODE_PATH, NODE_PATH]],
+          gitCommonDir: resolveGitCommonDir(),
+          bindMounts: [
+            [NODE_PATH, NODE_PATH],
+            ["/usr/bin/git", "/usr/bin/git"],
+            ["/usr/lib/git-core", "/usr/lib/git-core"],
+            ...workspaceNodeModulesMounts().map((rel) => [
+              join(repositoryRoot, rel),
+              join(wtDir, rel),
+            ]),
+          ],
           workDir: join(wtDir, "apps", "api"),
         });
         // 不拆除 runner——模拟中断。清单应保留。
