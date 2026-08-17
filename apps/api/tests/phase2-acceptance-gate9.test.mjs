@@ -18,6 +18,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -451,6 +452,16 @@ function resetWorktreeState(worktreeDirectory) {
   git(worktreeDirectory, "checkout", "--quiet", "--detach", mainHead);
   git(worktreeDirectory, "reset", "--hard");
   git(worktreeDirectory, "clean", "-fd");
+  // sparse 缝会在共享 .git 公共目录写入 info/sparse-checkout/… 之外的
+  // info/sparse-checkout 文件（不在 worktree 内，git clean 不会清理）。
+  // 残留该文件会让后续权威运行的预检命中 sparseCheckoutFilePresent，
+  // 误报更早的「Git 元数据掩盖」门。
+  const sparsePath = git(worktreeDirectory, "rev-parse", "--git-path", "info/sparse-checkout").trim();
+  try {
+    unlinkSync(sparsePath);
+  } catch {
+    // 不存在即无需清理。
+  }
 }
 
 describe.skipIf(!gate9Enabled)("Gate 9 验收运行后整树突变隔离", () => {
