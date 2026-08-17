@@ -92,6 +92,8 @@ const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
 const acceptanceMode = process.env.URMOTIV_PHASE2_RUNNER_ACCEPTANCE === "1";
 const acceptanceCommit = process.env.URMOTIV_PHASE2_ACCEPTANCE_COMMIT;
 const describePostgres = adminUrl === undefined && !acceptanceMode ? describe.skip : describe;
+// 从 adminUrl 解析主集群端口——不再硬编码 5434。
+const primaryPort = adminUrl !== undefined ? parseInt(new URL(adminUrl).port, 10) : 5434;
 const temporaryDirectories: string[] = [];
 const temporaryDatabaseNames: string[] = [];
 function registerDatabase(name: string): void {
@@ -176,16 +178,29 @@ function sleep(milliseconds: number): Promise<void> {
 interface TcpProxyHandle {
   readonly url: string;
   setTarget(port: number): void;
+  setTarget(host: string, port: number): void;
   stop(): Promise<void>;
 }
 
+/**
+ * 启动 TCP 代理：连接串文本不变，只有代理背后的真实端点被改指。
+ * 密码和主机从 adminUrl 解析——不再硬编码 test-password/127.0.0.1:5434。
+ */
 async function startTcpProxy(initialTargetPort: number): Promise<TcpProxyHandle> {
+  const adminUrl = process.env.URMOTIV_TEST_POSTGRES_ADMIN_URL;
+  if (adminUrl === undefined) {
+    throw new Error("活身份代理需要 URMOTIV_TEST_POSTGRES_ADMIN_URL。");
+  }
+  const parsed = new URL(adminUrl);
+  const proxyPassword = decodeURIComponent(parsed.password);
+  const proxyHost = parsed.hostname;
+  let targetHost = proxyHost;
   let targetPort = initialTargetPort;
   const clients = new Set<Socket>();
   const upstreams = new Set<Socket>();
   const proxy = createServer((client) => {
     clients.add(client);
-    const upstream = connect({ host: "127.0.0.1", port: targetPort });
+    const upstream = connect({ host: targetHost, port: targetPort });
     upstreams.add(upstream);
     const teardown = (): void => {
       client.destroy();
@@ -209,16 +224,21 @@ async function startTcpProxy(initialTargetPort: number): Promise<TcpProxyHandle>
   });
   await new Promise<void>((resolve, reject) => {
     proxy.once("error", reject);
-    proxy.listen(0, "127.0.0.1", () => resolve());
+    proxy.listen(0, proxyHost, () => resolve());
   });
   const address = proxy.address();
   if (typeof address === "string" || address === null) {
     throw new Error("活身份代理端口不可用。");
   }
   return {
-    url: `postgres://postgres:test-password@127.0.0.1:${address.port}/postgres`,
-    setTarget(port: number) {
-      targetPort = port;
+    url: `postgres://postgres:${encodeURIComponent(proxyPassword)}@${proxyHost}:${address.port}/postgres`,
+    setTarget(portOrHost: number | string, port?: number) {
+      if (typeof portOrHost === "string" && typeof port === "number") {
+        targetHost = portOrHost;
+        targetPort = port;
+      } else if (typeof portOrHost === "number") {
+        targetPort = portOrHost;
+      }
     },
     async stop() {
       for (const socket of clients) socket.destroy();
@@ -259,9 +279,33 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+/**
+ * 从 secondCluster.url 解析次集群的主机名和端口。
+ * 用于 TCP 代理改指到次集群。
+ */
+function parseClusterEndpoint(url: string): { host: string; port: number } {
+  const parsed = new URL(url);
+  return { host: parsed.hostname, port: parseInt(parsed.port, 10) || 5432 };
+}
+
+/**
+ * 获取第二集群：如果父进程提供了 URMOTIV_TEST_SECONDARY_PG_URL，直接使用
+ * （gate9 隔离模式——子进程无 Docker 权限）。否则自行创建 Docker 容器
+ * （独立运行模式——需要 Docker 访问权限）。
+ */
 function startSecondCluster(containerName: string, port: number): { url: string; stop(): void } {
+  const secondaryUrl = process.env.URMOTIV_TEST_SECONDARY_PG_URL;
+  if (secondaryUrl !== undefined) {
+    // 父进程已创建次集群——子进程只使用 URL，不调用 docker。
+    return {
+      url: secondaryUrl,
+      stop() {
+        // 无操作——父进程负责拆除。
+      },
+    };
+  }
+  // 独立运行模式：自行创建 Docker 容器。
   spawnSync("docker", ["rm", "-f", containerName], { encoding: "utf8" });
-  // 环境不可达 docker.io 时可用本地镜像（如内网镜像源）覆盖。
   const image =
     process.env.URMOTIV_LIVEIDENT_PG_IMAGE ?? "docker.m.daocloud.io/library/postgres:17-alpine";
   const run = spawnSync(
@@ -1614,7 +1658,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       const clusterPort = await freePort();
       const containerName = `urmotiv-liveident-${process.pid}`;
       const secondCluster = startSecondCluster(containerName, clusterPort);
-      const proxy = await startTcpProxy(5434);
+      const proxy = await startTcpProxy(primaryPort);
       try {
         expect(await postgresReady(secondCluster.url, 60)).toBe(true);
         const liveSourceName = scratchName("livsrc");
@@ -1676,7 +1720,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
         const liveTrash = `${liveBatch.runnerReceiptDirectory}/storage.snapshot.terminal-trash`;
         expect(await exists(liveTrash)).toBe(true);
         // 1) 端点被改指到第二集群（文本不变）：零效果拒绝。
-        proxy.setTarget(clusterPort);
+        { const se = parseClusterEndpoint(secondCluster.url); proxy.setTarget(se.host, se.port); };
         await expect(
           completePhase2TerminalCleanup({
             receiptDirectory: liveBatch.runnerReceiptDirectory,
@@ -1695,7 +1739,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
           await adminA.close();
         }
         // 2) 指针摆回原集群（同一活身份）：续做成功，接着幂等重放成功。
-        proxy.setTarget(5434);
+        proxy.setTarget(primaryPort);
         expect(
           (
             await completePhase2TerminalCleanup({
@@ -1765,7 +1809,7 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
       const clusterPort = await freePort();
       const containerName = `urmotiv-livebound-${process.pid}`;
       const secondCluster = startSecondCluster(containerName, clusterPort);
-      const proxy = await startTcpProxy(5434);
+      const proxy = await startTcpProxy(primaryPort);
       try {
         expect(await postgresReady(secondCluster.url, 60)).toBe(true);
         const liveSourceName = scratchName("lbsrc");
@@ -1784,11 +1828,11 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
         // 建库函数自身要先用同一条新连接复核身份 —— 复核失败，任何集群都不落库。
         const repointedTarget = scratchName("lbddl");
         trackDatabaseFamily(repointedTarget);
-        proxy.setTarget(clusterPort);
+        { const se = parseClusterEndpoint(secondCluster.url); proxy.setTarget(se.host, se.port); };
         await expect(
           prepareHistoryImportDatabase(liveSourceConnection, repointedTarget, frozen),
         ).rejects.toThrow("维护活身份");
-        proxy.setTarget(5434);
+        proxy.setTarget(primaryPort);
         const adminA = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
         const adminB = createPostgresDatabase({
           connectionString: secondCluster.url,
@@ -1818,12 +1862,12 @@ describePostgres("Phase-2 runner 真实 PostgreSQL 验收", () => {
           ...provenanceHooks(),
           afterLiveIdentityVerified: async () => {
             hookFired = true;
-            proxy.setTarget(clusterPort);
+            { const se = parseClusterEndpoint(secondCluster.url); proxy.setTarget(se.host, se.port); };
           },
         });
         expect(hookFired).toBe(true);
         expect(exitCode).toBe(1);
-        proxy.setTarget(5434);
+        proxy.setTarget(primaryPort);
         const probeA = createPostgresDatabase({ connectionString: adminUrl, maxConnections: 1 });
         const probeB = createPostgresDatabase({
           connectionString: secondCluster.url,
