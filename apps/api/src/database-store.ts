@@ -1899,6 +1899,7 @@ export class DatabaseDataStore implements DataStore {
         },
         replaceProblem: () => false,
         writeReviewSuggestionAudit: async () => undefined,
+        writeFrozenFieldEditAudit: async () => undefined,
       });
     }
 
@@ -1998,6 +1999,31 @@ export class DatabaseDataStore implements DataStore {
                 nextRevision: event.nextRevision,
                 fields: event.fields,
                 opinionCount: event.opinionCount,
+              })}::jsonb
+            )
+          `);
+        },
+        writeFrozenFieldEditAudit: async (event) => {
+          if (event.problemId !== problemId) {
+            throw new Error("冻结字段审计与当前题目不匹配。");
+          }
+          const actorId = requireDatabaseId(event.actorUserId, "冻结字段操作者编号");
+          await executor.execute(sql`
+            INSERT INTO audit_events (
+              actor_user_id, request_id, action, object_type, object_id, result, metadata
+            ) VALUES (
+              ${actorId},
+              ${event.requestId}::uuid,
+              'problem.frozen.fields.edit',
+              'problem',
+              ${event.problemId},
+              'success',
+              ${JSON.stringify({
+                round: event.round,
+                previousRevision: event.previousRevision,
+                nextRevision: event.nextRevision,
+                fields: event.fields,
+                reason: event.reason,
               })}::jsonb
             )
           `);

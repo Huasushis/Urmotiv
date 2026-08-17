@@ -3,6 +3,7 @@ import {
   type ApplyReviewSuggestionsInput,
   problemDraftSchema,
   type CreateProblemInput,
+  type ForceFrozenFieldEditInput,
   type ManualReviewDecisionInput,
   type Problem,
   type ProblemCapabilities,
@@ -485,6 +486,80 @@ export class ProblemService {
     }
 
     return this.toProblem(next, user);
+  }
+
+  /**
+   * 管理员专用的冻结字段覆盖路径：只允许修改基础题面/基础题解两个字段，
+   * 必须填写原因并写入审计。权限用单独的 problem.frozen.edit 精确判断，
+   * 明确拒绝优先于角色或单题允许，机器人固定禁止优先级不变。
+   */
+  public async updateFrozenFields(
+    user: StoredUser,
+    problemId: string,
+    input: ForceFrozenFieldEditInput,
+    requestId?: string
+  ): Promise<Problem> {
+    const updated = await this.store.runProblemTransaction(problemId, async (transaction) => {
+      const problem = transaction.getProblem();
+      if (problem === undefined || problem.id !== problemId) {
+        throw notFound();
+      }
+      const actor = user.accountType === "robot" ? user : await transaction.lockUserForAuthorization(user.id);
+      const refreshedActor = actor ?? user;
+      if (
+        !canViewProblem(createProblemVisibility(refreshedActor, this.now()), problem) ||
+        refreshedActor.accountType !== "human"
+      ) {
+        throw notFound();
+      }
+      const target = { ownerId: problem.ownerId, objectId: problem.id };
+      if (!hasPermission(refreshedActor, "problem.frozen.edit", target, this.now())) {
+        throw forbidden();
+      }
+      if (
+        problem.status !== "pending_review" &&
+        problem.status !== "approved"
+      ) {
+        throw conflict("当前状态没有冻结字段，请使用普通编辑接口。");
+      }
+      this.assertExpectedRevision(problem, input.expectedRevision);
+
+      const currentContent = problem.content;
+      const next: StoredProblem = {
+        ...problem,
+        content: {
+          ...currentContent,
+          basicStatement:
+            input.content.basicStatement === undefined
+              ? currentContent.basicStatement
+              : input.content.basicStatement,
+          basicSolution:
+            input.content.basicSolution === undefined
+              ? currentContent.basicSolution
+              : input.content.basicSolution
+        },
+        revision: problem.revision + 1,
+        updatedAt: asIso(this.now())
+      };
+      if (!transaction.replaceProblem(next, problem.revision, refreshedActor.id)) {
+        throw conflict("题目已被其他操作修改，请刷新后重试。");
+      }
+      await transaction.writeFrozenFieldEditAudit({
+        actorUserId: refreshedActor.id,
+        requestId: requestId ?? "",
+        problemId: problem.id,
+        round: problem.reviewRound,
+        previousRevision: problem.revision,
+        nextRevision: next.revision,
+        fields: [
+          ...(input.content.basicStatement === undefined ? [] : (["basicStatement"] as const)),
+          ...(input.content.basicSolution === undefined ? [] : (["basicSolution"] as const))
+        ],
+        reason: input.reason
+      });
+      return next;
+    });
+    return this.toProblem(updated, user);
   }
 
   public async submitProblem(
@@ -1542,7 +1617,10 @@ export class ProblemService {
       canView: true,
       canEdit,
       canEditTitle: canEdit,
-      canEditFrozen: false,
+      canEditFrozen:
+        user.accountType === "human" &&
+        hasPermission(user, "problem.frozen.edit", target, this.now()) &&
+        (problem.status === "pending_review" || problem.status === "approved"),
       canSubmit,
       canWithdraw,
       canReview:
