@@ -22,6 +22,7 @@ import {
   deleteTagAliasInputSchema,
   emailRegistrationInputSchema,
   emailVerificationInputSchema,
+  forceFrozenFieldEditInputSchema,
   loginInputSchema,
   manualReviewDecisionInputSchema,
   createExportJobRequestSchema,
@@ -1213,6 +1214,17 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     const user = await requireUser(request);
     const input = updateProblemInputSchema.strict().parse(request.body);
     return dependencies.service.updateProblem(user, parseProblemId(request), input);
+  });
+
+  app.post("/api/v1/problems/:problemId/frozen-fields", async (request) => {
+    const user = await requireUser(request);
+    const input = forceFrozenFieldEditInputSchema.strict().parse(request.body);
+    return dependencies.service.updateFrozenFields(
+      user,
+      parseProblemId(request),
+      input,
+      request.id
+    );
   });
 
   app.post("/api/v1/problems/:problemId/submit", async (request) => {

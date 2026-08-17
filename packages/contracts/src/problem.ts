@@ -249,6 +249,30 @@ export const updateProblemInputSchema = problemDraftSchema.partial().extend({
 
 export type UpdateProblemInput = z.infer<typeof updateProblemInputSchema>;
 
+/**
+ * 强制修改冻结字段的专用接口：只能携带基础题面/基础题解两个冻结字段，
+ * 必须填写原因。题目名称不在其中——名称永远走普通编辑接口。
+ */
+export const forceFrozenFieldEditInputSchema = z
+  .object({
+    expectedRevision: z.number().int().positive(),
+    reason: z.string().trim().min(1, "必须填写修改原因").max(1_000),
+    content: z
+      .object({
+        basicStatement: markdownSchema.optional(),
+        basicSolution: markdownSchema.optional()
+      })
+      .strict()
+  })
+  .strict()
+  .refine(
+    (input) =>
+      input.content.basicStatement !== undefined || input.content.basicSolution !== undefined,
+    { path: ["content"], message: "至少要修改基础题面或基础题解中的一个冻结字段。" }
+  );
+
+export type ForceFrozenFieldEditInput = z.infer<typeof forceFrozenFieldEditInputSchema>;
+
 export const submitProblemInputSchema = z.object({
   expectedRevision: z.number().int().positive()
 });

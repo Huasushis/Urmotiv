@@ -34,6 +34,17 @@ export interface ReviewSuggestionAuditEvent {
   readonly opinionCount: number;
 }
 
+export interface FrozenFieldEditAuditEvent {
+  readonly actorUserId: string;
+  readonly requestId: string;
+  readonly problemId: string;
+  readonly round: number;
+  readonly previousRevision: number;
+  readonly nextRevision: number;
+  readonly fields: readonly ("basicStatement" | "basicSolution")[];
+  readonly reason: string;
+}
+
 export interface ProblemTransaction {
   getProblem(): StoredProblem | undefined;
   /** 当前事务已在任何题目行之前取得共享锁的知识点目录版本。 */
@@ -54,6 +65,7 @@ export interface ProblemTransaction {
     changedByUserId?: string
   ): boolean;
   writeReviewSuggestionAudit(event: ReviewSuggestionAuditEvent): Promise<void>;
+  writeFrozenFieldEditAudit(event: FrozenFieldEditAuditEvent): Promise<void>;
   /** Database-only hook: runs after opinion rows are durable in this transaction and before problem state writes. */
   afterReviewWrites?(action: (executor: DatabaseExecutor) => Promise<void>): void;
   /** Database transactions expose their executor only so related core stores can share it. */
@@ -486,7 +498,8 @@ export class InMemoryDataStore implements DataStore {
           problem = copy(nextProblem);
           return true;
         },
-        writeReviewSuggestionAudit: async () => undefined
+        writeReviewSuggestionAudit: async () => undefined,
+        writeFrozenFieldEditAudit: async () => undefined
       };
 
       const result = await operation(transaction);
