@@ -312,7 +312,7 @@ function runVitestReport(vitestArgs, cwd) {
   );
   const result = spawnSync(
     process.execPath,
-    [vitestBin, "run", ...vitestArgs, "--reporter=json", `--outputFile=${reportFile}`],
+    [vitestBin, "run", "--configLoader", "runner", ...vitestArgs, "--reporter=json", `--outputFile=${reportFile}`],
     { cwd, stdio: ["ignore", "ignore", "ignore"], env: process.env },
   );
   return { result, reportFile };
@@ -419,7 +419,7 @@ function parseReport(reportFile) {
 }
 
 console.log(`phase2-acceptance: HEAD=${head}`);
-const acceptance = spawnSync(process.execPath, [vitestBin, "run", acceptanceTestFile], {
+const acceptance = spawnSync(process.execPath, [vitestBin, "run", "--configLoader", "runner", acceptanceTestFile], {
   cwd: apiDirectory,
   stdio: "inherit",
   env: {
