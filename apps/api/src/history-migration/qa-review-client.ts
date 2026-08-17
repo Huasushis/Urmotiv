@@ -186,7 +186,11 @@ function parseReviewJson(content: string): QaReviewResult {
     throw normalizationFailure("schema");
   }
   const record = payload as Record<string, unknown>;
-  const verdictField = record.verdict;
+  // 提示词要求模型把 verdict 映射为大写 PASS/ANOMALY/ERROR；但模型常按
+  // 字面示例回传小写。这里统一规范化大小写，避免合法判定被误判为 schema 失败。
+  const rawVerdict = record.verdict;
+  const verdictField =
+    typeof rawVerdict === "string" ? rawVerdict.toUpperCase() : rawVerdict;
   if (verdictField !== "PASS" && verdictField !== "ANOMALY" && verdictField !== "ERROR") {
     throw normalizationFailure("schema");
   }
