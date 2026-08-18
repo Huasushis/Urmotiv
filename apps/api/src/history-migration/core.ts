@@ -1285,11 +1285,13 @@ async function loadCandidateSeed(options: {
     .filter(({ sourceId }) => !seededSourceIds.has(sourceId))
     .map(({ sourceId }) => sourceId);
   const receiptSourceIds = receipt.candidates.map(({ sourceId }) => sourceId);
+  const canonicalRemainingIdSet = new Set(canonicalRemainingSourceIds);
   if (
     JSON.stringify(receiptSourceIds) !== JSON.stringify(canonicalSeededSourceIds) ||
     JSON.stringify(remainingSelection.sourceIds) !== JSON.stringify(canonicalRemainingSourceIds) ||
-    JSON.stringify(options.sourceSelection.sourceIds) !==
-      JSON.stringify(canonicalRemainingSourceIds) ||
+    !options.sourceSelection.sourceIds.every((sourceId) =>
+      canonicalRemainingIdSet.has(sourceId),
+    ) ||
     receipt.remainingSourceCount !== canonicalRemainingSourceIds.length ||
     receipt.partitionSha256 !==
       candidateSeedPartitionDigest(canonicalSeededSourceIds, canonicalRemainingSourceIds) ||
@@ -1299,7 +1301,7 @@ async function loadCandidateSeed(options: {
   ) {
     throw new HistoryMigrationError(
       "INVALID_CANDIDATE_SEED",
-      "候选种子与剩余源选择不是当前权威集合的严格不相交补集。",
+      "候选种子要求选择清单是当前权威集合剩余补集的非空无重复子集。",
     );
   }
   return { receiptSha256, candidates };

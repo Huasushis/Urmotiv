@@ -445,6 +445,185 @@ describe("历史题目迁移安全核心", () => {
     await expect(stat(rejectedOutput)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("允许种子补集的真子集运行一源，并支持后续补集续跑而不回放", async () => {
+    const fixture = await createMultiFixture();
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize(input) {
+          return { problems: [normalizedProblem(`合成候选题-${input.sourceId}`)] };
+        },
+      },
+    });
+    const firstLegacy = await readCandidate(fixture.prepareOutput, "candidate-000001");
+    const legacyApprovalFile = join(fixture.root, "legacy-approval.private.json");
+    await writeFile(
+      legacyApprovalFile,
+      `${JSON.stringify(
+        {
+          version: 1,
+          confirmed: true,
+          approvals: [
+            {
+              candidateId: firstLegacy.candidateId,
+              contentSha256: firstLegacy.contentSha256,
+              decision: "approved",
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await chmod(legacyApprovalFile, 0o600);
+    const metadata = JSON.parse(
+      await readFile(fixture.prepareOptions.metadataFile, "utf8"),
+    ) as { records: Array<Record<string, unknown>> };
+    for (const record of metadata.records) {
+      record.name = `${String(record.name)}-权威修订`;
+    }
+    await writeFile(
+      fixture.prepareOptions.metadataFile,
+      `${JSON.stringify(metadata, null, 2)}\n`,
+      "utf8",
+    );
+    await chmod(fixture.prepareOptions.metadataFile, 0o600);
+    const groupingBatchSha256 = await rewriteMultiFixtureMaterialization(fixture);
+
+    const seedDirectory = join(fixture.root, "candidate-seed-subset");
+    const seedResult = await seedApprovedHistoryCandidates({
+      privateRootDirectory: fixture.root,
+      materializedDirectory: fixture.materializedDirectory,
+      metadataFile: fixture.prepareOptions.metadataFile,
+      legacyPreparedDirectory: fixture.prepareOutput,
+      legacyApprovalFile,
+      outputDirectory: seedDirectory,
+    });
+    expect(seedResult).toMatchObject({
+      sourceCount: 3,
+      seededSourceCount: 1,
+      remainingSourceCount: 2,
+    });
+    const fullSelection = JSON.parse(
+      await readFile(join(seedDirectory, "remaining-selection.private.json"), "utf8"),
+    ) as { sourceIds: string[] };
+    expect(fullSelection.sourceIds).toEqual(["source-000002", "source-000003"]);
+
+    const subsetSelection = join(fixture.root, "subset-selection.private.json");
+    await writeFile(
+      subsetSelection,
+      `${JSON.stringify(
+        { version: 1, confirmed: true, sourceIds: ["source-000002"] },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await chmod(subsetSelection, 0o600);
+    const canaryOutput = join(fixture.root, "prepared-subset");
+    const calls: string[] = [];
+    const canaryResult = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      outputDirectory: canaryOutput,
+      sourceSelectorFile: subsetSelection,
+      candidateSeedDirectory: seedDirectory,
+      authoritativeGroupingBatchSha256: groupingBatchSha256,
+      normalizer: {
+        async normalize(input) {
+          calls.push(input.sourceId);
+          return normalizedOutput();
+        },
+      },
+    });
+    expect(canaryResult).toMatchObject({
+      sourceCount: 3,
+      completedSourceCount: 2,
+      candidateCount: 2,
+      pendingSourceCount: 1,
+      complete: false,
+    });
+    expect(calls).toEqual(["source-000002"]);
+    const canaryCandidate = await readCandidate(canaryOutput, "candidate-000031");
+    expect(canaryCandidate.problem.title).toBe("合成候选题");
+    expect(await readdir(join(canaryOutput, "candidates"))).toEqual([
+      "candidate-000001.json",
+      "candidate-000031.json",
+    ]);
+    expect(await readdir(canaryOutput)).not.toContain("PREPARE_COMPLETE");
+
+    const resumeSelection = join(fixture.root, "resume-selection.private.json");
+    await writeFile(
+      resumeSelection,
+      `${JSON.stringify(
+        {
+          version: 1,
+          confirmed: true,
+          sourceIds: ["source-000003"],
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await chmod(resumeSelection, 0o600);
+    const resumeResult = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      resume: true,
+      outputDirectory: canaryOutput,
+      sourceSelectorFile: resumeSelection,
+      candidateSeedDirectory: seedDirectory,
+      authoritativeGroupingBatchSha256: groupingBatchSha256,
+      normalizer: {
+        async normalize(input) {
+          calls.push(input.sourceId);
+          return normalizedOutput();
+        },
+      },
+    });
+    expect(resumeResult).toMatchObject({
+      sourceCount: 3,
+      completedSourceCount: 3,
+      candidateCount: 3,
+      pendingSourceCount: 0,
+      complete: true,
+    });
+    expect(calls).toEqual(["source-000002", "source-000003"]);
+    expect(await readdir(join(canaryOutput, "candidates"))).toEqual([
+      "candidate-000001.json",
+      "candidate-000031.json",
+      "candidate-000061.json",
+    ]);
+    expect(await readCandidate(canaryOutput, "candidate-000031")).toEqual(
+      canaryCandidate,
+    );
+    expect(await readdir(canaryOutput)).toContain("PREPARE_COMPLETE");
+
+    const foreignSelection = join(fixture.root, "foreign-selection.private.json");
+    await writeFile(
+      foreignSelection,
+      `${JSON.stringify(
+        { version: 1, confirmed: true, sourceIds: ["source-000001"] },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await chmod(foreignSelection, 0o600);
+    const foreignNormalizer = { normalize: vi.fn(async () => normalizedOutput()) };
+    await expect(
+      prepareHistoryCandidates({
+        ...fixture.prepareOptions,
+        outputDirectory: join(fixture.root, "rejected-foreign"),
+        sourceSelectorFile: foreignSelection,
+        candidateSeedDirectory: seedDirectory,
+        authoritativeGroupingBatchSha256: groupingBatchSha256,
+        normalizer: foreignNormalizer,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_CANDIDATE_SEED" });
+    expect(foreignNormalizer.normalize).not.toHaveBeenCalled();
+  });
+
   it("严格拒绝带额外字段的选择清单和超出上限的并发数", async () => {
     const fixture = await createFixture("只用于参数边界测试的合成正文。");
     const selectionManifestFile = join(fixture.root, "selection.private.json");
