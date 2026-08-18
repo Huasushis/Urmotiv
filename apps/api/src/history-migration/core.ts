@@ -14,7 +14,12 @@ import {
   type HistoryAttachmentMappingCapability,
   revalidateHistoryAttachmentMappingCapability,
 } from "./attachment-mapping";
-import { candidateContentDigest, sha256Hex, sourceBindingDigest, sourceMappingDigest } from "./digests";
+import {
+  candidateContentDigest,
+  sha256Hex,
+  sourceBindingDigest,
+  sourceMappingDigest,
+} from "./digests";
 import {
   HistoryMigrationError,
   HistoryNormalizationError,
@@ -46,6 +51,7 @@ import {
   historyMetadataFileSchema,
   historyRepairManifestSchema,
   historySourceMappingSchema,
+  historySourceSelectionSchema,
   normalizedHistoryOutputSchema,
   type HistoryCandidateRecord,
   type HistoryMetadataRecord,
@@ -183,9 +189,7 @@ export interface HistoryNormalizerInput {
    * 逃逸之前等待。接收器错误会取代原始终端失败，且不携带正文。成功时返回
    * 不透明绑定描述符，供未来 core 持久化层使用。Stage A 不做文件系统持久化。
    */
-  readonly captureTransportEvidence?: (
-    transport: CapturedTransport,
-  ) => Promise<EvidenceDescriptor>;
+  readonly captureTransportEvidence?: (transport: CapturedTransport) => Promise<EvidenceDescriptor>;
 }
 
 export interface HistoryNormalizer {
@@ -210,6 +214,14 @@ export interface PrepareHistoryCandidatesOptions {
   /** 每次新运行必须使用新的非空标签；检查点只保存其摘要。 */
   readonly operationTag: string;
   readonly executionIdentity: HistoryPreparationExecutionIdentity;
+  /**
+   * 可选的选择清单文件：只准备这里明确列出的 sourceId，其余源保持未处理。
+   * 候选安全编号仍然按它们在完整确认集合中的原始位置生成，不重排子集的编号，
+   * 因此选中子集与完整运行共享同一套全局候选编号。
+   */
+  readonly sourceSelectorFile?: string;
+  /** 同时进行的源处理数。省略时默认 12，只接受 1..20 的整数。 */
+  readonly concurrency?: number;
   /** 只允许在同一输出目录、同一标签和同一执行身份下续跑。 */
   readonly resume?: boolean;
 }
@@ -304,16 +316,48 @@ export async function prepareHistoryCandidates(
     );
   }
   const executionIdentity = parsedExecutionIdentity.data;
+  const concurrency = parsePreparationConcurrency(options.concurrency);
   await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
     { path: options.sourceDirectory, kind: "existing" },
     { path: options.metadataFile, kind: "existing" },
     { path: options.sourceConfirmationFile, kind: "existing" },
+    ...(options.sourceSelectorFile === undefined
+      ? []
+      : [{ path: options.sourceSelectorFile, kind: "existing" as const }]),
     { path: options.outputDirectory, kind: options.resume === true ? "existing" : "new" },
   ]);
-  const { confirmedSources } = await loadConfirmedInputs(
+  const { confirmedSources: allConfirmedSources } = await loadConfirmedInputs(
     options.metadataFile,
     await readPrivateJson(options.sourceConfirmationFile),
   );
+  const confirmedSourceIds = new Set(allConfirmedSources.map(({ sourceId }) => sourceId));
+  const indexedConfirmedSources = allConfirmedSources.map((source, sourceIndex) => ({
+    source,
+    sourceIndex,
+  }));
+  let selectedSources = indexedConfirmedSources;
+  if (options.sourceSelectorFile !== undefined) {
+    const parsedSelection = historySourceSelectionSchema.safeParse(
+      await readPrivateJson(options.sourceSelectorFile),
+    );
+    if (!parsedSelection.success) {
+      throw new HistoryMigrationError(
+        "INVALID_SOURCE_SELECTION",
+        "prepare 的源选择清单格式不正确。",
+      );
+    }
+    const selectedIds = new Set(parsedSelection.data.sourceIds);
+    if (!parsedSelection.data.sourceIds.every((sourceId) => confirmedSourceIds.has(sourceId))) {
+      throw new HistoryMigrationError(
+        "INVALID_SOURCE_SELECTION",
+        "prepare 的源选择清单引用了当前确认集合之外的安全编号。",
+      );
+    }
+    selectedSources = indexedConfirmedSources.filter(({ source }) =>
+      selectedIds.has(source.sourceId),
+    );
+  }
+  const confirmedSources = selectedSources.map(({ source }) => source);
   const operationTagSha256 = sha256Hex(operationTag);
   const inputBatchSha256 = sha256Hex(
     JSON.stringify(
@@ -386,166 +430,180 @@ export async function prepareHistoryCandidates(
   }
 
   const executionIdentitySha256 = sha256Hex(JSON.stringify(executionIdentity));
-  for (const [sourceIndex, source] of confirmedSources.entries()) {
-    const existingState = await loadPreparationSourceState(
-      options.privateRootDirectory,
-      options.outputDirectory,
-      source.sourceId,
-    );
-    if (existingState !== "pending") continue;
-
-    let sourceContent: Awaited<ReturnType<typeof readConfirmedSource>>;
-    try {
-      sourceContent = await readConfirmedSource(
-        options.sourceDirectory,
-        source.mapping.sourcePath,
-        source.mapping.sourceSha256,
-        source.sourceId,
-      );
-    } catch {
-      await writePreparationFailure(
+  let nextSource = 0;
+  let stopScheduling = false;
+  const processNextSource = async (): Promise<void> => {
+    while (!stopScheduling) {
+      const selectedSource = selectedSources[nextSource];
+      nextSource += 1;
+      if (selectedSource === undefined) return;
+      const { source, sourceIndex } = selectedSource;
+      const existingState = await loadPreparationSourceState(
         options.privateRootDirectory,
         options.outputDirectory,
         source.sourceId,
-        null,
-        [],
-        "source_validation",
       );
-      continue;
-    }
+      if (existingState !== "pending") continue;
 
-    const sourceIdentitySha256 = sha256Hex(
-      JSON.stringify({
-        sourceId: source.sourceId,
-        sourceContentSha256: sourceContent.sha256,
-        sourceMappingSha256: source.sourceMappingSha256,
-      }),
-    );
-    const active = preparationActiveSchema.parse({
-      version: 1,
-      status: "active",
-      sourceId: source.sourceId,
-      sourceIdentitySha256,
-      executionIdentitySha256,
-      operationSha256: sha256Hex(
-        JSON.stringify({ operationTagSha256, sourceId: source.sourceId, attempt: 1 }),
-      ),
-    });
-    await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
-      { path: join(options.outputDirectory, "requests"), kind: "existing" },
-      { path: join(options.outputDirectory, "candidates"), kind: "existing" },
-    ]);
-    await writeNewPrivateJson(
-      preparationStatePath(options.outputDirectory, source.sourceId, "active"),
-      active,
-    );
-    const activeSha256 = sha256Hex(JSON.stringify(active));
-    const requestAttemptSha256s = [activeSha256];
+      let sourceContent: Awaited<ReturnType<typeof readConfirmedSource>>;
+      try {
+        sourceContent = await readConfirmedSource(
+          options.sourceDirectory,
+          source.mapping.sourcePath,
+          source.mapping.sourceSha256,
+          source.sourceId,
+        );
+      } catch {
+        await writePreparationFailure(
+          options.privateRootDirectory,
+          options.outputDirectory,
+          source.sourceId,
+          null,
+          [],
+          "source_validation",
+        );
+        continue;
+      }
 
-    try {
-      const normalized = normalizedHistoryOutputSchema.parse(
-        await options.normalizer.normalize({
+      const sourceIdentitySha256 = sha256Hex(
+        JSON.stringify({
           sourceId: source.sourceId,
-          text: sourceContent.text,
-          beforeRequest: async (attempt) => {
-            if (attempt === 1) return;
-            const retryActive = preparationActiveSchema.parse({
-              ...active,
-              operationSha256: sha256Hex(
-                JSON.stringify({ operationTagSha256, sourceId: source.sourceId, attempt }),
-              ),
-            });
-            await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
-              { path: join(options.outputDirectory, "requests"), kind: "existing" },
-            ]);
-            await writeNewPrivateJson(
-              join(
-                options.outputDirectory,
-                "requests",
-                `${source.sourceId}.attempt-${String(attempt).padStart(2, "0")}.active.json`,
-              ),
-              retryActive,
-            );
-            requestAttemptSha256s.push(sha256Hex(JSON.stringify(retryActive)));
-          },
+          sourceContentSha256: sourceContent.sha256,
+          sourceMappingSha256: source.sourceMappingSha256,
         }),
       );
-      const candidates: Array<{
-        readonly candidateId: string;
-        readonly contentSha256: string;
-      }> = [];
-      for (const [problemIndex, normalizedProblem] of normalized.problems.entries()) {
-        const candidateId = makeSafeId("candidate", sourceIndex * 30 + problemIndex + 1);
-        const problem = toCandidateProblem(normalizedProblem);
-        assertPrivateIdentifiersNotPresent(
-          { problem, normalizationNote: normalizedProblem.migrationNote },
-          source.metadata.authorStudentId,
-          source.mapping.sourcePath,
-        );
-        const sourceBindingSha256 = sourceBindingDigest({
-          sourceId: source.sourceId,
-          sourceContentSha256: sourceContent.sha256,
-          sourcePath: source.mapping.sourcePath,
-          sourceSha256: source.mapping.sourceSha256,
-          metadataNumber: source.mapping.metadataNumber,
-        });
-        const contentSha256 = candidateContentDigest({
-          sourceId: source.sourceId,
-          sourceContentSha256: sourceContent.sha256,
-          sourceMappingSha256: source.sourceMappingSha256,
-          modelConfidence: normalizedProblem.confidence,
-          normalizationNote: normalizedProblem.migrationNote,
-          problem,
-        });
-        const candidate = historyCandidateRecordSchema.parse({
-          version: 1,
-          candidateId,
-          sourceId: source.sourceId,
-          sourceContentSha256: sourceContent.sha256,
-          sourceMappingSha256: source.sourceMappingSha256,
-          sourceBindingSha256,
-          contentSha256,
-          modelConfidence: normalizedProblem.confidence,
-          normalizationNote: normalizedProblem.migrationNote,
-          problem,
-        });
-        await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
-          { path: join(options.outputDirectory, "candidates"), kind: "existing" },
-        ]);
-        await writeNewPrivateJson(
-          join(options.outputDirectory, "candidates", `${candidateId}.json`),
-          candidate,
-        );
-        candidates.push({ candidateId, contentSha256 });
-      }
+      const active = preparationActiveSchema.parse({
+        version: 1,
+        status: "active",
+        sourceId: source.sourceId,
+        sourceIdentitySha256,
+        executionIdentitySha256,
+        operationSha256: sha256Hex(
+          JSON.stringify({ operationTagSha256, sourceId: source.sourceId, attempt: 1 }),
+        ),
+      });
       await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
         { path: join(options.outputDirectory, "requests"), kind: "existing" },
+        { path: join(options.outputDirectory, "candidates"), kind: "existing" },
       ]);
       await writeNewPrivateJson(
-        preparationStatePath(options.outputDirectory, source.sourceId, "completed"),
-        preparationCompletedSchema.parse({
-          version: 1,
-          status: "completed",
-          sourceId: source.sourceId,
+        preparationStatePath(options.outputDirectory, source.sourceId, "active"),
+        active,
+      );
+      const activeSha256 = sha256Hex(JSON.stringify(active));
+      const requestAttemptSha256s = [activeSha256];
+
+      try {
+        const normalized = normalizedHistoryOutputSchema.parse(
+          await options.normalizer.normalize({
+            sourceId: source.sourceId,
+            text: sourceContent.text,
+            beforeRequest: async (attempt) => {
+              if (attempt === 1) return;
+              const retryActive = preparationActiveSchema.parse({
+                ...active,
+                operationSha256: sha256Hex(
+                  JSON.stringify({ operationTagSha256, sourceId: source.sourceId, attempt }),
+                ),
+              });
+              await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+                { path: join(options.outputDirectory, "requests"), kind: "existing" },
+              ]);
+              await writeNewPrivateJson(
+                join(
+                  options.outputDirectory,
+                  "requests",
+                  `${source.sourceId}.attempt-${String(attempt).padStart(2, "0")}.active.json`,
+                ),
+                retryActive,
+              );
+              requestAttemptSha256s.push(sha256Hex(JSON.stringify(retryActive)));
+            },
+          }),
+        );
+        const candidates: Array<{
+          readonly candidateId: string;
+          readonly contentSha256: string;
+        }> = [];
+        for (const [problemIndex, normalizedProblem] of normalized.problems.entries()) {
+          const candidateId = makeSafeId("candidate", sourceIndex * 30 + problemIndex + 1);
+          const problem = toCandidateProblem(normalizedProblem);
+          assertPrivateIdentifiersNotPresent(
+            { problem, normalizationNote: normalizedProblem.migrationNote },
+            source.metadata.authorStudentId,
+            source.mapping.sourcePath,
+          );
+          const sourceBindingSha256 = sourceBindingDigest({
+            sourceId: source.sourceId,
+            sourceContentSha256: sourceContent.sha256,
+            sourcePath: source.mapping.sourcePath,
+            sourceSha256: source.mapping.sourceSha256,
+            metadataNumber: source.mapping.metadataNumber,
+          });
+          const contentSha256 = candidateContentDigest({
+            sourceId: source.sourceId,
+            sourceContentSha256: sourceContent.sha256,
+            sourceMappingSha256: source.sourceMappingSha256,
+            modelConfidence: normalizedProblem.confidence,
+            normalizationNote: normalizedProblem.migrationNote,
+            problem,
+          });
+          const candidate = historyCandidateRecordSchema.parse({
+            version: 1,
+            candidateId,
+            sourceId: source.sourceId,
+            sourceContentSha256: sourceContent.sha256,
+            sourceMappingSha256: source.sourceMappingSha256,
+            sourceBindingSha256,
+            contentSha256,
+            modelConfidence: normalizedProblem.confidence,
+            normalizationNote: normalizedProblem.migrationNote,
+            problem,
+          });
+          await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+            { path: join(options.outputDirectory, "candidates"), kind: "existing" },
+          ]);
+          await writeNewPrivateJson(
+            join(options.outputDirectory, "candidates", `${candidateId}.json`),
+            candidate,
+          );
+          candidates.push({ candidateId, contentSha256 });
+        }
+        await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+          { path: join(options.outputDirectory, "requests"), kind: "existing" },
+        ]);
+        await writeNewPrivateJson(
+          preparationStatePath(options.outputDirectory, source.sourceId, "completed"),
+          preparationCompletedSchema.parse({
+            version: 1,
+            status: "completed",
+            sourceId: source.sourceId,
+            activeSha256,
+            requestAttemptSha256s,
+            candidates,
+          }),
+        );
+      } catch (error) {
+        await writePreparationFailure(
+          options.privateRootDirectory,
+          options.outputDirectory,
+          source.sourceId,
           activeSha256,
           requestAttemptSha256s,
-          candidates,
-        }),
-      );
-    } catch (error) {
-      await writePreparationFailure(
-        options.privateRootDirectory,
-        options.outputDirectory,
-        source.sourceId,
-        activeSha256,
-        requestAttemptSha256s,
-        classifyPreparationFailure(error),
-      );
-      if (error instanceof HistoryNormalizationError && error.failureKind === "cancelled") {
-        break;
+          classifyPreparationFailure(error),
+        );
+        if (error instanceof HistoryNormalizationError && error.failureKind === "cancelled") {
+          stopScheduling = true;
+          return;
+        }
       }
     }
-  }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, selectedSources.length) }, () =>
+      processNextSource(),
+    ),
+  );
 
   const summary = await summarizePreparation(
     options.privateRootDirectory,
@@ -623,6 +681,14 @@ export async function prepareHistoryCandidates(
     pendingSourceCount: summary.pendingSourceCount,
     complete: summary.complete,
   };
+}
+
+function parsePreparationConcurrency(value: number | undefined): number {
+  const concurrency = value ?? 12;
+  if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 20) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "prepare 并发数必须是 1 到 20 的整数。");
+  }
+  return concurrency;
 }
 
 type PreparationSourceState =
@@ -923,7 +989,10 @@ async function summarizePreparation(
         contentSha256: candidate.contentSha256,
         titleLength: candidate.problem.title.length,
         basicStatementLength: candidate.problem.content.basicStatement.length,
-        basicSolutionLength: candidate.problem.content.basicSolution === null ? 0 : candidate.problem.content.basicSolution.length,
+        basicSolutionLength:
+          candidate.problem.content.basicSolution === null
+            ? 0
+            : candidate.problem.content.basicSolution.length,
         totalContentLength: totalCandidateContentLength(candidate.problem),
         sampleCount: candidate.problem.samples.length,
         status: "awaiting_approval",
@@ -1208,7 +1277,8 @@ export async function repairFailedHistoryCandidates(
     if (state.kind === "completed") {
       if (
         !state.record.candidates.some(
-          (item) => item.candidateId === candidateId && item.contentSha256 === reference.contentSha256,
+          (item) =>
+            item.candidateId === candidateId && item.contentSha256 === reference.contentSha256,
         )
       ) {
         throw new HistoryMigrationError(
@@ -1295,10 +1365,9 @@ export async function repairFailedHistoryCandidates(
     );
     // 完成检查点已权威地取代失败回执：移除它，让状态与 prepare 成功路径一致。
     // 若中途崩溃留下两者并存，重跑时由 removeSupersededFailureReceipt 自愈。
-    await rm(
-      preparationStatePath(options.preparedDirectory, repair.source.sourceId, "failed"),
-      { force: true },
-    );
+    await rm(preparationStatePath(options.preparedDirectory, repair.source.sourceId, "failed"), {
+      force: true,
+    });
   }
 
   // ── 阶段 3：汇总并发布完成标记（与 prepare 收尾一致，全部 write-or-validate）。
@@ -1499,7 +1568,11 @@ async function loadAuthoritativelyApprovedCandidates(
       );
     }
     assignedSourceIds.add(candidate.sourceId);
-    approvedCandidates.push({ record: candidate, metadata: source.metadata, mapping: source.mapping });
+    approvedCandidates.push({
+      record: candidate,
+      metadata: source.metadata,
+      mapping: source.mapping,
+    });
   }
   await loadPreparationMarker(
     options.privateRootDirectory,
@@ -1523,7 +1596,10 @@ export async function verifyApprovedPackageSourceIdentities(
     materializedDirectory: options.materializedDirectory,
   });
   try {
-    const approvedCandidates = await loadAuthoritativelyApprovedCandidates(options, materialization);
+    const approvedCandidates = await loadAuthoritativelyApprovedCandidates(
+      options,
+      materialization,
+    );
     await materialization.assertUnchangedBeforePublish();
     return approvedCandidates.map(({ record, mapping }) => ({
       candidateId: record.candidateId,
@@ -1634,7 +1710,10 @@ export async function packageApprovedCandidates(
       const problemForExport =
         candidateAttachmentPlan === undefined || candidateAttachmentPlan.rewrites.length === 0
           ? approved.record.problem
-          : applyStatementReferenceRewrites(approved.record.problem, candidateAttachmentPlan.rewrites);
+          : applyStatementReferenceRewrites(
+              approved.record.problem,
+              candidateAttachmentPlan.rewrites,
+            );
       const generated = await urmotivNativeAdapter.export(problemForExport, {
         exportedAt: options.exportedAt ?? new Date().toISOString(),
       });
@@ -1682,7 +1761,8 @@ export async function packageApprovedCandidates(
         candidateId: approved.record.candidateId,
         contentSha256: approved.record.contentSha256,
         sourceBindingSha256:
-          approved.record.sourceBindingSha256 ?? sourceBindingDigest({
+          approved.record.sourceBindingSha256 ??
+          sourceBindingDigest({
             sourceId: approved.record.sourceId,
             sourceContentSha256: approved.record.sourceContentSha256,
             sourcePath: approved.mapping.sourcePath,
@@ -1853,7 +1933,10 @@ interface AttachmentPackagePreservedEntry {
 
 interface AttachmentPackagePlan {
   readonly groupIdBySourceId: ReadonlyMap<string, string>;
-  readonly rewritesByGroupId: ReadonlyMap<string, readonly { readonly from: string; readonly to: string }[]>;
+  readonly rewritesByGroupId: ReadonlyMap<
+    string,
+    readonly { readonly from: string; readonly to: string }[]
+  >;
   readonly targetsByGroupId: ReadonlyMap<string, readonly AttachmentPackageTarget[]>;
   readonly preservedEntries: readonly AttachmentPackagePreservedEntry[];
 }
@@ -1872,18 +1955,12 @@ function buildAttachmentPackagePlan(
   const reportGroupIds = new Set(materializeReport.sources.map((source) => source.groupId));
   for (const source of materializeReport.sources) {
     if (!capability.groups.some((group) => group.groupId === source.groupId)) {
-      throw new HistoryMigrationError(
-        "GROUPING_CHANGED",
-        "物化报告的分组与附件完成门不一致。",
-      );
+      throw new HistoryMigrationError("GROUPING_CHANGED", "物化报告的分组与附件完成门不一致。");
     }
   }
   for (const group of capability.groups) {
     if (!reportGroupIds.has(group.groupId)) {
-      throw new HistoryMigrationError(
-        "GROUPING_CHANGED",
-        "附件完成门分组缺少对应的物化源。",
-      );
+      throw new HistoryMigrationError("GROUPING_CHANGED", "附件完成门分组缺少对应的物化源。");
     }
   }
   const rewritesByGroupId = new Map<
@@ -1948,10 +2025,12 @@ function buildAttachmentPackagePlan(
 function attachmentPlanForCandidate(
   plan: AttachmentPackagePlan,
   sourceId: string,
-): {
-  readonly rewrites: readonly { readonly from: string; readonly to: string }[];
-  readonly targets: readonly AttachmentPackageTarget[];
-} | undefined {
+):
+  | {
+      readonly rewrites: readonly { readonly from: string; readonly to: string }[];
+      readonly targets: readonly AttachmentPackageTarget[];
+    }
+  | undefined {
   const groupId = plan.groupIdBySourceId.get(sourceId);
   if (groupId === undefined) {
     throw new HistoryMigrationError(
@@ -2019,10 +2098,7 @@ function readVerifiedAttachmentBytes(
 ): Uint8Array {
   const bytes = capability.readAttachmentBytes(target.locator);
   if (bytes.byteLength !== target.byteLength || sha256Hex(bytes) !== target.contentSha256) {
-    throw new HistoryMigrationError(
-      "SOURCE_DIGEST_MISMATCH",
-      "附件固定源字节与已确认映射不一致。",
-    );
+    throw new HistoryMigrationError("SOURCE_DIGEST_MISMATCH", "附件固定源字节与已确认映射不一致。");
   }
   return bytes;
 }
@@ -2040,10 +2116,7 @@ function repackagedWithAttachmentChecksums(
     files.set(file.path, file.content);
   }
   files.delete(checksumFilePath);
-  files.set(
-    checksumFilePath,
-    new TextEncoder().encode(renderChecksums(checksumsForFiles(files))),
-  );
+  files.set(checksumFilePath, new TextEncoder().encode(renderChecksums(checksumsForFiles(files))));
   return [...files.entries()].map(([path, content]) => ({ path, content }));
 }
 

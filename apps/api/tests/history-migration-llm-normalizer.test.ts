@@ -4,7 +4,6 @@ import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createLlmHistoryNormalizer,
-  defaultNormalizationOutputTokens,
   defaultNormalizationMaximumDurationMs,
   historyNormalizationRequestProfileVersion,
   historyReplayParserVersion,
@@ -14,10 +13,7 @@ import {
   type CapturedTransport,
   type LlmHistoryNormalizerOptions,
 } from "../src/history-migration/index";
-import {
-  HistoryMigrationError,
-  HistoryNormalizationError,
-} from "../src/history-migration/errors";
+import { HistoryMigrationError, HistoryNormalizationError } from "../src/history-migration/errors";
 
 const sourceInput = {
   sourceId: "source-000001",
@@ -28,8 +24,20 @@ const normalizedContent = JSON.stringify({
   problems: [
     {
       title: "合成候选题",
+      type: "traditional",
       basicStatement: "只用于测试的合成题面。",
       basicSolution: "只用于测试的合成题解。",
+      background: "",
+      statement: "",
+      inputFormat: "",
+      outputFormat: "",
+      constraints: "",
+      solution: "",
+      hints: "",
+      samples: [],
+      tags: [],
+      confidence: 0.9,
+      migrationNote: "",
     },
   ],
 });
@@ -57,9 +65,7 @@ describe("历史题目模型整理流式请求", () => {
     let requestBody: unknown;
     const fetch = vi.fn(async (_input: URL, init: RequestInit) => {
       requestBody = JSON.parse(String(init.body)) as unknown;
-      return eventStreamResponse(
-        `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\n`,
-      );
+      return eventStreamResponse(`${completionEvent(normalizedContent, "stop")}data: [DONE]\n\n`);
     });
     const normalizer = createNormalizer({
       fetch,
@@ -72,9 +78,7 @@ describe("历史题目模型整理流式请求", () => {
     expect(requestBody).toEqual({
       model: "synthetic-model",
       temperature: 0.1,
-      max_tokens: 65_536,
-      thinking: { type: "disabled" },
-      response_format: { type: "json_object" },
+      thinking: { type: "max" },
       stream: true,
       messages: [
         { role: "system", content: expect.any(String) },
@@ -84,17 +88,20 @@ describe("历史题目模型整理流式请求", () => {
     expect(Object.keys(requestBody as Record<string, unknown>)).toEqual([
       "model",
       "temperature",
-      "max_tokens",
       "thinking",
-      "response_format",
       "stream",
       "messages",
     ]);
+    expect(requestBody).not.toHaveProperty("max_tokens");
+    expect(requestBody).not.toHaveProperty("max_completion_tokens");
+    expect(requestBody).not.toHaveProperty("response_format");
     const messages = (requestBody as { messages: Array<{ content: string }> }).messages;
     expect(messages[0]?.content).toContain("题面和题解是核心");
     expect(messages[0]?.content).toContain("tags 必须始终是空数组 []");
     expect(messages[0]?.content).toContain("不要读取、采信或推断投题者自报难度");
     expect(messages[0]?.content).toContain("JSON 前后不得出现说明");
+    expect(messages[0]?.content).toContain('"additionalProperties": false');
+    expect(messages[0]?.content).toContain('"required": [');
 
     const expectedConfig = {
       endpointSha256: sha256("https://synthetic.invalid/v1/chat/completions"),
@@ -108,9 +115,7 @@ describe("历史题目模型整理流式请求", () => {
         version: historyNormalizationRequestProfileVersion,
         parameters: {
           temperature: 0.1,
-          max_tokens: defaultNormalizationOutputTokens,
-          thinking: { type: "disabled" },
-          response_format: { type: "json_object" },
+          thinking: { type: "max" },
           stream: true,
         },
         messageLayout: {
@@ -120,24 +125,31 @@ describe("历史题目模型整理流式请求", () => {
         },
       },
       streamingProtocol: "sse-eof-benign-controls-v2",
-      retryPolicy: "http-429-only",
+      retryPolicy: "http-429-and-zero-byte-transport",
     };
     expect(normalizer.preparationIdentity.configSha256).toBe(
       sha256(JSON.stringify(expectedConfig)),
     );
-    expect(normalizer.preparationIdentity.modelSha256).toBe(
-      sha256("synthetic-model"),
-    );
+    expect(normalizer.preparationIdentity.modelSha256).toBe(sha256("synthetic-model"));
   });
 
-  it("输出 token 上限变化会改变执行身份，且拒绝超出已验证上限的配置", () => {
-    expect(defaultNormalizationOutputTokens).toBe(65_536);
+  it("只有显式配置才发送输出 token 上限并改变执行身份", async () => {
     expect(maximumNormalizationOutputTokens).toBe(65_536);
-    const current = createNormalizer();
-    const reduced = createNormalizer({ maximumOutputTokens: 65_535 });
-    expect(current.preparationIdentity.configSha256).not.toBe(
-      reduced.preparationIdentity.configSha256,
+    let requestBody: Record<string, unknown> | undefined;
+    const fetch = vi.fn(async (_input: URL, init: RequestInit) => {
+      requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return eventStreamResponse(`${completionEvent(normalizedContent, "stop")}data: [DONE]\n\n`);
+    });
+    const uncapped = createNormalizer();
+    const capped = createNormalizer({
+      fetch,
+      maximumOutputTokens: 65_535,
+    });
+    expect(uncapped.preparationIdentity.configSha256).not.toBe(
+      capped.preparationIdentity.configSha256,
     );
+    await expect(capped.normalize(sourceInput)).resolves.toBeDefined();
+    expect(requestBody).toMatchObject({ max_tokens: 65_535 });
     expect(() =>
       createNormalizer({ maximumOutputTokens: maximumNormalizationOutputTokens + 1 }),
     ).toThrow("模型请求限制配置不正确。");
@@ -219,20 +231,18 @@ describe("历史题目模型整理流式请求", () => {
     `\`\`\`json\n${normalizedContent}\n\`\`\``,
     `整理结果如下：${normalizedContent}`,
     `${normalizedContent}\n以上为整理结果。`,
-  ])("拒绝 JSON 对象之外的说明或代码围栏", async (content) => {
+  ])("只做一次本地 JSON 包装格式修复且不重新请求", async (content) => {
     const fetch = vi.fn(async () =>
       eventStreamResponse(`${completionEvent(content, "stop")}data: [DONE]\n\n`),
     );
 
-    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
-      code: "NORMALIZATION_FAILED",
-      failureKind: "invalid_json",
-      message: "source-000001 的模型响应不包含有效候选 JSON。",
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).resolves.toMatchObject({
+      problems: [{ title: "合成候选题" }],
     });
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it("模型自行选择知识点标签时强制重置为空数组", async () => {
+  it("模型自行选择知识点标签时严格拒绝且不重新请求", async () => {
     const withInventedTag = JSON.stringify({
       ...JSON.parse(normalizedContent),
       problems: [
@@ -243,13 +253,27 @@ describe("历史题目模型整理流式请求", () => {
       ],
     });
     const fetch = vi.fn(async () =>
-      eventStreamResponse(
-        `${completionEvent(withInventedTag, "stop")}data: [DONE]\n\n`,
-      ),
+      eventStreamResponse(`${completionEvent(withInventedTag, "stop")}data: [DONE]\n\n`),
     );
 
-    const result = await createNormalizer({ fetch }).normalize(sourceInput);
-    expect(result.problems[0]!.tags).toEqual([]);
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "schema",
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("模型结果含结构外字段时严格拒绝且不重新请求", async () => {
+    const parsed = JSON.parse(normalizedContent);
+    parsed.problems[0].unexpected = "synthetic-extra";
+    const fetch = vi.fn(async () =>
+      eventStreamResponse(`${completionEvent(JSON.stringify(parsed), "stop")}data: [DONE]\n\n`),
+    );
+
+    await expect(createNormalizer({ fetch }).normalize(sourceInput)).rejects.toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind: "schema",
+    });
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
@@ -417,18 +441,19 @@ describe("历史题目模型整理流式请求", () => {
     const encoder = new TextEncoder();
     let streamController!: ReadableStreamDefaultController<Uint8Array>;
     let cancelled = false;
-    const fetch = vi.fn(async () =>
-      new Response(
-        new ReadableStream<Uint8Array>({
-          start(controller) {
-            streamController = controller;
-          },
-          cancel() {
-            cancelled = true;
-          },
-        }),
-        { headers: { "Content-Type": "text/event-stream" } },
-      ),
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              streamController = controller;
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
     );
     const resultPromise = createNormalizer({
       fetch,
@@ -493,20 +518,21 @@ describe("历史题目模型整理流式请求", () => {
       ].join("\r\n"),
     );
     let offset = 0;
-    const fetch = vi.fn(async () =>
-      new Response(
-        new ReadableStream<Uint8Array>({
-          pull(controller) {
-            if (offset < bytes.byteLength) {
-              controller.enqueue(bytes.slice(offset, offset + 1));
-              offset += 1;
-            } else {
-              controller.close();
-            }
-          },
-        }),
-        { headers: { "Content-Type": "text/event-stream; charset=utf-8" } },
-      ),
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (offset < bytes.byteLength) {
+                controller.enqueue(bytes.slice(offset, offset + 1));
+                offset += 1;
+              } else {
+                controller.close();
+              }
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream; charset=utf-8" } },
+        ),
     );
 
     await expect(createNormalizer({ fetch }).normalize(sourceInput)).resolves.toMatchObject({
@@ -538,18 +564,19 @@ describe("历史题目模型整理流式请求", () => {
     const encoder = new TextEncoder();
     let streamController!: ReadableStreamDefaultController<Uint8Array>;
     let cancelled = false;
-    const fetch = vi.fn(async () =>
-      new Response(
-        new ReadableStream<Uint8Array>({
-          start(controller) {
-            streamController = controller;
-          },
-          cancel() {
-            cancelled = true;
-          },
-        }),
-        { headers: { "Content-Type": "text/event-stream" } },
-      ),
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              streamController = controller;
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
     );
     const resultPromise = createNormalizer({
       fetch,
@@ -601,7 +628,9 @@ describe("历史题目模型整理流式请求", () => {
       ),
     );
 
-    const error = await createNormalizer({ fetch }).normalize(sourceInput).catch((caught) => caught);
+    const error = await createNormalizer({ fetch })
+      .normalize(sourceInput)
+      .catch((caught) => caught);
     expect(error).toMatchObject({
       code: "NORMALIZATION_FAILED",
       failureKind: "protocol",
@@ -613,13 +642,12 @@ describe("历史题目模型整理流式请求", () => {
   it.each([
     { mode: "stream_interrupted", failureKind: "eof_incomplete" },
     { mode: "cancelled", failureKind: "cancelled" },
-  ] as const)(
-    "协议首错排空期间 $mode 仍保持不完整",
-    async ({ mode, failureKind }) => {
-      const encoder = new TextEncoder();
-      const cancellation = new AbortController();
-      let streamController!: ReadableStreamDefaultController<Uint8Array>;
-      const fetch = vi.fn(async () =>
+  ] as const)("协议首错排空期间 $mode 仍保持不完整", async ({ mode, failureKind }) => {
+    const encoder = new TextEncoder();
+    const cancellation = new AbortController();
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const fetch = vi.fn(
+      async () =>
         new Response(
           new ReadableStream<Uint8Array>({
             start(controller) {
@@ -628,36 +656,35 @@ describe("历史题目模型整理流式请求", () => {
           }),
           { headers: { "Content-Type": "text/event-stream" } },
         ),
-      );
-      const resultPromise = createNormalizer({
-        fetch,
-        signal: cancellation.signal,
-        firstOutputTimeoutMs: 1_000,
-        outputIdleTimeoutMs: 1_000,
-        maximumDurationMs: 5_000,
-      }).normalize(sourceInput);
-      await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
-      streamController.enqueue(
-        encoder.encode(
-          `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: {not-json}\n\n`,
-        ),
-      );
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      if (mode === "stream_interrupted") {
-        streamController.error(new Error("不应泄漏的合成传输错误"));
-      } else {
-        cancellation.abort();
-      }
+    );
+    const resultPromise = createNormalizer({
+      fetch,
+      signal: cancellation.signal,
+      firstOutputTimeoutMs: 1_000,
+      outputIdleTimeoutMs: 1_000,
+      maximumDurationMs: 5_000,
+    }).normalize(sourceInput);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    streamController.enqueue(
+      encoder.encode(
+        `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: {not-json}\n\n`,
+      ),
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (mode === "stream_interrupted") {
+      streamController.error(new Error("不应泄漏的合成传输错误"));
+    } else {
+      cancellation.abort();
+    }
 
-      const error = await resultPromise.catch((caught: unknown) => caught);
-      expect(error).toMatchObject({
-        code: "NORMALIZATION_FAILED",
-        failureKind,
-      });
-      expect(String(error)).not.toContain("不应泄漏");
-      expect(fetch).toHaveBeenCalledTimes(1);
-    },
-  );
+    const error = await resultPromise.catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      code: "NORMALIZATION_FAILED",
+      failureKind,
+    });
+    expect(String(error)).not.toContain("不应泄漏");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
 
   it("非空 reasoning 输出会续期，最终仍必须收到非空 content 和 stop", async () => {
     let generation: ReturnType<typeof setInterval> | undefined;
@@ -731,15 +758,16 @@ describe("历史题目模型整理流式请求", () => {
     try {
       const encoder = new TextEncoder();
       let streamController!: ReadableStreamDefaultController<Uint8Array>;
-      const fetch = vi.fn(async () =>
-        new Response(
-          new ReadableStream<Uint8Array>({
-            start(controller) {
-              streamController = controller;
-            },
-          }),
-          { headers: { "Content-Type": "text/event-stream" } },
-        ),
+      const fetch = vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                streamController = controller;
+              },
+            }),
+            { headers: { "Content-Type": "text/event-stream" } },
+          ),
       );
       const normalizer = createNormalizer({
         fetch,
@@ -753,9 +781,7 @@ describe("历史题目模型整理流式请求", () => {
       await vi.advanceTimersByTimeAsync(0);
 
       await vi.advanceTimersByTimeAsync(60);
-      streamController.enqueue(
-        encoder.encode(`${completionEvent("", "stop")}data: [DONE]\n\n`),
-      );
+      streamController.enqueue(encoder.encode(`${completionEvent("", "stop")}data: [DONE]\n\n`));
       streamController.close();
       await expect(resultPromise).resolves.toMatchObject({
         problems: [{ title: "合成候选题" }],
@@ -772,18 +798,19 @@ describe("历史题目模型整理流式请求", () => {
       const encoder = new TextEncoder();
       let streamController!: ReadableStreamDefaultController<Uint8Array>;
       let cancelled = false;
-      const fetch = vi.fn(async () =>
-        new Response(
-          new ReadableStream<Uint8Array>({
-            start(controller) {
-              streamController = controller;
-            },
-            cancel() {
-              cancelled = true;
-            },
-          }),
-          { headers: { "Content-Type": "text/event-stream" } },
-        ),
+      const fetch = vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                streamController = controller;
+              },
+              cancel() {
+                cancelled = true;
+              },
+            }),
+            { headers: { "Content-Type": "text/event-stream" } },
+          ),
       );
       const resultPromise = createNormalizer({
         fetch,
@@ -825,18 +852,19 @@ describe("历史题目模型整理流式请求", () => {
       const encoder = new TextEncoder();
       let streamController!: ReadableStreamDefaultController<Uint8Array>;
       let cancelled = false;
-      const fetch = vi.fn(async () =>
-        new Response(
-          new ReadableStream<Uint8Array>({
-            start(controller) {
-              streamController = controller;
-            },
-            cancel() {
-              cancelled = true;
-            },
-          }),
-          { headers: { "Content-Type": "text/event-stream" } },
-        ),
+      const fetch = vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                streamController = controller;
+              },
+              cancel() {
+                cancelled = true;
+              },
+            }),
+            { headers: { "Content-Type": "text/event-stream" } },
+          ),
       );
       const resultPromise = createNormalizer({
         fetch,
@@ -870,15 +898,16 @@ describe("历史题目模型整理流式请求", () => {
     try {
       const encoder = new TextEncoder();
       let streamController!: ReadableStreamDefaultController<Uint8Array>;
-      const fetch = vi.fn(async () =>
-        new Response(
-          new ReadableStream<Uint8Array>({
-            start(controller) {
-              streamController = controller;
-            },
-          }),
-          { headers: { "Content-Type": "text/event-stream" } },
-        ),
+      const fetch = vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                streamController = controller;
+              },
+            }),
+            { headers: { "Content-Type": "text/event-stream" } },
+          ),
       );
       const resultPromise = createNormalizer({
         fetch,
@@ -897,9 +926,7 @@ describe("历史题目模型整理流式请求", () => {
       await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(20);
       streamController.enqueue(
-        encoder.encode(
-          `data: [DONE]\n\ndata: ${JSON.stringify(strictUsageMetadataEvent())}\n\n`,
-        ),
+        encoder.encode(`data: [DONE]\n\ndata: ${JSON.stringify(strictUsageMetadataEvent())}\n\n`),
       );
       await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(11);
@@ -970,12 +997,17 @@ describe("历史题目模型整理流式请求", () => {
   it("stop 后流连接报错时拒绝部分结果且不重试", async () => {
     const privateMarker = "SYNTHETIC-STREAM-ERROR-MARKER";
     const fetch = vi.fn(async () => {
+      let delivered = false;
       return new Response(
         new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(
-              new TextEncoder().encode(completionEvent(normalizedContent, "stop")),
-            );
+          pull(controller) {
+            if (!delivered) {
+              delivered = true;
+              controller.enqueue(
+                new TextEncoder().encode(completionEvent(normalizedContent, "stop")),
+              );
+              return;
+            }
             controller.error(new Error(privateMarker));
           },
         }),
@@ -1113,7 +1145,7 @@ describe("历史题目模型整理重试与完整性", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it("请求是否到达服务端无法确认的网络错误不自动重发", async () => {
+  it("确认零字节的网络错误最多尝试三次且不泄露底层错误", async () => {
     const privateMarker = "SYNTHETIC-NETWORK-ERROR-MARKER";
     const fetch = vi.fn(async () => {
       throw new Error(privateMarker);
@@ -1121,7 +1153,11 @@ describe("历史题目模型整理重试与完整性", () => {
 
     let caught: unknown;
     try {
-      await createNormalizer({ fetch, maximumAttempts: 3 }).normalize(sourceInput);
+      await createNormalizer({
+        fetch,
+        maximumAttempts: 10,
+        retryBaseDelayMs: 1,
+      }).normalize(sourceInput);
     } catch (error) {
       caught = error;
     }
@@ -1130,24 +1166,25 @@ describe("历史题目模型整理重试与完整性", () => {
       message: "source-000001 的模型连接失败。",
     });
     expect(String(caught)).not.toContain(privateMarker);
-    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(3);
   });
 
   it("SSE 正文超过硬字节上限时立即失败并且不自动重发", async () => {
     let cancelled = false;
-    const fetch = vi.fn(async () =>
-      new Response(
-        new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(new Uint8Array(20));
-            controller.enqueue(new Uint8Array(20));
-          },
-          cancel() {
-            cancelled = true;
-          },
-        }),
-        { headers: { "Content-Type": "text/event-stream" } },
-      ),
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array(20));
+              controller.enqueue(new Uint8Array(20));
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
     );
 
     await expect(
@@ -1210,15 +1247,10 @@ describe("传输证据捕获与离线重放", () => {
     const normalizer = createNormalizer({ fetch: online });
     return normalizer.normalize(sourceInput).then(async (onlineResult) => {
       // 离线重放提取的严格内容必须与原始 payload 逐字节一致。
-      const replayResult = ReplaySession.replay(
-        new TextEncoder().encode(body),
-        "event_stream",
-      );
+      const replayResult = ReplaySession.replay(new TextEncoder().encode(body), "event_stream");
       expect(replayResult).toBe(normalizedContent);
       // 在线结果与同一原始 payload 的字段一致（schema 校验会补默认字段）。
-      expect(onlineResult.problems[0]).toMatchObject(
-        JSON.parse(normalizedContent).problems[0],
-      );
+      expect(onlineResult.problems[0]).toMatchObject(JSON.parse(normalizedContent).problems[0]);
     });
   });
 
@@ -1226,24 +1258,21 @@ describe("传输证据捕获与离线重放", () => {
     const jsonBody = JSON.stringify({
       choices: [{ message: { content: normalizedContent }, finish_reason: "stop" }],
     });
-    const fetch = vi.fn(async () =>
-      new Response(jsonBody, { headers: { "Content-Type": "application/json" } }),
+    const fetch = vi.fn(
+      async () => new Response(jsonBody, { headers: { "Content-Type": "application/json" } }),
     );
     const onlineResult = await createNormalizer({ fetch }).normalize(sourceInput);
-    const replayResult = ReplaySession.replay(
-      new TextEncoder().encode(jsonBody),
-      "json",
-    );
+    const replayResult = ReplaySession.replay(new TextEncoder().encode(jsonBody), "json");
     expect(replayResult).toBe(normalizedContent);
-    expect(onlineResult.problems[0]).toMatchObject(
-      JSON.parse(normalizedContent).problems[0],
-    );
+    expect(onlineResult.problems[0]).toMatchObject(JSON.parse(normalizedContent).problems[0]);
   });
 
   it("SSE 协议失败在线和离线重放抛出相同 failureKind 与消息", async () => {
     const body = `${completionEvent(normalizedContent, "stop")}data: [DONE]\n\ndata: {not-json}\n\n`;
     const fetch = vi.fn(async () => eventStreamResponse(body));
-    const onlineError = await createNormalizer({ fetch }).normalize(sourceInput).catch((e) => e);
+    const onlineError = await createNormalizer({ fetch })
+      .normalize(sourceInput)
+      .catch((e) => e);
     expect(onlineError).toMatchObject({ code: "NORMALIZATION_FAILED", failureKind: "protocol" });
     let offlineError: unknown;
     try {
@@ -1257,10 +1286,12 @@ describe("传输证据捕获与离线重放", () => {
 
   it("JSON 协议失败在线和离线重放抛出相同 failureKind", async () => {
     const jsonBody = JSON.stringify({ choices: [] });
-    const fetch = vi.fn(async () =>
-      new Response(jsonBody, { headers: { "Content-Type": "application/json" } }),
+    const fetch = vi.fn(
+      async () => new Response(jsonBody, { headers: { "Content-Type": "application/json" } }),
     );
-    const onlineError = await createNormalizer({ fetch }).normalize(sourceInput).catch((e) => e);
+    const onlineError = await createNormalizer({ fetch })
+      .normalize(sourceInput)
+      .catch((e) => e);
     expect(onlineError).toMatchObject({ code: "NORMALIZATION_FAILED", failureKind: "protocol" });
     expect(() => ReplaySession.replay(new TextEncoder().encode(jsonBody), "json")).toThrowError(
       expect.objectContaining({ code: "NORMALIZATION_FAILED", failureKind: "protocol" }),
@@ -1288,7 +1319,7 @@ describe("传输证据捕获与离线重放", () => {
   it("证据接收器在真实 payload schema 失败前被等待并携带精确正文", async () => {
     let sinkCalled = false;
     let capturedDescriptor: CapturedTransport | undefined;
-    const schemaViolatingPayload = "{\"problems\":[]}";
+    const schemaViolatingPayload = '{"problems":[]}';
     const body = `${completionEvent(schemaViolatingPayload, "stop")}data: [DONE]\n\n`;
     const fetch = vi.fn(async () => eventStreamResponse(body));
     const input = {
@@ -1311,13 +1342,10 @@ describe("传输证据捕获与离线重放", () => {
   });
 
   it("schema 失败的已提取 payload 与离线重放严格一致", async () => {
-    const schemaViolatingPayload = "{\"problems\":[]}";
+    const schemaViolatingPayload = '{"problems":[]}';
     const body = `${completionEvent(schemaViolatingPayload, "stop")}data: [DONE]\n\n`;
     // 离线重放不执行 schema 校验，只提取严格 payload：必须等于原始内容。
-    const replayResult = ReplaySession.replay(
-      new TextEncoder().encode(body),
-      "event_stream",
-    );
+    const replayResult = ReplaySession.replay(new TextEncoder().encode(body), "event_stream");
     expect(replayResult).toBe(schemaViolatingPayload);
     // 在线同一传输内容在 schema 校验阶段失败。
     const fetch = vi.fn(async () => eventStreamResponse(body));
@@ -1365,16 +1393,19 @@ describe("传输证据捕获与离线重放", () => {
 
   it("证据接收器在 EOF 中断终端失败前被等待", async () => {
     let sinkCalled = false;
-    const fetch = vi.fn(async () =>
-      new Response(
-        new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(new TextEncoder().encode(completionEvent(normalizedContent, "stop")));
-            controller.error(new Error("synthetic-connection-drop"));
-          },
-        }),
-        { headers: { "Content-Type": "text/event-stream" } },
-      ),
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(completionEvent(normalizedContent, "stop")),
+              );
+              controller.error(new Error("synthetic-connection-drop"));
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
     );
     const input = {
       ...sourceInput,
@@ -1410,7 +1441,11 @@ describe("传输证据捕获与离线重放", () => {
         return { descriptorDigest: "synthetic-digest" };
       },
     };
-    const result = createNormalizer({ fetch, signal: cancellation.signal, maximumAttempts: 3 }).normalize(input);
+    const result = createNormalizer({
+      fetch,
+      signal: cancellation.signal,
+      maximumAttempts: 3,
+    }).normalize(input);
     await new Promise<void>((resolve) => setImmediate(resolve));
     cancellation.abort();
     await expect(result).rejects.toMatchObject({
@@ -1422,16 +1457,17 @@ describe("传输证据捕获与离线重放", () => {
 
   it("证据接收器在 response_too_large 终端失败前被等待", async () => {
     let sinkCalled = false;
-    const fetch = vi.fn(async () =>
-      new Response(
-        new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(new TextEncoder().encode("x".repeat(200)));
-            controller.close();
-          },
-        }),
-        { headers: { "Content-Type": "application/json" } },
-      ),
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("x".repeat(200)));
+              controller.close();
+            },
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        ),
     );
     const input = {
       ...sourceInput,
@@ -1459,7 +1495,9 @@ describe("传输证据捕获与离线重放", () => {
         throw new Error(sinkMarker);
       },
     };
-    const error = await createNormalizer({ fetch }).normalize(input).catch((e) => e);
+    const error = await createNormalizer({ fetch })
+      .normalize(input)
+      .catch((e) => e);
     expect(error).toMatchObject({ code: "NORMALIZATION_FAILED", failureKind: "internal" });
     expect(String(error)).not.toContain(sinkMarker);
   });
@@ -1499,8 +1537,9 @@ describe("传输证据捕获与离线重放", () => {
         return { descriptorDigest: "synthetic-digest" };
       },
     };
-    await expect(createNormalizer({ fetch, maximumAttempts: 1 }).normalize(input)).rejects
-      .toMatchObject({ code: "NORMALIZATION_FAILED", failureKind: "http_429" });
+    await expect(
+      createNormalizer({ fetch, maximumAttempts: 1 }).normalize(input),
+    ).rejects.toMatchObject({ code: "NORMALIZATION_FAILED", failureKind: "http_429" });
     expect(sinkCalled).toBe(true);
     expect(capturedDescriptor!.status).toBe(429);
     expect(capturedDescriptor!.failureKind).toBe("http_429");
@@ -1558,17 +1597,15 @@ describe("传输证据捕获与离线重放", () => {
   it("声明长度越界仍产出 limit_exceeded 证据并等待接收器", async () => {
     let sinkCalled = false;
     let capturedDescriptor: CapturedTransport | undefined;
-    const fetch = vi.fn(async () =>
-      new Response(
-        "x".repeat(50),
-        {
+    const fetch = vi.fn(
+      async () =>
+        new Response("x".repeat(50), {
           status: 200,
           headers: {
             "Content-Type": "application/json",
             "Content-Length": "99999",
           },
-        },
-      ),
+        }),
     );
     const input = {
       ...sourceInput,
@@ -1592,15 +1629,16 @@ describe("传输证据捕获与离线重放", () => {
   it("已接收但零字节的响应也触发证据接收器（不以 byteCount>0 为准）", async () => {
     let sinkCalled = false;
     let capturedByteCount: number | undefined;
-    const fetch = vi.fn(async () =>
-      new Response(
-        new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.close();
-          },
-        }),
-        { headers: { "Content-Type": "text/event-stream" } },
-      ),
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.close();
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
     );
     const input = {
       ...sourceInput,
@@ -1628,7 +1666,9 @@ describe("传输证据捕获与离线重放", () => {
         return { descriptorDigest: "synthetic-digest" };
       },
     };
-    await createNormalizer({ fetch }).normalize(input).catch(() => {});
+    await createNormalizer({ fetch })
+      .normalize(input)
+      .catch(() => {});
     expect(capturedDescriptor).toBeDefined();
     expect(capturedDescriptor!.parserVersion).toBe(historyReplayParserVersion);
     expect(capturedDescriptor!.attempt).toBe(1);
@@ -1641,16 +1681,19 @@ describe("传输证据捕获与离线重放", () => {
 
   it("partial_eof 终止类别在流中断时正确标记", async () => {
     let capturedDescriptor: CapturedTransport | undefined;
-    const fetch = vi.fn(async () =>
-      new Response(
-        new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(new TextEncoder().encode(completionEvent(normalizedContent, "stop")));
-            controller.error(new Error("synthetic-stream-error"));
-          },
-        }),
-        { headers: { "Content-Type": "text/event-stream" } },
-      ),
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(completionEvent(normalizedContent, "stop")),
+              );
+              controller.error(new Error("synthetic-stream-error"));
+            },
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        ),
     );
     const input = {
       ...sourceInput,
@@ -1659,7 +1702,9 @@ describe("传输证据捕获与离线重放", () => {
         return { descriptorDigest: "synthetic-digest" };
       },
     };
-    await createNormalizer({ fetch }).normalize(input).catch(() => {});
+    await createNormalizer({ fetch })
+      .normalize(input)
+      .catch(() => {});
     expect(capturedDescriptor!.termination).toBe("partial_eof");
   });
 
@@ -1683,7 +1728,11 @@ describe("传输证据捕获与离线重放", () => {
         return { descriptorDigest: "synthetic-digest" };
       },
     };
-    const result = createNormalizer({ fetch, signal: cancellation.signal, maximumAttempts: 3 }).normalize(input);
+    const result = createNormalizer({
+      fetch,
+      signal: cancellation.signal,
+      maximumAttempts: 3,
+    }).normalize(input);
     await new Promise<void>((resolve) => setImmediate(resolve));
     cancellation.abort();
     await result.catch(() => {});
@@ -1692,16 +1741,17 @@ describe("传输证据捕获与离线重放", () => {
 
   it("limit_exceeded 终止类别在超字节上限时正确标记", async () => {
     let capturedDescriptor: CapturedTransport | undefined;
-    const fetch = vi.fn(async () =>
-      new Response(
-        new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(new TextEncoder().encode("x".repeat(200)));
-            controller.close();
-          },
-        }),
-        { headers: { "Content-Type": "application/json" } },
-      ),
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("x".repeat(200)));
+              controller.close();
+            },
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        ),
     );
     const input = {
       ...sourceInput,
@@ -1710,7 +1760,9 @@ describe("传输证据捕获与离线重放", () => {
         return { descriptorDigest: "synthetic-digest" };
       },
     };
-    await createNormalizer({ fetch, maximumResponseBytes: 100 }).normalize(input).catch(() => {});
+    await createNormalizer({ fetch, maximumResponseBytes: 100 })
+      .normalize(input)
+      .catch(() => {});
     expect(capturedDescriptor!.termination).toBe("limit_exceeded");
   });
 

@@ -111,6 +111,8 @@ type Command =
       readonly metadataFile: string;
       readonly outputDirectory: string;
       readonly operationTag: string;
+      readonly selectionManifestFile?: string;
+      readonly concurrency: number;
       readonly resume: boolean;
     }
   | {
@@ -222,6 +224,8 @@ async function main(): Promise<void> {
       outputDirectory: command.outputDirectory,
       operationTag: command.operationTag,
       resume: command.resume,
+      sourceSelectorFile: command.selectionManifestFile,
+      concurrency: command.concurrency,
       executionIdentity: normalizer.preparationIdentity,
       normalizer,
     });
@@ -402,6 +406,8 @@ function parseCommand(argv: readonly string[]): Command {
       metadataFile: requiredOption(argv, "--metadata"),
       outputDirectory: requiredOption(argv, "--out"),
       operationTag: requiredOption(argv, "--run-tag"),
+      selectionManifestFile: optionalOption(argv, "--selection-manifest"),
+      concurrency: integerOption(argv, "--concurrency", 12),
       resume: argv.includes("--resume"),
     };
   }
@@ -447,6 +453,26 @@ function requiredOption(argv: readonly string[], name: string): string {
       "INVALID_ARGUMENTS",
       `缺少必填参数 ${name}。确认文件不能省略。`,
     );
+  }
+  return value;
+}
+
+function optionalOption(argv: readonly string[], name: string): string | undefined {
+  const index = argv.indexOf(name);
+  if (index < 0) return undefined;
+  const value = argv[index + 1];
+  if (value === undefined || value.length === 0 || value.startsWith("--")) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", `参数 ${name} 缺少值。`);
+  }
+  return value;
+}
+
+function integerOption(argv: readonly string[], name: string, defaultValue: number): number {
+  const raw = optionalOption(argv, name);
+  if (raw === undefined) return defaultValue;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1 || value > 20) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", `${name} 必须是 1 到 20 的整数。`);
   }
   return value;
 }

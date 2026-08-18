@@ -1,8 +1,5 @@
 import { z } from "zod";
-import {
-  canonicalProblemSchema,
-  isSafeArchivePath
-} from "@urmotiv/problem-package";
+import { canonicalProblemSchema, isSafeArchivePath } from "@urmotiv/problem-package";
 
 export const historyContentDigestSchema = z
   .string()
@@ -23,13 +20,13 @@ export const historyMetadataRecordSchema = z
     authorStudentId: z.string().trim().max(200).default(""),
     status: z.string().max(500).default(""),
     contest: z.string().max(500).default(""),
-    note: z.string().max(10_000).default("")
+    note: z.string().max(10_000).default(""),
   })
   .strict();
 
 export const historyMetadataFileSchema = z
   .object({
-    records: z.array(historyMetadataRecordSchema).min(1).max(10_000)
+    records: z.array(historyMetadataRecordSchema).min(1).max(10_000),
   })
   .strict()
   .superRefine((value, context) => {
@@ -37,7 +34,7 @@ export const historyMetadataFileSchema = z
       value.records.map((record) => record.number),
       context,
       ["records"],
-      "元数据题号重复，必须先人工消除歧义。"
+      "元数据题号重复，必须先人工消除歧义。",
     );
   });
 
@@ -48,7 +45,7 @@ const confirmedSourcePathSchema = z
   .refine((value) => isSafeArchivePath(value), "源文件路径不安全。")
   .refine(
     (value) => /\.(?:md|txt)$/i.test(value),
-    "第一阶段只读取已经人工分组的 Markdown 或纯文本文件。"
+    "第一阶段只读取已经人工分组的 Markdown 或纯文本文件。",
   );
 
 export const historySourceMappingSchema = z
@@ -62,12 +59,12 @@ export const historySourceMappingSchema = z
           .object({
             sourcePath: confirmedSourcePathSchema,
             sourceSha256: historyContentDigestSchema,
-            metadataNumber: z.string().trim().min(1).max(200)
+            metadataNumber: z.string().trim().min(1).max(200),
           })
-          .strict()
+          .strict(),
       )
       .min(1)
-      .max(10_000)
+      .max(10_000),
   })
   .strict()
   .superRefine((value, context) => {
@@ -75,55 +72,49 @@ export const historySourceMappingSchema = z
       value.mappings.map((mapping) => mapping.sourcePath.toLocaleLowerCase("en-US")),
       context,
       ["mappings"],
-      "同一个源文件不能被重复分配。"
+      "同一个源文件不能被重复分配。",
     );
     addDuplicateIssues(
       value.mappings.map((mapping) => mapping.metadataNumber),
       context,
       ["mappings"],
-      "同一条元数据不能分配给多个源文件。"
+      "同一条元数据不能分配给多个源文件。",
     );
   });
 
 const normalizedHistoryProblemSchema = z
   .object({
-    title: z.string().trim().min(1).max(200),
-    type: z
-      .enum(["traditional", "interactive", "submit_answer"])
-      .default("traditional"),
-    basicStatement: z.string().trim().min(1).max(500_000),
+    title: z.string().min(1).max(200),
+    type: z.enum(["traditional", "interactive", "submit_answer"]),
+    basicStatement: z.string().min(1).max(500_000),
     basicSolution: z.string().max(500_000).nullable(),
-    background: z.string().max(500_000).default(""),
-    statement: z.string().max(500_000).default(""),
-    inputFormat: z.string().max(500_000).default(""),
-    outputFormat: z.string().max(500_000).default(""),
-    constraints: z.string().max(500_000).default(""),
-    solution: z.string().max(500_000).default(""),
-    hints: z.string().max(500_000).default(""),
+    background: z.string().max(500_000),
+    statement: z.string().max(500_000),
+    inputFormat: z.string().max(500_000),
+    outputFormat: z.string().max(500_000),
+    constraints: z.string().max(500_000),
+    solution: z.string().max(500_000),
+    hints: z.string().max(500_000),
     samples: z
       .array(
         z
           .object({
-            input: z.string().max(100_000).default(""),
-            output: z.string().max(100_000).default(""),
-            explanation: z.string().max(500_000).default("")
+            input: z.string().max(100_000),
+            output: z.string().max(100_000),
+            explanation: z.string().max(500_000),
           })
-          .strict()
+          .strict(),
       )
-      .max(50)
-      .default([]),
-    tags: z
-      .array(z.string().trim().min(1).max(120))
-      .max(0, "历史整理模型不能自行选择知识点标签。")
-      .default([]),
-    confidence: z.number().min(0).max(1).default(0.5),
-    migrationNote: z.string().max(10_000).default("")
+      .max(50),
+    tags: z.array(z.string().min(1).max(120)).max(0, "历史整理模型不能自行选择知识点标签。"),
+    confidence: z.number().min(0).max(1),
+    migrationNote: z.string().max(10_000),
   })
   .strict();
 
 export const normalizedHistoryOutputSchema = z
   .object({
-    problems: z.array(normalizedHistoryProblemSchema).min(1).max(30)
+    problems: z.array(normalizedHistoryProblemSchema).min(1).max(30),
   })
   .strict();
 
@@ -133,28 +124,28 @@ export const historyCandidateProblemSchema = canonicalProblemSchema.superRefine(
       context.addIssue({
         code: "custom",
         path: ["files"],
-        message: "第一阶段候选内容不能直接加入附件或评测文件。"
+        message: "第一阶段候选内容不能直接加入附件或评测文件。",
       });
     }
     if (problem.judge !== undefined) {
       context.addIssue({
         code: "custom",
         path: ["judge"],
-        message: "第一阶段候选内容不能直接加入评测配置。"
+        message: "第一阶段候选内容不能直接加入评测配置。",
       });
     }
     if (Object.keys(problem.difficulty).length > 0) {
       context.addIssue({
         code: "custom",
         path: ["difficulty"],
-        message: "历史迁移候选不能采用投题者自填或人工写入的难度。"
+        message: "历史迁移候选不能采用投题者自填或人工写入的难度。",
       });
     }
     if (Object.keys(problem.extensions).length > 0) {
       context.addIssue({
         code: "custom",
         path: ["extensions"],
-        message: "历史迁移候选不能写入私有元数据或其他扩展字段。"
+        message: "历史迁移候选不能写入私有元数据或其他扩展字段。",
       });
     }
     if (
@@ -164,10 +155,10 @@ export const historyCandidateProblemSchema = canonicalProblemSchema.superRefine(
       context.addIssue({
         code: "custom",
         path: ["provenance"],
-        message: "题目包不能包含历史题号或原始修订编号。"
+        message: "题目包不能包含历史题号或原始修订编号。",
       });
     }
-  }
+  },
 );
 
 export const historyCandidateRecordSchema = z
@@ -181,7 +172,7 @@ export const historyCandidateRecordSchema = z
     contentSha256: historyContentDigestSchema,
     modelConfidence: z.number().min(0).max(1),
     normalizationNote: z.string().max(10_000),
-    problem: historyCandidateProblemSchema
+    problem: historyCandidateProblemSchema,
   })
   .strict();
 
@@ -195,12 +186,12 @@ export const historyCandidateApprovalSchema = z
           .object({
             candidateId: historyCandidateIdSchema,
             contentSha256: historyContentDigestSchema,
-            decision: z.literal("approved")
+            decision: z.literal("approved"),
           })
-          .strict()
+          .strict(),
       )
       .min(1)
-      .max(10_000)
+      .max(10_000),
   })
   .strict()
   .superRefine((value, context) => {
@@ -208,7 +199,7 @@ export const historyCandidateApprovalSchema = z
       value.approvals.map((approval) => approval.candidateId),
       context,
       ["approvals"],
-      "同一个候选不能重复批准。"
+      "同一个候选不能重复批准。",
     );
   });
 
@@ -224,9 +215,9 @@ export const historyRepairManifestSchema = z
             sourceSha256: historyContentDigestSchema,
             metadataNumber: z.string().trim().min(1).max(200),
             /** 失败回执（requests/<sourceId>.failed.json 解析后）的整体内容摘要。 */
-            failedReceiptSha256: historyContentDigestSchema
+            failedReceiptSha256: historyContentDigestSchema,
           })
-          .strict()
+          .strict(),
       )
       .length(9, "受控本地源文修复必须恰好选择九个失败回执。")
       .superRefine((value, context) => {
@@ -234,12 +225,24 @@ export const historyRepairManifestSchema = z
           value.map((receipt) => receipt.sourceId),
           context,
           ["receipts"],
-          "同一份源文件的失败回执不能重复修复。"
+          "同一份源文件的失败回执不能重复修复。",
         );
-      })
+      }),
   })
   .strict();
 
+export const historySourceSelectionSchema = z
+  .object({
+    version: z.literal(1),
+    confirmed: z.literal(true),
+    sourceIds: z.array(historySourceIdSchema).min(1).max(10_000),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    addDuplicateIssues(value.sourceIds, context, ["sourceIds"], "同一份源文件不能重复选择。");
+  });
+
+export type HistorySourceSelection = z.infer<typeof historySourceSelectionSchema>;
 export type HistoryRepairManifest = z.infer<typeof historyRepairManifestSchema>;
 export type HistoryMetadataRecord = z.infer<typeof historyMetadataRecordSchema>;
 export type HistoryMetadataFile = z.infer<typeof historyMetadataFileSchema>;
@@ -253,7 +256,7 @@ function addDuplicateIssues(
   values: readonly string[],
   context: z.RefinementCtx,
   path: readonly (string | number)[],
-  message: string
+  message: string,
 ): void {
   const seen = new Set<string>();
   for (const [index, value] of values.entries()) {
@@ -261,7 +264,7 @@ function addDuplicateIssues(
       context.addIssue({
         code: "custom",
         path: [...path, index],
-        message
+        message,
       });
     }
     seen.add(value);

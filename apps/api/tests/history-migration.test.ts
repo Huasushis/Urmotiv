@@ -212,6 +212,120 @@ describe("历史题目迁移安全核心", () => {
     expect(JSON.stringify(candidate)).not.toContain(syntheticSourceName);
   });
 
+  it("省略选择清单时处理完整确认集合，默认并发严格限制为十二", async () => {
+    const fixture = await createMultiFixture(13);
+    const release = deferred<void>();
+    let active = 0;
+    let maximumActive = 0;
+    let callCount = 0;
+    const running = prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize() {
+          active += 1;
+          callCount += 1;
+          maximumActive = Math.max(maximumActive, active);
+          try {
+            await release.promise;
+            return normalizedOutput();
+          } finally {
+            active -= 1;
+          }
+        },
+      },
+    });
+
+    await vi.waitFor(() => expect(active).toBe(12));
+    expect(maximumActive).toBe(12);
+    release.resolve(undefined);
+    await expect(running).resolves.toMatchObject({
+      sourceCount: 13,
+      completedSourceCount: 13,
+      complete: true,
+    });
+    expect(callCount).toBe(13);
+    expect(await readdir(join(fixture.prepareOutput, "candidates"))).toContain(
+      "candidate-000361.json",
+    );
+  });
+
+  it("选择清单按完整集合原位置保留候选编号，且并发二十在待处理数更小时只启动待处理数", async () => {
+    const fixture = await createMultiFixture();
+    const selectionManifestFile = join(fixture.root, "selection.private.json");
+    await writeFile(
+      selectionManifestFile,
+      `${JSON.stringify({
+        version: 1,
+        confirmed: true,
+        sourceIds: ["source-000003"],
+      })}\n`,
+      "utf8",
+    );
+    await chmod(selectionManifestFile, 0o600);
+    let active = 0;
+    let maximumActive = 0;
+    const calls: string[] = [];
+
+    const result = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      sourceSelectorFile: selectionManifestFile,
+      concurrency: 20,
+      normalizer: {
+        async normalize(input) {
+          active += 1;
+          maximumActive = Math.max(maximumActive, active);
+          calls.push(input.sourceId);
+          active -= 1;
+          return normalizedOutput();
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      sourceCount: 1,
+      completedSourceCount: 1,
+      complete: true,
+    });
+    expect(calls).toEqual(["source-000003"]);
+    expect(maximumActive).toBe(1);
+    expect(await readdir(join(fixture.prepareOutput, "candidates"))).toEqual([
+      "candidate-000061.json",
+    ]);
+  });
+
+  it("严格拒绝带额外字段的选择清单和超出上限的并发数", async () => {
+    const fixture = await createFixture("只用于参数边界测试的合成正文。");
+    const selectionManifestFile = join(fixture.root, "selection.private.json");
+    await writeFile(
+      selectionManifestFile,
+      `${JSON.stringify({
+        version: 1,
+        confirmed: true,
+        sourceIds: ["source-000001"],
+        unexpected: true,
+      })}\n`,
+      "utf8",
+    );
+    await chmod(selectionManifestFile, 0o600);
+    const normalizer = { normalize: vi.fn(async () => normalizedOutput()) };
+
+    await expect(
+      prepareHistoryCandidates({
+        ...fixture.prepareOptions,
+        sourceSelectorFile: selectionManifestFile,
+        normalizer,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_SOURCE_SELECTION" });
+    await expect(
+      prepareHistoryCandidates({
+        ...fixture.prepareOptions,
+        concurrency: 21,
+        normalizer,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_ARGUMENTS" });
+    expect(normalizer.normalize).not.toHaveBeenCalled();
+  });
+
   it("输出路径存在时停止，不覆盖上一次候选结果", async () => {
     const fixture = await createFixture("只用于合成测试的源正文。");
     const first = await prepareHistoryCandidates({
@@ -327,6 +441,7 @@ describe("历史题目迁移安全核心", () => {
     const firstCalls: string[] = [];
     const first = await prepareHistoryCandidates({
       ...fixture.prepareOptions,
+      concurrency: 1,
       normalizer: {
         async normalize(input) {
           firstCalls.push(input.sourceId);
@@ -355,6 +470,7 @@ describe("历史题目迁移安全核心", () => {
     const resumedCalls: string[] = [];
     const resumed = await prepareHistoryCandidates({
       ...fixture.prepareOptions,
+      concurrency: 1,
       resume: true,
       normalizer: {
         async normalize(input) {
@@ -385,6 +501,7 @@ describe("历史题目迁移安全核心", () => {
     await expect(
       prepareHistoryCandidates({
         ...fixture.prepareOptions,
+        concurrency: 1,
         normalizer: {
           async normalize() {
             await rename(requests, heldRequests);
@@ -400,6 +517,7 @@ describe("历史题目迁移安全核心", () => {
     const resumedCalls: string[] = [];
     const resumed = await prepareHistoryCandidates({
       ...fixture.prepareOptions,
+      concurrency: 1,
       resume: true,
       normalizer: {
         async normalize(input) {
@@ -966,13 +1084,7 @@ describe("历史题目迁移安全核心", () => {
 
     // 批次内部保全材料只进入独立保全目录，不进入题目包 ZIP。
     const preservedBytes = await readFile(
-      join(
-        fixture.packageOutput,
-        "internal",
-        "preservation",
-        "internal",
-        "attachment-000001.bin",
-      ),
+      join(fixture.packageOutput, "internal", "preservation", "internal", "attachment-000001.bin"),
     );
     expect(new Uint8Array(preservedBytes)).toEqual(new Uint8Array([1, 2, 3, 4]));
 
@@ -1148,7 +1260,7 @@ describe("历史题目模型整理响应限制", () => {
   });
 });
 
-async function createFixture(sourceText: string): Promise<{
+interface HistoryMigrationFixture {
   readonly root: string;
   readonly sourceDirectory: string;
   readonly materializedDirectory: string;
@@ -1182,7 +1294,9 @@ async function createFixture(sourceText: string): Promise<{
     readonly attachmentMappingCapability: HistoryAttachmentMappingCapability;
     readonly exportedAt: string;
   };
-}> {
+}
+
+async function createFixture(sourceText: string): Promise<HistoryMigrationFixture> {
   const root = await mkdtemp(join(tmpdir(), "urmotiv-history-migration-"));
   temporaryDirectories.push(root);
   const materializedDirectory = join(root, "materialized");
@@ -1342,7 +1456,7 @@ async function writeSyntheticMaterialization(options: {
 }
 
 async function rewriteFixtureMaterializationBatch(
-  fixture: Awaited<ReturnType<typeof createFixture>>,
+  fixture: HistoryMigrationFixture,
   capability: HistoryAttachmentMappingCapability,
 ): Promise<void> {
   const sourceText = await readFile(join(fixture.sourceDirectory, syntheticSourceName), "utf8");
@@ -1355,7 +1469,7 @@ async function rewriteFixtureMaterializationBatch(
   });
 }
 
-async function createPreparedFixture(): Promise<Awaited<ReturnType<typeof createFixture>>> {
+async function createPreparedFixture(): Promise<HistoryMigrationFixture> {
   const fixture = await createFixture("只用于合成测试的源正文。");
   await prepareHistoryCandidates({
     ...fixture.prepareOptions,
@@ -1538,13 +1652,13 @@ async function createAttachmentMappingCapability(options: {
   });
 }
 
-async function createMultiFixture(): Promise<Awaited<ReturnType<typeof createFixture>>> {
-  const fixture = await createFixture("第一份合成正文。");
-  const sources = [
-    { path: syntheticSourceName, text: "第一份合成正文。", number: "synthetic-1" },
-    { path: "synthetic-extra-two.md", text: "第二份合成正文。", number: "synthetic-2" },
-    { path: "synthetic-extra-three.md", text: "第三份合成正文。", number: "synthetic-3" },
-  ] as const;
+async function createMultiFixture(sourceCount = 3): Promise<HistoryMigrationFixture> {
+  const fixture = await createFixture("第 1 份合成正文。");
+  const sources = Array.from({ length: sourceCount }, (_, index) => ({
+    path: index === 0 ? syntheticSourceName : `synthetic-extra-${index + 1}.md`,
+    text: `第 ${index + 1} 份合成正文。`,
+    number: `synthetic-${index + 1}`,
+  }));
   for (const source of sources.slice(1)) {
     await writeFile(join(fixture.sourceDirectory, source.path), source.text, "utf8");
   }
@@ -1692,7 +1806,10 @@ describe("打包期目录与输出防替换（同用户负例）", () => {
         ...fixture.packageOptions,
         testingHooks: {
           async afterMaterializationVerified() {
-            await rename(fixture.materializedDirectory, `${fixture.materializedDirectory}-displaced`);
+            await rename(
+              fixture.materializedDirectory,
+              `${fixture.materializedDirectory}-displaced`,
+            );
             await mkdir(fixture.materializedDirectory, { mode: 0o700 });
           },
         },
@@ -1781,7 +1898,10 @@ describe("打包期目录与输出防替换（同用户负例）", () => {
         ...fixture.packageOptions,
         testingHooks: {
           async afterFinalOutputRecheck() {
-            await rename(fixture.materializedDirectory, `${fixture.materializedDirectory}-displaced`);
+            await rename(
+              fixture.materializedDirectory,
+              `${fixture.materializedDirectory}-displaced`,
+            );
             await mkdir(fixture.materializedDirectory, { mode: 0o700 });
           },
         },

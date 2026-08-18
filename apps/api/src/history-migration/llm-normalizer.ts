@@ -39,7 +39,8 @@ export interface LlmHistoryNormalizerOptions {
   readonly maximumAttempts?: number;
   readonly retryBaseDelayMs?: number;
   readonly maximumResponseBytes?: number;
-  /** 单次整理允许模型生成的最大 token 数，写入请求并绑定 prepare 执行身份。 */
+  /** 单次整理允许模型生成的最大 token 数，写入请求并绑定 prepare 执行身份；
+   *  省略时完全不设置输出 token 上限，交由模型的最大思考模式自行决定。 */
   readonly maximumOutputTokens?: number;
   /** 人工停止任务或上层不再允许继续时，明确取消正在运行的请求。 */
   readonly signal?: AbortSignal;
@@ -49,9 +50,14 @@ export interface LlmHistoryNormalizerOptions {
 
 export const maximumNormalizationResponseBytes = 10_000_000;
 export const maximumNormalizationOutputTokens = 65_536;
-export const defaultNormalizationOutputTokens = maximumNormalizationOutputTokens;
+/**
+ * 零字节传输失败的单独尝试上限。确认未产生任何输出字节的连接/空响应失败
+ * 才允许重试，且总尝试次数不论 maximumAttempts 多大都不能超过这个固定上限。
+ * 一旦收到非零响应字节，任何失败都绝不重放。
+ */
+export const maximumZeroByteTransportAttempts = 3;
 export const historyNormalizationRequestProfileVersion =
-  "history-normalization-request-v2" as const;
+  "history-normalization-request-v3" as const;
 export const historyReplayParserVersion = "history-replay-parser-v1" as const;
 export const defaultNormalizationFirstOutputTimeoutMs = 30 * 60 * 1_000;
 export const defaultNormalizationOutputIdleTimeoutMs = 10 * 60 * 1_000;
@@ -67,7 +73,7 @@ interface NormalizationRuntime {
   readonly maximumAttempts: number;
   readonly retryBaseDelayMs: number;
   readonly maximumResponseBytes: number;
-  readonly maximumOutputTokens: number;
+  readonly maximumOutputTokens: number | undefined;
   readonly signal: AbortSignal | undefined;
   readonly fetch: HistoryNormalizerFetch;
 }
@@ -102,10 +108,10 @@ export function createLlmHistoryNormalizer(
       options.maximumResponseBytes ?? maximumNormalizationResponseBytes,
       maximumNormalizationResponseBytes,
     ),
-    maximumOutputTokens: positiveInteger(
-      options.maximumOutputTokens ?? defaultNormalizationOutputTokens,
-      maximumNormalizationOutputTokens,
-    ),
+    maximumOutputTokens:
+      options.maximumOutputTokens === undefined
+        ? undefined
+        : positiveInteger(options.maximumOutputTokens, maximumNormalizationOutputTokens),
     signal: options.signal,
     fetch: options.fetch ?? defaultStreamingFetch,
   };
@@ -127,7 +133,7 @@ export function createLlmHistoryNormalizer(
           maximumResponseBytes: runtime.maximumResponseBytes,
           requestProfile: normalizationRequestProfile(runtime.maximumOutputTokens),
           streamingProtocol: "sse-eof-benign-controls-v2",
-          retryPolicy: "http-429-only",
+          retryPolicy: "http-429-and-zero-byte-transport",
         }),
       ),
     },
@@ -139,16 +145,10 @@ export function createLlmHistoryNormalizer(
         input,
         runtime,
       );
-      const sanitized = coerceDisallowedTagsArray(requestResult.payload);
-      const parsed = normalizedHistoryOutputSchema.safeParse(sanitized);
+      const parsed = normalizedHistoryOutputSchema.safeParse(requestResult.payload);
       if (!parsed.success) {
         // 真实 payload 的 schema 失败也在净化后的拒绝逃逸前等待证据接收器。
-        await sinkCapturedTransport(
-          input,
-          input.sourceId,
-          requestResult.capture,
-          "schema",
-        );
+        await sinkCapturedTransport(input, input.sourceId, requestResult.capture, "schema");
         throw normalizationFailure("schema", `${input.sourceId} 的模型结果不符合候选内容格式。`);
       }
       return parsed.data;
@@ -178,41 +178,48 @@ async function requestNormalization(
   runtime: NormalizationRuntime,
 ): Promise<RequestNormalizationResult> {
   for (let attempt = 1; attempt <= runtime.maximumAttempts; attempt += 1) {
-    const attemptResult = await requestNormalizationOnce(
-      endpoint,
-      apiKey,
-      model,
-      input.sourceId,
-      input,
-      attempt,
-      runtime,
-    );
+    let attemptResult: NormalizationAttemptResult;
+    try {
+      attemptResult = await requestNormalizationOnce(
+        endpoint,
+        apiKey,
+        model,
+        input.sourceId,
+        input,
+        attempt,
+        runtime,
+      );
+    } catch (error) {
+      if (
+        attempt < Math.min(runtime.maximumAttempts, maximumZeroByteTransportAttempts) &&
+        isZeroByteTransportRetryable(error)
+      ) {
+        await waitBeforeRateLimitRetry(
+          runtime.retryBaseDelayMs * attempt,
+          runtime.signal,
+          input.sourceId,
+        );
+        continue;
+      }
+      throw error;
+    }
+
     if (attemptResult.kind === "content") {
       try {
-        const payload = JSON.parse(attemptResult.content.trim()) as unknown;
+        const payload = parseNormalizationPayload(attemptResult.content);
         return { payload, capture: attemptResult.capture };
       } catch {
-        // 成功传输但 JSON 解析失败：仍等待证据接收器后再抛出净化后的失败。
-        await sinkCapturedTransport(
-          input,
-          input.sourceId,
-          attemptResult.capture,
-          "invalid_json",
-        );
+        // 只做一次本地纯格式修复；有正文的失败绝不重新请求模型。
+        await sinkCapturedTransport(input, input.sourceId, attemptResult.capture, "invalid_json");
         throw normalizationFailure(
           "invalid_json",
           `${input.sourceId} 的模型响应不包含有效候选 JSON。`,
         );
       }
     }
+
     if (attempt === runtime.maximumAttempts) {
-      // 重试耗尽时保留最后一次 429 尝试的证据并等待接收器。
-      await sinkCapturedTransport(
-        input,
-        input.sourceId,
-        attemptResult.capture,
-        "http_429",
-      );
+      await sinkCapturedTransport(input, input.sourceId, attemptResult.capture, "http_429");
       throw normalizationFailure("http_429", `${input.sourceId} 的模型服务持续返回 HTTP 429。`);
     }
     await waitBeforeRateLimitRetry(
@@ -335,9 +342,7 @@ async function requestNormalizationOnce(
     responseStatus = response.status;
     responseContentType = response.headers.get("content-type")?.toLowerCase() ?? "";
     responseContentLength = response.headers.get("content-length");
-    responseMediaKind = responseContentType.includes("text/event-stream")
-      ? "event_stream"
-      : "json";
+    responseMediaKind = responseContentType.includes("text/event-stream") ? "event_stream" : "json";
     // 只要收到响应就建立收集器：状态失败、声明长度越界、零字节响应都必须
     // 能产出有界证据（可能为零字节），不以 byteCount > 0 为准。
     responseCollector = new TransportCollector();
@@ -426,6 +431,7 @@ async function requestNormalizationOnce(
       );
     }
 
+    terminalTransportByteCounts.set(terminalError, responseCollector?.byteCount ?? 0);
     // 在净化后的终端失败逃逸之前，等待证据接收器。
     if (responseCollector !== undefined) {
       await sinkCapturedTransport(
@@ -679,7 +685,6 @@ async function collectBoundedStatusBody(
   }
 }
 
-
 interface CompletionStreamState {
   content: string;
   sawChoice: boolean;
@@ -898,10 +903,7 @@ export class ReplaySession {
   }
 }
 
-
-function isDrainableNormalizationProtocolError(
-  error: unknown,
-): error is HistoryNormalizationError {
+function isDrainableNormalizationProtocolError(error: unknown): error is HistoryNormalizationError {
   return (
     error instanceof HistoryNormalizationError &&
     (error.failureKind === "protocol" || error.failureKind === "invalid_utf8")
@@ -1056,28 +1058,17 @@ function isPlainJsonRecord(value: unknown): value is Record<string, unknown> {
 function isStrictStreamUsageMetadata(raw: unknown): boolean {
   if (!isPlainJsonRecord(raw)) return false;
   const entries = Object.entries(raw);
-  if (
-    entries.length === 0 ||
-    entries.some(([key]) => !streamUsageMetadataKeys.has(key))
-  ) {
+  if (entries.length === 0 || entries.some(([key]) => !streamUsageMetadataKeys.has(key))) {
     return false;
   }
-  if (
-    Object.hasOwn(raw, "choices") &&
-    (!Array.isArray(raw.choices) || raw.choices.length !== 0)
-  ) {
+  if (Object.hasOwn(raw, "choices") && (!Array.isArray(raw.choices) || raw.choices.length !== 0)) {
     return false;
   }
-  if (
-    Object.hasOwn(raw, "usage") &&
-    !isBoundedStreamUsageCounterStructure(raw.usage)
-  ) {
+  if (Object.hasOwn(raw, "usage") && !isBoundedStreamUsageCounterStructure(raw.usage)) {
     return false;
   }
   const hasControlEvidence =
-    (Object.hasOwn(raw, "choices") &&
-      Array.isArray(raw.choices) &&
-      raw.choices.length === 0) ||
+    (Object.hasOwn(raw, "choices") && Array.isArray(raw.choices) && raw.choices.length === 0) ||
     Object.hasOwn(raw, "usage");
   if (!hasControlEvidence) return false;
 
@@ -1088,18 +1079,13 @@ function isStrictStreamUsageMetadata(raw: unknown): boolean {
   }
 
   for (const key of ["system_fingerprint", "service_tier"] as const) {
-    if (
-      Object.hasOwn(raw, key) &&
-      !isBoundedStreamMetadataString(raw[key], true)
-    ) {
+    if (Object.hasOwn(raw, key) && !isBoundedStreamMetadataString(raw[key], true)) {
       return false;
     }
   }
   if (
     Object.hasOwn(raw, "created") &&
-    (typeof raw.created !== "number" ||
-      !Number.isSafeInteger(raw.created) ||
-      raw.created < 0)
+    (typeof raw.created !== "number" || !Number.isSafeInteger(raw.created) || raw.created < 0)
   ) {
     return false;
   }
@@ -1126,10 +1112,7 @@ function isPostStopStreamUsageRecord(record: Record<string, unknown>): boolean {
     }
   }
   for (const key of ["system_fingerprint", "service_tier"] as const) {
-    if (
-      Object.hasOwn(record, key) &&
-      !isBoundedStreamMetadataString(record[key], true)
-    ) {
+    if (Object.hasOwn(record, key) && !isBoundedStreamMetadataString(record[key], true)) {
       return false;
     }
   }
@@ -1238,7 +1221,6 @@ function appendEventStreamText(
   }
   return { pending, trailingCarriageReturn: carried };
 }
-
 
 function containsNonWhitespaceByte(bytes: Uint8Array): boolean {
   return bytes.some((byte) => byte !== 0x09 && byte !== 0x0a && byte !== 0x0d && byte !== 0x20);
@@ -1352,47 +1334,77 @@ function readCompletedResponseContent(payload: unknown): string {
   return first.message.content;
 }
 
-/**
- * 规范化指令第 7 条明确要求 tags 必须是空数组 []。部分模型偶尔忽略此条
- * 产出非空 tags，导致 schema 校验失败。此函数在 schema 校验前将 problems
- * 数组中每个题目的 tags 强制重置为 []，不修改其它字段。这不会发明内容，
- * 只执行指令已要求的约束。
- */
-function coerceDisallowedTagsArray(response: unknown): unknown {
-  if (response !== null && typeof response === "object" && Array.isArray((response as Record<string, unknown>).problems)) {
-    const problems = (response as Record<string, unknown>).problems as unknown[];
-    const allowedFields = new Set([
-      "title","type","basicStatement","basicSolution","background","statement",
-      "inputFormat","outputFormat","constraints","solution","hints","samples",
-      "tags","confidence","migrationNote",
-    ]);
-    for (const problem of problems) {
-      if (problem !== null && typeof problem === "object") {
-        const record = problem as Record<string, unknown>;
-        // 指令第 7 条：tags 必须始终是空数组
-        record.tags = [];
-        // 指令第 4 条：basicSolution 为空字符串时视为缺失，写成 null
-        if (typeof record.basicSolution === "string" && record.basicSolution.trim().length === 0) {
-          record.basicSolution = null;
-        }
-        // 移除 schema 未声明的额外字段（.strict() 会拒绝它们）
-        for (const key of Object.keys(record)) {
-          if (!allowedFields.has(key)) {
-            delete record[key];
-          }
-        }
-      }
-    }
-  }
-  return response;
-}
-
-/**
- * 公共域对"原文没有题解"的权威缺失表示：结构性的 null。规范化指令要求模型
- * 在原文缺题解时把 basicSolution 写成 null（而非任何占位字符串）、solution 留空，
- * 并在 migrationNote 如实记录。本地修复同样写入 null，候选 → 打包 → 导入全程
- * 按原文含义保持结构性缺失，缺失在幂等重放后依然保持缺失。
- */
+const historyNormalizationOutputJsonSchema = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  type: "object",
+  additionalProperties: false,
+  required: ["problems"],
+  properties: {
+    problems: {
+      type: "array",
+      minItems: 1,
+      maxItems: 30,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "title",
+          "type",
+          "basicStatement",
+          "basicSolution",
+          "background",
+          "statement",
+          "inputFormat",
+          "outputFormat",
+          "constraints",
+          "solution",
+          "hints",
+          "samples",
+          "tags",
+          "confidence",
+          "migrationNote",
+        ],
+        properties: {
+          title: { type: "string", minLength: 1, maxLength: 200 },
+          type: {
+            type: "string",
+            enum: ["traditional", "interactive", "submit_answer"],
+          },
+          basicStatement: { type: "string", minLength: 1, maxLength: 500_000 },
+          basicSolution: { type: ["string", "null"], maxLength: 500_000 },
+          background: { type: "string", maxLength: 500_000 },
+          statement: { type: "string", maxLength: 500_000 },
+          inputFormat: { type: "string", maxLength: 500_000 },
+          outputFormat: { type: "string", maxLength: 500_000 },
+          constraints: { type: "string", maxLength: 500_000 },
+          solution: { type: "string", maxLength: 500_000 },
+          hints: { type: "string", maxLength: 500_000 },
+          samples: {
+            type: "array",
+            maxItems: 50,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["input", "output", "explanation"],
+              properties: {
+                input: { type: "string", maxLength: 100_000 },
+                output: { type: "string", maxLength: 100_000 },
+                explanation: { type: "string", maxLength: 500_000 },
+              },
+            },
+          },
+          tags: {
+            type: "array",
+            maxItems: 0,
+            items: { type: "string", minLength: 1, maxLength: 120 },
+          },
+          confidence: { type: "number", minimum: 0, maximum: 1 },
+          migrationNote: { type: "string", maxLength: 10_000 },
+        },
+      },
+    },
+  },
+} as const;
 
 const normalizationInstructions = [
   "你是算法竞赛题库历史资料整理助手。输入材料已经过人工分组，但你的结果仍只是待人工批准的候选，不能直接导入。",
@@ -1400,26 +1412,50 @@ const normalizationInstructions = [
   "1. 先辨认材料中实际包含几道题。一份源含多道题时必须逐题拆成 problems 数组的独立项目；不要把多题合并，也不要凭题名、编号或顺序补出材料中没有的题。",
   "2. 题面和题解是核心。逐题提取明确出现的题意、输入、输出、约束、样例和题解；不得臆造规则、数据范围、样例、算法、结论或缺失段落。材料不明确时保留空字段，并在 migrationNote 简短说明不确定项。",
   "3. basicStatement 写成完整、可读且自洽的 Markdown 核心题面；background、statement、inputFormat、outputFormat、constraints、hints 和 samples 只放各自对应且原文确有的内容。不要把同一整段题面原样复制到 basicStatement 与任一拆分字段，也不要在多个拆分字段间重复整段正文。",
-  `4. basicSolution 写原文已有的完整核心题解；solution 只放原文中可明确区分的补充题解内容，不能与 basicSolution 重复整段。原文没有题解时，basicSolution 必须写成 null（不得写任何占位或提示文字），solution 留空，并在 migrationNote 如实记录缺失。`,
+  "4. basicSolution 写原文已有的完整核心题解；solution 只放原文中可明确区分的补充题解内容，不能与 basicSolution 重复整段。原文没有题解时，basicSolution 必须写成 null（不得写任何占位或提示文字），solution 留空，并在 migrationNote 如实记录缺失。",
   "5. title 优先取材料中明确出现的题名；材料没有明确题名时，从题意中归纳一个简短（不超过 20 字）的中文描述性标题，不得编造规则或结论。type 只能是 traditional、interactive 或 submit_answer。只有材料明确要求交互或提交答案时才使用后两种，否则使用 traditional。",
   "6. samples 只登记材料中明确成对出现的输入、输出及解释；不要把正文代码块猜成样例。保留原有公式、代码和 Markdown 含义，不要擅自改题或润色成不同规则。",
   "7. tags 必须始终是空数组 []。不要选择或创造知识点标签，不要读取、采信或推断投题者自报难度，也不要输出任何难度字段。",
   "8. confidence 只表示本次整理对材料边界和字段归属的把握，不表示题目质量、难度或审核结论。",
   "9. 完成后在内部逐项核对题目数量、题面题解证据、缺失项、整段重复、tags 为空以及下方结构；不要输出核对过程、推理、评论或 Markdown 代码围栏。",
-  "最终响应必须是且只能是一个严格符合下方结构的 JSON object。JSON 前后不得出现说明、寒暄、reasoning、commentary、代码围栏或其他非空字节。不得增加结构之外的字段。",
+  "最终响应必须是且只能是一个严格符合下方 JSON Schema 的 JSON object。JSON 前后不得出现说明、寒暄、reasoning、commentary、代码围栏或其他非空字节。不得增加结构之外的字段。",
   "所有字符串都必须完整输出，不能为了缩短响应而截断。无法完整整理时应让请求失败，不要返回半段内容。",
-  "唯一允许的结构：",
-  '{"problems":[{"title":"","type":"traditional","basicStatement":"","basicSolution":"","background":"","statement":"","inputFormat":"","outputFormat":"","constraints":"","solution":"","hints":"","samples":[{"input":"","output":"","explanation":""}],"tags":[],"confidence":0.5,"migrationNote":""}]}',
+  "唯一允许的结构（JSON Schema）：",
+  JSON.stringify(historyNormalizationOutputJsonSchema, null, 2),
 ].join("\n");
 
-function normalizationRequestProfile(maximumOutputTokens: number): {
+function parseNormalizationPayload(content: string): unknown {
+  const trimmed = content.trim();
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    const repaired = repairNormalizationJsonFormatting(trimmed);
+    if (repaired === null) throw new SyntaxError("invalid normalization JSON");
+    return JSON.parse(repaired) as unknown;
+  }
+}
+
+function repairNormalizationJsonFormatting(content: string): string | null {
+  const fenced = /^```(?:json)?\s*([\s\S]*?)```\s*$/i.exec(content);
+  if (fenced?.[1] !== undefined) return fenced[1].trim();
+
+  const firstBrace = content.indexOf("{");
+  const lastBrace = content.lastIndexOf("}");
+  if (firstBrace > 0 || (firstBrace === 0 && lastBrace < content.length - 1)) {
+    return firstBrace >= 0 && lastBrace > firstBrace
+      ? content.slice(firstBrace, lastBrace + 1)
+      : null;
+  }
+  return null;
+}
+
+function normalizationRequestProfile(maximumOutputTokens: number | undefined): {
   readonly version: typeof historyNormalizationRequestProfileVersion;
   readonly parameters: {
     readonly temperature: 0.1;
-    readonly max_tokens: number;
-    readonly thinking: { readonly type: "disabled" };
-    readonly response_format: { readonly type: "json_object" };
+    readonly thinking: { readonly type: "max" };
     readonly stream: true;
+    readonly max_tokens?: number;
   };
   readonly messageLayout: {
     readonly systemRole: "system";
@@ -1431,10 +1467,9 @@ function normalizationRequestProfile(maximumOutputTokens: number): {
     version: historyNormalizationRequestProfileVersion,
     parameters: {
       temperature: 0.1,
-      max_tokens: maximumOutputTokens,
-      thinking: { type: "disabled" },
-      response_format: { type: "json_object" },
+      thinking: { type: "max" },
       stream: true,
+      ...(maximumOutputTokens === undefined ? {} : { max_tokens: maximumOutputTokens }),
     },
     messageLayout: {
       systemRole: "system",
@@ -1460,6 +1495,22 @@ function interruptedResponse(): HistoryMigrationError {
   return normalizationFailure("eof_incomplete", "模型响应在完成标记前结束。");
 }
 
+const terminalTransportByteCounts = new WeakMap<HistoryNormalizationError, number>();
+
+function isZeroByteTransportRetryable(error: unknown): boolean {
+  if (!(error instanceof HistoryNormalizationError)) return false;
+  if (terminalTransportByteCounts.get(error) !== 0) return false;
+  switch (error.failureKind) {
+    case "connection":
+    case "first_output_timeout":
+    case "output_idle_timeout":
+    case "maximum_duration_timeout":
+    case "eof_incomplete":
+      return true;
+    default:
+      return false;
+  }
+}
 function normalizationFailure(
   kind: HistoryNormalizationFailureKind,
   message: string,
