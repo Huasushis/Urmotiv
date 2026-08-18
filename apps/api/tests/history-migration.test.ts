@@ -1,41 +1,42 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  copyFile,
   chmod,
   chown,
-  mkdtemp,
+  copyFile,
   mkdir,
-  readFile,
+  mkdtemp,
   readdir,
+  readFile,
   rename,
   rm,
   stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { readZipArchive, urmotivNativeAdapter } from "@urmotiv/problem-package";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  createLlmHistoryNormalizer,
   assertHistoryAttachmentMappingComplete,
-  initializeHistoryAttachmentMappingWorksheet,
-  inventoryHistorySources,
+  createLlmHistoryNormalizer,
+  type HistoryAttachmentMappingCapability,
+  type HistoryCandidateRecord,
+  type HistoryGroupingPlan,
+  HistoryNormalizationError,
+  type HistoryNormalizer,
+  type HistorySourceLocations,
   historyMetadataFileSchema,
   historySourceMappingSchema,
-  HistoryNormalizationError,
+  initializeHistoryAttachmentMappingWorksheet,
+  inventoryHistorySources,
+  type NormalizedHistoryOutput,
   packageApprovedCandidates,
   prepareHistoryCandidates,
   sealHistoryAttachmentMapping,
   sealHistoryGrouping,
+  seedApprovedHistoryCandidates,
   sha256Hex,
   writeHistoryGroupingConfirmation,
-  type HistoryAttachmentMappingCapability,
-  type HistoryCandidateRecord,
-  type HistoryGroupingPlan,
-  type HistoryNormalizer,
-  type HistorySourceLocations,
-  type NormalizedHistoryOutput,
 } from "../src/history-migration/index";
 
 const temporaryDirectories: string[] = [];
@@ -291,6 +292,157 @@ describe("历史题目迁移安全核心", () => {
     expect(await readdir(join(fixture.prepareOutput, "candidates"))).toEqual([
       "candidate-000061.json",
     ]);
+  });
+
+  it("将旧批准候选按权威身份重绑定为种子，并只整理严格补集", async () => {
+    const fixture = await createMultiFixture();
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize(input) {
+          return {
+            problems: [
+              {
+                ...normalizedProblem(`合成候选题-${input.sourceId}`),
+                basicSolution: input.sourceId === "source-000003" ? null : "合成候选题解。",
+              },
+            ],
+          };
+        },
+      },
+    });
+    const firstLegacy = await readCandidate(fixture.prepareOutput, "candidate-000001");
+    const thirdLegacy = await readCandidate(fixture.prepareOutput, "candidate-000061");
+    const legacyApprovalFile = join(fixture.root, "legacy-approval.private.json");
+    await writeFile(
+      legacyApprovalFile,
+      `${JSON.stringify(
+        {
+          version: 1,
+          confirmed: true,
+          approvals: [
+            {
+              candidateId: firstLegacy.candidateId,
+              contentSha256: firstLegacy.contentSha256,
+              decision: "approved",
+            },
+            {
+              candidateId: thirdLegacy.candidateId,
+              contentSha256: thirdLegacy.contentSha256,
+              decision: "approved",
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await chmod(legacyApprovalFile, 0o600);
+
+    const metadata = JSON.parse(await readFile(fixture.prepareOptions.metadataFile, "utf8")) as {
+      records: Array<Record<string, unknown>>;
+    };
+    for (const record of metadata.records) {
+      record.name = `${String(record.name)}-权威修订`;
+    }
+    await writeFile(
+      fixture.prepareOptions.metadataFile,
+      `${JSON.stringify(metadata, null, 2)}\n`,
+      "utf8",
+    );
+    await chmod(fixture.prepareOptions.metadataFile, 0o600);
+    const groupingBatchSha256 = await rewriteMultiFixtureMaterialization(fixture);
+
+    const seedDirectory = join(fixture.root, "candidate-seed");
+    const seedResult = await seedApprovedHistoryCandidates({
+      privateRootDirectory: fixture.root,
+      materializedDirectory: fixture.materializedDirectory,
+      metadataFile: fixture.prepareOptions.metadataFile,
+      legacyPreparedDirectory: fixture.prepareOutput,
+      legacyApprovalFile,
+      outputDirectory: seedDirectory,
+    });
+    expect(seedResult).toMatchObject({
+      sourceCount: 3,
+      seededSourceCount: 2,
+      remainingSourceCount: 1,
+      solutionPresentCount: 1,
+      solutionMissingCount: 1,
+    });
+    const selectionFile = join(seedDirectory, "remaining-selection.private.json");
+    expect(JSON.parse(await readFile(selectionFile, "utf8"))).toEqual({
+      version: 1,
+      confirmed: true,
+      sourceIds: ["source-000002"],
+    });
+    expect(await readdir(join(seedDirectory, "candidates"))).toEqual([
+      "candidate-000001.json",
+      "candidate-000061.json",
+    ]);
+    const seedReceipt = JSON.parse(
+      await readFile(join(seedDirectory, "seed-receipt.json"), "utf8"),
+    ) as {
+      candidates: Array<{ legacyArtifactSha256: string }>;
+    };
+    expect(seedReceipt.candidates.map(({ legacyArtifactSha256 }) => legacyArtifactSha256)).toEqual([
+      sha256Hex(await readFile(join(fixture.prepareOutput, "candidates", "candidate-000001.json"))),
+      sha256Hex(await readFile(join(fixture.prepareOutput, "candidates", "candidate-000061.json"))),
+    ]);
+    const firstSeeded = await readCandidate(seedDirectory, "candidate-000001");
+    const thirdSeeded = await readCandidate(seedDirectory, "candidate-000061");
+    expect(firstSeeded.problem).toEqual(firstLegacy.problem);
+    expect(thirdSeeded.problem).toEqual(thirdLegacy.problem);
+    expect(firstSeeded.sourceMappingSha256).not.toBe(firstLegacy.sourceMappingSha256);
+    expect(thirdSeeded.problem.content.basicSolution).toBeNull();
+
+    const finalOutput = join(fixture.root, "prepared-from-seed");
+    const calls: string[] = [];
+    const result = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      outputDirectory: finalOutput,
+      sourceSelectorFile: selectionFile,
+      candidateSeedDirectory: seedDirectory,
+      authoritativeGroupingBatchSha256: groupingBatchSha256,
+      normalizer: {
+        async normalize(input) {
+          calls.push(input.sourceId);
+          return normalizedOutput();
+        },
+      },
+    });
+    expect(result).toMatchObject({
+      sourceCount: 3,
+      completedSourceCount: 3,
+      candidateCount: 3,
+      complete: true,
+    });
+    expect(calls).toEqual(["source-000002"]);
+    expect(await readdir(join(finalOutput, "candidates"))).toEqual([
+      "candidate-000001.json",
+      "candidate-000031.json",
+      "candidate-000061.json",
+    ]);
+
+    await writeFile(
+      join(seedDirectory, "candidates", "candidate-000001.json"),
+      `${JSON.stringify({ ...firstSeeded, normalizationNote: "篡改" }, null, 2)}\n`,
+      "utf8",
+    );
+    const rejectedOutput = join(fixture.root, "rejected-seed-import");
+    const rejectedNormalizer = { normalize: vi.fn(async () => normalizedOutput()) };
+    await expect(
+      prepareHistoryCandidates({
+        ...fixture.prepareOptions,
+        outputDirectory: rejectedOutput,
+        sourceSelectorFile: selectionFile,
+        candidateSeedDirectory: seedDirectory,
+        authoritativeGroupingBatchSha256: groupingBatchSha256,
+        normalizer: rejectedNormalizer,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_CANDIDATE_SEED" });
+    expect(rejectedNormalizer.normalize).not.toHaveBeenCalled();
+    await expect(stat(rejectedOutput)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("严格拒绝带额外字段的选择清单和超出上限的并发数", async () => {
@@ -1660,7 +1812,9 @@ async function createMultiFixture(sourceCount = 3): Promise<HistoryMigrationFixt
     number: `synthetic-${index + 1}`,
   }));
   for (const source of sources.slice(1)) {
-    await writeFile(join(fixture.sourceDirectory, source.path), source.text, "utf8");
+    const sourcePath = join(fixture.sourceDirectory, source.path);
+    await writeFile(sourcePath, source.text, "utf8");
+    await chmod(sourcePath, 0o600);
   }
   const metadataText = `${JSON.stringify(
     {
@@ -1695,7 +1849,102 @@ async function createMultiFixture(sourceCount = 3): Promise<HistoryMigrationFixt
     )}\n`,
     "utf8",
   );
+  await chmod(fixture.prepareOptions.metadataFile, 0o600);
+  await chmod(fixture.prepareOptions.sourceConfirmationFile, 0o600);
   return fixture;
+}
+
+async function rewriteMultiFixtureMaterialization(
+  fixture: HistoryMigrationFixture,
+): Promise<string> {
+  const sourceConfirmation = JSON.parse(
+    await readFile(fixture.prepareOptions.sourceConfirmationFile, "utf8"),
+  ) as {
+    version: 1;
+    confirmed: true;
+    metadataFileSha256: string;
+    mappings: Array<{
+      sourcePath: string;
+      sourceSha256: string;
+      metadataNumber: string;
+    }>;
+  };
+  sourceConfirmation.metadataFileSha256 = sha256Hex(
+    await readFile(fixture.prepareOptions.metadataFile),
+  );
+  const materializationMarker = JSON.parse(
+    await readFile(join(fixture.materializedDirectory, "MATERIALIZE_COMPLETE"), "utf8"),
+  ) as { groupingBatchSha256: string; sourceInventorySha256?: string };
+  const sources = await Promise.all(
+    sourceConfirmation.mappings.map(async (mapping, index) => {
+      const text = await readFile(join(fixture.sourceDirectory, mapping.sourcePath), "utf8");
+      return {
+        groupId: `group-${String(index + 1).padStart(6, "0")}`,
+        sourceId: `source-${String(index + 1).padStart(6, "0")}`,
+        sourceSha256: mapping.sourceSha256,
+        fragmentCount: 1,
+        byteLength: new TextEncoder().encode(text).byteLength,
+        characterCount: text.length,
+        status: "ready_for_prepare" as const,
+      };
+    }),
+  );
+  const report = {
+    version: 2,
+    phase: "materialize",
+    sourceInventorySha256: materializationMarker.sourceInventorySha256 ?? "e".repeat(64),
+    groupingBatchSha256: materializationMarker.groupingBatchSha256,
+    fragmentCount: sources.length,
+    sourceCount: sources.length,
+    unresolvedItemCount: 0,
+    sources,
+  };
+  const sourceConfirmationSha256 = sha256Hex(JSON.stringify(sourceConfirmation));
+  const reportSha256 = sha256Hex(JSON.stringify(report));
+  const sourceSetSha256 = sha256Hex(
+    JSON.stringify({
+      version: 1,
+      sources: sources.map(({ sourceId, sourceSha256, byteLength }) => ({
+        sourceId,
+        sourceSha256,
+        byteLength,
+      })),
+    }),
+  );
+  const marker = {
+    version: 2,
+    phase: "materialize",
+    reportSha256,
+    sourceConfirmationSha256,
+    sourceSetSha256,
+    groupingBatchSha256: materializationMarker.groupingBatchSha256,
+    sourceCount: sources.length,
+    fragmentCount: sources.length,
+    unresolvedItemCount: 0,
+  };
+  await writeFile(
+    fixture.prepareOptions.sourceConfirmationFile,
+    `${JSON.stringify(sourceConfirmation, null, 2)}\n`,
+    "utf8",
+  );
+  await writeFile(
+    join(fixture.materializedDirectory, "report.json"),
+    `${JSON.stringify(report, null, 2)}\n`,
+    "utf8",
+  );
+  await writeFile(
+    join(fixture.materializedDirectory, "MATERIALIZE_COMPLETE"),
+    `${JSON.stringify(marker, null, 2)}\n`,
+    "utf8",
+  );
+  for (const path of [
+    fixture.prepareOptions.sourceConfirmationFile,
+    join(fixture.materializedDirectory, "report.json"),
+    join(fixture.materializedDirectory, "MATERIALIZE_COMPLETE"),
+  ]) {
+    await chmod(path, 0o600);
+  }
+  return marker.groupingBatchSha256;
 }
 
 function fixedNormalizer(): HistoryNormalizer {

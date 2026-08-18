@@ -10,16 +10,17 @@ import {
   assertHistoryMaterializationComplete,
   createLlmHistoryNormalizer,
   HistoryMigrationError,
-  initializeHistoryGroupingWorksheet,
   initializeHistoryAttachmentMappingWorksheet,
+  initializeHistoryGroupingWorksheet,
   inventoryHistorySources,
   loadHistoryPreparationCodeSha256,
   materializeHistoryGrouping,
   packageApprovedCandidates,
   prepareHistoryCandidates,
   repairFailedHistoryCandidates,
-  sealHistoryGrouping,
   sealHistoryAttachmentMapping,
+  sealHistoryGrouping,
+  seedApprovedHistoryCandidates,
   writeHistoryGroupingConfirmation,
 } from "../src/history-migration/index";
 
@@ -113,7 +114,17 @@ type Command =
       readonly operationTag: string;
       readonly selectionManifestFile?: string;
       readonly concurrency: number;
+      readonly candidateSeedDirectory?: string;
       readonly resume: boolean;
+    }
+  | {
+      readonly phase: "seed-approved";
+      readonly privateRootDirectory: string;
+      readonly materializedDirectory: string;
+      readonly metadataFile: string;
+      readonly legacyPreparedDirectory: string;
+      readonly legacyApprovalFile: string;
+      readonly outputDirectory: string;
     }
   | {
       readonly phase: "repair-local";
@@ -196,49 +207,69 @@ async function main(): Promise<void> {
     );
     return;
   }
+  if (command.phase === "seed-approved") {
+    const result = await seedApprovedHistoryCandidates({
+      privateRootDirectory: command.privateRootDirectory,
+      materializedDirectory: command.materializedDirectory,
+      metadataFile: command.metadataFile,
+      legacyPreparedDirectory: command.legacyPreparedDirectory,
+      legacyApprovalFile: command.legacyApprovalFile,
+      outputDirectory: command.outputDirectory,
+    });
+    process.stdout.write(
+      `候选种子已完成：权威来源 ${result.sourceCount} 份，已验证导入 ${result.seededSourceCount} 份，剩余选择 ${result.remainingSourceCount} 份；题解保留 ${result.solutionPresentCount} 份，结构性缺失 ${result.solutionMissingCount} 份。\n`,
+    );
+    return;
+  }
   if (command.phase === "prepare") {
-    await assertHistoryMaterializationComplete({
+    const materialization = await assertHistoryMaterializationComplete({
       privateRootDirectory: command.privateRootDirectory,
       materializedDirectory: command.materializedDirectory,
     });
-    const baseUrl = process.env.AETHER_BASE_URL;
-    const apiKey = process.env.AETHER_API_KEY;
-    if (baseUrl === undefined || apiKey === undefined) {
-      throw new HistoryMigrationError("INVALID_ARGUMENTS", "准备候选内容需要私有模型地址与密钥。");
-    }
-    const codeSha256 = await loadHistoryPreparationCodeSha256();
-    const normalizer = createLlmHistoryNormalizer({
-      baseUrl,
-      apiKey,
-      model: process.env.MIGRATE_MODEL ?? "deepseek-v4-flash",
-      codeSha256,
-    });
-    const result = await prepareHistoryCandidates({
-      privateRootDirectory: command.privateRootDirectory,
-      sourceDirectory: join(command.materializedDirectory, "sources"),
-      metadataFile: command.metadataFile,
-      sourceConfirmationFile: join(
-        command.materializedDirectory,
-        "source-confirmation.private.json",
-      ),
-      outputDirectory: command.outputDirectory,
-      operationTag: command.operationTag,
-      resume: command.resume,
-      sourceSelectorFile: command.selectionManifestFile,
-      concurrency: command.concurrency,
-      executionIdentity: normalizer.preparationIdentity,
-      normalizer,
-    });
-    if (!result.complete) {
-      throw new HistoryMigrationError(
-        "PREPARE_INCOMPLETE",
-        "本次 prepare 含失败、未确认结束或尚未处理的样本；安全报告已保留。",
+    try {
+      const baseUrl = process.env.AETHER_BASE_URL;
+      const apiKey = process.env.AETHER_API_KEY;
+      if (baseUrl === undefined || apiKey === undefined) {
+        throw new HistoryMigrationError(
+          "INVALID_ARGUMENTS",
+          "准备候选内容需要私有模型地址与密钥。",
+        );
+      }
+      const codeSha256 = await loadHistoryPreparationCodeSha256();
+      const normalizer = createLlmHistoryNormalizer({
+        baseUrl,
+        apiKey,
+        model: process.env.MIGRATE_MODEL ?? "deepseek-v4-flash",
+        codeSha256,
+      });
+      const result = await prepareHistoryCandidates({
+        privateRootDirectory: command.privateRootDirectory,
+        sourceDirectory: materialization.sourceDirectory,
+        metadataFile: command.metadataFile,
+        sourceConfirmationFile: materialization.sourceConfirmationFile,
+        outputDirectory: command.outputDirectory,
+        operationTag: command.operationTag,
+        resume: command.resume,
+        sourceSelectorFile: command.selectionManifestFile,
+        candidateSeedDirectory: command.candidateSeedDirectory,
+        authoritativeGroupingBatchSha256: materialization.groupingBatchSha256,
+        concurrency: command.concurrency,
+        executionIdentity: normalizer.preparationIdentity,
+        normalizer,
+      });
+      if (!result.complete) {
+        throw new HistoryMigrationError(
+          "PREPARE_INCOMPLETE",
+          "本次 prepare 含失败、未确认结束或尚未处理的样本；安全报告已保留。",
+        );
+      }
+      process.stdout.write(
+        `已读取 ${result.sourceCount} 个确认源文件，生成 ${result.candidateCount} 个待人工批准的候选。\n`,
       );
+      return;
+    } finally {
+      await materialization.close();
     }
-    process.stdout.write(
-      `已读取 ${result.sourceCount} 个确认源文件，生成 ${result.candidateCount} 个待人工批准的候选。\n`,
-    );
-    return;
   }
   if (command.phase === "repair-local") {
     await assertHistoryMaterializationComplete({
@@ -407,8 +438,20 @@ function parseCommand(argv: readonly string[]): Command {
       outputDirectory: requiredOption(argv, "--out"),
       operationTag: requiredOption(argv, "--run-tag"),
       selectionManifestFile: optionalOption(argv, "--selection-manifest"),
+      candidateSeedDirectory: optionalOption(argv, "--candidate-seed"),
       concurrency: integerOption(argv, "--concurrency", 12),
       resume: argv.includes("--resume"),
+    };
+  }
+  if (phase === "seed-approved") {
+    return {
+      phase,
+      privateRootDirectory: requiredOption(argv, "--private-root"),
+      materializedDirectory: requiredOption(argv, "--materialized"),
+      metadataFile: requiredOption(argv, "--metadata"),
+      legacyPreparedDirectory: requiredOption(argv, "--legacy-prepared"),
+      legacyApprovalFile: requiredOption(argv, "--legacy-approval"),
+      outputDirectory: requiredOption(argv, "--out"),
     };
   }
   if (phase === "repair-local") {
@@ -441,7 +484,7 @@ function parseCommand(argv: readonly string[]): Command {
   }
   throw new HistoryMigrationError(
     "INVALID_ARGUMENTS",
-    "必须明确选择 inventory、init-grouping、seal-grouping、confirm-grouping、materialize、init-attachments、seal-attachments、assert-attachments、prepare、repair-local 或 package 阶段。",
+    "必须明确选择 inventory、init-grouping、seal-grouping、confirm-grouping、materialize、init-attachments、seal-attachments、assert-attachments、seed-approved、prepare、repair-local 或 package 阶段。",
   );
 }
 

@@ -23,28 +23,31 @@ import {
 import {
   HistoryMigrationError,
   HistoryNormalizationError,
-  historyNormalizationFailureKinds,
   type HistoryNormalizationFailureKind,
+  historyNormalizationFailureKinds,
 } from "./errors";
 import {
-  type HistoryAttachmentSourceLocator,
   assertHistoryMaterializationComplete,
+  type HistoryAttachmentSourceLocator,
 } from "./grouping-workflow";
 import {
+  assertNewOutputPath,
   assertPathsInsidePrivateRoot,
   assertPrivateDirectoryMode,
   assertPrivateFileMode,
-  assertNewOutputPath,
   createNewPrivateDirectory,
+  movePrivateFileNoReplace,
   openVerifiedPrivateOutputWriter,
-  type VerifiedPrivateOutputWriter,
   readConfirmedSource,
   readPrivateJson,
   readPrivateJsonWithDigest,
-  movePrivateFileNoReplace,
+  type VerifiedPrivateOutputWriter,
   writeNewPrivateJson,
 } from "./private-files";
 import {
+  type HistoryCandidateRecord,
+  type HistoryMetadataRecord,
+  type HistorySourceMapping,
   historyCandidateApprovalSchema,
   historyCandidateProblemSchema,
   historyCandidateRecordSchema,
@@ -52,13 +55,9 @@ import {
   historyRepairManifestSchema,
   historySourceMappingSchema,
   historySourceSelectionSchema,
-  normalizedHistoryOutputSchema,
-  type HistoryCandidateRecord,
-  type HistoryMetadataRecord,
-  type HistoryRepairManifest,
-  type HistorySourceMapping,
   type NormalizedHistoryOutput,
   type NormalizedHistoryProblem,
+  normalizedHistoryOutputSchema,
 } from "./schema";
 
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/);
@@ -135,6 +134,68 @@ const preparationCompleteSchema = z
     candidateCount: z.number().int().nonnegative(),
     sourceCount: z.number().int().positive(),
     runSha256: digestSchema,
+  })
+  .strict();
+
+const candidateSeedReferenceSchema = z
+  .object({
+    sourceId: z.string().regex(/^source-[0-9]{6}$/),
+    candidateId: z.string().regex(/^candidate-[0-9]{6}$/),
+    legacyContentSha256: digestSchema,
+    legacyArtifactSha256: digestSchema,
+    contentSha256: digestSchema,
+    sourceBindingSha256: digestSchema,
+  })
+  .strict();
+
+const candidateSeedReceiptSchema = z
+  .object({
+    version: z.literal(1),
+    phase: z.literal("candidate-seed"),
+    groupingBatchSha256: digestSchema,
+    materializationReportSha256: digestSchema,
+    sourceConfirmationSha256: digestSchema,
+    metadataFileSha256: digestSchema,
+    authoritativeInputBatchSha256: digestSchema,
+    legacyApprovalSha256: digestSchema,
+    sourceCount: z.number().int().positive(),
+    seededSourceCount: z.number().int().positive(),
+    remainingSourceCount: z.number().int().positive(),
+    solutionPresentCount: z.number().int().nonnegative(),
+    solutionMissingCount: z.number().int().nonnegative(),
+    remainingSelectionSha256: digestSchema,
+    partitionSha256: digestSchema,
+    seedBatchSha256: digestSchema,
+    candidates: z.array(candidateSeedReferenceSchema).min(1).max(10_000),
+  })
+  .strict();
+
+const candidateSeedCompleteSchema = z
+  .object({
+    version: z.literal(1),
+    phase: z.literal("candidate-seed"),
+    receiptSha256: digestSchema,
+    sourceCount: z.number().int().positive(),
+    seededSourceCount: z.number().int().positive(),
+    remainingSourceCount: z.number().int().positive(),
+  })
+  .strict();
+
+const preparationSeededSchema = z
+  .object({
+    version: z.literal(1),
+    status: z.literal("seeded"),
+    sourceId: z.string().regex(/^source-[0-9]{6}$/),
+    seedReceiptSha256: digestSchema,
+    candidates: z
+      .array(
+        candidateSeedReferenceSchema.pick({
+          candidateId: true,
+          contentSha256: true,
+        }),
+      )
+      .min(1)
+      .max(30),
   })
   .strict();
 
@@ -222,6 +283,13 @@ export interface PrepareHistoryCandidatesOptions {
   readonly sourceSelectorFile?: string;
   /** 同时进行的源处理数。省略时默认 12，只接受 1..20 的整数。 */
   readonly concurrency?: number;
+  /**
+   * 可选的已批准候选种子目录。使用时，选择清单必须恰好是种子收据声明的补集；
+   * prepare 会先验证并导入种子，再只调用整理器处理补集。
+   */
+  readonly candidateSeedDirectory?: string;
+  /** 使用候选种子时必填；绑定到已核验物化批次，不接受调用方自造的普通标签。 */
+  readonly authoritativeGroupingBatchSha256?: string;
   /** 只允许在同一输出目录、同一标签和同一执行身份下续跑。 */
   readonly resume?: boolean;
 }
@@ -274,6 +342,25 @@ export interface PrepareHistoryCandidatesResult {
   readonly complete: boolean;
 }
 
+export interface SeedApprovedHistoryCandidatesOptions {
+  readonly privateRootDirectory: string;
+  readonly materializedDirectory: string;
+  readonly metadataFile: string;
+  readonly legacyPreparedDirectory: string;
+  readonly legacyApprovalFile: string;
+  readonly outputDirectory: string;
+}
+
+export interface SeedApprovedHistoryCandidatesResult {
+  readonly sourceCount: number;
+  readonly seededSourceCount: number;
+  readonly remainingSourceCount: number;
+  readonly solutionPresentCount: number;
+  readonly solutionMissingCount: number;
+  readonly receiptSha256: string;
+  readonly remainingSelectionSha256: string;
+}
+
 export interface PackageApprovedCandidatesResult {
   readonly packageCount: number;
   readonly authorMappingCount: number;
@@ -317,6 +404,12 @@ export async function prepareHistoryCandidates(
   }
   const executionIdentity = parsedExecutionIdentity.data;
   const concurrency = parsePreparationConcurrency(options.concurrency);
+  if (options.candidateSeedDirectory !== undefined && options.sourceSelectorFile === undefined) {
+    throw new HistoryMigrationError(
+      "INVALID_CANDIDATE_SEED",
+      "导入候选种子时必须提供与种子收据一致的剩余源选择清单。",
+    );
+  }
   await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
     { path: options.sourceDirectory, kind: "existing" },
     { path: options.metadataFile, kind: "existing" },
@@ -324,18 +417,23 @@ export async function prepareHistoryCandidates(
     ...(options.sourceSelectorFile === undefined
       ? []
       : [{ path: options.sourceSelectorFile, kind: "existing" as const }]),
+    ...(options.candidateSeedDirectory === undefined
+      ? []
+      : [{ path: options.candidateSeedDirectory, kind: "existing" as const }]),
     { path: options.outputDirectory, kind: options.resume === true ? "existing" : "new" },
   ]);
-  const { confirmedSources: allConfirmedSources } = await loadConfirmedInputs(
+  const confirmedInput = await loadConfirmedInputs(
     options.metadataFile,
     await readPrivateJson(options.sourceConfirmationFile),
   );
+  const { confirmedSources: allConfirmedSources } = confirmedInput;
   const confirmedSourceIds = new Set(allConfirmedSources.map(({ sourceId }) => sourceId));
   const indexedConfirmedSources = allConfirmedSources.map((source, sourceIndex) => ({
     source,
     sourceIndex,
   }));
   let selectedSources = indexedConfirmedSources;
+  let sourceSelection: z.infer<typeof historySourceSelectionSchema> | undefined;
   if (options.sourceSelectorFile !== undefined) {
     const parsedSelection = historySourceSelectionSchema.safeParse(
       await readPrivateJson(options.sourceSelectorFile),
@@ -346,8 +444,9 @@ export async function prepareHistoryCandidates(
         "prepare 的源选择清单格式不正确。",
       );
     }
-    const selectedIds = new Set(parsedSelection.data.sourceIds);
-    if (!parsedSelection.data.sourceIds.every((sourceId) => confirmedSourceIds.has(sourceId))) {
+    sourceSelection = parsedSelection.data;
+    const selectedIds = new Set(sourceSelection.sourceIds);
+    if (!sourceSelection.sourceIds.every((sourceId) => confirmedSourceIds.has(sourceId))) {
       throw new HistoryMigrationError(
         "INVALID_SOURCE_SELECTION",
         "prepare 的源选择清单引用了当前确认集合之外的安全编号。",
@@ -357,17 +456,23 @@ export async function prepareHistoryCandidates(
       selectedIds.has(source.sourceId),
     );
   }
-  const confirmedSources = selectedSources.map(({ source }) => source);
+  const selectedConfirmedSources = selectedSources.map(({ source }) => source);
+  const candidateSeed =
+    options.candidateSeedDirectory === undefined || sourceSelection === undefined
+      ? undefined
+      : await loadCandidateSeed({
+          privateRootDirectory: options.privateRootDirectory,
+          seedDirectory: options.candidateSeedDirectory,
+          allConfirmedSources,
+          sourceSelection,
+          groupingBatchSha256: options.authoritativeGroupingBatchSha256,
+          metadataFileSha256: confirmedInput.metadataFileSha256,
+          sourceConfirmationSha256: confirmedInput.sourceConfirmationSha256,
+        });
+  const confirmedSources =
+    candidateSeed === undefined ? selectedConfirmedSources : allConfirmedSources;
   const operationTagSha256 = sha256Hex(operationTag);
-  const inputBatchSha256 = sha256Hex(
-    JSON.stringify(
-      confirmedSources.map((source) => ({
-        sourceId: source.sourceId,
-        sourceContentSha256: source.mapping.sourceSha256,
-        sourceMappingSha256: source.sourceMappingSha256,
-      })),
-    ),
-  );
+  const inputBatchSha256 = confirmedSourceBatchDigest(confirmedSources);
   const run = preparationRunSchema.parse({
     version: 2,
     phase: "prepare",
@@ -427,6 +532,10 @@ export async function prepareHistoryCandidates(
       status: "incomplete",
       runSha256,
     });
+  }
+
+  if (candidateSeed !== undefined) {
+    await importCandidateSeed(options.privateRootDirectory, options.outputDirectory, candidateSeed);
   }
 
   const executionIdentitySha256 = sha256Hex(JSON.stringify(executionIdentity));
@@ -683,6 +792,559 @@ export async function prepareHistoryCandidates(
   };
 }
 
+interface LoadedCandidateSeed {
+  readonly receiptSha256: string;
+  readonly candidates: readonly {
+    readonly source: ConfirmedSource;
+    readonly candidate: HistoryCandidateRecord;
+  }[];
+}
+
+function confirmedSourceBatchDigest(confirmedSources: readonly ConfirmedSource[]): string {
+  return sha256Hex(
+    JSON.stringify(
+      confirmedSources.map((source) => ({
+        sourceId: source.sourceId,
+        sourceContentSha256: source.mapping.sourceSha256,
+        sourceMappingSha256: source.sourceMappingSha256,
+      })),
+    ),
+  );
+}
+
+function candidateSeedBatchDigest(
+  candidates: readonly z.infer<typeof candidateSeedReferenceSchema>[],
+): string {
+  return sha256Hex(JSON.stringify({ version: 1, candidates }));
+}
+
+function candidateSeedPartitionDigest(
+  seededSourceIds: readonly string[],
+  remainingSourceIds: readonly string[],
+): string {
+  return sha256Hex(
+    JSON.stringify({
+      version: 1,
+      seededSourceIds,
+      remainingSourceIds,
+    }),
+  );
+}
+
+export async function seedApprovedHistoryCandidates(
+  options: SeedApprovedHistoryCandidatesOptions,
+): Promise<SeedApprovedHistoryCandidatesResult> {
+  await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+    { path: options.materializedDirectory, kind: "existing" },
+    { path: options.metadataFile, kind: "existing" },
+    { path: options.legacyPreparedDirectory, kind: "existing" },
+    { path: options.legacyApprovalFile, kind: "existing" },
+    { path: options.outputDirectory, kind: "new" },
+  ]);
+  const materialization = await assertHistoryMaterializationComplete({
+    privateRootDirectory: options.privateRootDirectory,
+    materializedDirectory: options.materializedDirectory,
+  });
+  let materializationClosed = false;
+  try {
+    const sourceConfirmationInput = await materialization.readSourceConfirmation();
+    const report = await materialization.readReport();
+    const confirmedInput = await loadConfirmedInputs(options.metadataFile, sourceConfirmationInput);
+    const approvalInput = await readPrivateJsonWithDigest(options.legacyApprovalFile);
+    const approval = parsePrivateInput(
+      historyCandidateApprovalSchema,
+      approvalInput.value,
+      "INVALID_CANDIDATE_APPROVAL",
+      "候选批准文件格式不正确或没有明确确认。",
+    );
+    const sourcesByBinding = new Map<string, ConfirmedSource | null>();
+    const sourceIndexes = new Map<string, number>();
+    for (const [sourceIndex, source] of confirmedInput.confirmedSources.entries()) {
+      sourceIndexes.set(source.sourceId, sourceIndex);
+      const binding = sourceBindingDigest({
+        sourceId: source.sourceId,
+        sourceContentSha256: source.mapping.sourceSha256,
+        sourcePath: source.mapping.sourcePath,
+        sourceSha256: source.mapping.sourceSha256,
+        metadataNumber: source.mapping.metadataNumber,
+      });
+      sourcesByBinding.set(binding, sourcesByBinding.has(binding) ? null : source);
+    }
+
+    const assignedSourceIds = new Set<string>();
+    const assignedCandidateIds = new Set<string>();
+    const seededCandidates: Array<{
+      readonly source: ConfirmedSource;
+      readonly candidate: HistoryCandidateRecord;
+      readonly reference: z.infer<typeof candidateSeedReferenceSchema>;
+    }> = [];
+    let solutionPresentCount = 0;
+    let solutionMissingCount = 0;
+    for (const approvalItem of approval.approvals) {
+      const legacyCandidatePath = join(
+        options.legacyPreparedDirectory,
+        "candidates",
+        `${approvalItem.candidateId}.json`,
+      );
+      await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+        { path: legacyCandidatePath, kind: "existing" },
+      ]);
+      const legacyCandidateInput = await readPrivateJsonWithDigest(legacyCandidatePath);
+      const legacyCandidate = parsePrivateInput(
+        historyCandidateRecordSchema,
+        legacyCandidateInput.value,
+        "CANDIDATE_INVALID",
+        "已批准候选文件格式不正确。",
+      );
+      const legacyDigest = candidateContentDigest(legacyCandidate);
+      if (
+        legacyCandidate.candidateId !== approvalItem.candidateId ||
+        legacyDigest !== legacyCandidate.contentSha256 ||
+        legacyDigest !== approvalItem.contentSha256
+      ) {
+        throw new HistoryMigrationError(
+          "CANDIDATE_CHANGED",
+          "已批准候选的内容或摘要已经变化，不能作为种子导入。",
+        );
+      }
+      if (legacyCandidate.sourceBindingSha256 === undefined) {
+        throw new HistoryMigrationError(
+          "INVALID_CANDIDATE_SEED",
+          "已批准候选缺少稳定来源绑定，不能猜测对应的权威源。",
+        );
+      }
+      const source = sourcesByBinding.get(legacyCandidate.sourceBindingSha256);
+      if (source === undefined || source === null) {
+        throw new HistoryMigrationError(
+          "INVALID_CANDIDATE_SEED",
+          "已批准候选无法一对一映射到当前权威来源。",
+        );
+      }
+      if (
+        assignedSourceIds.has(source.sourceId) ||
+        assignedCandidateIds.has(legacyCandidate.candidateId)
+      ) {
+        throw new HistoryMigrationError(
+          "DUPLICATE_ASSIGNMENT",
+          "候选种子存在重复来源或重复候选分配。",
+        );
+      }
+      if (
+        legacyCandidate.sourceId !== source.sourceId ||
+        legacyCandidate.sourceContentSha256 !== source.mapping.sourceSha256
+      ) {
+        throw new HistoryMigrationError(
+          "INVALID_CANDIDATE_SEED",
+          "已批准候选与当前权威来源的安全身份不一致。",
+        );
+      }
+      const sourceIndex = sourceIndexes.get(source.sourceId);
+      const candidateSequence = Number(legacyCandidate.candidateId.slice("candidate-".length));
+      if (
+        sourceIndex === undefined ||
+        !Number.isSafeInteger(candidateSequence) ||
+        candidateSequence <= sourceIndex * 30 ||
+        candidateSequence > sourceIndex * 30 + 30
+      ) {
+        throw new HistoryMigrationError(
+          "INVALID_CANDIDATE_SEED",
+          "已批准候选编号不属于其权威来源的全局编号区间。",
+        );
+      }
+      await materialization.readConfirmedSource(
+        source.mapping.sourcePath,
+        source.mapping.sourceSha256,
+        source.sourceId,
+      );
+      assertPrivateIdentifiersNotPresent(
+        {
+          problem: legacyCandidate.problem,
+          normalizationNote: legacyCandidate.normalizationNote,
+        },
+        source.metadata.authorStudentId,
+        source.mapping.sourcePath,
+      );
+      const contentSha256 = candidateContentDigest({
+        sourceId: source.sourceId,
+        sourceContentSha256: source.mapping.sourceSha256,
+        sourceMappingSha256: source.sourceMappingSha256,
+        modelConfidence: legacyCandidate.modelConfidence,
+        normalizationNote: legacyCandidate.normalizationNote,
+        problem: legacyCandidate.problem,
+      });
+      const candidate = historyCandidateRecordSchema.parse({
+        ...legacyCandidate,
+        sourceId: source.sourceId,
+        sourceContentSha256: source.mapping.sourceSha256,
+        sourceMappingSha256: source.sourceMappingSha256,
+        sourceBindingSha256: legacyCandidate.sourceBindingSha256,
+        contentSha256,
+      });
+      seededCandidates.push({
+        source,
+        candidate,
+        reference: candidateSeedReferenceSchema.parse({
+          sourceId: source.sourceId,
+          candidateId: candidate.candidateId,
+          legacyContentSha256: legacyCandidate.contentSha256,
+          contentSha256: candidate.contentSha256,
+          legacyArtifactSha256: legacyCandidateInput.sha256,
+          sourceBindingSha256: legacyCandidate.sourceBindingSha256,
+        }),
+      });
+      assignedSourceIds.add(source.sourceId);
+      assignedCandidateIds.add(candidate.candidateId);
+      if (candidate.problem.content.basicSolution === null) {
+        solutionMissingCount += 1;
+      } else {
+        solutionPresentCount += 1;
+      }
+    }
+    seededCandidates.sort(
+      (left, right) =>
+        (sourceIndexes.get(left.source.sourceId) as number) -
+        (sourceIndexes.get(right.source.sourceId) as number),
+    );
+    const remainingSources = confirmedInput.confirmedSources.filter(
+      (source) => !assignedSourceIds.has(source.sourceId),
+    );
+    if (remainingSources.length === 0) {
+      throw new HistoryMigrationError(
+        "INVALID_CANDIDATE_SEED",
+        "候选种子必须保留至少一份权威来源供后续 prepare。",
+      );
+    }
+    const remainingSelection = historySourceSelectionSchema.parse({
+      version: 1,
+      confirmed: true,
+      sourceIds: remainingSources.map(({ sourceId }) => sourceId),
+    });
+    const references = seededCandidates.map(({ reference }) => reference);
+    const seededSourceIds = references.map(({ sourceId }) => sourceId);
+    const remainingSourceIds = remainingSelection.sourceIds;
+    const remainingSelectionSha256 = sha256Hex(JSON.stringify(remainingSelection));
+    const receipt = candidateSeedReceiptSchema.parse({
+      version: 1,
+      phase: "candidate-seed",
+      groupingBatchSha256: materialization.groupingBatchSha256,
+      materializationReportSha256: sha256Hex(JSON.stringify(report)),
+      sourceConfirmationSha256: confirmedInput.sourceConfirmationSha256,
+      metadataFileSha256: confirmedInput.metadataFileSha256,
+      authoritativeInputBatchSha256: confirmedSourceBatchDigest(confirmedInput.confirmedSources),
+      legacyApprovalSha256: approvalInput.sha256,
+      sourceCount: confirmedInput.confirmedSources.length,
+      seededSourceCount: references.length,
+      remainingSourceCount: remainingSources.length,
+      solutionPresentCount,
+      solutionMissingCount,
+      remainingSelectionSha256,
+      partitionSha256: candidateSeedPartitionDigest(seededSourceIds, remainingSourceIds),
+      seedBatchSha256: candidateSeedBatchDigest(references),
+      candidates: references,
+    });
+    const receiptSha256 = sha256Hex(JSON.stringify(receipt));
+    const marker = candidateSeedCompleteSchema.parse({
+      version: 1,
+      phase: "candidate-seed",
+      receiptSha256,
+      sourceCount: receipt.sourceCount,
+      seededSourceCount: receipt.seededSourceCount,
+      remainingSourceCount: receipt.remainingSourceCount,
+    });
+
+    await materialization.assertUnchangedBeforePublish();
+    await createNewPrivateDirectory(options.outputDirectory);
+    await createNewPrivateDirectory(join(options.outputDirectory, "candidates"));
+    await createNewPrivateDirectory(join(options.outputDirectory, "requests"));
+    for (const { source, candidate } of seededCandidates) {
+      await writeNewPrivateJson(
+        join(options.outputDirectory, "candidates", `${candidate.candidateId}.json`),
+        candidate,
+      );
+      await writeNewPrivateJson(
+        preparationStatePath(options.outputDirectory, source.sourceId, "seeded"),
+        preparationSeededSchema.parse({
+          version: 1,
+          status: "seeded",
+          sourceId: source.sourceId,
+          seedReceiptSha256: receiptSha256,
+          candidates: [
+            {
+              candidateId: candidate.candidateId,
+              contentSha256: candidate.contentSha256,
+            },
+          ],
+        }),
+      );
+    }
+    await writeNewPrivateJson(
+      join(options.outputDirectory, "remaining-selection.private.json"),
+      remainingSelection,
+    );
+    await writeNewPrivateJson(join(options.outputDirectory, "seed-receipt.json"), receipt);
+    const [latestMetadata, latestApproval] = await Promise.all([
+      readPrivateJsonWithDigest(options.metadataFile),
+      readPrivateJsonWithDigest(options.legacyApprovalFile),
+    ]);
+    if (
+      latestMetadata.sha256 !== confirmedInput.metadataFileSha256 ||
+      latestApproval.sha256 !== approvalInput.sha256
+    ) {
+      throw new HistoryMigrationError(
+        "INVALID_CANDIDATE_SEED",
+        "候选种子输入在发布完成标记前发生变化。",
+      );
+    }
+    for (const reference of references) {
+      const legacyCandidatePath = join(
+        options.legacyPreparedDirectory,
+        "candidates",
+        `${reference.candidateId}.json`,
+      );
+      await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+        { path: legacyCandidatePath, kind: "existing" },
+      ]);
+      const latestCandidate = await readPrivateJsonWithDigest(legacyCandidatePath);
+      if (latestCandidate.sha256 !== reference.legacyArtifactSha256) {
+        throw new HistoryMigrationError(
+          "INVALID_CANDIDATE_SEED",
+          "已批准候选文件在发布完成标记前发生变化。",
+        );
+      }
+    }
+    await materialization.close();
+    materializationClosed = true;
+    await writeNewPrivateJson(join(options.outputDirectory, "SEED_COMPLETE"), marker);
+    return {
+      sourceCount: receipt.sourceCount,
+      seededSourceCount: receipt.seededSourceCount,
+      remainingSourceCount: receipt.remainingSourceCount,
+      solutionPresentCount,
+      solutionMissingCount,
+      receiptSha256,
+      remainingSelectionSha256,
+    };
+  } finally {
+    if (!materializationClosed) {
+      await materialization.close();
+    }
+  }
+}
+
+async function loadCandidateSeed(options: {
+  readonly privateRootDirectory: string;
+  readonly seedDirectory: string;
+  readonly allConfirmedSources: readonly ConfirmedSource[];
+  readonly sourceSelection: z.infer<typeof historySourceSelectionSchema>;
+  readonly groupingBatchSha256: string | undefined;
+  readonly metadataFileSha256: string;
+  readonly sourceConfirmationSha256: string;
+}): Promise<LoadedCandidateSeed> {
+  const receiptPath = join(options.seedDirectory, "seed-receipt.json");
+  const markerPath = join(options.seedDirectory, "SEED_COMPLETE");
+  const selectionPath = join(options.seedDirectory, "remaining-selection.private.json");
+  await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+    { path: join(options.seedDirectory, "candidates"), kind: "existing" },
+    { path: join(options.seedDirectory, "requests"), kind: "existing" },
+    { path: receiptPath, kind: "existing" },
+    { path: markerPath, kind: "existing" },
+    { path: selectionPath, kind: "existing" },
+  ]);
+  const receipt = parsePrivateInput(
+    candidateSeedReceiptSchema,
+    await readPrivateJson(receiptPath),
+    "INVALID_CANDIDATE_SEED",
+    "候选种子收据格式不正确。",
+  );
+  const marker = parsePrivateInput(
+    candidateSeedCompleteSchema,
+    await readPrivateJson(markerPath),
+    "INVALID_CANDIDATE_SEED",
+    "候选种子没有完整完成标记。",
+  );
+  const remainingSelection = parsePrivateInput(
+    historySourceSelectionSchema,
+    await readPrivateJson(selectionPath),
+    "INVALID_CANDIDATE_SEED",
+    "候选种子的剩余源选择清单格式不正确。",
+  );
+  const receiptSha256 = sha256Hex(JSON.stringify(receipt));
+  if (
+    options.groupingBatchSha256 === undefined ||
+    !digestSchema.safeParse(options.groupingBatchSha256).success ||
+    marker.receiptSha256 !== receiptSha256 ||
+    marker.sourceCount !== receipt.sourceCount ||
+    marker.seededSourceCount !== receipt.seededSourceCount ||
+    marker.remainingSourceCount !== receipt.remainingSourceCount ||
+    receipt.groupingBatchSha256 !== options.groupingBatchSha256 ||
+    receipt.sourceConfirmationSha256 !== options.sourceConfirmationSha256 ||
+    receipt.metadataFileSha256 !== options.metadataFileSha256 ||
+    receipt.authoritativeInputBatchSha256 !==
+      confirmedSourceBatchDigest(options.allConfirmedSources) ||
+    receipt.remainingSelectionSha256 !== sha256Hex(JSON.stringify(remainingSelection)) ||
+    receipt.sourceCount !== options.allConfirmedSources.length ||
+    receipt.candidates.length !== receipt.seededSourceCount ||
+    receipt.solutionPresentCount + receipt.solutionMissingCount !== receipt.seededSourceCount
+  ) {
+    throw new HistoryMigrationError(
+      "INVALID_CANDIDATE_SEED",
+      "候选种子收据与当前权威物化身份或完成标记不一致。",
+    );
+  }
+
+  const sourcesById = new Map(
+    options.allConfirmedSources.map((source) => [source.sourceId, source] as const),
+  );
+  const sourceIndexes = new Map(
+    options.allConfirmedSources.map((source, index) => [source.sourceId, index] as const),
+  );
+  const seededSourceIds = new Set<string>();
+  const candidateIds = new Set<string>();
+  const candidates: Array<{
+    readonly source: ConfirmedSource;
+    readonly candidate: HistoryCandidateRecord;
+  }> = [];
+  let solutionPresentCount = 0;
+  let solutionMissingCount = 0;
+  for (const reference of receipt.candidates) {
+    const source = sourcesById.get(reference.sourceId);
+    if (
+      source === undefined ||
+      seededSourceIds.has(reference.sourceId) ||
+      candidateIds.has(reference.candidateId)
+    ) {
+      throw new HistoryMigrationError("INVALID_CANDIDATE_SEED", "候选种子的来源或候选分配不唯一。");
+    }
+    const candidate = await loadCandidate(
+      options.privateRootDirectory,
+      options.seedDirectory,
+      reference.candidateId,
+    );
+    const sourceBindingSha256 = sourceBindingDigest({
+      sourceId: source.sourceId,
+      sourceContentSha256: source.mapping.sourceSha256,
+      sourcePath: source.mapping.sourcePath,
+      sourceSha256: source.mapping.sourceSha256,
+      metadataNumber: source.mapping.metadataNumber,
+    });
+    const sourceIndex = sourceIndexes.get(source.sourceId);
+    const candidateSequence = Number(candidate.candidateId.slice("candidate-".length));
+    if (
+      candidate.candidateId !== reference.candidateId ||
+      candidate.sourceId !== source.sourceId ||
+      candidate.sourceContentSha256 !== source.mapping.sourceSha256 ||
+      candidate.sourceMappingSha256 !== source.sourceMappingSha256 ||
+      candidate.sourceBindingSha256 !== sourceBindingSha256 ||
+      candidate.contentSha256 !== reference.contentSha256 ||
+      candidateContentDigest(candidate) !== reference.contentSha256 ||
+      reference.sourceBindingSha256 !== sourceBindingSha256 ||
+      sourceIndex === undefined ||
+      !Number.isSafeInteger(candidateSequence) ||
+      candidateSequence <= sourceIndex * 30 ||
+      candidateSequence > sourceIndex * 30 + 30
+    ) {
+      throw new HistoryMigrationError(
+        "INVALID_CANDIDATE_SEED",
+        "候选种子内容、来源绑定、摘要或全局编号不一致。",
+      );
+    }
+    const seededState = await readOptionalPreparationRecord(
+      options.privateRootDirectory,
+      preparationStatePath(options.seedDirectory, source.sourceId, "seeded"),
+      preparationSeededSchema,
+    );
+    if (
+      seededState === null ||
+      seededState.seedReceiptSha256 !== receiptSha256 ||
+      JSON.stringify(seededState.candidates) !==
+        JSON.stringify([
+          {
+            candidateId: candidate.candidateId,
+            contentSha256: candidate.contentSha256,
+          },
+        ])
+    ) {
+      throw new HistoryMigrationError(
+        "INVALID_CANDIDATE_SEED",
+        "候选种子的逐源检查点与收据不一致。",
+      );
+    }
+    seededSourceIds.add(source.sourceId);
+    candidateIds.add(candidate.candidateId);
+    candidates.push({ source, candidate });
+    if (candidate.problem.content.basicSolution === null) {
+      solutionMissingCount += 1;
+    } else {
+      solutionPresentCount += 1;
+    }
+  }
+  const canonicalSeededSourceIds = options.allConfirmedSources
+    .filter(({ sourceId }) => seededSourceIds.has(sourceId))
+    .map(({ sourceId }) => sourceId);
+  const canonicalRemainingSourceIds = options.allConfirmedSources
+    .filter(({ sourceId }) => !seededSourceIds.has(sourceId))
+    .map(({ sourceId }) => sourceId);
+  const receiptSourceIds = receipt.candidates.map(({ sourceId }) => sourceId);
+  if (
+    JSON.stringify(receiptSourceIds) !== JSON.stringify(canonicalSeededSourceIds) ||
+    JSON.stringify(remainingSelection.sourceIds) !== JSON.stringify(canonicalRemainingSourceIds) ||
+    JSON.stringify(options.sourceSelection.sourceIds) !==
+      JSON.stringify(canonicalRemainingSourceIds) ||
+    receipt.remainingSourceCount !== canonicalRemainingSourceIds.length ||
+    receipt.partitionSha256 !==
+      candidateSeedPartitionDigest(canonicalSeededSourceIds, canonicalRemainingSourceIds) ||
+    receipt.seedBatchSha256 !== candidateSeedBatchDigest(receipt.candidates) ||
+    receipt.solutionPresentCount !== solutionPresentCount ||
+    receipt.solutionMissingCount !== solutionMissingCount
+  ) {
+    throw new HistoryMigrationError(
+      "INVALID_CANDIDATE_SEED",
+      "候选种子与剩余源选择不是当前权威集合的严格不相交补集。",
+    );
+  }
+  return { receiptSha256, candidates };
+}
+
+async function importCandidateSeed(
+  privateRootDirectory: string,
+  outputDirectory: string,
+  seed: LoadedCandidateSeed,
+): Promise<void> {
+  for (const { source, candidate } of seed.candidates) {
+    await writeOrValidatePreparationJson(
+      privateRootDirectory,
+      join(outputDirectory, "candidates", `${candidate.candidateId}.json`),
+      candidate,
+    );
+    await writeOrValidatePreparationJson(
+      privateRootDirectory,
+      preparationStatePath(outputDirectory, source.sourceId, "seeded"),
+      preparationSeededSchema.parse({
+        version: 1,
+        status: "seeded",
+        sourceId: source.sourceId,
+        seedReceiptSha256: seed.receiptSha256,
+        candidates: [
+          {
+            candidateId: candidate.candidateId,
+            contentSha256: candidate.contentSha256,
+          },
+        ],
+      }),
+    );
+  }
+  await writeOrValidatePreparationJson(
+    privateRootDirectory,
+    join(outputDirectory, "seed-import.json"),
+    {
+      version: 1,
+      phase: "candidate-seed-import",
+      seedReceiptSha256: seed.receiptSha256,
+      seededSourceCount: seed.candidates.length,
+    },
+  );
+}
+
 function parsePreparationConcurrency(value: number | undefined): number {
   const concurrency = value ?? 12;
   if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 20) {
@@ -698,12 +1360,16 @@ type PreparationSourceState =
   | {
       readonly kind: "completed";
       readonly record: z.infer<typeof preparationCompletedSchema>;
+    }
+  | {
+      readonly kind: "seeded";
+      readonly record: z.infer<typeof preparationSeededSchema>;
     };
 
 function preparationStatePath(
   outputDirectory: string,
   sourceId: string,
-  state: "active" | "completed" | "failed",
+  state: "active" | "completed" | "failed" | "seeded",
 ): string {
   return join(outputDirectory, "requests", `${sourceId}.${state}.json`);
 }
@@ -728,13 +1394,27 @@ async function loadPreparationSourceState(
     preparationStatePath(outputDirectory, sourceId, "failed"),
     preparationFailureSchema,
   );
-  for (const record of [active, completed, failed]) {
+  const seeded = await readOptionalPreparationRecord(
+    privateRootDirectory,
+    preparationStatePath(outputDirectory, sourceId, "seeded"),
+    preparationSeededSchema,
+  );
+  for (const record of [active, completed, failed, seeded]) {
     if (record !== null && record.sourceId !== sourceId) {
       throw new HistoryMigrationError(
         "PREPARE_RESUME_UNSAFE",
         "prepare 检查点的安全编号不一致，不能继续。",
       );
     }
+  }
+  if (seeded !== null) {
+    if (active !== null || completed !== null || failed !== null) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "prepare 种子检查点与其他请求状态冲突，不能继续。",
+      );
+    }
+    return { kind: "seeded", record: seeded };
   }
   if (completed !== null) {
     if (
@@ -1274,7 +1954,7 @@ export async function repairFailedHistoryCandidates(
         `${receipt.sourceId} 尚未处理，没有可用的失败回执，不能修复。`,
       );
     }
-    if (state.kind === "completed") {
+    if (state.kind === "completed" || state.kind === "seeded") {
       if (
         !state.record.candidates.some(
           (item) =>
@@ -1334,7 +2014,7 @@ export async function repairFailedHistoryCandidates(
       options.preparedDirectory,
       source.sourceId,
     );
-    if (state !== "pending" && state.kind !== "completed") {
+    if (state !== "pending" && state.kind !== "completed" && state.kind !== "seeded") {
       throw new HistoryMigrationError(
         "REPAIR_REJECTED",
         `${source.sourceId} 不在受控修复清单中但尚未完成，不能修复。`,
@@ -2164,6 +2844,8 @@ async function loadConfirmedInputs(
   sourceConfirmationInput: unknown,
 ): Promise<{
   readonly confirmedSources: readonly ConfirmedSource[];
+  readonly metadataFileSha256: string;
+  readonly sourceConfirmationSha256: string;
 }> {
   const metadataInput = await readPrivateJsonWithDigest(metadataFile);
   const metadata = parsePrivateInput(
@@ -2202,7 +2884,11 @@ async function loadConfirmedInputs(
       metadata: matchedMetadata,
     };
   });
-  return { confirmedSources };
+  return {
+    confirmedSources,
+    metadataFileSha256: metadataInput.sha256,
+    sourceConfirmationSha256: sha256Hex(JSON.stringify(sourceConfirmation)),
+  };
 }
 
 async function loadPreparationMarker(
@@ -2380,6 +3066,7 @@ function parsePrivateInput<T>(
     | "INVALID_METADATA"
     | "INVALID_SOURCE_CONFIRMATION"
     | "INVALID_CANDIDATE_APPROVAL"
+    | "INVALID_CANDIDATE_SEED"
     | "CANDIDATE_INVALID"
     | "REPAIR_MANIFEST_INVALID",
   message: string,
