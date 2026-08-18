@@ -75,6 +75,27 @@ export interface ProblemTransaction {
 export interface DataStore {
   getUser(userId: string): Promise<StoredUser | undefined>;
   listUsers(): Promise<StoredUser[]>;
+  getPrimaryEmail(userId: string): Promise<{ readonly address: string; readonly verified: boolean } | undefined>;
+  listUserIdentifiers(
+    userId: string
+  ): Promise<readonly { readonly attribute: string; readonly value: string }[]>;
+  updateUserProfile(
+    userId: string,
+    patch: {
+      readonly nickname?: string;
+      readonly qq?: string | null;
+      readonly avatarSource?: "none" | "qq" | "uploaded";
+    }
+  ): Promise<StoredUser | undefined>;
+  setUserAvatar(
+    userId: string,
+    mediaType: string,
+    content: Uint8Array
+  ): Promise<StoredUser | undefined>;
+  getUserAvatar(
+    userId: string
+  ): Promise<{ readonly mediaType: string; readonly content: Uint8Array; readonly updatedAt: string } | undefined>;
+  clearUserAvatar(userId: string): Promise<StoredUser | undefined>;
   findEmailCredential(normalizedEmail: string): Promise<EmailCredential | undefined>;
   registerEmailUser(input: EmailRegistration): Promise<StoredUser | undefined>;
   findPendingEmailVerification(normalizedEmail: string): Promise<EmailVerificationTarget | undefined>;
@@ -192,6 +213,15 @@ export class InMemoryDataStore implements DataStore {
   private readonly emailVerificationTokens = new Map<string, EmailVerificationToken & { consumed: boolean }>();
   private readonly externalIdentities = new Map<string, string>();
   private readonly loginStates = new Map<string, { expiresAt: string; consumed: boolean }>();
+  private readonly primaryEmails = new Map<string, { address: string; verified: boolean }>();
+  private readonly userIdentifiers = new Map<
+    string,
+    readonly { attribute: string; value: string }[]
+  >();
+  private readonly avatarContents = new Map<
+    string,
+    { mediaType: string; content: Uint8Array; updatedAt: string }
+  >();
   private nextUserId = 1_000_000;
   private readonly problemLocks = new Map<string, Promise<void>>();
   private reviewPolicy: StoredReviewPolicy;
@@ -222,6 +252,81 @@ export class InMemoryDataStore implements DataStore {
     return [...this.users.values()].map(copy);
   }
 
+  public async getPrimaryEmail(
+    userId: string
+  ): Promise<{ readonly address: string; readonly verified: boolean } | undefined> {
+    const entry = this.primaryEmails.get(userId);
+    return entry === undefined ? undefined : { ...entry };
+  }
+
+  public async listUserIdentifiers(
+    userId: string
+  ): Promise<readonly { readonly attribute: string; readonly value: string }[]> {
+    return (this.userIdentifiers.get(userId) ?? []).map(copy);
+  }
+
+  public async updateUserProfile(
+    userId: string,
+    patch: {
+      readonly nickname?: string;
+      readonly qq?: string | null;
+      readonly avatarSource?: "none" | "qq" | "uploaded";
+    }
+  ): Promise<StoredUser | undefined> {
+    const user = this.users.get(userId);
+    if (user === undefined) {
+      return undefined;
+    }
+    if (patch.nickname !== undefined) {
+      user.nickname = patch.nickname;
+    }
+    if (patch.qq !== undefined) {
+      user.qq = patch.qq;
+    }
+    if (patch.avatarSource !== undefined) {
+      user.avatarSource = patch.avatarSource;
+      if (patch.avatarSource !== "uploaded") {
+        this.avatarContents.delete(userId);
+      }
+    }
+    return copy(user);
+  }
+
+  public async setUserAvatar(
+    userId: string,
+    mediaType: string,
+    content: Uint8Array
+  ): Promise<StoredUser | undefined> {
+    const user = this.users.get(userId);
+    if (user === undefined) {
+      return undefined;
+    }
+    this.avatarContents.set(userId, {
+      mediaType,
+      content: copy(content),
+      updatedAt: new Date().toISOString()
+    });
+    user.avatarSource = "uploaded";
+    return copy(user);
+  }
+
+  public async getUserAvatar(
+    userId: string
+  ): Promise<{ readonly mediaType: string; readonly content: Uint8Array; readonly updatedAt: string } | undefined> {
+    const entry = this.avatarContents.get(userId);
+    return entry === undefined ? undefined : { ...entry, content: copy(entry.content) };
+  }
+
+  public async clearUserAvatar(userId: string): Promise<StoredUser | undefined> {
+    const user = this.users.get(userId);
+    if (user === undefined) {
+      return undefined;
+    }
+    this.avatarContents.delete(userId);
+    user.avatarSource = "none";
+    return copy(user);
+  }
+
   public async findEmailCredential(normalizedEmail: string): Promise<EmailCredential | undefined> {
     const credential = this.emailCredentials.get(normalizedEmail);
     if (credential === undefined || !credential.verified) {
@@ -250,6 +355,7 @@ export class InMemoryDataStore implements DataStore {
       passwordHash: input.passwordHash,
       verified: false
     });
+    this.primaryEmails.set(user.id, { address: input.displayEmail, verified: false });
     return copy(user);
   }
 
@@ -302,10 +408,21 @@ export class InMemoryDataStore implements DataStore {
       disabled: false,
       roles: ["投稿人"],
       grants: contributorGrants(),
-      isRoot: false
+      isRoot: false,
+      qq: null,
+      avatarSource: "none"
     };
     this.users.set(user.id, copy(user));
     this.externalIdentities.set(key, user.id);
+    if (input.email !== undefined) {
+      this.primaryEmails.set(user.id, { address: input.email, verified: true });
+    }
+    if (input.studentIds !== undefined && input.studentIds.length > 0) {
+      this.userIdentifiers.set(
+        user.id,
+        input.studentIds.map((item) => ({ attribute: item.attribute, value: item.value }))
+      );
+    }
     return copy(user);
   }
 

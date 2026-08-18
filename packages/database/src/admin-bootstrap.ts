@@ -6,7 +6,7 @@ import { hasExactDefaultCoreSeed } from "./seed";
 
 const migrationLockKeyOne = 1_431_453_001;
 const migrationLockKeyTwo = 1_651_666_804;
-const expectedMigrationCount = 16;
+const expectedMigrationCount = 17;
 
 const seededPublicTables = new Set([
   "admin_bootstrap_state",

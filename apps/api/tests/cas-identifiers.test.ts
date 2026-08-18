@@ -11,6 +11,7 @@ import {
 import { sql } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DatabaseDataStore } from "../src/database-store";
+import { readProfileView } from "../src/profile-service";
 
 const openDatabases: LocalDatabaseHandle[] = [];
 
@@ -102,5 +103,66 @@ describe("统一身份认证的学号落库", () => {
       nickname: "无学号用户"
     });
     expect(await listIdentifiers(database, user.id)).toHaveLength(0);
+  });
+
+  it("首次登录的昵称、主邮箱与学号可直接构成个人资料视图", async () => {
+    const database = await openDatabase();
+    const store = new DatabaseDataStore(database);
+    const created = await store.findOrCreateExternalUser({
+      provider: "ustc-cas",
+      subject: "gid-2002",
+      nickname: "统一身份认证用户",
+      email: "cas.user@example.test",
+      studentIds: [{ attribute: "cas:studentId", value: "PB21000077" }]
+    });
+    expect(created.nickname).toBe("统一身份认证用户");
+
+    const [email, identifiers] = await Promise.all([
+      store.getPrimaryEmail(created.id),
+      store.listUserIdentifiers(created.id)
+    ]);
+    expect(email).toEqual({ address: "cas.user@example.test", verified: true });
+    expect(identifiers).toEqual([
+      { attribute: "cas:studentId", value: "PB21000077" }
+    ]);
+
+    const profile = await readProfileView(created, store);
+    expect(profile).toEqual(
+      expect.objectContaining({
+        id: created.id,
+        nickname: "统一身份认证用户",
+        accountType: "human",
+        email: "cas.user@example.test",
+        emailVerified: true,
+        studentIds: [{ attribute: "cas:studentId", value: "PB21000077" }]
+      })
+    );
+  });
+
+  it("头像字节可写入并可读回，来源切换会按约束清空字节", async () => {
+    const database = await openDatabase();
+    const store = new DatabaseDataStore(database);
+    const user = await store.findOrCreateExternalUser({
+      provider: "ustc-cas",
+      subject: "gid-3003",
+      nickname: "头像用户"
+    });
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+
+    const updated = await store.setUserAvatar(user.id, "image/png", bytes);
+    expect(updated?.avatarSource).toBe("uploaded");
+    const readBack = await store.getUserAvatar(user.id);
+    expect(readBack?.mediaType).toBe("image/png");
+    expect(Buffer.from(readBack?.content ?? new Uint8Array())).toEqual(Buffer.from(bytes));
+
+    // 从 uploaded 切回 qq/none 时字节必须一并清空，满足数据库约束。
+    await store.updateUserProfile(user.id, { qq: "12345678", avatarSource: "qq" });
+    expect(await store.getUserAvatar(user.id)).toBeUndefined();
+    const afterQq = await store.getUser(user.id);
+    expect(afterQq?.avatarSource).toBe("qq");
+
+    await store.clearUserAvatar(user.id);
+    expect((await store.getUser(user.id))?.avatarSource).toBe("none");
+    expect(await store.getUserAvatar(user.id)).toBeUndefined();
   });
 });

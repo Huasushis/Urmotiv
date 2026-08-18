@@ -3,6 +3,7 @@ export * from "./auth";
 export * from "./contest";
 export * from "./ip-address";
 export * from "./permissions";
+export * from "./profile";
 export * from "./problem-file";
 export * from "./problem";
 export * from "./review";

@@ -4078,3 +4078,159 @@ textarea:read-only {
     grid-template-columns: 1fr;
   }
 }
+
+/* 个人资料：头部头像与页面样式 */
+.user-profile-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.header-avatar {
+  width: 34px;
+  height: 34px;
+  flex: none;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.header-avatar-initial {
+  display: grid;
+  place-items: center;
+  background: var(--teal);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 750;
+}
+
+.profile-page .form-grid {
+  max-width: 960px;
+}
+
+.avatar-editor {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+  max-width: 960px;
+}
+
+.avatar-preview-frame {
+  display: grid;
+  place-items: center;
+}
+
+.avatar-preview,
+.avatar-initial {
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+}
+
+.avatar-preview {
+  object-fit: cover;
+}
+
+.avatar-initial {
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-size: 34px;
+  font-weight: 750;
+}
+
+.avatar-source-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.avatar-source-button,
+.avatar-upload-button,
+.avatar-remove-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.avatar-source-button.selected {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+  color: var(--teal-dark);
+  font-weight: 700;
+}
+
+.avatar-source-button:disabled {
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+
+.avatar-remove-button {
+  color: var(--red);
+}
+
+.hidden-file-input {
+  display: none;
+}
+
+.avatar-hint {
+  grid-column: 2;
+}
+
+.identifier-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.identifier-list li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface);
+  font-size: 13px;
+}
+
+.identifier-attribute {
+  color: var(--text-faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.identifier-value {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  .avatar-editor {
+    grid-template-columns: 1fr;
+  }
+
+  .avatar-hint {
+    grid-column: 1;
+  }
+
+  .avatar-source-button,
+  .avatar-upload-button,
+  .avatar-remove-button {
+    min-height: 44px;
+    padding: 10px 16px;
+    font-size: 14px;
+  }
+}
