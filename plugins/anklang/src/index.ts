@@ -84,6 +84,88 @@ export const anklangCandidateSchema = z
   })
   .strict();
 
+/**
+ * candidate.metadata 的可选镜像契约，与 Anklang anklang/metadata.py 的
+ * canonicalize_metadata 按同一套边界独立实现：键必须是 ASCII 小写字母/
+ * 数字/下划线且以字母开头（^[a-z][a-z0-9_]{0,63}$），最多 16 个键；值
+ * 只允许字符串、安全整数、布尔或 null（不允许嵌套对象/数组）；字符串值
+ * 必须非空、已经是去掉两端空白的形式并按 UTF-8 字节数不超过 512；数字值
+ * 只接受 [MIN_SAFE_INTEGER, MAX_SAFE_INTEGER] 内的安全整数（小数、越界、
+ * 非有限值、-0 一律拒绝，0 是唯一规范形式），保证与 Python json.dumps 的
+ * 字节一致；整包按规范 JSON（ASCII 升序键、紧凑分隔符、不转义非 ASCII）
+ * 编码后不超过 2048 个 UTF-8 字节。元数据是展示性、非检索性的题面外信息，
+ * 不参与 problem contentHash/相似度/推荐/拦截或任何裁决输入。
+ */
+const metadataKeySchema = z.string().regex(
+  /^[a-z][a-z0-9_]{0,63}$/u,
+  "元数据键必须是小写字母开头的字母/数字/下划线。"
+);
+const metadataStringValueSchema = z
+  .string()
+  .min(1)
+  .refine((value) => value === value.trim(), "元数据字符串值必须已是去空白形式。")
+  .refine(
+    (value) => new TextEncoder().encode(value).byteLength <= 512,
+    "元数据字符串值不能超过 512 字节。"
+  );
+const metadataIntegerValueSchema = z
+  .number()
+  .refine(Number.isSafeInteger, "元数据数字值必须是安全整数。")
+  .refine((value) => !Object.is(value, -0), "元数据数字值不能是负零；0 是唯一规范形式。");
+const metadataValueSchema = z.union([
+  metadataStringValueSchema,
+  metadataIntegerValueSchema,
+  z.boolean(),
+  z.null()
+]);
+const MAX_CANDIDATE_METADATA_KEYS = 16;
+const MAX_CANDIDATE_METADATA_BYTES = 2_048;
+const anklangCandidateMetadataSchema = z
+  .record(metadataKeySchema, metadataValueSchema)
+  .superRefine((metadata, context) => {
+    const keys = Object.keys(metadata);
+    if (keys.length > MAX_CANDIDATE_METADATA_KEYS) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [],
+        message: `candidate.metadata 最多允许 ${MAX_CANDIDATE_METADATA_KEYS} 个键。`
+      });
+      return;
+    }
+    const byteLength = new TextEncoder().encode(canonicalMetadataJson(metadata)).byteLength;
+    if (byteLength > MAX_CANDIDATE_METADATA_BYTES) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [],
+        message: `candidate.metadata 整包不能超过 ${MAX_CANDIDATE_METADATA_BYTES} 字节。`
+      });
+    }
+  });
+export type AnklangCandidateMetadata = z.infer<typeof anklangCandidateMetadataSchema>;
+
+/** ASCII 升序键、紧凑分隔符、不转义非 ASCII 的规范 JSON 序列化。 */
+function canonicalMetadataJson(metadata: Record<string, unknown>): string {
+  const keys = Object.keys(metadata).sort();
+  const parts = keys.map((key) => {
+    const serializedKey = JSON.stringify(key);
+    const serializedValue = JSON.stringify(metadata[key]);
+    return `${serializedKey}:${serializedValue}`;
+  });
+  return `{${parts.join(",")}}`;
+}
+
+/** v2 专用候选题：v1 候选保持原有字节形状，携带 metadata 的 v1 候选被拒绝。 */
+export const anklangV2CandidateSchema = anklangCandidateSchema
+  .extend({ metadata: anklangCandidateMetadataSchema.optional() })
+  .strict()
+  .transform((candidate) => {
+    if (candidate.metadata !== undefined && Object.keys(candidate.metadata).length !== 0) {
+      return candidate;
+    }
+    const { metadata: _omitted, ...rest } = candidate;
+    return rest;
+  });
+
 const contentHashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const recommendationSchema = z
   .object({
@@ -156,7 +238,7 @@ const v2ResultCommon = {
   apiVersion: z.literal("2"),
   contentHash: contentHashSchema,
   checkedAt: utcDateTimeSchema,
-  candidates: z.array(anklangCandidateSchema).max(50),
+  candidates: z.array(anklangV2CandidateSchema).max(50),
   recommendation: recommendationSchema
 } as const;
 
@@ -206,7 +288,7 @@ const unavailableV2ResultSchema = z
   .object({
     ...v2ResultCommon,
     completion: noncompleteCompletionSchema("unavailable"),
-    candidates: z.array(anklangCandidateSchema).length(0),
+    candidates: z.array(anklangV2CandidateSchema).length(0),
     recommendation: z
       .object({
         blockSubmission: z.literal(false),
