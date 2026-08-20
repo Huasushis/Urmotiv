@@ -644,14 +644,14 @@ export async function prepareHistoryCandidates(
           );
           const sourceBindingSha256 = sourceBindingDigest({
             sourceId: source.sourceId,
-            sourceContentSha256: sourceContent.sha256,
+            sourceContentSha256: sourceContent.textSha256,
             sourcePath: source.mapping.sourcePath,
             sourceSha256: source.mapping.sourceSha256,
             metadataNumber: source.mapping.metadataNumber,
           });
           const contentSha256 = candidateContentDigest({
             sourceId: source.sourceId,
-            sourceContentSha256: sourceContent.sha256,
+            sourceContentSha256: sourceContent.textSha256,
             sourceMappingSha256: source.sourceMappingSha256,
             modelConfidence: normalizedProblem.confidence,
             normalizationNote: normalizedProblem.migrationNote,
@@ -661,7 +661,7 @@ export async function prepareHistoryCandidates(
             version: 1,
             candidateId,
             sourceId: source.sourceId,
-            sourceContentSha256: sourceContent.sha256,
+            sourceContentSha256: sourceContent.textSha256,
             sourceMappingSha256: source.sourceMappingSha256,
             sourceBindingSha256,
             contentSha256,
@@ -1921,7 +1921,11 @@ export async function repairFailedHistoryCandidates(
       options.preparedDirectory,
       receipt.sourceId,
     );
-    let sourceContent: { readonly text: string; readonly sha256: string };
+    let sourceContent: {
+      readonly text: string;
+      readonly sha256: string;
+      readonly textSha256: string;
+    };
     try {
       sourceContent = await readConfirmedSource(
         options.sourceDirectory,
@@ -1945,7 +1949,7 @@ export async function repairFailedHistoryCandidates(
     const candidate = buildRepairedCandidate({
       candidateId,
       source,
-      sourceContentSha256: sourceContent.sha256,
+      sourceContentSha256: sourceContent.textSha256,
       title: normalizeRepairTitle(source.metadata.name),
       sourceText: sourceContent.text,
     });

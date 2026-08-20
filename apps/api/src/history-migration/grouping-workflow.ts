@@ -558,7 +558,11 @@ export interface VerifiedHistoryMaterialization {
     sourcePath: string,
     expectedSha256: string,
     sourceId: string,
-  ): Promise<{ readonly text: string; readonly sha256: string }>;
+  ): Promise<{
+    readonly text: string;
+    readonly sha256: string;
+    readonly textSha256: string;
+  }>;
   /**
    * 发布任何最终输出之前的最终复核：通过公开路径重新检查物化目录身份，
    * 并通过持有的句柄重新读取完成标记确认摘要未变。任何不一致都抛

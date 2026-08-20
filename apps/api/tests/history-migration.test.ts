@@ -38,6 +38,7 @@ import {
   sha256Hex,
   writeHistoryGroupingConfirmation,
 } from "../src/history-migration/index";
+import { runQaDeterministicChecks } from "../src/history-migration/qa-gate";
 
 const temporaryDirectories: string[] = [];
 const syntheticSourceName = "synthetic-original-name.md";
@@ -1519,6 +1520,101 @@ describe("历史题目迁移安全核心", () => {
     ).rejects.toMatchObject({
       code: "INVALID_ARGUMENTS",
     });
+  });
+});
+
+describe("源文件原始字节摘要与解码文本摘要的契约", () => {
+  const body = "只用于合成测试的源正文。";
+  const qaItemId = 1;
+
+  async function readMappingSourceSha256(
+    fixture: HistoryMigrationFixture,
+  ): Promise<string> {
+    const confirmation = JSON.parse(
+      await readFile(join(fixture.materializedDirectory, "source-confirmation.private.json"), "utf8"),
+    ) as {
+      mappings: Array<{ readonly sourceSha256: string }>;
+    };
+    const source = confirmation.mappings[0];
+    if (source === undefined) {
+      throw new Error("合成源映射确认缺少来源。");
+    }
+    return source.sourceSha256;
+  }
+
+  it("BOM 文件：原始字节 sha256 与解码文本 sha256 不同，但候选与确定性 QA 门都使用文本摘要", async () => {
+    const sourceWithBom = `\uFEFF${body}`;
+    const fixture = await createFixture(sourceWithBom);
+    const rawSha256 = sha256Hex(sourceWithBom);
+    const textSha256 = sha256Hex(body);
+
+    expect(rawSha256).not.toBe(textSha256);
+
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: fixedNormalizer(),
+    });
+    expect(await readdir(join(fixture.prepareOutput, "candidates"))).toEqual([
+      "candidate-000001.json",
+    ]);
+    const candidate = await readCandidate(fixture.prepareOutput);
+
+    // 映射/溯源仍保留原始字节摘要（防篡改身份），不被改写。
+    expect(await readMappingSourceSha256(fixture)).toBe(rawSha256);
+    // 候选记录的 sourceContentSha256 必须是 QA 消费的解码文本摘要。
+    expect(candidate.sourceContentSha256).toBe(textSha256);
+    expect(candidate.sourceContentSha256).not.toBe(rawSha256);
+
+    const checks = runQaDeterministicChecks({
+      id: qaItemId,
+      sourceText: body,
+      sourceSha256: textSha256,
+      candidateText: JSON.stringify(candidate),
+      expectedSourceId: candidate.sourceId,
+      sourceMappingSha256: candidate.sourceMappingSha256,
+    });
+    // 确定性门必须通过：无任何错误项（风险项是语义复评输入，不阻塞机械门）。
+    expect(checks.errors).toEqual([]);
+  });
+
+  it("BOM 文件的原始字节被篡改后仍拒绝确认（不因文本摘要匹配而被绕过）", async () => {
+    const sourceWithBom = `\uFEFF${body}`;
+    const fixture = await createFixture(sourceWithBom);
+    await writeFile(
+      join(fixture.sourceDirectory, syntheticSourceName),
+      `\uFEFF篡改后的合成正文。`,
+      "utf8",
+    );
+
+    const result = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: fixedNormalizer(),
+    });
+    expect(result).toMatchObject({ complete: false, failedSourceCount: 1 });
+    await expectFailureKind(fixture.prepareOutput, "source_validation");
+  });
+
+  it("非 BOM 文件行为不变：原始字节摘要与解码文本摘要相同，确定性 QA 门通过", async () => {
+    const fixture = await createFixture(body);
+    const textSha256 = sha256Hex(body);
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: fixedNormalizer(),
+    });
+    const candidate = await readCandidate(fixture.prepareOutput);
+    expect(candidate.sourceContentSha256).toBe(textSha256);
+    expect(await readMappingSourceSha256(fixture)).toBe(textSha256);
+
+    const checks = runQaDeterministicChecks({
+      id: qaItemId,
+      sourceText: body,
+      sourceSha256: textSha256,
+      candidateText: JSON.stringify(candidate),
+      expectedSourceId: candidate.sourceId,
+      sourceMappingSha256: candidate.sourceMappingSha256,
+    });
+    // 确定性门必须通过：无任何错误项（风险项是语义复评输入，不阻塞机械门）。
+    expect(checks.errors).toEqual([]);
   });
 });
 

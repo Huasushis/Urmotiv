@@ -115,7 +115,7 @@ export async function readConfirmedSource(
   sourcePath: string,
   expectedSha256: string,
   sourceId: string,
-): Promise<{ readonly text: string; readonly sha256: string }> {
+): Promise<{ readonly text: string; readonly sha256: string; readonly textSha256: string }> {
   const root = resolve(sourceDirectory);
   const filePath = resolve(root, ...sourcePath.split("/"));
   const pathFromRoot = relative(root, filePath);
@@ -175,7 +175,7 @@ export async function readConfirmedSource(
   if (text.trim().length === 0) {
     throw new HistoryMigrationError("SOURCE_FILE_INVALID", `${sourceId} 是空文件。`);
   }
-  return { text, sha256: digest };
+  return { text, sha256: digest, textSha256: sha256Hex(text) };
 }
 
 export async function createNewPrivateDirectory(path: string): Promise<void> {
@@ -756,7 +756,11 @@ export interface HeldVerifiedDirectoryAccess {
     sourcePath: string,
     expectedSha256: string,
     sourceId: string,
-  ): Promise<{ readonly text: string; readonly sha256: string }>;
+  ): Promise<{
+    readonly text: string;
+    readonly sha256: string;
+    readonly textSha256: string;
+  }>;
   listSourcePaths(): Promise<readonly string[]>;
   assertPublicPathUnchanged(): Promise<void>;
   close(): Promise<void>;
@@ -856,7 +860,7 @@ async function readConfirmedSourceThroughHeldDirectoryHandle(
   expectedSha256: string,
   sourceId: string,
   stateByPath: Map<string, PrivateFileSecurityState>,
-): Promise<{ readonly text: string; readonly sha256: string }> {
+): Promise<{ readonly text: string; readonly sha256: string; readonly textSha256: string }> {
   if (!isHeldSourceRelativePath(sourcePath)) {
     throw new HistoryMigrationError("SOURCE_FILE_INVALID", `${sourceId} 的源路径不安全。`);
   }
@@ -899,7 +903,8 @@ async function readConfirmedSourceThroughHeldDirectoryHandle(
         `${sourceId} 的源文件内容与安全编号不一致。`,
       );
     }
-    return { text: decodeUtf8(bytes), sha256: digest };
+    const text = decodeUtf8(bytes);
+    return { text, sha256: digest, textSha256: sha256Hex(text) };
   } finally {
     await Promise.all(openedDirectories.map((handle) => handle.close().catch(() => undefined)));
   }
