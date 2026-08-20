@@ -1,6 +1,11 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import { pluginManifestSchema, type BeforeSubmitInput } from "@urmotiv/plugin-sdk";
+import {
+  pluginManifestSchema,
+  type BeforeSubmitInput,
+  type BeforeSubmitResult,
+  type ReviewItemInput
+} from "@urmotiv/plugin-sdk";
 import {
   AnklangClient,
   anklangCompletionStatus,
@@ -563,5 +568,149 @@ describe("提交前相似度检查与缓存", () => {
       expect(JSON.stringify(output)).not.toContain(marker);
       expect(JSON.stringify(output)).not.toContain(input.problem.basicStatement);
     }
+  });
+});
+
+describe("candidate.metadata 镜像契约", () => {
+  function continueReviewItems(output: BeforeSubmitResult): ReviewItemInput[] {
+    if (output.decision !== "continue") {
+      throw new Error("metadata 用例应为放行决策，不应拦截。");
+    }
+    return output.reviewItems ?? [];
+  }
+
+  function withCandidateMetadata(metadata: unknown): AnklangV2Result {
+    return {
+      ...v2Result(),
+      candidates: [{ ...candidate, metadata }]
+    } as unknown as AnklangV2Result;
+  }
+
+  function parseV2(metadata: unknown): boolean {
+    return anklangV2ResultSchema.safeParse(withCandidateMetadata(metadata)).success;
+  }
+
+  function throughReviewItem(metadata: unknown) {
+    const ck = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({ baseUrl: "https://anklang.example.test" }),
+      fetch: async () => jsonResponse(withCandidateMetadata(metadata))
+    });
+    return ck.run(input, { signal: new AbortController().signal });
+  }
+
+  it("合法标量 metadata（字符串/安全整数/布尔/null）原样保留进 review-item，决策输入不变", async () => {
+    const metadata = {
+      origin: "CF 1000A",
+      rounds: 3,
+      pinned: true,
+      archived: null,
+      display_order: 2,
+      limit: Number.MAX_SAFE_INTEGER,
+      floor: Number.MIN_SAFE_INTEGER
+    };
+    const output = await throughReviewItem(metadata);
+    expect(output.decision).toBe("continue");
+    const data = continueReviewItems(output)[0]?.data as AnklangV2Result;
+    expect(data.candidates[0]).toMatchObject({ metadata });
+    expect(
+      (anklangV2ResultSchema.parse(data).candidates[0] as Record<string, unknown> | undefined)
+        ?.metadata
+    ).toEqual(metadata);
+  });
+
+  it("v1 候选携带 metadata 仍被拒绝；v2 空对象与缺失同样视为没有 metadata", async () => {
+    // v1 候选 schema 未声明 metadata：strict 拒绝携带 metadata 的 v1 候选。
+    const v1 = { ...v1Result(), candidates: [{ ...candidate, metadata: { a: "b" } }] };
+    const client = new AnklangClient({
+      baseUrl: "https://anklang.example.test",
+      apiVersion: "1",
+      fetch: async () => jsonResponse(v1)
+    });
+    await expect(client.check(request("1"), new AbortController().signal)).rejects.toThrow(
+      "格式不正确"
+    );
+
+    // v2 空对象在解析边界规范化为缺失：candidates 里不再出现 metadata 键。
+    const empty = anklangV2ResultSchema.parse(withCandidateMetadata({}));
+    expect(Object.hasOwn(empty.candidates[0] ?? {}, "metadata")).toBe(false);
+    const absent = anklangV2ResultSchema.parse(withCandidateMetadata(undefined));
+    expect(Object.hasOwn(absent.candidates[0] ?? {}, "metadata")).toBe(false);
+    const preserved = anklangV2ResultSchema.parse(withCandidateMetadata({ origin: "CF" }));
+    expect(
+      (preserved.candidates[0] as Record<string, unknown> | undefined)?.metadata
+    ).toEqual({ origin: "CF" });
+  });
+
+  it("键名、键数量、值类型与整包字节的每个边界都 fail closed", () => {
+    const invalidKeyBadChar = parseV2({ BadKey: "x" });
+    expect(invalidKeyBadChar).toBe(false);
+
+    const invalidKeyDigitStart = parseV2({ OneAbc: "x" });
+    expect(invalidKeyDigitStart).toBe(false);
+
+    const invalidKeyHyphen = parseV2({ "a-b": "x" });
+    expect(invalidKeyHyphen).toBe(false);
+
+    const invalidKeyDot = parseV2({ "a.b": "x" });
+    expect(invalidKeyDot).toBe(false);
+
+    const tooLongKey = parseV2({ [`a${"a".repeat(64)}`]: "x" });
+    expect(tooLongKey).toBe(false);
+
+    const emptyKey = parseV2({ "": "x" });
+    expect(emptyKey).toBe(false);
+
+    const tooManyKeys = parseV2(
+      Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`k${i}`, "x"]))
+    );
+    expect(tooManyKeys).toBe(false);
+
+    const nestedObject = parseV2({ nested: { value: 1 } });
+    expect(nestedObject).toBe(false);
+
+    const nestedArray = parseV2({ children: [1, 2, 3] });
+    expect(nestedArray).toBe(false);
+
+    const emptyStringValue = parseV2({ empty: "" });
+    expect(emptyStringValue).toBe(false);
+
+    const untrimmed = parseV2({ untrimmed: "  x " });
+    expect(untrimmed).toBe(false);
+
+    const tooLongString = parseV2({ long: "中".repeat(171) });
+    expect(tooLongString).toBe(false);
+
+    const fractional = parseV2({ float: 1.5 });
+    expect(fractional).toBe(false);
+
+    const negativeZero = parseV2({ negativeZero: -0 });
+    expect(negativeZero).toBe(false);
+
+    const outOfRange = parseV2({ beyond: Number.MAX_SAFE_INTEGER + 1 });
+    expect(outOfRange).toBe(false);
+
+    const nonFinite = parseV2({
+      infinity: Number.POSITIVE_INFINITY,
+      nan: Number.NaN
+    });
+    expect(nonFinite).toBe(false);
+
+    // 16 个键、每值 500 字节 → 整包超 2048 字节；单值仍 ≤512。
+    const overBudget = parseV2(
+      Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`k${i}`, "x".repeat(500)]))
+    );
+    expect(overBudget).toBe(false);
+  });
+
+  it("有/无 metadata 时 contentHash、相似度、推荐与决策逐字节不变", async () => {
+    const withMetadata = await throughReviewItem({ origin: "CF", rounds: 3 });
+    const withoutMetadata = await throughReviewItem(undefined);
+    expect(withMetadata.decision).toBe(withoutMetadata.decision);
+    expect(withMetadata).toMatchObject(withoutMetadata);
+    const withData = continueReviewItems(withMetadata)[0]?.data as AnklangV2Result;
+    const withoutData = continueReviewItems(withoutMetadata)[0]?.data as AnklangV2Result;
+    expect(withData.contentHash).toBe(withoutData.contentHash);
+    expect(withData.candidates[0]?.similarity).toBe(withoutData.candidates[0]?.similarity);
+    expect(withData.recommendation).toEqual(withoutData.recommendation);
   });
 });
