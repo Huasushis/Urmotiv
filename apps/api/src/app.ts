@@ -6,6 +6,8 @@ import {
   applyReviewSuggestionsInputSchema,
   casCallbackQuerySchema,
   casStartQuerySchema,
+  ustcOAuthCallbackQuerySchema,
+  ustcOAuthStartQuerySchema,
   confirmTagDeactivationInputSchema,
   claimRobotReviewTasksInputSchema,
   claimRobotReviewTasksResponseSchema,
@@ -50,6 +52,10 @@ import {
 import {
   CasAuthenticationError,
   casBrowserBindingCookieName,
+  UstcOAuthError,
+  ustcOAuthBrowserBindingCookieName,
+  type UstcOAuthClient,
+  type UstcOAuthLoginStart,
   createEmailVerificationToken,
   digestSecretToken,
   type CasClient,
@@ -163,6 +169,7 @@ export interface ApiAppOptions {
   emailVerificationDelivery?: EmailVerificationDelivery;
   emailVerificationWebUrl?: string;
   casClient?: CasClient;
+  ustcOAuthClient?: UstcOAuthClient;
   demoUserIds?: readonly string[];
   demoLoginUserIds?: Readonly<Record<string, string>>;
   pluginHost?: TrustedPluginHost;
@@ -190,6 +197,7 @@ interface AppDependencies {
   emailVerificationDelivery?: EmailVerificationDelivery;
   emailVerificationWebUrl?: string;
   casClient?: CasClient;
+  ustcOAuthClient?: UstcOAuthClient;
   demoUserIds: ReadonlySet<string>;
   demoLoginUserIds: ReadonlyMap<string, string>;
   now: () => Date;
@@ -539,6 +547,9 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
       ? {}
       : { emailVerificationWebUrl: options.emailVerificationWebUrl }),
     ...(options.casClient === undefined ? {} : { casClient: options.casClient }),
+    ...(options.ustcOAuthClient === undefined
+      ? {}
+      : { ustcOAuthClient: options.ustcOAuthClient }),
     demoUserIds: new Set(options.demoUserIds ?? defaultDemoUsers.map((user) => user.id)),
     demoLoginUserIds: new Map(Object.entries(options.demoLoginUserIds ?? {})),
     pluginHost,
@@ -713,6 +724,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       auth: {
         emailEnabled: dependencies.emailLoginEnabled,
         emailRegistrationEnabled: dependencies.emailRegistrationEnabled,
+        ustcOAuthEnabled: dependencies.ustcOAuthClient !== undefined,
         casEnabled: dependencies.casClient !== undefined,
         demoEnabled: dependencies.demoAuthEnabled
       }
@@ -963,6 +975,98 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     await beginSession(credential.user, reply);
     return authSummary(credential.user);
   });
+
+  if (dependencies.ustcOAuthClient !== undefined) {
+    app.get("/api/v1/auth/ustc/start", async (request, reply) => {
+      reply.header("cache-control", "no-store");
+      reply.header("referrer-policy", "no-referrer");
+      const input = ustcOAuthStartQuerySchema.strict().parse(request.query);
+      let start: UstcOAuthLoginStart;
+      try {
+        start = await dependencies.ustcOAuthClient!.startLogin(input.returnPath);
+      } catch (error) {
+        if (error instanceof UstcOAuthError) {
+          throw new ApiError(
+            400,
+            "INVALID_USTC_OAUTH_START",
+            "统一身份认证登录请求无效。"
+          );
+        }
+        throw error;
+      }
+      reply.setCookie(
+        start.browserBindingCookie.name,
+        start.browserBindingCookie.value,
+        {
+          ...casBrowserBindingCookieOptions,
+          maxAge: start.browserBindingCookie.maxAgeSeconds
+        }
+      );
+      return reply.redirect(start.authorizeUrl);
+    });
+
+    app.get("/api/v1/auth/ustc/callback", async (request, reply) => {
+      reply.header("cache-control", "no-store");
+      reply.header("referrer-policy", "no-referrer");
+      try {
+        const parsedInput = ustcOAuthCallbackQuerySchema.strict().safeParse(request.query);
+        if (!parsedInput.success) {
+          throw unauthorized();
+        }
+        const input = parsedInput.data;
+        const browserBindingCookieName = ustcOAuthBrowserBindingCookieName(input.state);
+        const completed = await dependencies.ustcOAuthClient!.finishLogin({
+          ...input,
+          browserBinding: readUnambiguousCookie(request, browserBindingCookieName)
+        });
+        const subject = z.string().trim().min(1).max(255).safeParse(
+          completed.identity.subject
+        );
+        const username = z.string().trim().min(1).max(255).safeParse(
+          completed.identity.username
+        );
+        const realName = z.string().trim().min(1).max(120).safeParse(
+          completed.identity.realName
+        );
+        const nickname = z.string().trim().min(1).max(120).safeParse(
+          completed.identity.nickname
+        );
+        if (!subject.success || !username.success || !realName.success || !nickname.success) {
+          throw unauthorized();
+        }
+        let email: string;
+        try {
+          if (completed.identity.email === undefined) {
+            throw new Error("missing email");
+          }
+          email = normalizeEmail(completed.identity.email);
+        } catch {
+          throw unauthorized();
+        }
+        const studentIds = completed.identity.studentIds
+          .map((identifier) => ({
+            attribute: identifier.attribute,
+            value: identifier.value.trim()
+          }))
+          .filter((identifier) => identifier.value.length > 0 && identifier.value.length <= 255);
+        const user = await dependencies.store.findOrCreateExternalUser({
+          provider: completed.identity.provider,
+          subject: subject.data,
+          nickname: nickname.data,
+          username: username.data,
+          realName: realName.data,
+          email,
+          strictReconciliation: true,
+          ...(studentIds.length === 0 ? {} : { studentIds })
+        });
+        await beginSession(user, reply);
+        reply.clearCookie(browserBindingCookieName, casBrowserBindingCookieOptions);
+        return reply.redirect(completed.returnTo);
+      } catch {
+        throw unauthorized();
+      }
+    });
+  }
 
   if (dependencies.casClient !== undefined) {
     app.get("/api/v1/auth/cas/start", async (request, reply) => {

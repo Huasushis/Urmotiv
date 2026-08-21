@@ -428,7 +428,13 @@ export async function getDemoSession(): Promise<SessionResponse> {
   if (!saved || !(saved in demoUsers)) {
     return {
       user: null,
-      auth: { emailEnabled: false, emailRegistrationEnabled: false, casEnabled: false, demoEnabled: true }
+      auth: {
+        emailEnabled: false,
+        emailRegistrationEnabled: false,
+        ustcOAuthEnabled: false,
+        casEnabled: false,
+        demoEnabled: true
+      }
     };
   }
   const user = demoUsers[saved as DemoUserId];
@@ -445,7 +451,13 @@ export async function getDemoSession(): Promise<SessionResponse> {
       canManagePlugins: user.accountType === "human" && permissions.includes("plugin.manage"),
       canManageTags: user.accountType === "human" && permissions.includes("tag.manage")
     },
-    auth: { emailEnabled: false, emailRegistrationEnabled: false, casEnabled: false, demoEnabled: true }
+    auth: {
+      emailEnabled: false,
+      emailRegistrationEnabled: false,
+      ustcOAuthEnabled: false,
+      casEnabled: false,
+      demoEnabled: true
+    }
   };
 }
 

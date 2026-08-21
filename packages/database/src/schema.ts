@@ -161,6 +161,8 @@ export const users = pgTable(
       .primaryKey()
       .generatedByDefaultAsIdentity({ name: "users_id_seq", startWith: 1 }),
     nickname: varchar("nickname", { length: 120 }).notNull(),
+    username: varchar("username", { length: 255 }),
+    realName: varchar("real_name", { length: 120 }),
     accountType: accountType("account_type").notNull().default("human"),
     passwordHash: text("password_hash"),
     authRevision: integer("auth_revision").notNull().default(1),
@@ -179,6 +181,14 @@ export const users = pgTable(
   },
   (table) => [
     check("users_nonnegative_id_ck", sql`${table.id} >= 0`),
+    check(
+      "users_username_not_blank_ck",
+      sql`${table.username} IS NULL OR length(btrim(${table.username})) > 0`
+    ),
+    check(
+      "users_real_name_not_blank_ck",
+      sql`${table.realName} IS NULL OR length(btrim(${table.realName})) > 0`
+    ),
     check("users_auth_revision_ck", sql`${table.authRevision} > 0`),
     check(
       "users_root_is_human_ck",

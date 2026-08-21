@@ -114,4 +114,65 @@ if [[ "$cas_enabled" == "true" ]]; then
   fi
 fi
 
+ustc_oauth_configuration_error() {
+  echo "URMOTIV_USTC_OAUTH_CONFIGURATION_INVALID" >&2
+  exit 78
+}
+
+ustc_oauth_enabled_count="$(grep -Ec '^URMOTIV_USTC_OAUTH_ENABLED=' "$env_file" || true)"
+if [[ "$ustc_oauth_enabled_count" -gt 1 ]]; then
+  ustc_oauth_configuration_error
+fi
+ustc_oauth_enabled="false"
+if [[ "$ustc_oauth_enabled_count" -eq 1 ]]; then
+  ustc_oauth_enabled="$(sed -n 's/^URMOTIV_USTC_OAUTH_ENABLED=//p' "$env_file")"
+fi
+if [[ "$ustc_oauth_enabled" != "true" && "$ustc_oauth_enabled" != "false" ]]; then
+  ustc_oauth_configuration_error
+fi
+
+if [[ "$ustc_oauth_enabled" == "true" ]]; then
+  ustc_oauth_keys=(
+    URMOTIV_USTC_OAUTH_AUTHORIZE_URL URMOTIV_USTC_OAUTH_TOKEN_URL
+    URMOTIV_USTC_OAUTH_PROFILE_URL URMOTIV_USTC_OAUTH_REDIRECT_URI
+    URMOTIV_USTC_OAUTH_CLIENT_ID URMOTIV_USTC_OAUTH_CLIENT_SECRET
+    URMOTIV_USTC_OAUTH_STATE_SECRET URMOTIV_USTC_OAUTH_SCOPE
+  )
+  for key in "${ustc_oauth_keys[@]}"; do
+    if [[ "$(grep -Ec "^${key}=" "$env_file" || true)" -gt 1 ]]; then
+      ustc_oauth_configuration_error
+    fi
+  done
+  for key in \
+    URMOTIV_USTC_OAUTH_AUTHORIZE_URL \
+    URMOTIV_USTC_OAUTH_TOKEN_URL \
+    URMOTIV_USTC_OAUTH_PROFILE_URL \
+    URMOTIV_USTC_OAUTH_REDIRECT_URI; do
+    if ! grep -Eq "^${key}=https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[^[:space:]#]*)?$" "$env_file"; then
+      ustc_oauth_configuration_error
+    fi
+  done
+  if ! grep -Eq '^URMOTIV_USTC_OAUTH_CLIENT_ID=[^[:space:]]{1,200}$' "$env_file" || \
+    ! grep -Eq '^URMOTIV_USTC_OAUTH_CLIENT_SECRET=[^[:space:]]{16,4096}$' "$env_file" || \
+    ! grep -Eq '^URMOTIV_USTC_OAUTH_STATE_SECRET=[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$' "$env_file"; then
+    ustc_oauth_configuration_error
+  fi
+  web_origin="$(sed -n 's/^URMOTIV_WEB_ORIGIN=//p' "$env_file")"
+  redirect_uri="$(sed -n 's/^URMOTIV_USTC_OAUTH_REDIRECT_URI=//p' "$env_file")"
+  web_origin="${web_origin%/}"
+  if [[ "$web_origin" != https://* ]] || \
+    [[ "$redirect_uri" != "${web_origin}/api/v1/auth/ustc/callback" ]]; then
+    ustc_oauth_configuration_error
+  fi
+  ustc_state_secret="$(sed -n 's/^URMOTIV_USTC_OAUTH_STATE_SECRET=//p' "$env_file")"
+  plugin_secret="$(sed -n 's/^URMOTIV_PLUGIN_SECRET_KEY=//p' "$env_file")"
+  cas_state_secret="$(sed -n 's/^URMOTIV_CAS_STATE_SECRET=//p' "$env_file")"
+  client_secret="$(sed -n 's/^URMOTIV_USTC_OAUTH_CLIENT_SECRET=//p' "$env_file")"
+  if [[ "$ustc_state_secret" == "$plugin_secret" ]] || \
+    [[ -n "$cas_state_secret" && "$ustc_state_secret" == "$cas_state_secret" ]] || \
+    [[ "$ustc_state_secret" == "$client_secret" ]]; then
+    ustc_oauth_configuration_error
+  fi
+fi
+
 echo "环境文件的必填项和权限已通过检查。"

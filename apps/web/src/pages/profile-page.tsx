@@ -256,9 +256,35 @@ export function ProfilePage() {
             ) : null}
             <small>QQ 号码只对你自己可见，不会展示给其他用户。</small>
           </div>
+          <div className="field">
+            <label>用户名（学工号）</label>
+            <input
+              data-testid="profile-username"
+              type="text"
+              value={profile.username ?? "（统一身份认证未提供）"}
+              readOnly
+              disabled
+            />
+          </div>
+          <div className="field">
+            <label>真实姓名</label>
+            <input
+              data-testid="profile-real-name"
+              type="text"
+              value={profile.realName ?? "（统一身份认证未提供）"}
+              readOnly
+              disabled
+            />
+          </div>
           <div className="field wide">
             <label>邮箱</label>
-            <input type="text" value={profile.email ?? "（未绑定邮箱）"} readOnly disabled />
+            <input
+              data-testid="profile-email"
+              type="text"
+              value={profile.email ?? "（未绑定邮箱）"}
+              readOnly
+              disabled
+            />
             <small>{profile.emailVerified ? "已验证" : "尚未验证"}</small>
           </div>
           {profile.studentIds.length > 0 ? (

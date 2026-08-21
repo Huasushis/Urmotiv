@@ -17,6 +17,7 @@ export const sessionResponseSchema = z.object({
   auth: z.object({
     emailEnabled: z.boolean(),
     emailRegistrationEnabled: z.boolean(),
+    ustcOAuthEnabled: z.boolean(),
     casEnabled: z.boolean(),
     demoEnabled: z.boolean()
   })
@@ -54,6 +55,15 @@ export const casStartQuerySchema = z.object({
 export const casCallbackQuerySchema = z.object({
   state: z.string().min(1).max(4_096),
   ticket: z.string().trim().min(1).max(2_000)
+});
+
+export const ustcOAuthStartQuerySchema = z.object({
+  returnPath: z.string().max(2_000).optional()
+});
+
+export const ustcOAuthCallbackQuerySchema = z.object({
+  state: z.string().min(1).max(4_096),
+  code: z.string().trim().min(1).max(200)
 });
 
 export const okResponseSchema = z.object({ ok: z.literal(true) });

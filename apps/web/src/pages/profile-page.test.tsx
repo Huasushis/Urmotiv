@@ -24,6 +24,8 @@ const baseProfile: ProfileView = {
   id: "author",
   nickname: "作者演示账号",
   accountType: "human",
+  username: "PB22000001",
+  realName: "作者姓名",
   email: "author@example.test",
   emailVerified: true,
   qq: null,
@@ -88,7 +90,7 @@ function qqInput(): HTMLInputElement {
 }
 
 function emailInput(): HTMLInputElement {
-  return document.querySelector('input[readonly]') as HTMLInputElement;
+  return document.querySelector('[data-testid="profile-email"]') as HTMLInputElement;
 }
 
 afterEach(() => {
@@ -104,6 +106,12 @@ describe("个人资料页", () => {
       expect(nicknameInput()?.value).toBe("作者演示账号");
     });
     expect(qqInput()?.value).toBe("");
+    expect(
+      (document.querySelector('[data-testid="profile-username"]') as HTMLInputElement)?.value
+    ).toBe("PB22000001");
+    expect(
+      (document.querySelector('[data-testid="profile-real-name"]') as HTMLInputElement)?.value
+    ).toBe("作者姓名");
     expect(emailInput()?.value).toBe("author@example.test");
     expect(document.querySelector('[data-testid="identifier-list"]')?.textContent).toContain(
       "PB22000001"

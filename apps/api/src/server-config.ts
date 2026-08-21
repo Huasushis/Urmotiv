@@ -1,5 +1,10 @@
 import type { ApiAppOptions } from "./app";
-import { casConfigurationSchema, type CasConfiguration } from "@urmotiv/auth";
+import {
+  casConfigurationSchema,
+  ustcOAuthConfigurationSchema,
+  type CasConfiguration,
+  type UstcOAuthConfiguration
+} from "@urmotiv/auth";
 import { normalizeIpCidr } from "@urmotiv/contracts";
 import {
   validateLocalStorageRoot,
@@ -14,6 +19,7 @@ const trustedProxyConfigurationError =
   "URMOTIV_TRUSTED_PROXY_CIDRS 必须是最多 32 项、逗号分隔且不含全网范围的 IPv4 或 IPv6 CIDR。";
 const casConfigurationError = "URMOTIV_CAS_CONFIGURATION_INVALID";
 const casStateSecretPattern = /^[A-Za-z0-9_-]{43}$/;
+const ustcOAuthConfigurationError = "URMOTIV_USTC_OAUTH_CONFIGURATION_INVALID";
 
 export interface ServerEnvironment {
   readonly [name: string]: string | undefined;
@@ -35,6 +41,15 @@ export interface ServerEnvironment {
   URMOTIV_CAS_NICKNAME_ATTRIBUTE?: string;
   URMOTIV_CAS_STUDENT_ID_ATTRIBUTES?: string;
   URMOTIV_CAS_STATE_SECRET?: string;
+  URMOTIV_USTC_OAUTH_ENABLED?: string;
+  URMOTIV_USTC_OAUTH_AUTHORIZE_URL?: string;
+  URMOTIV_USTC_OAUTH_TOKEN_URL?: string;
+  URMOTIV_USTC_OAUTH_PROFILE_URL?: string;
+  URMOTIV_USTC_OAUTH_REDIRECT_URI?: string;
+  URMOTIV_USTC_OAUTH_CLIENT_ID?: string;
+  URMOTIV_USTC_OAUTH_CLIENT_SECRET?: string;
+  URMOTIV_USTC_OAUTH_STATE_SECRET?: string;
+  URMOTIV_USTC_OAUTH_SCOPE?: string;
   URMOTIV_PLUGIN_SECRET_KEY?: string;
   URMOTIV_PGLITE_PATH?: string;
   URMOTIV_TRUSTED_PROXY_CIDRS?: string;
@@ -74,6 +89,10 @@ export interface ServerAuthenticationOptions {
   };
   readonly cas?: {
     readonly configuration: CasConfiguration;
+    readonly stateSecret: Uint8Array;
+  };
+  readonly ustcOAuth?: {
+    readonly configuration: UstcOAuthConfiguration;
     readonly stateSecret: Uint8Array;
   };
 }
@@ -139,12 +158,14 @@ export function readServerAuthenticationOptions(
     throw new Error("开启邮箱注册前必须开启邮箱登录。");
   }
   const verification = readEmailVerificationOptions(environment, emailRegistrationEnabled);
+  const ustcOAuth = readUstcOAuthOptions(environment);
   const casEnabled = environment.URMOTIV_CAS_ENABLED;
   if (casEnabled === undefined || casEnabled === "false") {
     return {
       emailLoginEnabled,
       emailRegistrationEnabled,
-      ...(verification === undefined ? {} : { emailVerification: verification })
+      ...(verification === undefined ? {} : { emailVerification: verification }),
+      ...(ustcOAuth === undefined ? {} : { ustcOAuth })
     };
   }
   if (casEnabled !== "true") {
@@ -242,7 +263,105 @@ export function readServerAuthenticationOptions(
     emailLoginEnabled,
     emailRegistrationEnabled,
     ...(verification === undefined ? {} : { emailVerification: verification }),
+    ...(ustcOAuth === undefined ? {} : { ustcOAuth }),
     cas: { configuration, stateSecret }
+  };
+}
+
+function readUstcOAuthOptions(
+  environment: ServerEnvironment
+): ServerAuthenticationOptions["ustcOAuth"] {
+  const enabled = environment.URMOTIV_USTC_OAUTH_ENABLED;
+  if (enabled === undefined || enabled === "false") {
+    return undefined;
+  }
+  if (enabled !== "true") {
+    throw new Error(ustcOAuthConfigurationError);
+  }
+  const secretText = environment.URMOTIV_USTC_OAUTH_STATE_SECRET ?? "";
+  if (
+    !casStateSecretPattern.test(secretText) ||
+    secretText === environment.URMOTIV_PLUGIN_SECRET_KEY ||
+    secretText === environment.URMOTIV_CAS_STATE_SECRET
+  ) {
+    throw new Error(ustcOAuthConfigurationError);
+  }
+  const decodedStateSecret = Buffer.from(secretText, "base64url");
+  if (
+    decodedStateSecret.byteLength !== 32 ||
+    decodedStateSecret.toString("base64url") !== secretText
+  ) {
+    throw new Error(ustcOAuthConfigurationError);
+  }
+  const textualValues = [
+    environment.URMOTIV_USTC_OAUTH_AUTHORIZE_URL,
+    environment.URMOTIV_USTC_OAUTH_TOKEN_URL,
+    environment.URMOTIV_USTC_OAUTH_PROFILE_URL,
+    environment.URMOTIV_USTC_OAUTH_REDIRECT_URI,
+    environment.URMOTIV_USTC_OAUTH_CLIENT_ID,
+    environment.URMOTIV_USTC_OAUTH_CLIENT_SECRET,
+    environment.URMOTIV_USTC_OAUTH_SCOPE
+  ];
+  if (textualValues.some((value) => value !== undefined && value !== value.trim())) {
+    throw new Error(ustcOAuthConfigurationError);
+  }
+  let configuration: UstcOAuthConfiguration;
+  try {
+    configuration = ustcOAuthConfigurationSchema.parse({
+      authorizeUrl: environment.URMOTIV_USTC_OAUTH_AUTHORIZE_URL,
+      tokenUrl: environment.URMOTIV_USTC_OAUTH_TOKEN_URL,
+      profileUrl: environment.URMOTIV_USTC_OAUTH_PROFILE_URL,
+      redirectUri: environment.URMOTIV_USTC_OAUTH_REDIRECT_URI,
+      clientId: environment.URMOTIV_USTC_OAUTH_CLIENT_ID,
+      clientSecret: environment.URMOTIV_USTC_OAUTH_CLIENT_SECRET,
+      ...(environment.URMOTIV_USTC_OAUTH_SCOPE
+        ? { scope: environment.URMOTIV_USTC_OAUTH_SCOPE }
+        : {})
+    });
+  } catch {
+    throw new Error(ustcOAuthConfigurationError);
+  }
+  if (configuration.clientSecret === secretText) {
+    throw new Error(ustcOAuthConfigurationError);
+  }
+  const redirectUrl = new URL(configuration.redirectUri);
+  if (
+    environment.NODE_ENV === "production" &&
+    [
+      configuration.authorizeUrl,
+      configuration.tokenUrl,
+      configuration.profileUrl,
+      configuration.redirectUri
+    ].some((value) => new URL(value).protocol !== "https:")
+  ) {
+    throw new Error(ustcOAuthConfigurationError);
+  }
+  if (environment.NODE_ENV === "production") {
+    const webOriginText = environment.URMOTIV_WEB_ORIGIN ?? "";
+    let webOrigin: URL;
+    try {
+      if (webOriginText !== webOriginText.trim() || webOriginText.includes(",")) {
+        throw new Error("invalid web origin");
+      }
+      webOrigin = new URL(webOriginText);
+    } catch {
+      throw new Error(ustcOAuthConfigurationError);
+    }
+    if (
+      webOrigin.protocol !== "https:" ||
+      webOrigin.username.length > 0 ||
+      webOrigin.password.length > 0 ||
+      (webOrigin.pathname !== "" && webOrigin.pathname !== "/") ||
+      webOrigin.search.length > 0 ||
+      webOrigin.hash.length > 0 ||
+      redirectUrl.origin !== webOrigin.origin
+    ) {
+      throw new Error(ustcOAuthConfigurationError);
+    }
+  }
+  return {
+    configuration,
+    stateSecret: new Uint8Array(decodedStateSecret)
   };
 }
 

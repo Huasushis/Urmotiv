@@ -5,7 +5,7 @@ import {
   migrateDatabase,
   seedCoreDatabase
 } from "@urmotiv/database";
-import { CasClient } from "@urmotiv/auth";
+import { CasClient, UstcOAuthClient } from "@urmotiv/auth";
 import {
   JobWorker,
   LocalJobQueue,
@@ -165,6 +165,16 @@ try {
           consume: (nonceDigest, now) => store.consumeLoginState(nonceDigest, now)
         }
       });
+  const ustcOAuthClient = authenticationOptions.ustcOAuth === undefined
+    ? undefined
+    : new UstcOAuthClient({
+        configuration: authenticationOptions.ustcOAuth.configuration,
+        stateSecret: authenticationOptions.ustcOAuth.stateSecret,
+        states: {
+          put: (nonceDigest, expiresAt) => store.putLoginState(nonceDigest, expiresAt),
+          consume: (nonceDigest, now) => store.consumeLoginState(nonceDigest, now)
+        }
+      });
   const emailVerificationOptions = authenticationOptions.emailVerification;
 
   const app = await createApp({
@@ -177,6 +187,7 @@ try {
           emailVerificationWebUrl: emailVerificationOptions.webUrl
         }),
     ...(casClient === undefined ? {} : { casClient }),
+    ...(ustcOAuthClient === undefined ? {} : { ustcOAuthClient }),
     store,
     contestStore: new DatabaseContestStore(database),
     pluginHost,

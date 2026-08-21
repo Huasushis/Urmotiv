@@ -96,6 +96,8 @@ describe("个人资料 API", () => {
         id: "author",
         nickname: "投稿人演示账号",
         accountType: "human",
+        username: null,
+        realName: null,
         email: null,
         emailVerified: false,
         qq: null,

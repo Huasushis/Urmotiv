@@ -164,12 +164,23 @@ export interface EmailVerificationToken extends EmailVerificationTarget {
   readonly tokenDigest: string;
   readonly expiresAt: string;
 }
+export class ExternalIdentityCollisionError extends Error {
+  public constructor() {
+    super("外部身份资料与现有账号绑定冲突。");
+    this.name = "ExternalIdentityCollisionError";
+  }
+}
+
 
 export interface ExternalIdentity {
   readonly provider: string;
   readonly subject: string;
   readonly nickname: string;
+  readonly username?: string;
+  readonly realName?: string;
   readonly email?: string;
+  /** OAuth2 使用严格模式：学工号、邮箱或同一 subject 的用户名冲突一律失败。 */
+  readonly strictReconciliation?: boolean;
   /** 认证来源返回的学号等用户标识；只用于历史资料匹配，不作为身份主键。 */
   readonly studentIds?: readonly { readonly attribute: string; readonly value: string }[];
 }
@@ -405,7 +416,90 @@ export class InMemoryDataStore implements DataStore {
     if (existingId !== undefined) {
       const existing = this.users.get(existingId);
       if (existing !== undefined) {
-        return copy(existing);
+        if (
+          input.strictReconciliation === true &&
+          input.username !== undefined &&
+          existing.username !== undefined &&
+          existing.username !== null &&
+          existing.username !== input.username
+        ) {
+          throw new ExternalIdentityCollisionError();
+        }
+        if (input.strictReconciliation === true) {
+          for (const [userId, identifiers] of this.userIdentifiers) {
+            if (
+              userId !== existing.id &&
+              input.studentIds?.some((candidate) =>
+                identifiers.some(
+                  (current) =>
+                    current.attribute === candidate.attribute &&
+                    current.value === candidate.value
+                )
+              )
+            ) {
+              throw new ExternalIdentityCollisionError();
+            }
+          }
+          if (input.email !== undefined) {
+            for (const [userId, email] of this.primaryEmails) {
+              if (userId !== existing.id && email.address === input.email) {
+                throw new ExternalIdentityCollisionError();
+              }
+            }
+            const currentEmail = this.primaryEmails.get(existing.id);
+            if (currentEmail !== undefined && currentEmail.address !== input.email) {
+              throw new ExternalIdentityCollisionError();
+            }
+          }
+        }
+        const reconciled: StoredUser = {
+          ...existing,
+          ...(input.username === undefined ? {} : { username: input.username }),
+          ...(input.realName === undefined ? {} : { realName: input.realName })
+        };
+        this.users.set(existing.id, copy(reconciled));
+        if (input.email !== undefined && this.primaryEmails.get(existing.id) === undefined) {
+          this.primaryEmails.set(existing.id, { address: input.email, verified: true });
+        }
+        if (input.studentIds !== undefined && input.studentIds.length > 0) {
+          const current = this.userIdentifiers.get(existing.id) ?? [];
+          this.userIdentifiers.set(
+            existing.id,
+            [
+              ...current,
+              ...input.studentIds.filter(
+                (candidate) =>
+                  !current.some(
+                    (item) =>
+                      item.attribute === candidate.attribute &&
+                      item.value === candidate.value
+                  )
+              )
+            ].map((item) => ({ attribute: item.attribute, value: item.value }))
+          );
+        }
+        return copy(reconciled);
+      }
+    }
+    if (input.strictReconciliation === true) {
+      for (const identifiers of this.userIdentifiers.values()) {
+        if (
+          input.studentIds?.some((candidate) =>
+            identifiers.some(
+              (current) =>
+                current.attribute === candidate.attribute &&
+                current.value === candidate.value
+            )
+          )
+        ) {
+          throw new ExternalIdentityCollisionError();
+        }
+      }
+      if (
+        input.email !== undefined &&
+        [...this.primaryEmails.values()].some((email) => email.address === input.email)
+      ) {
+        throw new ExternalIdentityCollisionError();
       }
     }
     const user: StoredUser = {
@@ -416,6 +510,8 @@ export class InMemoryDataStore implements DataStore {
       roles: ["投稿人"],
       grants: contributorGrants(),
       isRoot: false,
+      username: input.username ?? null,
+      realName: input.realName ?? null,
       qq: null,
       avatarSource: "none"
     };

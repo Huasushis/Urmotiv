@@ -19,15 +19,16 @@ import type {
   VisibleProblemPage,
 } from "./domain";
 import type { ProblemPermissionFilter, ProblemVisibility } from "./permissions";
-import type {
-  DataStore,
-  EmailCredential,
-  EmailRegistration,
-  EmailVerificationTarget,
-  EmailVerificationToken,
-  ExternalIdentity,
-  ProblemRevisionAction,
-  ProblemTransaction
+import {
+  ExternalIdentityCollisionError,
+  type DataStore,
+  type EmailCredential,
+  type EmailRegistration,
+  type EmailVerificationTarget,
+  type EmailVerificationToken,
+  type ExternalIdentity,
+  type ProblemRevisionAction,
+  type ProblemTransaction
 } from "./repository";
 import { initialReviewPolicyRule } from "./review-decision";
 
@@ -35,6 +36,8 @@ const maximumDatabaseId = 9_223_372_036_854_775_807n;
 interface UserRow extends Record<string, unknown> {
   id: string;
   nickname: string;
+  username: string | null;
+  real_name: string | null;
   account_type: "human" | "robot";
   qq: string | null;
   avatar_source: "none" | "qq" | "uploaded";
@@ -234,14 +237,28 @@ async function upsertStudentIdentifiers(
   executor: DatabaseExecutor,
   userId: bigint,
   studentIds: readonly { readonly attribute: string; readonly value: string }[] | undefined,
+  strictCollision = false,
 ): Promise<void> {
   for (const identifier of studentIds ?? []) {
     const value = identifier.value.trim();
     if (value.length === 0 || value.length > 255) {
       continue;
     }
-    // (kind, source, value) 全局唯一：同一学号已经绑定到其他账号时保持不动，
-    // 留给管理员按“歧义需人工确认”的规则处理，不自动改绑。
+    if (strictCollision) {
+      const rows = await executor.query<{ user_id: string }>(sql`
+        INSERT INTO user_identifiers (id, user_id, kind, value, source)
+        VALUES (${randomUUID()}::uuid, ${userId}, 'student_id', ${value}, ${identifier.attribute})
+        ON CONFLICT (kind, source, value) DO UPDATE
+        SET value = EXCLUDED.value
+        WHERE user_identifiers.user_id = EXCLUDED.user_id
+        RETURNING user_id::text AS user_id
+      `);
+      if (rows.length !== 1) {
+        throw new ExternalIdentityCollisionError();
+      }
+      continue;
+    }
+    // 经典 CAS 保持原兼容行为：同一学号已绑定其他账号时不自动改绑。
     await executor.execute(sql`
       INSERT INTO user_identifiers (id, user_id, kind, value, source)
       VALUES (${randomUUID()}::uuid, ${userId}, 'student_id', ${value}, ${identifier.attribute})
@@ -277,6 +294,8 @@ export async function loadUsers(
       SELECT
         u.id::text AS id,
         u.nickname,
+        u.username,
+        u.real_name,
         u.account_type,
         u.qq,
         u.avatar_source,
@@ -367,6 +386,8 @@ export async function loadUsers(
   return userRows.map((row) => ({
     id: row.id,
     nickname: row.nickname,
+    username: row.username,
+    realName: row.real_name,
     accountType: row.account_type,
     disabled: row.disabled,
     roles: rolesByUser.get(row.id) ?? [],
@@ -1590,12 +1611,79 @@ export class DatabaseDataStore implements DataStore {
       const existingId = existing[0]?.user_id;
       if (existingId !== undefined) {
         const existingUserId = requireDatabaseId(existingId, "用户编号");
+        const current = (await loadUsers(transaction, [existingUserId]))[0];
+        if (current === undefined) {
+          throw new Error("统一身份认证绑定的账号不存在。");
+        }
+        if (
+          input.strictReconciliation === true &&
+          input.username !== undefined &&
+          current.username !== undefined &&
+          current.username !== null &&
+          current.username !== input.username
+        ) {
+          throw new ExternalIdentityCollisionError();
+        }
+        if (input.strictReconciliation === true && input.email !== undefined) {
+          const conflictingEmail = await transaction.query<{ user_id: string }>(sql`
+            SELECT user_id::text AS user_id
+            FROM user_emails
+            WHERE normalized_address = ${input.email}
+              AND user_id <> ${existingUserId}
+            LIMIT 1
+          `);
+          if (conflictingEmail.length > 0) {
+            throw new ExternalIdentityCollisionError();
+          }
+          const currentPrimaryEmail = await transaction.query<{ address: string }>(sql`
+            SELECT normalized_address AS address
+            FROM user_emails
+            WHERE user_id = ${existingUserId} AND is_primary = true
+            LIMIT 1
+          `);
+          const currentAddress = currentPrimaryEmail[0]?.address;
+          if (currentAddress !== undefined && currentAddress !== input.email) {
+            throw new ExternalIdentityCollisionError();
+          }
+          if (currentAddress === undefined) {
+            const insertedEmail = await transaction.query<{ user_id: string }>(sql`
+              INSERT INTO user_emails (
+                id, user_id, address, normalized_address, is_primary, verified_at
+              ) VALUES (
+                ${randomUUID()}::uuid,
+                ${existingUserId},
+                ${input.email},
+                ${input.email},
+                true,
+                now()
+              )
+              ON CONFLICT (normalized_address) DO NOTHING
+              RETURNING user_id::text AS user_id
+            `);
+            if (insertedEmail.length !== 1) {
+              throw new ExternalIdentityCollisionError();
+            }
+          }
+        }
+        await upsertStudentIdentifiers(
+          transaction,
+          existingUserId,
+          input.studentIds,
+          input.strictReconciliation === true
+        );
         await transaction.execute(sql`
           UPDATE external_identities
           SET last_authenticated_at = now(), updated_at = now()
           WHERE provider = ${input.provider} AND subject = ${input.subject}
         `);
-        await upsertStudentIdentifiers(transaction, existingUserId, input.studentIds);
+        await transaction.execute(sql`
+          UPDATE users
+          SET
+            username = COALESCE(${input.username ?? null}, username),
+            real_name = COALESCE(${input.realName ?? null}, real_name),
+            updated_at = now()
+          WHERE id = ${existingUserId}
+        `);
         const user = (await loadUsers(transaction, [existingUserId]))[0];
         if (user === undefined) {
           throw new Error("统一身份认证绑定的账号不存在。");
@@ -1604,8 +1692,13 @@ export class DatabaseDataStore implements DataStore {
       }
 
       const inserted = await transaction.query<{ id: string }>(sql`
-        INSERT INTO users (nickname, account_type)
-        VALUES (${input.nickname}, 'human')
+        INSERT INTO users (nickname, username, real_name, account_type)
+        VALUES (
+          ${input.nickname},
+          ${input.username ?? null},
+          ${input.realName ?? null},
+          'human'
+        )
         RETURNING id::text AS id
       `);
       const userId = inserted[0]?.id;
@@ -1625,9 +1718,14 @@ export class DatabaseDataStore implements DataStore {
           now()
         )
       `);
-      await upsertStudentIdentifiers(transaction, databaseUserId, input.studentIds);
+      await upsertStudentIdentifiers(
+        transaction,
+        databaseUserId,
+        input.studentIds,
+        input.strictReconciliation === true
+      );
       if (input.email !== undefined) {
-        await transaction.execute(sql`
+        const insertedEmail = await transaction.query<{ user_id: string }>(sql`
           INSERT INTO user_emails (
             id, user_id, address, normalized_address, is_primary, verified_at
           ) VALUES (
@@ -1639,7 +1737,11 @@ export class DatabaseDataStore implements DataStore {
             now()
           )
           ON CONFLICT (normalized_address) DO NOTHING
+          RETURNING user_id::text AS user_id
         `);
+        if (input.strictReconciliation === true && insertedEmail.length !== 1) {
+          throw new ExternalIdentityCollisionError();
+        }
       }
       const contributor = await transaction.query<{ id: string }>(sql`
         SELECT id::text AS id FROM roles WHERE key = 'contributor' LIMIT 1

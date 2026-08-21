@@ -14,7 +14,7 @@
    chmod 600 /home/ubuntu/urmotiv-codex/private/urmotiv.env
    ```
 
-   填写 `urmotiv.env` 时请使用密码管理器生成随机值。`URMOTIV_PLUGIN_SECRET_KEY` 必须是 32 字节随机值的 Base64URL 编码（把随机字节写成只含字母、数字、下划线和短横线的文本），用于加密保存插件令牌，不能复用数据库或 MinIO 密码。网页会话使用服务端生成的随机令牌，数据库只保存摘要，不需要另配一个未使用的 `SESSION_SECRET`。启用 CAS 时，`URMOTIV_CAS_STATE_SECRET` 必须单独生成恰好 32 字节的无填充 Base64URL 值，也不能与前述密钥复用。PostgreSQL 密码会进入连接地址，因此只使用字母、数字、连字符和下划线。`URMOTIV_WEB_ORIGIN` 写用户实际打开的网站地址，例如 `https://problems.example.edu.cn`，不能带路径。
+   填写 `urmotiv.env` 时请使用密码管理器生成随机值。`URMOTIV_PLUGIN_SECRET_KEY` 必须是 32 字节随机值的 Base64URL 编码（把随机字节写成只含字母、数字、下划线和短横线的文本），用于加密保存插件令牌，不能复用数据库或 MinIO 密码。网页会话使用服务端生成的随机令牌，数据库只保存摘要，不需要另配一个未使用的 `SESSION_SECRET`。启用 OAuth2 时，`URMOTIV_USTC_OAUTH_CLIENT_SECRET` 只写入这个权限为 600 的私有环境文件，`URMOTIV_USTC_OAUTH_STATE_SECRET` 必须单独生成恰好 32 字节的无填充 Base64URL 值；两者都不能与插件密钥或经典 CAS 状态密钥复用。启用经典 CAS 兼容模式时，`URMOTIV_CAS_STATE_SECRET` 也必须独立生成。PostgreSQL 密码会进入连接地址，因此只使用字母、数字、连字符和下划线。`URMOTIV_WEB_ORIGIN` 写用户实际打开的网站地址，例如 `https://problems.example.edu.cn`，不能带路径。
 
 2. 检查私有环境文件。脚本只报告缺少的字段，不会打印字段值。
 
@@ -141,7 +141,7 @@ worker 连续多次不通过就绪检查时会主动以非零码退出，交由 
 - 正式环境必须配置 `URMOTIV_PLUGIN_SECRET_KEY`。如果数据库已经保存插件令牌而这个值缺失，API 会在监听端口前停止启动，避免插件改用无认证请求。
 - `URMOTIV_TRUSTED_PROXY_CIDRS` 默认留空。只有明确掌握每一层代理地址并确认其正确处理转发头时才可配置；应用不会自动信任回环地址、私网、容器网络或固定跳数。
 - `URMOTIV_EMAIL_REGISTRATION_ENABLED` 默认为 `false`。在完成真实邮件验证和投递配置前，不要开启它。
-- CAS 的地址、稳定身份字段和状态密钥需要在真实 USTC 联调后写入私有环境文件；确认前不能把学号当作永久唯一身份。CAS 配置和状态密钥只注入 API 容器，不进入迁移、后台任务、网站或其他容器。
+- USTC OAuth2 的客户端编号、客户端密钥、授权/令牌/资料端点、公开来源、回调和状态密钥只由服务器管理员写入私有环境文件，只注入 API 容器。客户端密钥不进入数据库、管理接口、日志、审计、迁移、后台任务或网站容器。经典 CAS 的地址、字段和独立状态密钥仅用于显式兼容模式。
 
 ## 邮箱注册与验证
 
@@ -209,29 +209,29 @@ Fermata 是独立的 AI 审题进程，默认不随主应用启动。启用步�
 
 Fermata 的难度评定与等级标定实验（结果与当前校准状态）见其仓库 `experiments/results/` 与 README。
 
-## 首次接入 USTC 统一身份认证（CAS）
+## 首次接入 USTC 统一身份认证（OAuth2 授权码）
 
-系统按标准 CAS 协议接入 `id.ustc.edu.cn`，但**具体返回哪些属性字段（学号、GID、邮箱等的字段名）
-必须以真实联调为准**，不能凭猜测写死。程序只接收明确配置的字段名，登录失败时返回固定的未登录响应，
-不会在响应或日志里列出认证服务返回的字段和值：
+用户已经手工验证 USTC CAS 的 OAuth2 授权码流程。正式接入仍必须使用身份服务管理员提供的配置，
+不能从浏览器响应、日志或聊天内容猜测或复制真实客户端密钥、授权码、访问令牌和个人资料。
 
-1. 在私有环境文件里打开 CAS 并填入地址与占位字段名（见 `deploy/env.production.example` 的 CAS 段）：
-   `URMOTIV_CAS_ENABLED=true`、登录/校验/回调地址、`URMOTIV_CAS_SUBJECT_ATTRIBUTE`（先用占位如
-   `cas:user`）、`URMOTIV_CAS_STATE_SECRET`（恰好 32 字节随机值的无填充 Base64URL）。当前认证契约
-   只有 `login`、`serviceValidate` 和本站 `callback` 三个地址，没有未使用的 base/logout 配置；正式环境
-   三个地址必须全部使用 HTTPS，也不能带账号密码。回调必须精确等于 `URMOTIV_WEB_ORIGIN` 加
-   `/api/v1/auth/cas/callback`，不能指向其他站点、其他路径，也不能预带查询参数或片段。
-2. 部署前运行 `validate-env.sh`。CAS 开关只接受 `true` 或 `false`；为 `false` 时其余 CAS 字段可以留空，
-   为 `true` 时缺项、HTTP 地址、畸形字段或长度/编码不规范的状态密钥都会在部署检查或 API 启动阶段以固定错误失败，不会输出配置值。
-3. 在受控测试实例中**用一个真实统一身份账号点一次登录**，并依据 USTC 认证服务的受控文档或由身份服务
-   管理员确认实际属性名称。不要通过打开调试日志、回显原始 XML 或把原始响应发到聊天来探测字段。
-4. 挑出真正稳定唯一的字段（GID 或学号），回填 `URMOTIV_CAS_SUBJECT_ATTRIBUTE`；
-   把含学号的字段名逗号分隔填进 `URMOTIV_CAS_STUDENT_ID_ATTRIBUTES`（登录时写入用户标识表，供历史
-   题目按学号匹配）；邮箱、昵称字段同理填入对应变量。改完重启 api 即可。
-5. 一个人可能有多个学号（本科+研究生），系统按“认证来源 + 稳定身份编号”识别账号、学号只作辅助匹配；
-   稳定字段确认前不要把学号当作永久唯一主键。
+1. 把 `deploy/env.production.example` 复制到 Git 之外、权限为 `600` 的私有环境文件，设置
+   `URMOTIV_USTC_OAUTH_ENABLED=true`，再填写授权、令牌、资料端点、客户端编号和客户端密钥。
+   这些值只有服务器管理员能写；应用没有读取或导出客户端密钥的 HTTP 接口。
+2. `URMOTIV_USTC_OAUTH_REDIRECT_URI` 必须精确等于 `URMOTIV_WEB_ORIGIN` 加
+   `/api/v1/auth/ustc/callback`。正式环境的公开来源、端点和回调都必须使用 HTTPS，不能带账号密码；
+   回调不能改到其他来源、其他路径，也不能附加查询参数或片段。
+3. 为 OAuth2 单独生成恰好 32 字节的无填充 Base64URL 状态密钥，不能与客户端密钥、插件密钥或经典 CAS
+   状态密钥复用。运行 `scripts/deploy/validate-env.sh`；失败只输出固定配置错误码，不打印任何配置值。
+4. 资料端点的稳定身份优先取 `attributes.gid`，缺失时取顶层 `id`；`attributes.zjhm` 写入用户名和学工号标识，
+   `attributes.name` 写入真实姓名，`attributes.email` 写入已验证主邮箱。上述建档字段缺失或与现有学工号、
+   邮箱、同一稳定身份的用户名冲突时，登录固定失败，不自动创建、合并或改绑账号。
+5. 回调使用签名 `state`、一次性随机值、浏览器绑定 Cookie 和本站返回路径白名单。重放、绑定错误、换码或取资料失败
+   都返回相同未登录响应；禁止在日志、错误、审计和调试输出中记录客户端密钥、授权码、访问令牌或资料原文。
+6. 经典 CAS 票据流程仍可通过独立的 `URMOTIV_CAS_*` 配置显式开启以兼容旧部署；它与 OAuth2 使用不同的
+   状态格式、Cookie 前缀和密钥，不能替代 OAuth2 或解除上述约束。
 
-这一步需要一个真实统一身份账号，只能由本人在浏览器里完成，无法在服务器端自动化。
+真实浏览器和真实 USTC 账号联调只能由获授权的本人在受控实例中完成。仓库测试只使用合成资料和本地替身，
+不向 USTC 或其他外部服务发请求。
 
 ## 历史题目迁移
 
@@ -268,4 +268,4 @@ bash scripts/deploy/backup.sh /home/ubuntu/urmotiv-codex/private/urmotiv.env /ho
 ```
 
 对象存储（MinIO）里的题目文件要按同一时点单独备份并一起迁移，避免数据库里的文件记录和实际文件对不上。
-迁移完成后按上面的 CAS 联调步骤确认统一身份登录，再放开对外访问。
+迁移完成后按上面的 OAuth2 联调步骤确认统一身份登录；若保留经典 CAS 兼容模式，也要单独验证，再放开对外访问。

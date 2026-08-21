@@ -5,6 +5,7 @@ import { useState } from "react";
 import type { SessionResponse } from "@urmotiv/contracts";
 import {
   casStartUrl,
+  ustcOAuthStartUrl,
   demoLogin,
   emailLogin,
   emailRegister,
@@ -90,7 +91,8 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
             </button>
           </div>
         ) : null}
-        {auth?.casEnabled ? <button type="button" className="cas-button" onClick={() => { window.location.assign(casStartUrl("/problems")); }}>使用统一身份认证登录</button> : null}
+        {auth?.ustcOAuthEnabled ? <button type="button" className="cas-button" onClick={() => { window.location.assign(ustcOAuthStartUrl("/problems")); }}>使用 USTC OAuth2 统一身份认证登录</button> : null}
+        {auth?.casEnabled ? <button type="button" className="cas-button" onClick={() => { window.location.assign(casStartUrl("/problems")); }}>使用经典 CAS 统一身份认证登录</button> : null}
         {auth?.demoEnabled ? <div className="demo-login-section"><p className="eyebrow">开发演示</p><div className="demo-account-list">{demoAccounts.map((account) => <button type="button" className="demo-account" key={account.id} disabled={login.isPending} onClick={() => login.mutate(account.id)}><span><strong>{account.title}</strong><small>{account.description}</small></span><LogIn size={17} aria-hidden="true" /></button>)}</div></div> : null}
         {emailLoginAction.error ? <p className="form-error">{emailLoginAction.error.message}</p> : null}
         {emailRegistrationAction.error ? <p className="form-error">{emailRegistrationAction.error.message}</p> : null}

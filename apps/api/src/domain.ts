@@ -14,6 +14,10 @@ export interface StoredUser extends UserSummary {
   roles: string[];
   grants: PermissionGrant[];
   isRoot: boolean;
+  /** 由 USTC OAuth2 学工号映射来的用户名；仅本人可见。 */
+  username?: string | null;
+  /** 由 USTC OAuth2 姓名映射来的真实姓名；仅本人可见。 */
+  realName?: string | null;
   /** 可选 QQ 号码；仅本人可读写，不进入公开接口。 */
   qq?: string | null;
   /** 头像来源，默认 none。 */

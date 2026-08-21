@@ -262,6 +262,68 @@ describe("认证启动配置", () => {
     ).toBeDefined();
   });
 
+  const validUstcOAuthEnvironment = {
+    NODE_ENV: "production",
+    URMOTIV_WEB_ORIGIN: "https://problems.example",
+    URMOTIV_USTC_OAUTH_ENABLED: "true",
+    URMOTIV_USTC_OAUTH_AUTHORIZE_URL: "https://identity.example/oauth2/authorize",
+    URMOTIV_USTC_OAUTH_TOKEN_URL: "https://identity.example/oauth2/accessToken",
+    URMOTIV_USTC_OAUTH_PROFILE_URL: "https://identity.example/oauth2/profile",
+    URMOTIV_USTC_OAUTH_REDIRECT_URI:
+      "https://problems.example/api/v1/auth/ustc/callback",
+    URMOTIV_USTC_OAUTH_CLIENT_ID: "synthetic-client-id",
+    URMOTIV_USTC_OAUTH_CLIENT_SECRET: "synthetic-client-secret-value",
+    URMOTIV_USTC_OAUTH_STATE_SECRET: Buffer.alloc(32, 9).toString("base64url"),
+    URMOTIV_PLUGIN_SECRET_KEY: Buffer.alloc(32, 8).toString("base64url")
+  } as const;
+
+  it("OAuth2 关闭时忽略配置，开启时只从服务器环境读取完整配置", () => {
+    expect(
+      readServerAuthenticationOptions({
+        URMOTIV_USTC_OAUTH_ENABLED: "false",
+        URMOTIV_USTC_OAUTH_CLIENT_SECRET: "invalid"
+      }).ustcOAuth
+    ).toBeUndefined();
+    const options = readServerAuthenticationOptions(validUstcOAuthEnvironment);
+    expect(options.ustcOAuth?.configuration.clientId).toBe("synthetic-client-id");
+    expect(options.ustcOAuth?.configuration.redirectUri).toBe(
+      "https://problems.example/api/v1/auth/ustc/callback"
+    );
+  });
+
+  it("OAuth2 配置错误只返回固定错误码，不回显 client_secret 或地址", () => {
+    for (const environment of [
+      {
+        ...validUstcOAuthEnvironment,
+        URMOTIV_USTC_OAUTH_CLIENT_SECRET: "too-short"
+      },
+      {
+        ...validUstcOAuthEnvironment,
+        URMOTIV_USTC_OAUTH_REDIRECT_URI:
+          "https://other.example/api/v1/auth/ustc/callback"
+      },
+      {
+        ...validUstcOAuthEnvironment,
+        URMOTIV_USTC_OAUTH_TOKEN_URL: "http://identity.example/token"
+      },
+      {
+        ...validUstcOAuthEnvironment,
+        URMOTIV_USTC_OAUTH_STATE_SECRET:
+          validUstcOAuthEnvironment.URMOTIV_PLUGIN_SECRET_KEY
+      }
+    ]) {
+      let message = "没有拒绝";
+      try {
+        readServerAuthenticationOptions(environment);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toBe("URMOTIV_USTC_OAUTH_CONFIGURATION_INVALID");
+      expect(message).not.toContain(environment.URMOTIV_USTC_OAUTH_CLIENT_SECRET);
+      expect(message).not.toContain(environment.URMOTIV_USTC_OAUTH_REDIRECT_URI);
+    }
+  });
+
   it("only allows the in-memory delivery sink in automated tests", () => {
     expect(() => readServerAuthenticationOptions({ URMOTIV_EMAIL_REGISTRATION_ENABLED: "true" })).toThrow(
       "邮箱注册只能在测试环境使用内存投递"

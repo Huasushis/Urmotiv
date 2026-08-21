@@ -34,6 +34,7 @@ const fullSession: SessionResponse = {
   auth: {
     emailEnabled: false,
     emailRegistrationEnabled: false,
+    ustcOAuthEnabled: false,
     casEnabled: false,
     demoEnabled: true
   }

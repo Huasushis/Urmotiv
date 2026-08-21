@@ -32,6 +32,8 @@ export async function readProfileView(user: StoredUser, store: DataStore): Promi
     id: user.id,
     nickname: user.nickname,
     accountType: user.accountType,
+    username: user.username ?? null,
+    realName: user.realName ?? null,
     email: email?.address ?? null,
     emailVerified: email?.verified ?? false,
     qq: user.qq ?? null,

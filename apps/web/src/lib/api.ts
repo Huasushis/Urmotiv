@@ -366,6 +366,11 @@ export function casStartUrl(returnPath: string): string {
   const parameters = new URLSearchParams({ returnPath });
   return `${apiBaseUrl()}/auth/cas/start?${parameters.toString()}`;
 }
+export function ustcOAuthStartUrl(returnPath: string): string {
+  const parameters = new URLSearchParams({ returnPath });
+  return `${apiBaseUrl()}/auth/ustc/start?${parameters.toString()}`;
+}
+
 
 export function listTags() {
   return fallback(

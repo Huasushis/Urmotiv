@@ -12,6 +12,7 @@ test("CAS 登录启动失败时显示确定的安全错误且返回后可继续�
       auth: {
         emailEnabled: true,
         emailRegistrationEnabled: false,
+        ustcOAuthEnabled: false,
         casEnabled: true,
         demoEnabled: true
       }

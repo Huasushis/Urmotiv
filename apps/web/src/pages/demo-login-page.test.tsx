@@ -31,6 +31,7 @@ const previousSession: SessionResponse = {
   auth: {
     emailEnabled: false,
     emailRegistrationEnabled: false,
+    ustcOAuthEnabled: false,
     casEnabled: false,
     demoEnabled: true
   }
@@ -126,5 +127,35 @@ describe("切换登录账号", () => {
     expect(
       sessionStorage.getItem("urmotiv.web.unsaved.reviewer.private-problem")
     ).toBeNull();
+  });
+  it("OAuth2 开启时显示独立入口，经典 CAS 入口不会冒充 OAuth2", () => {
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false }
+      }
+    });
+    const oauthSession: SessionResponse = {
+      ...previousSession,
+      auth: {
+        ...previousSession.auth,
+        ustcOAuthEnabled: true,
+        casEnabled: false
+      }
+    };
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => {
+      root?.render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter>
+            <DemoLoginPage existingSession={oauthSession} />
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+    });
+    expect(container.textContent).toContain("使用 USTC OAuth2 统一身份认证登录");
+    expect(container.textContent).not.toContain("使用经典 CAS 统一身份认证登录");
   });
 });

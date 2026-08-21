@@ -12,6 +12,7 @@ import { sql } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DatabaseDataStore } from "../src/database-store";
 import { readProfileView } from "../src/profile-service";
+import { ExternalIdentityCollisionError } from "../src/repository";
 
 const openDatabases: LocalDatabaseHandle[] = [];
 
@@ -165,4 +166,90 @@ describe("统一身份认证的学号落库", () => {
     expect((await store.getUser(user.id))?.avatarSource).toBe("none");
     expect(await store.getUserAvatar(user.id)).toBeUndefined();
   });
+  it("OAuth2 首次登录写入 username/realName/email，后续同一 gid 安全更新", async () => {
+    const database = await openDatabase();
+    const store = new DatabaseDataStore(database);
+    const first = await store.findOrCreateExternalUser({
+      provider: "ustc-oauth",
+      subject: "synthetic-gid-1",
+      nickname: "首次昵称",
+      username: "PB21000077",
+      realName: "张三",
+      email: "zhangsan@example.test",
+      strictReconciliation: true,
+      studentIds: [{ attribute: "zjhm", value: "PB21000077" }]
+    });
+    const profile = await readProfileView(first, store);
+    expect(profile).toEqual(
+      expect.objectContaining({
+        id: first.id,
+        nickname: "首次昵称",
+        username: "PB21000077",
+        realName: "张三",
+        email: "zhangsan@example.test",
+        emailVerified: true,
+        studentIds: [{ attribute: "zjhm", value: "PB21000077" }]
+      })
+    );
+
+    const reconciled = await store.findOrCreateExternalUser({
+      provider: "ustc-oauth",
+      subject: "synthetic-gid-1",
+      nickname: "不覆盖用户昵称",
+      username: "PB21000077",
+      realName: "张三（新）",
+      email: "zhangsan@example.test",
+      strictReconciliation: true,
+      studentIds: [{ attribute: "zjhm", value: "PB21000077" }]
+    });
+    expect(reconciled.id).toBe(first.id);
+    expect(reconciled.nickname).toBe("首次昵称");
+    expect(reconciled.realName).toBe("张三（新）");
+  });
+
+  it("OAuth2 的学工号或邮箱碰撞时失败并回滚新账号", async () => {
+    const database = await openDatabase();
+    const store = new DatabaseDataStore(database);
+    await store.findOrCreateExternalUser({
+      provider: "ustc-oauth",
+      subject: "synthetic-gid-owner",
+      nickname: "已有账号",
+      username: "PB21000088",
+      realName: "已有姓名",
+      email: "owner@example.test",
+      strictReconciliation: true,
+      studentIds: [{ attribute: "zjhm", value: "PB21000088" }]
+    });
+
+    await expect(
+      store.findOrCreateExternalUser({
+        provider: "ustc-oauth",
+        subject: "synthetic-gid-collision",
+        nickname: "冲突账号",
+        username: "PB21000088",
+        realName: "冲突姓名",
+        email: "other@example.test",
+        strictReconciliation: true,
+        studentIds: [{ attribute: "zjhm", value: "PB21000088" }]
+      })
+    ).rejects.toBeInstanceOf(ExternalIdentityCollisionError);
+    await expect(
+      store.findOrCreateExternalUser({
+        provider: "ustc-oauth",
+        subject: "synthetic-gid-email-collision",
+        nickname: "邮箱冲突账号",
+        username: "PB21000099",
+        realName: "邮箱冲突姓名",
+        email: "owner@example.test",
+        strictReconciliation: true,
+        studentIds: [{ attribute: "zjhm", value: "PB21000099" }]
+      })
+    ).rejects.toBeInstanceOf(ExternalIdentityCollisionError);
+
+    const rows = await database.query<{ subject: string }>(sql`
+      SELECT subject FROM external_identities WHERE provider = 'ustc-oauth'
+    `);
+    expect(rows.map((row) => row.subject)).toEqual(["synthetic-gid-owner"]);
+  });
+
 });
