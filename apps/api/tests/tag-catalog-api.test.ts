@@ -759,4 +759,101 @@ describe("知识点目录管理 API", () => {
         AND link.tag_id = 'test.tag.deleted-problem'
     `)).toEqual([{ count: 1 }]);
   });
+
+  it("删除题目当前唯一标签而未提供替代标签：确认被拒后修订、标签状态、目录版本和审计全部保持不变", async () => {
+    const { app, database, store, problems } = await context();
+    const leaderCookie = await login(app, databaseDemoUserIds.leader);
+    const author = await store.getUser(databaseDemoUserIds.author);
+    if (author === undefined) throw new Error("演示作者缺失。");
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/tag-catalog/items",
+      headers: { cookie: leaderCookie, origin },
+      payload: {
+        expectedVersion: 1,
+        id: "test.tag.sole",
+        itemKind: "tag",
+        parentId: "catalog.category.01",
+        name: "唯一标签",
+        description: "",
+        sortOrder: 0,
+      },
+    });
+    expect(created.statusCode).toBe(200);
+
+    const problem = await problems.createProblem(author, {
+      type: "traditional",
+      codeforcesDifficulty: null,
+      thinkingLevel: null,
+      codingLevel: null,
+      content: {
+        basicStatement: "合成题面",
+        basicSolution: "合成题解",
+        background: "",
+        statement: "",
+        inputFormat: "",
+        outputFormat: "",
+        constraints: "",
+        solution: "",
+        hints: "",
+      },
+      title: "唯一标签私有题目",
+      tagIds: ["test.tag.sole"],
+    });
+
+    const preview = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/tag-catalog/items/test.tag.sole/deactivation-preview",
+      headers: { cookie: leaderCookie, origin },
+      payload: {},
+    });
+    expect(preview.statusCode).toBe(200);
+    const previewBody = preview.json() as {
+      confirmationId: string;
+      catalogVersion: number;
+      impact: Record<string, number>;
+    };
+    expect(previewBody.impact).toMatchObject({ soleCurrentTagCount: 1 });
+
+    const baselineVersion = await managementVersion(app, leaderCookie);
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/tag-catalog/items/test.tag.sole/deactivate",
+      headers: { cookie: leaderCookie, origin },
+      payload: {
+        confirmationId: previewBody.confirmationId,
+        catalogVersion: previewBody.catalogVersion,
+      },
+    });
+    expect(rejected.statusCode).toBe(409);
+
+    expect(await managementVersion(app, leaderCookie)).toBe(baselineVersion);
+    expect(await database.query<{ is_active: boolean }>(sql`
+      SELECT is_active FROM tags WHERE id = 'test.tag.sole'
+    `)).toEqual([{ is_active: true }]);
+    expect(await database.query<{ current_revision: number }>(sql`
+      SELECT current_revision FROM problems WHERE id = 1
+    `)).toEqual([{ current_revision: problem.revision }]);
+    expect(await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM problem_revision_tags link
+      JOIN problem_revisions revision ON revision.id = link.revision_id
+      WHERE link.tag_id = 'test.tag.sole'
+    `)).toEqual([{ count: 1 }]);
+    expect(await database.query<{ count: number }>(sql`
+      SELECT count(*)::integer AS count
+      FROM audit_events
+      WHERE action = 'tag.catalog.deactivate'
+    `)).toEqual([{ count: 0 }]);
+
+    const robotCookie = await login(app, databaseDemoUserIds.robot);
+    const robotDenied = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/tag-catalog/items/test.tag.sole/deactivation-preview",
+      headers: { cookie: robotCookie, origin },
+      payload: {},
+    });
+    expect(robotDenied.statusCode).toBe(403);
+  });
 });
