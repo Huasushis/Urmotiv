@@ -74,10 +74,13 @@ export type HistoryNormalizationFailureKind = (typeof historyNormalizationFailur
  */
 export class HistoryNormalizationError extends HistoryMigrationError {
   public readonly failureKind: HistoryNormalizationFailureKind;
+  /** Safe HTTP status class (e.g. "4xx"/"5xx") if available; never the raw body. */
+  public readonly httpStatusClass: string | undefined;
 
-  public constructor(failureKind: HistoryNormalizationFailureKind, message: string) {
+  public constructor(failureKind: HistoryNormalizationFailureKind, message: string, httpStatusClass: string | undefined = undefined) {
     super("NORMALIZATION_FAILED", message);
     this.name = "HistoryNormalizationError";
     this.failureKind = failureKind;
+    this.httpStatusClass = httpStatusClass;
   }
 }

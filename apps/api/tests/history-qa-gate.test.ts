@@ -465,6 +465,96 @@ describe("runQaGate 风险标记项处置与防臆造", () => {
     expect(spy.calls).toHaveLength(1);
     expect(await store.read(27)).toBeNull();
   });
+
+  it("transport accounting: http_status failure durably records request/transport/received-byte/retry counts; missing accounting cannot be clean success", async () => {
+    // Fixture: 2 items, concurrency 1. Item 1 reviewer throws non-retryable
+    // http_status on first call, succeeds on subsequent. Item 2 is processed
+    // after item 1 is caught as ERROR. The gate must NOT reject;
+    // it must return a RunQaGateResult with transport-level aggregate accounting
+    // and persist ERROR state with transport metadata for the failed item.
+    let callCount = 0;
+    const failItem = makeItem(41, makeCandidate(41));
+    const passItem = makeItem(42, makeCandidate(42));
+    const spy = createReviewerSpy(() => {
+      callCount += 1;
+      if (callCount === 1) throw new HistoryNormalizationError("http_status", "http_status");
+      return resultFor("PASS");
+    });
+    const store = memoryStore();
+    const result = await runQaGate([failItem, passItem], spy.reviewer, store, {
+      ...fastOptions,
+      concurrency: 1,
+      maximumAttempts: 3,
+    });
+
+    // Aggregate: the run must not be clean success.
+    expect(result.error).toBe(1);
+    expect(result.total).toBe(2);
+    expect(result.pass + result.anomaly + result.error).toBe(2);
+
+    // Aggregate transport accounting on RunQaGateResult.
+    expect(result.requestIssuedCount).toBe(2);
+    expect(result.transportAttemptCount).toBe(2);
+    expect(result.receivedByteCallCount).toBe(1);
+    expect(result.retryCount).toBe(0);
+    expect(result.httpStatusClassCount).toBeDefined();
+
+    // Per-attempt transport metadata on persisted QaPersistedState.
+    const failedState = await store.read(41);
+    expect(failedState?.verdict).toBe("ERROR");
+    expect(failedState?.requestIssued).toBe(true);
+    expect(failedState?.transportAttempted).toBe(true);
+    expect(failedState?.receivedBytes).toBe(false);
+    expect(failedState?.retryClassification).toBe("non-retryable");
+    expect(failedState?.httpStatusClass).toBe("unknown");
+
+    // Pass item: state written with PASS verdict.
+    const passState = await store.read(42);
+    expect(passState?.verdict).toBe("PASS");
+    expect(spy.calls).toHaveLength(2);
+
+    // error count must be non-zero.
+    expect(result.error).toBeGreaterThan(0);
+  });
+
+  it("no-start accounting: non-retryable transport failure on first item leaves remaining items not-started when concurrency is 1 and the gate stops on first ERROR", async () => {
+    // Fixture: 4 items, concurrency 1, reviewer always throws http_status.
+    // First item fails with ERROR; remaining 3 are never reached (not-started).
+    const items = [
+      makeItem(51, makeCandidate(51)),
+      makeItem(52, makeCandidate(52)),
+      makeItem(53, makeCandidate(53)),
+      makeItem(54, makeCandidate(54)),
+    ];
+    const spy = createReviewerSpy(() => {
+      throw new HistoryNormalizationError("http_status", "http_status");
+    });
+    const store = memoryStore();
+    const result = await runQaGate(items, spy.reviewer, store, {
+      ...fastOptions,
+      concurrency: 1,
+      maximumAttempts: 3,
+    });
+
+    // 3-failed + 1-not-started cannot become clean success.
+    expect(result.error).toBeGreaterThan(0);
+    expect(result.total).toBe(4);
+
+    // All items got verdicts (ERROR for all since reviewer always throws).
+    expect(result.pass + result.anomaly + result.error).toBe(4);
+
+    // All 4 had transport attempts, all failed.
+    expect(result.requestIssuedCount).toBe(4);
+    expect(result.transportAttemptCount).toBe(4);
+    expect(result.receivedByteCallCount).toBe(0);
+
+    // All persisted as ERROR with non-retryable classification.
+    for (const id of [51, 52, 53, 54]) {
+      const st = await store.read(id);
+      expect(st?.verdict).toBe("ERROR");
+      expect(st?.retryClassification).toBe("non-retryable");
+    }
+  });
 });
 
 describe("两阶段真实客户端 + 有界重试（传输注入）", () => {

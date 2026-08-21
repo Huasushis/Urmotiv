@@ -78,6 +78,16 @@ export interface QaPersistedState {
   readonly secondReviewCount: number;
   /** 风险项复评后的结构化处置；无风险或未复评时为 null。 */
   readonly disposition: QaDisposition | null;
+  /** 传输层记账：是否已发出请求。 */
+  readonly requestIssued?: boolean;
+  /** 传输层记账：是否尝试过传输。 */
+  readonly transportAttempted?: boolean;
+  /** 传输层记账：是否收到字节。 */
+  readonly receivedBytes?: boolean;
+  /** 传输层记账：重试分类。 */
+  readonly retryClassification?: "retryable" | "non-retryable" | "not-attempted";
+  /** 传输层记账：安全 HTTP 状态分类（如 "4xx"/"5xx"），不含原始状态码或正文。 */
+  readonly httpStatusClass?: string;
 }
 
 export interface QaStateStore {
@@ -124,6 +134,16 @@ export interface RunQaGateResult {
   readonly error: number;
   readonly total: number;
   readonly account: readonly { readonly id: number; readonly verdict: QaVerdict }[];
+  /** 传输层聚合：已发出请求的题号数。 */
+  readonly requestIssuedCount: number;
+  /** 传输层聚合：尝试过传输的题号数。 */
+  readonly transportAttemptCount: number;
+  /** 传输层聚合：收到字节的题号数。 */
+  readonly receivedByteCallCount: number;
+  /** 传输层聚合：重试次数（不含首次）。 */
+  readonly retryCount: number;
+  /** 传输层聚合：安全 HTTP 状态分类计数（键为 "4xx"/"5xx"/"unknown"，值为题号数）。 */
+  readonly httpStatusClassCount: ReadonlyMap<string, number>;
 }
 
 const retryableKinds: ReadonlySet<string> = new Set([
@@ -312,6 +332,13 @@ export async function runQaGate(
     throw new HistoryMigrationError("INVALID_ARGUMENTS", "同一题号不能重复进入 QA 门。");
   }
 
+  // 传输层聚合计数器
+  let requestIssuedCount = 0;
+  let transportAttemptCount = 0;
+  let receivedByteCallCount = 0;
+  let retryCount = 0;
+  const httpStatusClassCount = new Map<string, number>();
+
   const prepared = await Promise.all(
     items.map(async (item) => {
       const prior = await store.read(item.id);
@@ -363,6 +390,7 @@ export async function runQaGate(
   };
   const onRetryWait = (waiting: boolean): void => {
     retryWaiting += waiting ? 1 : -1;
+    if (waiting) retryCount += 1;
     emitProgress();
   };
   emitProgress();
@@ -391,6 +419,14 @@ export async function runQaGate(
             onRetryWait,
           },
           results,
+          {
+            onRequestIssued: () => { requestIssuedCount += 1; },
+            onTransportAttempted: () => { transportAttemptCount += 1; },
+            onReceivedBytes: () => { receivedByteCallCount += 1; },
+            onHttpStatusClass: (cls: string) => {
+              httpStatusClassCount.set(cls, (httpStatusClassCount.get(cls) ?? 0) + 1);
+            },
+          },
         );
       } finally {
         inFlight -= 1;
@@ -426,6 +462,11 @@ export async function runQaGate(
     account: [...idSet]
       .sort((left, right) => left - right)
       .map((id) => ({ id, verdict: results.get(id) as QaVerdict })),
+    requestIssuedCount,
+    transportAttemptCount,
+    receivedByteCallCount,
+    retryCount,
+    httpStatusClassCount,
   };
 }
 
@@ -457,6 +498,12 @@ async function runOneQueuedItem(
     readonly onRetryWait: (waiting: boolean) => void;
   },
   results: Map<number, QaVerdict>,
+  transport: {
+    readonly onRequestIssued: () => void;
+    readonly onTransportAttempted: () => void;
+    readonly onReceivedBytes: () => void;
+    readonly onHttpStatusClass: (cls: string) => void;
+  },
 ): Promise<void> {
   let state = await store.read(item.id);
   if (state === null) {
@@ -491,27 +538,62 @@ async function runOneQueuedItem(
     return;
   }
 
+  transport.onRequestIssued();
+  transport.onTransportAttempted();
+
   // 有确定性风险（如 possible-fabricated-solution、attachment-refs-dropped）
   // 时不再短路：把风险标记随请求交给语义复评，得到结构化处置后记账。
   const reviewRequest = buildReviewRequest(item, false, deterministic.risks);
-  const primary = await reviewWithRetries(reviewer, reviewRequest, item.id, options, "primary");
-  state = {
-    ...state,
-    attemptCount: state.attemptCount + 1,
-    verdict: primary.verdict,
-    disposition: primary.disposition ?? null,
-  };
-  if (state.verdict === "ANOMALY" && options.secondReviewEnabled) {
-    const second = await reviewWithRetries(reviewer, buildReviewRequest(item, true, deterministic.risks), item.id, options, "second");
+  try {
+    const primary = await reviewWithRetries(reviewer, reviewRequest, item.id, options, "primary");
+    transport.onReceivedBytes();
     state = {
       ...state,
-      verdict: second.verdict,
-      disposition: second.disposition ?? state.disposition,
-      secondReviewCount: state.secondReviewCount + 1,
+      attemptCount: state.attemptCount + 1,
+      verdict: primary.verdict,
+      disposition: primary.disposition ?? null,
+      requestIssued: true,
+      transportAttempted: true,
+      receivedBytes: true,
+      retryClassification: "not-attempted",
     };
+    if (state.verdict === "ANOMALY" && options.secondReviewEnabled) {
+      const second = await reviewWithRetries(reviewer, buildReviewRequest(item, true, deterministic.risks), item.id, options, "second");
+      state = {
+        ...state,
+        verdict: second.verdict,
+        disposition: second.disposition ?? state.disposition,
+        secondReviewCount: state.secondReviewCount + 1,
+      };
+    }
+    await store.write(state);
+    results.set(item.id, state.verdict as QaVerdict);
+  } catch (error) {
+    // 只有非重试型传输失败才持久化终态 ERROR 并写入传输层记账，不拒绝整个门。
+    // 语义/校验失败（schema 等）和可重试耗尽（http_429 等）仍向上抛出以保持既有契约。
+    if (!isQaRetryableFailure(error) && error instanceof HistoryNormalizationError) {
+      const failureKind = error.failureKind;
+      // 语义/校验类失败不在此处理；仍向上抛出。
+      const semanticKinds = new Set(["schema", "invalid_json", "source_validation", "candidate_validation", "internal", "response_too_large"]);
+      if (semanticKinds.has(failureKind)) throw error;
+      const httpStatusClass = error.httpStatusClass ?? (failureKind === "http_status" ? "unknown" : "unknown");
+      transport.onHttpStatusClass(httpStatusClass);
+      state = {
+        ...state,
+        verdict: "ERROR",
+        attemptCount: state.attemptCount + 1,
+        requestIssued: true,
+        transportAttempted: true,
+        receivedBytes: false,
+        retryClassification: "non-retryable",
+        httpStatusClass,
+      };
+      await store.write(state);
+      results.set(item.id, "ERROR");
+      return;
+    }
+    throw error;
   }
-  await store.write(state);
-  results.set(item.id, state.verdict as QaVerdict);
 }
 
 function buildReviewRequest(
@@ -665,6 +747,12 @@ function structuredQaStateCheck(value: unknown):
       attemptCount: record.attemptCount as number,
       secondReviewCount: record.secondReviewCount as number,
       disposition,
+      ...(typeof record.requestIssued === "boolean" ? { requestIssued: record.requestIssued } : {}),
+      ...(typeof record.transportAttempted === "boolean" ? { transportAttempted: record.transportAttempted } : {}),
+      ...(typeof record.receivedBytes === "boolean" ? { receivedBytes: record.receivedBytes } : {}),
+      ...(record.retryClassification === "retryable" || record.retryClassification === "non-retryable" || record.retryClassification === "not-attempted"
+        ? { retryClassification: record.retryClassification } : {}),
+      ...(typeof record.httpStatusClass === "string" ? { httpStatusClass: record.httpStatusClass } : {}),
     },
   };
 }

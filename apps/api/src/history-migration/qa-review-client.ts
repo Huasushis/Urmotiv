@@ -104,7 +104,12 @@ async function streamCompletion(
   }
   if (response.status === 429 || response.status >= 500 || !response.ok) {
     await response.body?.cancel();
-    throw normalizationFailure(response.status === 429 ? "http_429" : "http_status");
+    const statusClass = response.status < 500 ? `${Math.floor(response.status / 100)}xx` : "5xx";
+    throw new HistoryNormalizationError(
+      response.status === 429 ? "http_429" : "http_status",
+      response.status === 429 ? "限流，稍后重试。" : `HTTP ${response.status}`,
+      statusClass,
+    );
   }
   const body = response.body;
   if (!body) {
