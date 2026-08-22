@@ -16,6 +16,12 @@ services:
       timeout: 3s
       retries: 20
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "1.5"
+          pids: 512
 
   redis:
     image: redis:7-alpine
@@ -28,6 +34,12 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+          pids: 256
 
   minio:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
@@ -44,6 +56,12 @@ services:
       timeout: 3s
       retries: 20
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "0.5"
+          pids: 512
 
   minio-init:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
@@ -60,6 +78,12 @@ services:
       mc alias set urmotiv http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD";
       mc mb --ignore-existing "urmotiv/$$S3_BUCKET";
       mc anonymous set none "urmotiv/$$S3_BUCKET"
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.1"
+          pids: 128
 
   migrate:
     build:
@@ -73,6 +97,12 @@ services:
       postgres:
         condition: service_healthy
     command: ["pnpm", "--filter", "@urmotiv/api", "migrate"]
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "0.2"
+          pids: 128
 
   api:
     build:
@@ -128,6 +158,12 @@ services:
       timeout: 5s
       retries: 12
       start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "1.5"
+          pids: 1024
 
   worker:
     build:
@@ -155,6 +191,12 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 1.5g
+          cpus: "1.5"
+          pids: 1024
 
   web:
     build:
@@ -172,6 +214,12 @@ services:
       timeout: 5s
       retries: 12
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.4"
+          pids: 512
 
   # Anklang 是独立仓库的原题检索服务，不连接 Urmotiv 的数据库、Redis 或对象存储。
   # 默认不启动；只有显式启用 anklang profile 时才加入当前 Compose 项目。
@@ -189,7 +237,12 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    pids_limit: 128
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "0.2"
+          pids: 128
     env_file:
       - path: ../Anklang/private/anklang.env
         required: true
@@ -250,6 +303,12 @@ services:
       timeout: 5s
       retries: 12
       start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 1.5g
+          cpus: "1.0"
+          pids: 1024
 
 volumes:
   postgres-data:
