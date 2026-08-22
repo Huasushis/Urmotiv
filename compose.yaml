@@ -74,10 +74,11 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?请在私有环境文件中设置 MINIO_ROOT_PASSWORD}
       S3_BUCKET: ${S3_BUCKET:?请在私有环境文件中设置 S3_BUCKET}
     entrypoint: ["/bin/sh", "-ec"]
-    command: >-
-      mc alias set urmotiv http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD";
-      mc mb --ignore-existing "urmotiv/$$S3_BUCKET";
-      mc anonymous set none "urmotiv/$$S3_BUCKET"
+    command:
+      - >-
+        mc alias set urmotiv http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD";
+        mc mb --ignore-existing "urmotiv/$$S3_BUCKET";
+        mc anonymous set none "urmotiv/$$S3_BUCKET"
     deploy:
       resources:
         limits:
