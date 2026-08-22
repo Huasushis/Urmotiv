@@ -1,4 +1,5 @@
 import {
+  batchAccountCreateResponseSchema,
   adminPluginListResponseSchema,
   adminPluginResponseSchema,
   contestListResponseSchema,
@@ -74,7 +75,8 @@ import {
   type UpdatePluginRequest,
   type UpdateProfileInput,
   type UpdateReviewPolicyInput,
-  type UpdateProblemInput
+  type UpdateProblemInput,
+  type BatchAccountCreateResponse
 } from "@urmotiv/contracts";
 import { z } from "zod";
 
@@ -233,6 +235,14 @@ export function getMyProfile(): Promise<ProfileView> {
 
 export function updateMyProfile(input: UpdateProfileInput): Promise<ProfileView> {
   return request("/me", json(input, "PATCH"), profileViewSchema);
+}
+
+export function createBatchAccounts(text: string): Promise<BatchAccountCreateResponse> {
+  return request(
+    "/admin/accounts/batch",
+    json({ text }),
+    batchAccountCreateResponseSchema
+  );
 }
 
 export function uploadMyAvatar(file: Blob): Promise<ProfileView> {

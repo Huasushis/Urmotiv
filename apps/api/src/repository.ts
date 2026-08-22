@@ -11,6 +11,8 @@ import type {
   VisibleProblemPage
 } from "./domain";
 import { canViewProblem, type ProblemVisibility } from "./permissions";
+import { BatchAccountConflictError, type HashedBatchAccount } from "./batch-account";
+import type { BatchAccountAuditEvent, BatchAccountAuditWriter } from "./account-audit";
 import { initialReviewPolicyRule } from "./review-decision";
 
 /**
@@ -98,6 +100,10 @@ export interface DataStore {
   clearUserAvatar(userId: string): Promise<StoredUser | undefined>;
   findEmailCredential(normalizedEmail: string): Promise<EmailCredential | undefined>;
   registerEmailUser(input: EmailRegistration): Promise<StoredUser | undefined>;
+  createEmailUsersBatch(
+    input: BatchAccountCreationInput,
+    auditWriter?: BatchAccountAuditWriter
+  ): Promise<BatchAccountCreationResult>;
   findPendingEmailVerification(normalizedEmail: string): Promise<EmailVerificationTarget | undefined>;
   replaceEmailVerificationToken(input: EmailVerificationToken): Promise<void>;
   consumeEmailVerificationToken(tokenDigest: string, now: string): Promise<string | undefined>;
@@ -153,6 +159,17 @@ export interface EmailRegistration {
   readonly displayEmail: string;
   readonly passwordHash: string;
   readonly nickname: string;
+}
+
+export interface BatchAccountCreationInput {
+  readonly actorUserId: string;
+  readonly requestId: string;
+  readonly accounts: readonly HashedBatchAccount[];
+}
+
+export interface BatchAccountCreationResult {
+  readonly createdCount: number;
+  readonly totalCount: number;
 }
 
 export interface EmailVerificationTarget {
@@ -227,6 +244,7 @@ export class InMemoryDataStore implements DataStore {
   private readonly externalIdentities = new Map<string, string>();
   private readonly loginStates = new Map<string, { expiresAt: string; consumed: boolean }>();
   private readonly primaryEmails = new Map<string, { address: string; verified: boolean }>();
+  public readonly batchAccountAuditEvents: BatchAccountAuditEvent[] = [];
   private readonly userIdentifiers = new Map<
     string,
     readonly { attribute: string; value: string }[]
@@ -375,6 +393,85 @@ export class InMemoryDataStore implements DataStore {
     });
     this.primaryEmails.set(user.id, { address: input.displayEmail, verified: false });
     return copy(user);
+  }
+  public async createEmailUsersBatch(
+    input: BatchAccountCreationInput,
+    auditWriter?: BatchAccountAuditWriter
+  ): Promise<BatchAccountCreationResult> {
+    const emailOwners = new Set(this.emailCredentials.keys());
+    const usernameOwners = new Set(
+      [...this.users.values()]
+        .map((user) => user.username)
+        .filter((username): username is string => username !== undefined && username !== null)
+    );
+    const identityOwners = new Set(
+      [...this.userIdentifiers.values()].flatMap((identifiers) => identifiers.map((identifier) => identifier.value))
+    );
+    const conflicts: Record<string, string[]> = {};
+    for (const account of input.accounts) {
+      if (emailOwners.has(account.normalizedEmail)) {
+        conflicts[`lines.${account.line}`] = ["邮箱或用户名已被其他账号使用。"];
+      }
+      if (
+        account.username !== null &&
+        (usernameOwners.has(account.username) || identityOwners.has(account.username))
+      ) {
+        conflicts[`lines.${account.line}`] = ["邮箱或用户名已被其他账号使用。"];
+      }
+    }
+    if (Object.keys(conflicts).length > 0) {
+      throw new BatchAccountConflictError(conflicts);
+    }
+
+    const nextUsers = new Map(this.users);
+    const nextEmailCredentials = new Map(this.emailCredentials);
+    const nextPrimaryEmails = new Map(this.primaryEmails);
+    let nextUserId = this.nextUserId;
+    for (const account of input.accounts) {
+      const user: StoredUser = {
+        id: String(nextUserId++),
+        nickname: account.nickname,
+        accountType: "human",
+        disabled: false,
+        roles: ["投稿人"],
+        grants: contributorGrants(),
+        isRoot: false,
+        username: account.username
+      };
+      nextUsers.set(user.id, copy(user));
+      nextEmailCredentials.set(account.normalizedEmail, {
+        userId: user.id,
+        passwordHash: account.passwordHash,
+        verified: true
+      });
+      nextPrimaryEmails.set(user.id, { address: account.displayEmail, verified: true });
+    }
+
+    const event = {
+      actorUserId: input.actorUserId,
+      requestId: input.requestId,
+      accountCount: input.accounts.length
+    };
+    if (auditWriter === undefined) {
+      this.batchAccountAuditEvents.push(copy(event));
+    } else {
+      await auditWriter.write(event);
+    }
+
+    this.users.clear();
+    for (const [id, user] of nextUsers) {
+      this.users.set(id, user);
+    }
+    this.emailCredentials.clear();
+    for (const [email, credential] of nextEmailCredentials) {
+      this.emailCredentials.set(email, credential);
+    }
+    this.primaryEmails.clear();
+    for (const [userId, email] of nextPrimaryEmails) {
+      this.primaryEmails.set(userId, email);
+    }
+    this.nextUserId = nextUserId;
+    return { createdCount: input.accounts.length, totalCount: input.accounts.length };
   }
 
   public async findPendingEmailVerification(

@@ -13,6 +13,7 @@ import { ContestPage } from "./pages/contest-page";
 import { ProblemListPage } from "./pages/problem-list-page";
 import { ProblemWorkspacePage } from "./pages/problem-workspace-page";
 import { ProfilePage } from "./pages/profile-page";
+import { BatchAccountPage } from "./pages/batch-account-page";
 import { TransferPage } from "./pages/transfer-page";
 import { VerifyEmailPage } from "./pages/verify-email-page";
 
@@ -80,6 +81,7 @@ function App() {
         <Route path="/contests" element={<ContestPage />} />
         <Route path="/transfer" element={<TransferPage />} />
         <Route path="/profile" element={<ProfilePage />} />
+        <Route path="/admin/accounts" element={<BatchAccountPage />} />
         <Route path="/admin" element={<AdminPage session={sessionData.user} />} />
         <Route path="*" element={<Navigate to="/problems" replace />} />
       </Routes>

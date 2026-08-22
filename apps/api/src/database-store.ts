@@ -19,8 +19,12 @@ import type {
   VisibleProblemPage,
 } from "./domain";
 import type { ProblemPermissionFilter, ProblemVisibility } from "./permissions";
+import { DatabaseBatchAccountAuditWriter, type BatchAccountAuditWriter } from "./account-audit";
+import { BatchAccountConflictError } from "./batch-account";
 import {
   ExternalIdentityCollisionError,
+  type BatchAccountCreationInput,
+  type BatchAccountCreationResult,
   type DataStore,
   type EmailCredential,
   type EmailRegistration,
@@ -1528,6 +1532,123 @@ export class DatabaseDataStore implements DataStore {
     } catch (error) {
       if (isUniqueViolation(error)) {
         return undefined;
+      }
+      throw error;
+    }
+  }
+  public async createEmailUsersBatch(
+    input: BatchAccountCreationInput,
+    auditWriter?: BatchAccountAuditWriter
+  ): Promise<BatchAccountCreationResult> {
+    const actorId = requireDatabaseId(input.actorUserId, "创建者编号");
+    const usernames = input.accounts
+      .map((account) => account.username)
+      .filter((username): username is string => username !== null);
+    const writer = auditWriter ?? new DatabaseBatchAccountAuditWriter(this.handle);
+
+    try {
+      return await this.handle.transaction(async (transaction) => {
+        const emailRows = await transaction.query<{ normalized_address: string }>(sql`
+          SELECT normalized_address
+          FROM user_emails
+          WHERE normalized_address IN (${sqlList(input.accounts.map((account) => account.normalizedEmail))})
+          FOR UPDATE
+        `);
+        const usernameRows =
+          usernames.length === 0
+            ? []
+            : await transaction.query<{ username: string }>(sql`
+                SELECT username
+                FROM users
+                WHERE username IN (${sqlList(usernames)})
+                FOR UPDATE
+              `);
+        const identityRows =
+          usernames.length === 0
+            ? []
+            : await transaction.query<{ value: string }>(sql`
+                SELECT value
+                FROM user_identifiers
+                WHERE value IN (${sqlList(usernames)})
+                FOR UPDATE
+              `);
+        const existingEmails = new Set(emailRows.map((row) => row.normalized_address));
+        const existingUsernames = new Set([
+          ...usernameRows.map((row) => row.username),
+          ...identityRows.map((row) => row.value)
+        ]);
+        const conflicts: Record<string, string[]> = {};
+        for (const account of input.accounts) {
+          if (
+            existingEmails.has(account.normalizedEmail) ||
+            (account.username !== null && existingUsernames.has(account.username))
+          ) {
+            conflicts[`lines.${account.line}`] = ["邮箱或用户名已被其他账号使用。"];
+          }
+        }
+        if (Object.keys(conflicts).length > 0) {
+          throw new BatchAccountConflictError(conflicts);
+        }
+
+        const contributor = await transaction.query<{ id: string }>(sql`
+          SELECT id::text AS id FROM roles WHERE key = 'contributor' LIMIT 1
+        `);
+        const roleId = contributor[0]?.id;
+        if (roleId === undefined) {
+          throw new Error("投稿人角色尚未初始化。");
+        }
+
+        for (const account of input.accounts) {
+          const inserted = await transaction.query<{ id: string }>(sql`
+            INSERT INTO users (nickname, username, account_type, password_hash)
+            VALUES (${account.nickname}, ${account.username}, 'human', ${account.passwordHash})
+            RETURNING id::text AS id
+          `);
+          const userId = inserted[0]?.id;
+          if (userId === undefined) {
+            throw new Error("批量创建账号时未获得用户编号。");
+          }
+          const databaseUserId = requireDatabaseId(userId, "用户编号");
+          await transaction.execute(sql`
+            INSERT INTO user_emails (
+              id, user_id, address, normalized_address, is_primary, verified_at
+            ) VALUES (
+              ${randomUUID()}::uuid,
+              ${databaseUserId},
+              ${account.displayEmail},
+              ${account.normalizedEmail},
+              true,
+              now()
+            )
+          `);
+          await transaction.execute(sql`
+            INSERT INTO role_memberships (id, user_id, role_id, granted_by_user_id, reason)
+            VALUES (
+              ${randomUUID()}::uuid,
+              ${databaseUserId},
+              ${roleId}::uuid,
+              ${actorId},
+              '批量创建账号'
+            )
+          `);
+        }
+
+        await writer.write(
+          {
+            actorUserId: input.actorUserId,
+            requestId: input.requestId,
+            accountCount: input.accounts.length
+          },
+          transaction
+        );
+        return { createdCount: input.accounts.length, totalCount: input.accounts.length };
+      });
+    } catch (error) {
+      if (error instanceof BatchAccountConflictError) {
+        throw error;
+      }
+      if (isUniqueViolation(error)) {
+        throw new BatchAccountConflictError();
       }
       throw error;
     }

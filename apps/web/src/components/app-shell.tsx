@@ -4,7 +4,8 @@ import {
   ClipboardCheck,
   FilePenLine,
   ListChecks,
-  Settings
+  Settings,
+  UserPlus
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
@@ -48,6 +49,9 @@ function buildNavItems(session: NonNullable<SessionResponse["user"]>) {
   }
   if (transferPermissions.some((name) => session.permissions.includes(name))) {
     items.push({ to: "/transfer", label: "导入导出", icon: ArrowLeftRight });
+  }
+  if (session.permissions.includes("user.create")) {
+    items.push({ to: "/admin/accounts", label: "批量账号", icon: UserPlus });
   }
   if (session.canManageReviewPolicy || session.canManagePlugins || session.canManageTags) {
     items.push({ to: "/admin", label: "管理", icon: Settings });

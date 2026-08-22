@@ -12,4 +12,5 @@ export * from "./robot";
 export * from "./service-account";
 export * from "./tag";
 export * from "./transfer";
+export * from "./account";
 export * from "./plugin";

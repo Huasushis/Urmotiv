@@ -47,7 +47,8 @@ import {
   updateTagAliasInputSchema,
   updateTagCatalogItemInputSchema,
   uploadProblemFileQuerySchema,
-  withdrawProblemInputSchema
+  withdrawProblemInputSchema,
+  batchAccountCreateInputSchema
 } from "@urmotiv/contracts";
 import {
   CasAuthenticationError,
@@ -70,6 +71,13 @@ import { ContestService } from "./contest-service";
 import { InMemoryContestStore, type ContestStore } from "./contest-store";
 import { createDemoUsers, demoTags } from "./demo-data";
 import { ApiError, conflict, forbidden, notFound, unauthorized } from "./errors";
+import {
+  BatchAccountAuditWriteError,
+  BatchAccountConflictError,
+  BatchAccountInputError,
+  parseBatchAccountText
+} from "./batch-account";
+import type { BatchAccountAuditWriter } from "./account-audit";
 import type { StoredUser } from "./domain";
 import {
   createProblemPermissionFilter,
@@ -150,7 +158,6 @@ const tagCatalogItemIdSchema = z
   .string()
   .max(120)
   .regex(/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/u);
-
 export interface ProblemFilePartsOptions {
   /** 文件元数据仓库，需要数据库存储。 */
   metadata: ProblemFileStore;
@@ -168,6 +175,7 @@ export interface ApiAppOptions {
   emailRegistrationEnabled?: boolean;
   emailVerificationDelivery?: EmailVerificationDelivery;
   emailVerificationWebUrl?: string;
+  batchAccountAuditWriter?: BatchAccountAuditWriter;
   casClient?: CasClient;
   ustcOAuthClient?: UstcOAuthClient;
   demoUserIds?: readonly string[];
@@ -196,6 +204,7 @@ interface AppDependencies {
   emailRegistrationEnabled: boolean;
   emailVerificationDelivery?: EmailVerificationDelivery;
   emailVerificationWebUrl?: string;
+  batchAccountAuditWriter?: BatchAccountAuditWriter;
   casClient?: CasClient;
   ustcOAuthClient?: UstcOAuthClient;
   demoUserIds: ReadonlySet<string>;
@@ -546,6 +555,9 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     ...(options.emailVerificationWebUrl === undefined
       ? {}
       : { emailVerificationWebUrl: options.emailVerificationWebUrl }),
+    ...(options.batchAccountAuditWriter === undefined
+      ? {}
+      : { batchAccountAuditWriter: options.batchAccountAuditWriter }),
     ...(options.casClient === undefined ? {} : { casClient: options.casClient }),
     ...(options.ustcOAuthClient === undefined
       ? {}
@@ -1203,6 +1215,60 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     }
     return result.data;
   }
+
+  app.post("/api/v1/admin/accounts/batch", async (request) => {
+    const user = await requireUser(request);
+    if (!hasPermission(user, "user.create", {}, dependencies.now())) {
+      throw forbidden();
+    }
+    const input = batchAccountCreateInputSchema.strict().parse(request.body);
+    let parsed;
+    try {
+      parsed = parseBatchAccountText(input.text);
+    } catch (error) {
+      if (error instanceof BatchAccountInputError) {
+        throw new ApiError(422, "INVALID_INPUT", error.message, error.fieldErrors);
+      }
+      if (error instanceof BatchAccountConflictError) {
+        throw conflict(error.message, error.fieldErrors);
+      }
+      throw error;
+    }
+    const accounts = [];
+    for (const account of parsed) {
+      accounts.push({
+        line: account.line,
+        username: account.username,
+        nickname: account.nickname,
+        displayEmail: account.displayEmail,
+        normalizedEmail: account.normalizedEmail,
+        passwordHash: await hashPassword(account.password)
+      });
+    }
+    try {
+      const result = await dependencies.store.createEmailUsersBatch(
+        {
+          actorUserId: user.id,
+          requestId: request.id,
+          accounts
+        },
+        dependencies.batchAccountAuditWriter
+      );
+      return { ok: true, ...result };
+    } catch (error) {
+      if (error instanceof BatchAccountConflictError) {
+        throw conflict(error.message, error.fieldErrors);
+      }
+      if (error instanceof BatchAccountAuditWriteError) {
+        throw new ApiError(
+          503,
+          "AUDIT_UNAVAILABLE",
+          "账号创建记录暂时无法保存，未创建任何账号。"
+        );
+      }
+      throw error;
+    }
+  });
 
   app.get("/api/v1/me", async (request) => {
     const user = await requireUser(request);
