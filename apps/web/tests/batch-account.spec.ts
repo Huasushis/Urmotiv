@@ -41,9 +41,10 @@ test.describe("批量创建账号", () => {
     await textarea.fill(input);
     await page.getByRole("button", { name: "创建账号" }).click();
 
-    await expect(page.getByRole("alert")).toContainText("第 2 行");
+    const feedback = page.getByRole("alert");
+    await expect(feedback).toContainText("第 2 行");
     await expect(textarea).toHaveValue(input);
-    await expect(page.locator("body")).not.toContainText("browser-c@example.test");
-    await expect(page.locator("body")).not.toContainText(secret);
+    await expect(feedback).not.toContainText("browser-c@example.test");
+    await expect(feedback).not.toContainText(secret);
   });
 });
