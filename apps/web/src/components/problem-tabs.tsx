@@ -897,21 +897,24 @@ const anklangSimilarityDataSchema = z.object({
       explanation: z.string().optional()
     })
   ),
-  recommendation: z.object({
-    blockSubmission: z.boolean(),
-    message: z.string()
-  })
+  recommendation: z
+    .object({
+      blockSubmission: z.boolean(),
+      message: z.string()
+    })
+    .optional()
 });
 type AnklangSimilarityData = z.infer<typeof anklangSimilarityDataSchema>;
 
 function AnklangCandidates({ data }: { data: AnklangSimilarityData }) {
   const completionStatus = data.apiVersion === "1" ? "complete" : data.completion?.status;
+  const recommendation = data.recommendation;
   return (
     <div className="candidate-panel">
-      {data.recommendation.message ? (
-        <p className={data.recommendation.blockSubmission ? "warning-note" : "notice-line"}>
-          {data.recommendation.blockSubmission ? <AlertTriangle size={16} aria-hidden="true" /> : null}
-          {data.recommendation.message}
+      {recommendation?.message ? (
+        <p className={recommendation.blockSubmission ? "warning-note" : "notice-line"}>
+          {recommendation.blockSubmission ? <AlertTriangle size={16} aria-hidden="true" /> : null}
+          {recommendation.message}
         </p>
       ) : null}
       {completionStatus === "partial" ? (

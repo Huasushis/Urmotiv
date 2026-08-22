@@ -327,8 +327,7 @@ describe("v2 严格契约", () => {
       {
         ...complete,
         reuse: { policy: "allowed", expiresAt, extra: true }
-      },
-      { ...complete, reuse: undefined }
+      }
     ];
     for (const value of invalid) {
       expect(anklangV2ResultSchema.safeParse(value).success).toBe(false);
@@ -559,12 +558,15 @@ describe("提交前相似度检查与缓存", () => {
             data: {
               apiVersion: "2",
               completion: { status: "unavailable" },
-              candidates: [],
-              reuse: { policy: "no-store" }
+              candidates: []
             }
           }
         ]
       });
+      // 本地生成的 unavailable 条目不合成推荐或复用策略，字段整体省略。
+      const dataJson = JSON.stringify((output as { reviewItems: unknown[] }).reviewItems[0]);
+      expect(dataJson).not.toContain('"recommendation"');
+      expect(dataJson).not.toContain('"reuse"');
       expect(JSON.stringify(output)).not.toContain(marker);
       expect(JSON.stringify(output)).not.toContain(input.problem.basicStatement);
     }
@@ -712,5 +714,175 @@ describe("candidate.metadata 镜像契约", () => {
     expect(withData.contentHash).toBe(withoutData.contentHash);
     expect(withData.candidates[0]?.similarity).toBe(withoutData.candidates[0]?.similarity);
     expect(withData.recommendation).toEqual(withoutData.recommendation);
+  });
+});
+
+describe("搜索型只读结果：recommendation 与 reuse 可选", () => {
+  /** 真实 Anklang 只会返回检索候选，不携带决策字段的完整 v2 结果。 */
+  function bareV2Result(overrides: Record<string, unknown> = {}): AnklangV2Result {
+    return anklangV2ResultSchema.parse({
+      apiVersion: "2",
+      contentHash,
+      checkedAt,
+      candidates: [candidate],
+      completion: { status: "complete", reasonCode: "complete", retryable: false },
+      ...overrides
+    });
+  }
+
+  it("正路径：五字段完整 v2 结果（无 recommendation/reuse）携带候选 metadata 被接受", async () => {
+    const withMetadata: Record<string, unknown> = {
+      ...candidate,
+      metadata: { origin: "CF", rounds: 3, pinned: true, archived: null }
+    };
+    const value = bareV2Result({ candidates: [withMetadata] });
+    expect(value.recommendation).toBeUndefined();
+    expect(value.reuse).toBeUndefined();
+    expect(
+      (value.candidates[0] as Record<string, unknown> | undefined)?.metadata
+    ).toEqual({
+      origin: "CF",
+      rounds: 3,
+      pinned: true,
+      archived: null
+    });
+
+    const check = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        failureBehavior: "continue",
+        blockWhenRecommended: true
+      }),
+      fetch: async () => jsonResponse(value)
+    });
+    const output = await check.run(input, { signal: new AbortController().signal });
+    expect(output.decision).toBe("continue");
+    const data = (output as { reviewItems?: unknown[] }).reviewItems?.[0] as
+      | { data: AnklangV2Result }
+      | undefined;
+    expect(data?.data.recommendation).toBeUndefined();
+    expect(data?.data.reuse).toBeUndefined();
+    expect(
+      (data?.data.candidates[0] as Record<string, unknown> | undefined)?.metadata
+    ).toEqual({
+      origin: "CF",
+      rounds: 3,
+      pinned: true,
+      archived: null
+    });
+  });
+
+  it("显式旧版决策字段仍参与本地 blockWhenRecommended 拦截", async () => {
+    const legacy = v2Result({ blockSubmission: true });
+    const check = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        blockWhenRecommended: true
+      }),
+      fetch: async () => jsonResponse(legacy)
+    });
+    const output = await check.run(input, { signal: new AbortController().signal });
+    expect(output).toMatchObject({
+      decision: "block",
+      code: "anklang_similar_problem",
+      message: "请继续人工核对。"
+    });
+
+    // blockWhenRecommended=false 时显式推荐不会拦截。
+    const permissive = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        blockWhenRecommended: false
+      }),
+      fetch: async () => jsonResponse(legacy)
+    });
+    await expect(
+      permissive.run(input, { signal: new AbortController().signal })
+    ).resolves.toMatchObject({ decision: "continue" });
+  });
+
+  it("缺失决策字段时非法 metadata 仍 fail closed 且不生成合成字段", async () => {
+    const check = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        failureBehavior: "continue"
+      }),
+      fetch: async () =>
+        jsonResponse({
+          apiVersion: "2",
+          contentHash,
+          checkedAt,
+          completion: { status: "complete", reasonCode: "complete", retryable: false },
+          candidates: [{ ...candidate, metadata: { float: 1.5 } }]
+        })
+    });
+    const output = await check.run(input, { signal: new AbortController().signal });
+    expect(output).toMatchObject({
+      decision: "continue",
+      reviewItems: [{ summary: expect.stringContaining("暂不可用") }]
+    });
+    const dataJson = JSON.stringify(output);
+    expect(dataJson).not.toContain("float");
+    expect(dataJson).not.toContain("1.5");
+    expect(dataJson).not.toContain('"recommendation"');
+    expect(dataJson).not.toContain('"reuse"');
+  });
+
+  it("缺失决策字段时不拦截、不写缓存、不产生 expiresAt，候选仍可见且不泄露内部默认值", async () => {
+    const set = vi.fn(async () => undefined);
+    const cache: AnklangCache = { get: vi.fn(async () => undefined), set };
+    const check = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        failureBehavior: "continue",
+        cacheMinutes: 60
+      }),
+      cache,
+      fetch: async () => jsonResponse(bareV2Result()),
+      now: () => new Date(checkedAt)
+    });
+    const output = await check.run(input, { signal: new AbortController().signal });
+    expect(output.decision).toBe("continue");
+    expect(cache.set).not.toHaveBeenCalled();
+
+    const item = (output as { decision: "continue"; reviewItems?: unknown[] }).reviewItems?.[0] as
+      | { summary?: string; data?: AnklangV2Result; expiresAt?: string }
+      | undefined;
+    expect(item?.expiresAt).toBeUndefined();
+    expect(item?.data?.candidates.length).toBe(1);
+    expect(item?.data?.recommendation).toBeUndefined();
+    expect(item?.data?.reuse).toBeUndefined();
+    const serialized = JSON.stringify(output);
+    const leakedDefaults = ['"blockSubmission"', '"policy"', '"no-store"', '"allowed"', '"expiresAt"'];
+    for (const token of leakedDefaults) {
+      expect(serialized).not.toContain(token);
+    }
+  });
+
+  it("partial/unavailable 失败语义不变：block 模式仍抛错，continue 模式明确降级", async () => {
+    const partial = v2Result({ status: "partial", candidates: [] });
+    const blocking = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        failureBehavior: "block"
+      }),
+      fetch: async () => jsonResponse(partial)
+    });
+    await expect(
+      blocking.run(input, { signal: new AbortController().signal })
+    ).rejects.toThrow("没有完整完成");
+
+    const continuing = createAnklangCheck({
+      settings: anklangSettingsSchema.parse({
+        baseUrl: "https://anklang.example.test",
+        failureBehavior: "continue"
+      }),
+      fetch: async () => jsonResponse(partial)
+    });
+    const output = await continuing.run(input, { signal: new AbortController().signal });
+    expect(output).toMatchObject({
+      decision: "continue",
+      reviewItems: [{ summary: expect.stringContaining("只完成了一部分") }]
+    });
   });
 });

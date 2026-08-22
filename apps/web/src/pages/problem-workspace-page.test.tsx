@@ -23,6 +23,7 @@ vi.mock("../lib/api", async (importOriginal) => {
 });
 
 import { ProblemWorkspacePage } from "./problem-workspace-page";
+import { ReviewItemCard } from "../components/problem-tabs";
 import { ApiError } from "../lib/api";
 
 function renderResult(
@@ -318,4 +319,46 @@ describe("ProblemWorkspacePage 名称专用权限自动保存", () => {
     expect(container!.textContent).not.toContain("虚构但不可回显的详情");
     expect(queryClient!.getQueryData(["problem", "p-title-1", "author"])).toBeUndefined();
   });
+});
+
+describe("原题检索条目省略决策字段时的渲染", () => {
+  const bareFiveFieldItem = (overrides: Record<string, unknown> = {}) => ({
+    id: "ri-anklang-1",
+    type: "org.ustc.urmotiv.anklang.similarity",
+    source: "anklang",
+    visibility: "author" as const,
+    summary: "完整检索发现 1 道候选题。",
+    createdAt: "2026-08-01T00:00:00.000Z",
+    data: {
+      apiVersion: "2",
+      checkedAt: "2026-08-01T00:00:00.000Z",
+      completion: { status: "complete", reasonCode: "complete", retryable: false },
+      candidates: [
+        {
+          source: "公开题库",
+          externalId: "sample-1",
+          title: "相似的公开题",
+          similarity: 0.82,
+          metadata: { origin: "CF", rounds: 3 }
+        }
+      ],
+      ...overrides,
+    }
+  });
+
+  it("search-only 条目不携带 recommendation/reuse 时候选仍可见且不泄露默认值", () => {
+    const html = renderToStaticMarkup(<ReviewItemCard item={bareFiveFieldItem()} defaultExpanded />);
+    expect(html).toContain("相似的公开题");
+    expect(html).toContain("82%");
+    expect(html).toContain("收起候选");
+    // 不合成推荐文案、拦截语义或复用策略。
+    expect(html).not.toContain("建议");
+    expect(html).not.toContain("拦截");
+    expect(html).not.toContain("no-store");
+    expect(html).not.toContain("allowed");
+    expect(html).not.toContain("expiresAt");
+    expect(html).not.toContain("blockSubmission");
+  });
+
+
 });

@@ -180,7 +180,7 @@ export const anklangV1ResultSchema = z
     contentHash: contentHashSchema,
     checkedAt: utcDateTimeSchema,
     candidates: z.array(anklangCandidateSchema).max(50),
-    recommendation: recommendationSchema
+    recommendation: recommendationSchema.optional()
   })
   .strict();
 
@@ -239,18 +239,18 @@ const v2ResultCommon = {
   contentHash: contentHashSchema,
   checkedAt: utcDateTimeSchema,
   candidates: z.array(anklangV2CandidateSchema).max(50),
-  recommendation: recommendationSchema
+  recommendation: recommendationSchema.optional()
 } as const;
 
 const completeV2ResultSchema = z
   .object({
     ...v2ResultCommon,
     completion: completeCompletionSchema,
-    reuse: z.union([allowedReuseSchema, noStoreReuseSchema])
+    reuse: z.union([allowedReuseSchema, noStoreReuseSchema]).optional()
   })
   .strict()
   .superRefine((result, context) => {
-    if (result.reuse.policy !== "allowed") {
+    if (result.reuse?.policy !== "allowed") {
       return;
     }
     const checkedAtMs = Date.parse(result.checkedAt);
@@ -268,12 +268,12 @@ const partialV2ResultSchema = z
   .object({
     ...v2ResultCommon,
     completion: noncompleteCompletionSchema("partial"),
-    reuse: noStoreReuseSchema
+    reuse: noStoreReuseSchema.optional()
   })
   .strict()
   .superRefine((result, context) => {
     if (
-      result.recommendation.blockSubmission &&
+      result.recommendation?.blockSubmission === true &&
       !result.candidates.some((candidate) => candidate.sameProblemSuggestion === true)
     ) {
       context.addIssue({
@@ -294,8 +294,9 @@ const unavailableV2ResultSchema = z
         blockSubmission: z.literal(false),
         message: boundedCanonicalText(2_000)
       })
-      .strict(),
-    reuse: noStoreReuseSchema
+      .strict()
+      .optional(),
+    reuse: noStoreReuseSchema.optional()
   })
   .strict();
 
@@ -499,7 +500,8 @@ export function createAnklangCheck(options: CreateAnklangCheckOptions): BeforeSu
         .filter(
           (candidate) =>
             candidate.similarity >= settings.minimumSimilarityToShow ||
-            (result.recommendation.blockSubmission && candidate === highestCandidate) ||
+            (result.recommendation?.blockSubmission === true &&
+              candidate === highestCandidate) ||
             (result.apiVersion === "2" &&
               result.completion.status === "partial" &&
               candidate.sameProblemSuggestion === true)
@@ -510,7 +512,7 @@ export function createAnklangCheck(options: CreateAnklangCheckOptions): BeforeSu
         result.apiVersion === "2" &&
         result.completion.status === "partial" &&
         settings.blockWhenRecommended &&
-        result.recommendation.blockSubmission
+        result.recommendation?.blockSubmission === true
       ) {
         return blockedResult(result, visibleCandidates, "anklang_partial_same_problem");
       }
@@ -523,7 +525,7 @@ export function createAnklangCheck(options: CreateAnklangCheckOptions): BeforeSu
         throw new Error("Anklang 检查没有完整完成。");
       }
 
-      if (settings.blockWhenRecommended && result.recommendation.blockSubmission) {
+      if (settings.blockWhenRecommended && result.recommendation?.blockSubmission === true) {
         return blockedResult(result, visibleCandidates, "anklang_similar_problem");
       }
 
@@ -571,12 +573,7 @@ export function createAnklangUnavailableReviewItem(
       reasonCode,
       retryable: reasonCode !== "service_invalid_response"
     },
-    candidates: [],
-    recommendation: {
-      blockSubmission: false,
-      message: "本次原题检索未能形成可信结果，请稍后重试。"
-    },
-    reuse: { policy: "no-store" }
+    candidates: []
   });
   return toReviewItem(result, []);
 }
@@ -617,17 +614,17 @@ async function readOrCheck(
   if (result.apiVersion === "1") {
     const expiresAt = new Date(now().getTime() + settings.cacheMinutes * 60_000).toISOString();
     await safeCacheSet(cache, cacheKey, result, expiresAt);
-  } else if (
-    result.completion.status === "complete" &&
-    result.reuse.policy === "allowed"
-  ) {
-    const observedNowMs = now().getTime();
-    const cacheExpiresAtMs = Math.min(
-      Date.parse(result.reuse.expiresAt),
-      observedNowMs + settings.cacheMinutes * 60_000
-    );
-    if (cacheExpiresAtMs > observedNowMs) {
-      await safeCacheSet(cache, cacheKey, result, new Date(cacheExpiresAtMs).toISOString());
+  } else if (result.apiVersion === "2" && result.completion.status === "complete") {
+    const reuse = result.reuse;
+    if (reuse?.policy === "allowed") {
+      const observedNowMs = now().getTime();
+      const cacheExpiresAtMs = Math.min(
+        Date.parse(reuse.expiresAt),
+        observedNowMs + settings.cacheMinutes * 60_000
+      );
+      if (cacheExpiresAtMs > observedNowMs) {
+        await safeCacheSet(cache, cacheKey, result, new Date(cacheExpiresAtMs).toISOString());
+      }
     }
   }
   return result;
@@ -658,12 +655,13 @@ function reusableCachedResult(
   }
 
   const parsed = anklangV2ResultSchema.safeParse(value);
+  const reuse = parsed.data?.reuse;
   if (
     !parsed.success ||
     parsed.data.contentHash !== contentHash ||
     parsed.data.completion.status !== "complete" ||
-    parsed.data.reuse.policy !== "allowed" ||
-    Date.parse(parsed.data.reuse.expiresAt) <= now.getTime()
+    reuse?.policy !== "allowed" ||
+    Date.parse(reuse?.expiresAt ?? "") <= now.getTime()
   ) {
     return undefined;
   }
@@ -678,7 +676,7 @@ function blockedResult(
   return {
     decision: "block",
     code,
-    message: result.recommendation.message,
+    message: result.recommendation?.message ?? "",
     details: {
       candidateCount: candidates.length,
       maximumSimilarity: candidates[0]?.similarity ?? 0,
@@ -711,7 +709,7 @@ function toReviewItem(
   const expiresAt =
     result.apiVersion === "2" &&
     result.completion.status === "complete" &&
-    result.reuse.policy === "allowed"
+    result.reuse?.policy === "allowed"
       ? result.reuse.expiresAt
       : undefined;
   return {
