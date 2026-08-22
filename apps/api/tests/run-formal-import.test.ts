@@ -242,17 +242,17 @@ describe("正式导入入口：参数校验与机械拒绝", () => {
       expect(code === 1 || code === 2).toBe(true);
     }
   });
-  it("数量闸门：仅指定批次精确数量通过", () => {
+  it("R-DEP-002：批准的最终 156 批次通过精确数量闸门", () => {
     expect(() =>
-      assertProductionFormalImportCount(designatedRealFormalImportCount),
+      assertProductionFormalImportCount(156),
     ).not.toThrow();
-    for (const count of [0, 1, 136, 138]) {
+    for (const count of [0, 1, 137, 155, 157]) {
       expect(() => assertProductionFormalImportCount(count)).toThrowError(
         expect.objectContaining({ code: "INVALID_METADATA" }),
       );
     }
   });
   it("数量闸门绑定唯一生产常数，防止误改", () => {
-    expect(designatedRealFormalImportCount).toBe(137);
+    expect(designatedRealFormalImportCount).toBe(156);
   });
 });
