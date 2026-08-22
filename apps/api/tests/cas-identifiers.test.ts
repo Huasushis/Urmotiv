@@ -251,4 +251,5 @@ describe("统一身份认证的学号落库", () => {
     `);
     expect(rows.map((row) => row.subject)).toEqual(["synthetic-gid-owner"]);
   });
+
 });
