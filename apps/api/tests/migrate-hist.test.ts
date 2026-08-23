@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { parseCommand } from "../scripts/migrate-hist";
 
 describe("recover-active CLI", () => {
-  it("parses the bound output, run tag, and source identity", () => {
+  it("parses the bound output and source identity without a caller run identity", () => {
     expect(
       parseCommand([
         "recover-active",
@@ -14,8 +14,6 @@ describe("recover-active CLI", () => {
         "/private/metadata.private.json",
         "--out",
         "/private/prepared",
-        "--run-tag",
-        "run-001",
         "--source-id",
         "source-000001",
       ]),
@@ -25,7 +23,6 @@ describe("recover-active CLI", () => {
       materializedDirectory: "/private/materialized",
       metadataFile: "/private/metadata.private.json",
       outputDirectory: "/private/prepared",
-      operationTag: "run-001",
       sourceId: "source-000001",
     });
   });
@@ -42,9 +39,27 @@ describe("recover-active CLI", () => {
         "/private/metadata.private.json",
         "--out",
         "/private/prepared",
-        "--run-tag",
-        "run-001",
       ]),
     ).toThrow(/--source-id/);
+  });
+
+  it("refuses a caller-supplied run tag", () => {
+    expect(() =>
+      parseCommand([
+        "recover-active",
+        "--private-root",
+        "/private",
+        "--materialized",
+        "/private/materialized",
+        "--metadata",
+        "/private/metadata.private.json",
+        "--out",
+        "/private/prepared",
+        "--source-id",
+        "source-000001",
+        "--run-tag",
+        "untrusted-run",
+      ]),
+    ).toThrow(/不接受调用方 run 标签/);
   });
 });

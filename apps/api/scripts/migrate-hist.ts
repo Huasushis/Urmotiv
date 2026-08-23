@@ -121,7 +121,6 @@ type Command =
       readonly materializedDirectory: string;
       readonly metadataFile: string;
       readonly outputDirectory: string;
-      readonly operationTag: string;
       readonly sourceId: string;
     }
   | {
@@ -274,8 +273,6 @@ async function main(): Promise<void> {
       ),
       outputDirectory: command.outputDirectory,
       sourceId: command.sourceId,
-      operationTag: command.operationTag,
-      executionIdentity: normalizer.preparationIdentity,
       normalizer,
     });
     if (result.status === "failed") {
@@ -459,13 +456,18 @@ export function parseCommand(argv: readonly string[]): Command {
     };
   }
   if (phase === "recover-active") {
+    if (argv.includes("--run-tag")) {
+      throw new HistoryMigrationError(
+        "INVALID_ARGUMENTS",
+        "recover-active 只读取存储的原 prepare 运行身份，不接受调用方 run 标签。",
+      );
+    }
     return {
       phase,
       privateRootDirectory: requiredOption(argv, "--private-root"),
       materializedDirectory: requiredOption(argv, "--materialized"),
       metadataFile: requiredOption(argv, "--metadata"),
       outputDirectory: requiredOption(argv, "--out"),
-      operationTag: requiredOption(argv, "--run-tag"),
       sourceId: requiredOption(argv, "--source-id"),
     };
   }

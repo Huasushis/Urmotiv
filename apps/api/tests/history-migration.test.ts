@@ -36,6 +36,7 @@ import {
   type HistoryGroupingPlan,
   type HistoryNormalizer,
   type HistorySourceLocations,
+  type HistoryRecoveryNormalizer,
   type NormalizedHistoryOutput,
 } from "../src/history-migration/index";
 
@@ -418,6 +419,20 @@ describe("历史题目迁移安全核心", () => {
     });
   });
 
+  it("恢复工具身份不同于原 prepare 身份时仍绑定存储运行检查点", async () => {
+    const fixture = await createActiveOnlyFixture("后续恢复工具身份差异正文。");
+    const untrustedPrepareOptions = {
+      ...fixture.prepareOptions,
+      operationTag: "untrusted-run",
+    };
+    const result = await recoverActiveHistoryCandidate({
+      sourceId: "source-000001",
+      ...untrustedPrepareOptions,
+      normalizer: fixedNormalizer(),
+    });
+    expect(result.status).toBe("completed");
+  });
+
   it("恢复 active-only 检查点追加第二次请求并兼容续跑", async () => {
     const fixture = await createActiveOnlyFixture("恢复成功的合成正文。");
     const activePath = join(fixture.prepareOutput, "requests", "source-000001.active.json");
@@ -440,14 +455,29 @@ describe("历史题目迁移安全核心", () => {
         join(fixture.prepareOutput, "requests", "source-000001.attempt-02.active.json"),
         "utf8",
       ),
-    ) as { readonly sourceId: string; readonly status: string };
+    ) as {
+      readonly sourceId: string;
+      readonly status: string;
+      readonly executionIdentitySha256: string;
+      readonly recoveryExecutorIdentity: { readonly codeSha256: string };
+    };
     const completed = JSON.parse(
       await readFile(join(fixture.prepareOutput, "requests", "source-000001.completed.json"), "utf8"),
     ) as {
       readonly activeSha256: string;
       readonly requestAttemptSha256s: readonly string[];
+      readonly recoveryExecutorIdentity: { readonly codeSha256: string };
     };
     expect(attempt).toMatchObject({ sourceId: "source-000001", status: "active" });
+    expect(attempt.executionIdentitySha256).toBe(
+      JSON.parse(originalActive).executionIdentitySha256,
+    );
+    expect(attempt.recoveryExecutorIdentity).toEqual(
+      fixedNormalizer().preparationIdentity,
+    );
+    expect(completed.recoveryExecutorIdentity).toEqual(
+      fixedNormalizer().preparationIdentity,
+    );
     expect(completed.requestAttemptSha256s).toHaveLength(2);
     expect(completed.activeSha256).toBe(
       sha256Hex(JSON.stringify(JSON.parse(originalActive))),
@@ -474,6 +504,7 @@ describe("历史题目迁移安全核心", () => {
       ...fixture.prepareOptions,
       sourceId: "source-000001",
       normalizer: {
+        preparationIdentity: fixedNormalizer().preparationIdentity,
         async normalize() {
           throw new HistoryNormalizationError("schema", "合成 schema 失败。");
         },
@@ -490,6 +521,7 @@ describe("历史题目迁移安全核心", () => {
     ) as {
       readonly activeSha256: string;
       readonly requestAttemptSha256s: readonly string[];
+      readonly recoveryExecutorIdentity: { readonly codeSha256: string };
     };
     expect(failed.activeSha256).toBe(
       sha256Hex(
@@ -504,6 +536,9 @@ describe("历史题目迁移安全核心", () => {
       ),
     );
     expect(failed.requestAttemptSha256s).toHaveLength(2);
+    expect(failed.recoveryExecutorIdentity).toEqual(
+      fixedNormalizer().preparationIdentity,
+    );
     await expect(
       recoverActiveHistoryCandidate({
         ...fixture.prepareOptions,
@@ -1751,8 +1786,15 @@ async function createMultiFixture(): Promise<Awaited<ReturnType<typeof createFix
   return fixture;
 }
 
-function fixedNormalizer(): HistoryNormalizer {
+function fixedNormalizer(): HistoryRecoveryNormalizer {
   return {
+    preparationIdentity: {
+      version: 1,
+      codeSha256: "f".repeat(64),
+      promptSha256: "0".repeat(64),
+      modelSha256: "1".repeat(64),
+      configSha256: "2".repeat(64),
+    },
     async normalize() {
       return normalizedOutput();
     },
