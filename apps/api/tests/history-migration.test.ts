@@ -544,6 +544,104 @@ describe("历史题目迁移安全核心", () => {
     });
   });
 
+  it("失败前缀恢复失败时写入编号回执并允许一次有界后续恢复", async () => {
+    const fixture = await createFixture("失败前缀再次失败的合成正文。");
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize() {
+          throw new HistoryNormalizationError("schema", "初始合成 schema 失败。");
+        },
+      },
+    });
+    const originalFailedPath = join(
+      fixture.prepareOutput,
+      "requests",
+      "source-000001.failed.json",
+    );
+    const originalFailed = await readFile(originalFailedPath, "utf8");
+
+    const failedRecovery = await recoverActiveHistoryCandidate({
+      ...fixture.prepareOptions,
+      sourceId: "source-000001",
+      normalizer: {
+        preparationIdentity: fixedNormalizer().preparationIdentity,
+        async normalize() {
+          throw new HistoryNormalizationError("schema", "恢复合成 schema 失败。");
+        },
+      },
+    });
+
+    expect(failedRecovery).toMatchObject({ status: "failed", requestAttemptCount: 2 });
+    const numberedFailedPath = join(
+      fixture.prepareOutput,
+      "requests",
+      "source-000001.attempt-02.failed.json",
+    );
+    const numberedFailed = await readFile(numberedFailedPath, "utf8");
+    expect(await readFile(originalFailedPath, "utf8")).toBe(originalFailed);
+
+    const completedRecovery = await recoverActiveHistoryCandidate({
+      ...fixture.prepareOptions,
+      sourceId: "source-000001",
+      normalizer: fixedNormalizer(),
+    });
+
+    expect(completedRecovery).toMatchObject({ status: "completed", requestAttemptCount: 3 });
+    expect(await readFile(originalFailedPath, "utf8")).toBe(originalFailed);
+    expect(await readFile(numberedFailedPath, "utf8")).toBe(numberedFailed);
+    const resumed = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      resume: true,
+      normalizer: fixedNormalizer(),
+    });
+    expect(resumed).toMatchObject({ complete: true, completedSourceCount: 1 });
+  });
+
+  it("兼容已登记 attempt-02 但编号失败回执缺失的旧终态窗口", async () => {
+    const fixture = await createFixture("旧终态窗口恢复的合成正文。");
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize() {
+          throw new HistoryNormalizationError("schema", "初始合成 schema 失败。");
+        },
+      },
+    });
+    const originalFailedPath = join(
+      fixture.prepareOutput,
+      "requests",
+      "source-000001.failed.json",
+    );
+    const originalFailed = await readFile(originalFailedPath, "utf8");
+    await recoverActiveHistoryCandidate({
+      ...fixture.prepareOptions,
+      sourceId: "source-000001",
+      normalizer: {
+        preparationIdentity: fixedNormalizer().preparationIdentity,
+        async normalize() {
+          throw new HistoryNormalizationError("schema", "恢复合成 schema 失败。");
+        },
+      },
+    });
+    await rm(
+      join(
+        fixture.prepareOutput,
+        "requests",
+        "source-000001.attempt-02.failed.json",
+      ),
+    );
+
+    const completed = await recoverActiveHistoryCandidate({
+      ...fixture.prepareOptions,
+      sourceId: "source-000001",
+      normalizer: fixedNormalizer(),
+    });
+
+    expect(completed).toMatchObject({ status: "completed", requestAttemptCount: 3 });
+    expect(await readFile(originalFailedPath, "utf8")).toBe(originalFailed);
+  });
+
   it("拒绝失败前缀之外已有追加 active 的歧义状态", async () => {
     const fixture = await createFixture("失败前缀歧义拒绝的合成正文。");
     await prepareHistoryCandidates({

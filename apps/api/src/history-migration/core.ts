@@ -468,6 +468,7 @@ export async function prepareHistoryCandidates(
       options.outputDirectory,
       source.sourceId,
       targetExecutionIdentitySha256,
+      operationTagSha256,
     );
     if (existingState !== "pending") continue;
     let sourceContent: Awaited<ReturnType<typeof readConfirmedSource>>;
@@ -632,6 +633,7 @@ export async function prepareHistoryCandidates(
     options.outputDirectory,
     confirmedSources,
     targetExecutionIdentitySha256,
+    operationTagSha256,
   );
   await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
     { path: join(options.outputDirectory, "reports"), kind: "existing" },
@@ -781,50 +783,54 @@ export async function recoverActiveHistoryCandidate(
     );
   }
 
-  const state = await loadPreparationSourceState(
-    options.privateRootDirectory,
-    options.outputDirectory,
-    source.sourceId,
+  const targetExecutionIdentitySha256 = sha256Hex(
+    JSON.stringify(savedRun.executionIdentity),
   );
+  let state: Awaited<ReturnType<typeof loadPreparationSourceState>>;
+  try {
+    state = await loadPreparationSourceState(
+      options.privateRootDirectory,
+      options.outputDirectory,
+      source.sourceId,
+      targetExecutionIdentitySha256,
+      savedRun.operationTagSha256,
+    );
+  } catch (error) {
+    if (error instanceof HistoryMigrationError && error.code === "PREPARE_RESUME_UNSAFE") {
+      throw new HistoryMigrationError(
+        "RECOVERY_REJECTED",
+        "recover-active 的现有请求或终态登记不一致。",
+      );
+    }
+    throw error;
+  }
   if (state === "pending") {
     throw new HistoryMigrationError(
       "RECOVERY_PENDING",
       "recover-active 只接受仍有 active 请求登记的源。",
     );
   }
-  let active: z.infer<typeof preparationActiveSchema> | null =
-    state.kind === "active" ? state.record : null;
-  if (state.kind === "failed") {
-    active = await loadRecoverableFailedActiveState(
-      options.privateRootDirectory,
-      options.outputDirectory,
-      source.sourceId,
+  if (state.kind === "completed") {
+    throw new HistoryMigrationError(
+      "RECOVERY_REJECTED",
+      "recover-active 拒绝已完成、歧义或不具备完整 active 前缀的源。",
     );
   }
-  if (active === null || state.kind === "completed") {
+  const failedPrefixActive = await loadRecoverableFailedActiveState(
+    options.privateRootDirectory,
+    options.outputDirectory,
+    source.sourceId,
+  );
+  const active =
+    failedPrefixActive ?? (state.kind === "active" ? state.record : null);
+  if (active === null) {
     throw new HistoryMigrationError(
       "RECOVERY_REJECTED",
       "recover-active 拒绝已完成、歧义或不具备完整 active 前缀的源。",
     );
   }
   const requestDirectory = join(options.outputDirectory, "requests");
-  const attemptPrefix = `${source.sourceId}.attempt-`;
-  const requestFiles = await readdir(requestDirectory);
-  if (
-    requestFiles.some(
-      (name) => name.startsWith(attemptPrefix) && name.endsWith(".active.json"),
-    )
-  ) {
-    throw new HistoryMigrationError(
-      "RECOVERY_REJECTED",
-      "recover-active 拒绝已有追加请求登记但没有终态回执的源。",
-    );
-  }
-
   const activeSha256 = sha256Hex(JSON.stringify(active));
-  const targetExecutionIdentitySha256 = sha256Hex(
-    JSON.stringify(savedRun.executionIdentity),
-  );
   const expectedOperationSha256 = sha256Hex(
     JSON.stringify({
       operationTagSha256: savedRun.operationTagSha256,
@@ -876,23 +882,43 @@ export async function recoverActiveHistoryCandidate(
     );
   }
   const activeTarget = { ...active, executorIdentity: undefined };
-
+  const attemptHistory = await loadAppendedPreparationAttemptHistory(
+    options.privateRootDirectory,
+    options.outputDirectory,
+    source.sourceId,
+    active,
+    targetExecutionIdentitySha256,
+    savedRun.operationTagSha256,
+  );
+  const operationAttempt = attemptHistory.requestAttemptSha256s.length + 1;
+  if (operationAttempt > 10) {
+    throw new HistoryMigrationError(
+      "RECOVERY_REJECTED",
+      "recover-active 的请求登记已达到有界尝试上限。",
+    );
+  }
   const retryActive = preparationActiveSchema.parse({
     ...activeTarget,
     operationSha256: sha256Hex(
       JSON.stringify({
         operationTagSha256: savedRun.operationTagSha256,
         sourceId: source.sourceId,
-        attempt: 2,
+        attempt: operationAttempt,
       }),
     ),
     recoveryExecutorIdentity,
   });
   await writeNewPrivateJson(
-    join(requestDirectory, `${source.sourceId}.attempt-02.active.json`),
+    join(
+      requestDirectory,
+      `${source.sourceId}.attempt-${String(operationAttempt).padStart(2, "0")}.active.json`,
+    ),
     retryActive,
   );
-  const requestAttemptSha256s = [activeSha256, sha256Hex(JSON.stringify(retryActive))];
+  const requestAttemptSha256s = [
+    ...attemptHistory.requestAttemptSha256s,
+    sha256Hex(JSON.stringify(retryActive)),
+  ];
   const candidates: Array<{ readonly candidateId: string; readonly contentSha256: string }> = [];
 
   try {
@@ -902,14 +928,20 @@ export async function recoverActiveHistoryCandidate(
         text: sourceContent.text,
         beforeRequest: async (attempt) => {
           if (attempt < 2) return;
-          const operationAttempt = attempt + 1;
+          const retryOperationAttempt = requestAttemptSha256s.length + 1;
+          if (retryOperationAttempt > 10) {
+            throw new HistoryMigrationError(
+              "RECOVERY_REJECTED",
+              "recover-active 的请求登记已达到有界尝试上限。",
+            );
+          }
           const retry = preparationActiveSchema.parse({
             ...activeTarget,
             operationSha256: sha256Hex(
               JSON.stringify({
                 operationTagSha256: savedRun.operationTagSha256,
                 sourceId: source.sourceId,
-                attempt: operationAttempt,
+                attempt: retryOperationAttempt,
               }),
             ),
             recoveryExecutorIdentity,
@@ -917,7 +949,7 @@ export async function recoverActiveHistoryCandidate(
           await writeNewPrivateJson(
             join(
               requestDirectory,
-              `${source.sourceId}.attempt-${String(operationAttempt).padStart(2, "0")}.active.json`,
+              `${source.sourceId}.attempt-${String(retryOperationAttempt).padStart(2, "0")}.active.json`,
             ),
             retry,
           );
@@ -994,6 +1026,7 @@ export async function recoverActiveHistoryCandidate(
       requestAttemptSha256s,
       failureKind,
       { recoveryExecutorIdentity },
+      failedPrefixActive === null ? undefined : requestAttemptSha256s.length,
     );
     return {
       sourceId: source.sourceId,
@@ -1038,6 +1071,7 @@ async function loadPreparationSourceState(
   outputDirectory: string,
   sourceId: string,
   targetExecutionIdentitySha256?: string,
+  operationTagSha256?: string,
 ): Promise<PreparationSourceState> {
   const active = await readOptionalPreparationRecord(
     privateRootDirectory,
@@ -1084,6 +1118,26 @@ async function loadPreparationSourceState(
       completed.requestAttemptSha256s,
       targetExecutionIdentitySha256,
     );
+    const appendedHistory = await loadAppendedPreparationAttemptHistory(
+      privateRootDirectory,
+      outputDirectory,
+      sourceId,
+      active,
+      targetExecutionIdentitySha256,
+      operationTagSha256,
+    );
+    if (
+      completed.requestAttemptSha256s.length !==
+        appendedHistory.requestAttemptSha256s.length ||
+      completed.requestAttemptSha256s.some(
+        (digest, index) => digest !== appendedHistory.requestAttemptSha256s[index],
+      )
+    ) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "prepare 完成检查点没有绑定全部编号请求登记。",
+      );
+    }
     if (failed !== null) {
       const failedAttempts = await assertPreparationAttemptChain(
         privateRootDirectory,
@@ -1116,10 +1170,46 @@ async function loadPreparationSourceState(
       targetExecutionIdentitySha256,
     );
     assertPreparationTerminalExecutorEvidence(failed, attempts);
+    if (active !== null && preparationFailureMatchesActivePrefix(failed, active)) {
+      const appendedHistory = await loadAppendedPreparationAttemptHistory(
+        privateRootDirectory,
+        outputDirectory,
+        sourceId,
+        active,
+        targetExecutionIdentitySha256,
+        operationTagSha256,
+      );
+      if (appendedHistory.records.length > 0) {
+        const latestAttempt = appendedHistory.records.length + 1;
+        const latestFailure = appendedHistory.terminalFailures.find(
+          ({ attempt }) => attempt === latestAttempt,
+        );
+        return latestFailure === undefined
+          ? { kind: "active", record: active }
+          : { kind: "failed", record: latestFailure.record };
+      }
+    }
     return { kind: "failed", record: failed };
   }
   if (active !== null) {
     assertPreparationActiveRecord(active, targetExecutionIdentitySha256);
+    const appendedHistory = await loadAppendedPreparationAttemptHistory(
+      privateRootDirectory,
+      outputDirectory,
+      sourceId,
+      active,
+      targetExecutionIdentitySha256,
+      operationTagSha256,
+    );
+    if (appendedHistory.records.length > 0) {
+      const latestAttempt = appendedHistory.records.length + 1;
+      const latestFailure = appendedHistory.terminalFailures.find(
+        ({ attempt }) => attempt === latestAttempt,
+      );
+      if (latestFailure !== undefined) {
+        return { kind: "failed", record: latestFailure.record };
+      }
+    }
   }
   return active === null ? "pending" : { kind: "active", record: active };
 }
@@ -1154,6 +1244,122 @@ async function loadRecoverableFailedActiveState(
   );
   assertPreparationTerminalExecutorEvidence(failed, attempts);
   return active;
+}
+interface AppendedPreparationAttemptHistory {
+  readonly records: readonly PreparationActiveRecord[];
+  readonly requestAttemptSha256s: readonly string[];
+  readonly terminalFailures: readonly {
+    readonly attempt: number;
+    readonly record: z.infer<typeof preparationFailureSchema>;
+  }[];
+}
+
+async function loadAppendedPreparationAttemptHistory(
+  privateRootDirectory: string,
+  outputDirectory: string,
+  sourceId: string,
+  active: PreparationActiveRecord,
+  targetExecutionIdentitySha256?: string,
+  operationTagSha256?: string,
+): Promise<AppendedPreparationAttemptHistory> {
+  const requestDirectory = join(outputDirectory, "requests");
+  const prefix = `${sourceId}.attempt-`;
+  const names = (await readdir(requestDirectory)).filter((name) => name.startsWith(prefix));
+  const parsedNames = names.map((name) => {
+    const match = name.match(
+      new RegExp(`^${sourceId}\\.attempt-([0-9]{2})\\.(active|failed)\\.json$`, "u"),
+    );
+    if (match === null) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "prepare 的编号请求或终态回执名称不明确，不能继续。",
+      );
+    }
+    return {
+      name,
+      attempt: Number(match[1]),
+      state: match[2] as "active" | "failed",
+    };
+  });
+  const activeNames = parsedNames
+    .filter(({ state }) => state === "active")
+    .sort((left, right) => left.attempt - right.attempt);
+  if (
+    activeNames.length > 9 ||
+    activeNames.some(({ attempt }, index) => attempt !== index + 2)
+  ) {
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "prepare 的编号请求登记不连续或超过有界上限。",
+    );
+  }
+  const records: PreparationActiveRecord[] = [];
+  for (const { attempt, name } of activeNames) {
+    const record = await readOptionalPreparationRecord(
+      privateRootDirectory,
+      join(requestDirectory, name),
+      preparationActiveSchema,
+    );
+    if (record === null || record.sourceId !== sourceId) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "prepare 的编号请求登记与安全编号不一致。",
+      );
+    }
+    assertPreparationActiveRecord(record, targetExecutionIdentitySha256);
+    if (
+      operationTagSha256 !== undefined &&
+      record.operationSha256 !==
+        sha256Hex(JSON.stringify({ operationTagSha256, sourceId, attempt }))
+    ) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "prepare 的编号请求登记没有绑定存储的操作身份。",
+      );
+    }
+    records.push(record);
+  }
+  const requestAttemptSha256s = [
+    sha256Hex(JSON.stringify(active)),
+    ...records.map((record) => sha256Hex(JSON.stringify(record))),
+  ];
+  const failedNames = parsedNames
+    .filter(({ state }) => state === "failed")
+    .sort((left, right) => left.attempt - right.attempt);
+  const terminalFailures: Array<{
+    readonly attempt: number;
+    readonly record: z.infer<typeof preparationFailureSchema>;
+  }> = [];
+  for (const { attempt, name } of failedNames) {
+    const failed = await readOptionalPreparationRecord(
+      privateRootDirectory,
+      join(requestDirectory, name),
+      preparationFailureSchema,
+    );
+    const expectedAttemptSha256s = requestAttemptSha256s.slice(0, attempt);
+    if (
+      failed === null ||
+      failed.sourceId !== sourceId ||
+      attempt < 2 ||
+      attempt > records.length + 1 ||
+      failed.activeSha256 !== requestAttemptSha256s[0] ||
+      failed.requestAttemptSha256s.length !== expectedAttemptSha256s.length ||
+      failed.requestAttemptSha256s.some(
+        (digest, index) => digest !== expectedAttemptSha256s[index],
+      )
+    ) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "prepare 的编号失败回执没有绑定完整请求前缀。",
+      );
+    }
+    assertPreparationTerminalExecutorEvidence(failed, [
+      active,
+      ...records.slice(0, attempt - 1),
+    ]);
+    terminalFailures.push({ attempt, record: failed });
+  }
+  return { records, requestAttemptSha256s, terminalFailures };
 }
 
 async function readOptionalPreparationRecord<T>(
@@ -1297,14 +1503,34 @@ async function writePreparationFailure(
   requestAttemptSha256s: readonly string[],
   failureKind: HistoryNormalizationFailureKind,
   executorEvidence: PreparationExecutorEvidence = {},
+  attemptNumber?: number,
 ): Promise<void> {
+  const requestDirectory = join(outputDirectory, "requests");
   await assertPathsInsidePrivateRoot(privateRootDirectory, [
-    { path: join(outputDirectory, "requests"), kind: "existing" },
+    { path: requestDirectory, kind: "existing" },
   ]);
+  if (
+    attemptNumber !== undefined &&
+    (attemptNumber < 2 ||
+      attemptNumber > 10 ||
+      attemptNumber !== requestAttemptSha256s.length)
+  ) {
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "prepare 的编号失败回执没有绑定最后一次请求。",
+    );
+  }
   const parsedExecutorEvidence = preparationExecutorEvidenceSchema.parse(executorEvidence);
   preparationExecutorIdentity(parsedExecutorEvidence);
+  const path =
+    attemptNumber === undefined
+      ? preparationStatePath(outputDirectory, sourceId, "failed")
+      : join(
+          requestDirectory,
+          `${sourceId}.attempt-${String(attemptNumber).padStart(2, "0")}.failed.json`,
+        );
   await writeNewPrivateJson(
-    preparationStatePath(outputDirectory, sourceId, "failed"),
+    path,
     preparationFailureSchema.parse({
       version: 1,
       status: "failed",
@@ -1316,7 +1542,6 @@ async function writePreparationFailure(
     }),
   );
 }
-
 function classifyPreparationFailure(error: unknown): HistoryNormalizationFailureKind {
   if (error instanceof HistoryNormalizationError) return error.failureKind;
   if (error instanceof z.ZodError) return "schema";
@@ -1364,6 +1589,7 @@ async function summarizePreparation(
   outputDirectory: string,
   confirmedSources: readonly ConfirmedSource[],
   targetExecutionIdentitySha256?: string,
+  operationTagSha256?: string,
 ): Promise<{
   readonly complete: boolean;
   readonly completedSourceCount: number;
@@ -1406,6 +1632,7 @@ async function summarizePreparation(
       outputDirectory,
       source.sourceId,
       targetExecutionIdentitySha256,
+      operationTagSha256,
     );
     if (state === "pending") {
       pendingSourceCount += 1;
@@ -2714,6 +2941,7 @@ async function loadPreparationMarker(
       preparedDirectory,
       confirmedSources,
       sha256Hex(JSON.stringify(run.data.executionIdentity)),
+      run.data.operationTagSha256,
     );
   } catch (error) {
     if (error instanceof HistoryMigrationError && error.code === "PREPARE_RESUME_UNSAFE") {
