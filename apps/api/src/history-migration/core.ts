@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, rm } from "node:fs/promises";
+import { lstat, mkdir, readdir, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { CanonicalProblem } from "@urmotiv/problem-package";
 import {
@@ -46,6 +46,7 @@ import {
   historyMetadataFileSchema,
   historyRepairManifestSchema,
   historySourceMappingSchema,
+  historySourceIdSchema,
   normalizedHistoryOutputSchema,
   type HistoryCandidateRecord,
   type HistoryMetadataRecord,
@@ -260,6 +261,26 @@ export interface PrepareHistoryCandidatesResult {
   readonly uncertainSourceCount: number;
   readonly pendingSourceCount: number;
   readonly complete: boolean;
+}
+
+export interface RecoverActiveHistoryCandidateOptions {
+  readonly privateRootDirectory: string;
+  readonly sourceDirectory: string;
+  readonly metadataFile: string;
+  readonly sourceConfirmationFile: string;
+  readonly outputDirectory: string;
+  readonly sourceId: string;
+  readonly operationTag: string;
+  readonly executionIdentity: HistoryPreparationExecutionIdentity;
+  readonly normalizer: HistoryNormalizer;
+}
+
+export interface RecoverActiveHistoryCandidateResult {
+  readonly sourceId: string;
+  readonly status: "completed" | "failed";
+  readonly candidateCount: number;
+  readonly requestAttemptCount: number;
+  readonly failureKind?: HistoryNormalizationFailureKind;
 }
 
 export interface PackageApprovedCandidatesResult {
@@ -623,6 +644,294 @@ export async function prepareHistoryCandidates(
     pendingSourceCount: summary.pendingSourceCount,
     complete: summary.complete,
   };
+}
+
+export async function recoverActiveHistoryCandidate(
+  options: RecoverActiveHistoryCandidateOptions,
+): Promise<RecoverActiveHistoryCandidateResult> {
+  const parsedSourceId = historySourceIdSchema.safeParse(options.sourceId);
+  if (!parsedSourceId.success) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "recover-active 的源编号格式不正确。");
+  }
+  const operationTag = options.operationTag.trim();
+  if (operationTag.length === 0 || operationTag.length > 200) {
+    throw new HistoryMigrationError(
+      "INVALID_ARGUMENTS",
+      "recover-active 必须使用原 prepare 操作标签。",
+    );
+  }
+  const parsedExecutionIdentity = historyPreparationExecutionIdentitySchema.safeParse(
+    options.executionIdentity,
+  );
+  if (!parsedExecutionIdentity.success) {
+    throw new HistoryMigrationError(
+      "INVALID_ARGUMENTS",
+      "recover-active 的执行身份不完整。",
+    );
+  }
+  const executionIdentity = parsedExecutionIdentity.data;
+  await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+    { path: options.sourceDirectory, kind: "existing" },
+    { path: options.metadataFile, kind: "existing" },
+    { path: options.sourceConfirmationFile, kind: "existing" },
+    { path: options.outputDirectory, kind: "existing" },
+  ]);
+
+  const { confirmedSources } = await loadConfirmedInputs(
+    options.metadataFile,
+    await readPrivateJson(options.sourceConfirmationFile),
+  );
+  const sourceIndex = confirmedSources.findIndex(
+    (source) => source.sourceId === parsedSourceId.data,
+  );
+  if (sourceIndex < 0) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "recover-active 的源编号不存在。");
+  }
+  const source = confirmedSources[sourceIndex];
+  if (source === undefined) {
+    throw new HistoryMigrationError("INVALID_ARGUMENTS", "recover-active 的源编号不存在。");
+  }
+  const operationTagSha256 = sha256Hex(operationTag);
+  const inputBatchSha256 = sha256Hex(
+    JSON.stringify(
+      confirmedSources.map((confirmedSource) => ({
+        sourceId: confirmedSource.sourceId,
+        sourceContentSha256: confirmedSource.mapping.sourceSha256,
+        sourceMappingSha256: confirmedSource.sourceMappingSha256,
+      })),
+    ),
+  );
+  const run = preparationRunSchema.parse({
+    version: 2,
+    phase: "prepare",
+    operationTagSha256,
+    inputBatchSha256,
+    sourceCount: confirmedSources.length,
+    executionIdentity,
+  });
+  const runSha256 = sha256Hex(JSON.stringify(run));
+
+  let savedRun: z.infer<typeof preparationRunSchema>;
+  try {
+    await assertPrivateDirectoryMode(options.outputDirectory);
+    await assertPrivateFileMode(join(options.outputDirectory, "run.json"));
+    savedRun = preparationRunSchema.parse(
+      await readPrivateJson(join(options.outputDirectory, "run.json")),
+    );
+  } catch {
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "recover-active 找不到可验证的 prepare 运行检查点。",
+    );
+  }
+  if (sha256Hex(JSON.stringify(savedRun)) !== runSha256) {
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "recover-active 的运行、输入或执行身份已经变化。",
+    );
+  }
+
+  const state = await loadPreparationSourceState(
+    options.privateRootDirectory,
+    options.outputDirectory,
+    source.sourceId,
+  );
+  if (state === "pending") {
+    throw new HistoryMigrationError(
+      "RECOVERY_PENDING",
+      "recover-active 只接受仍有 active 请求登记的源。",
+    );
+  }
+  if (state.kind !== "active") {
+    throw new HistoryMigrationError(
+      "RECOVERY_REJECTED",
+      "recover-active 拒绝已完成或已有失败回执的源。",
+    );
+  }
+  const requestDirectory = join(options.outputDirectory, "requests");
+  const attemptPrefix = `${source.sourceId}.attempt-`;
+  const requestFiles = await readdir(requestDirectory);
+  if (
+    requestFiles.some(
+      (name) => name.startsWith(attemptPrefix) && name.endsWith(".active.json"),
+    )
+  ) {
+    throw new HistoryMigrationError(
+      "RECOVERY_REJECTED",
+      "recover-active 拒绝已有追加请求登记但没有终态回执的源。",
+    );
+  }
+
+  const active = state.record;
+  const activeSha256 = sha256Hex(JSON.stringify(active));
+  const executionIdentitySha256 = sha256Hex(JSON.stringify(executionIdentity));
+  const expectedOperationSha256 = sha256Hex(
+    JSON.stringify({
+      operationTagSha256: savedRun.operationTagSha256,
+      sourceId: source.sourceId,
+      attempt: 1,
+    }),
+  );
+  if (
+    active.executionIdentitySha256 !== executionIdentitySha256 ||
+    active.operationSha256 !== expectedOperationSha256
+  ) {
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "recover-active 的 active 执行或操作身份不一致。",
+    );
+  }
+
+  let sourceContent: { readonly text: string; readonly sha256: string };
+  try {
+    sourceContent = await readConfirmedSource(
+      options.sourceDirectory,
+      source.mapping.sourcePath,
+      source.mapping.sourceSha256,
+      source.sourceId,
+    );
+  } catch {
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "recover-active 的源内容摘要或映射已经变化。",
+    );
+  }
+  const expectedSourceIdentitySha256 = sha256Hex(
+    JSON.stringify({
+      sourceId: source.sourceId,
+      sourceContentSha256: sourceContent.sha256,
+      sourceMappingSha256: source.sourceMappingSha256,
+    }),
+  );
+  if (active.sourceIdentitySha256 !== expectedSourceIdentitySha256) {
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "recover-active 的 active 源身份摘要不一致。",
+    );
+  }
+
+  const retryActive = preparationActiveSchema.parse({
+    ...active,
+    operationSha256: sha256Hex(
+      JSON.stringify({
+        operationTagSha256: savedRun.operationTagSha256,
+        sourceId: source.sourceId,
+        attempt: 2,
+      }),
+    ),
+  });
+  await writeNewPrivateJson(
+    join(requestDirectory, `${source.sourceId}.attempt-02.active.json`),
+    retryActive,
+  );
+  const requestAttemptSha256s = [activeSha256, sha256Hex(JSON.stringify(retryActive))];
+  const candidates: Array<{ readonly candidateId: string; readonly contentSha256: string }> = [];
+
+  try {
+    const normalized = normalizedHistoryOutputSchema.parse(
+      await options.normalizer.normalize({
+        sourceId: source.sourceId,
+        text: sourceContent.text,
+        beforeRequest: async (attempt) => {
+          if (attempt < 2) return;
+          const operationAttempt = attempt + 1;
+          const retry = preparationActiveSchema.parse({
+            ...active,
+            operationSha256: sha256Hex(
+              JSON.stringify({
+                operationTagSha256: savedRun.operationTagSha256,
+                sourceId: source.sourceId,
+                attempt: operationAttempt,
+              }),
+            ),
+          });
+          await writeNewPrivateJson(
+            join(
+              requestDirectory,
+              `${source.sourceId}.attempt-${String(operationAttempt).padStart(2, "0")}.active.json`,
+            ),
+            retry,
+          );
+          requestAttemptSha256s.push(sha256Hex(JSON.stringify(retry)));
+        },
+      }),
+    );
+    for (const [problemIndex, normalizedProblem] of normalized.problems.entries()) {
+      const candidateId = makeSafeId("candidate", sourceIndex * 30 + problemIndex + 1);
+      const problem = toCandidateProblem(normalizedProblem);
+      assertPrivateIdentifiersNotPresent(
+        { problem, normalizationNote: normalizedProblem.migrationNote },
+        source.metadata.authorStudentId,
+        source.mapping.sourcePath,
+      );
+      const sourceBindingSha256 = sourceBindingDigest({
+        sourceId: source.sourceId,
+        sourceContentSha256: sourceContent.sha256,
+        sourcePath: source.mapping.sourcePath,
+        sourceSha256: source.mapping.sourceSha256,
+        metadataNumber: source.mapping.metadataNumber,
+      });
+      const contentSha256 = candidateContentDigest({
+        sourceId: source.sourceId,
+        sourceContentSha256: sourceContent.sha256,
+        sourceMappingSha256: source.sourceMappingSha256,
+        modelConfidence: normalizedProblem.confidence,
+        normalizationNote: normalizedProblem.migrationNote,
+        problem,
+      });
+      const candidate = historyCandidateRecordSchema.parse({
+        version: 1,
+        candidateId,
+        sourceId: source.sourceId,
+        sourceContentSha256: sourceContent.sha256,
+        sourceMappingSha256: source.sourceMappingSha256,
+        sourceBindingSha256,
+        contentSha256,
+        modelConfidence: normalizedProblem.confidence,
+        normalizationNote: normalizedProblem.migrationNote,
+        problem,
+      });
+      await writeNewPrivateJson(
+        join(options.outputDirectory, "candidates", `${candidateId}.json`),
+        candidate,
+      );
+      candidates.push({ candidateId, contentSha256 });
+    }
+    await writeNewPrivateJson(
+      preparationStatePath(options.outputDirectory, source.sourceId, "completed"),
+      preparationCompletedSchema.parse({
+        version: 1,
+        status: "completed",
+        sourceId: source.sourceId,
+        activeSha256,
+        requestAttemptSha256s,
+        candidates,
+      }),
+    );
+    return {
+      sourceId: source.sourceId,
+      status: "completed",
+      candidateCount: candidates.length,
+      requestAttemptCount: requestAttemptSha256s.length,
+    };
+  } catch (error) {
+    const failureKind = classifyPreparationFailure(error);
+    await writePreparationFailure(
+      options.privateRootDirectory,
+      options.outputDirectory,
+      source.sourceId,
+      activeSha256,
+      requestAttemptSha256s,
+      failureKind,
+    );
+    return {
+      sourceId: source.sourceId,
+      status: "failed",
+      candidateCount: candidates.length,
+      requestAttemptCount: requestAttemptSha256s.length,
+      failureKind,
+    };
+  }
 }
 
 type PreparationSourceState =

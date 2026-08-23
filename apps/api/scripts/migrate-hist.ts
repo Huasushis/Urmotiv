@@ -4,7 +4,8 @@
  * 具体校验、候选生成和题目包生成都在 src/history-migration 中。本文件只读取参数，
  * 这样安全规则可以用合成数据做单元测试。所有输入和输出都必须位于服务器非 Git 私有目录。
  */
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   assertHistoryAttachmentMappingComplete,
   assertHistoryMaterializationComplete,
@@ -17,6 +18,7 @@ import {
   materializeHistoryGrouping,
   packageApprovedCandidates,
   prepareHistoryCandidates,
+  recoverActiveHistoryCandidate,
   repairFailedHistoryCandidates,
   sealHistoryGrouping,
   sealHistoryAttachmentMapping,
@@ -112,6 +114,15 @@ type Command =
       readonly outputDirectory: string;
       readonly operationTag: string;
       readonly resume: boolean;
+    }
+  | {
+      readonly phase: "recover-active";
+      readonly privateRootDirectory: string;
+      readonly materializedDirectory: string;
+      readonly metadataFile: string;
+      readonly outputDirectory: string;
+      readonly operationTag: string;
+      readonly sourceId: string;
     }
   | {
       readonly phase: "repair-local";
@@ -236,6 +247,48 @@ async function main(): Promise<void> {
     );
     return;
   }
+  if (command.phase === "recover-active") {
+    await assertHistoryMaterializationComplete({
+      privateRootDirectory: command.privateRootDirectory,
+      materializedDirectory: command.materializedDirectory,
+    });
+    const baseUrl = process.env.AETHER_BASE_URL;
+    const apiKey = process.env.AETHER_API_KEY;
+    if (baseUrl === undefined || apiKey === undefined) {
+      throw new HistoryMigrationError("INVALID_ARGUMENTS", "恢复 active 请求需要私有模型地址与密钥。");
+    }
+    const codeSha256 = await loadHistoryPreparationCodeSha256();
+    const normalizer = createLlmHistoryNormalizer({
+      baseUrl,
+      apiKey,
+      model: process.env.MIGRATE_MODEL ?? "deepseek-v4-flash",
+      codeSha256,
+    });
+    const result = await recoverActiveHistoryCandidate({
+      privateRootDirectory: command.privateRootDirectory,
+      sourceDirectory: join(command.materializedDirectory, "sources"),
+      metadataFile: command.metadataFile,
+      sourceConfirmationFile: join(
+        command.materializedDirectory,
+        "source-confirmation.private.json",
+      ),
+      outputDirectory: command.outputDirectory,
+      sourceId: command.sourceId,
+      operationTag: command.operationTag,
+      executionIdentity: normalizer.preparationIdentity,
+      normalizer,
+    });
+    if (result.status === "failed") {
+      throw new HistoryMigrationError(
+        "PREPARE_INCOMPLETE",
+        "recover-active 已保留失败回执；请按回执类别处理，不能自动覆盖。",
+      );
+    }
+    process.stdout.write(
+      `recover-active 已完成一个活动请求并保留 ${result.requestAttemptCount} 次登记。\n`,
+    );
+    return;
+  }
   if (command.phase === "repair-local") {
     await assertHistoryMaterializationComplete({
       privateRootDirectory: command.privateRootDirectory,
@@ -294,7 +347,7 @@ async function main(): Promise<void> {
   }
 }
 
-function parseCommand(argv: readonly string[]): Command {
+export function parseCommand(argv: readonly string[]): Command {
   const phase = argv[0];
   if (phase === "inventory") {
     return {
@@ -405,6 +458,17 @@ function parseCommand(argv: readonly string[]): Command {
       resume: argv.includes("--resume"),
     };
   }
+  if (phase === "recover-active") {
+    return {
+      phase,
+      privateRootDirectory: requiredOption(argv, "--private-root"),
+      materializedDirectory: requiredOption(argv, "--materialized"),
+      metadataFile: requiredOption(argv, "--metadata"),
+      outputDirectory: requiredOption(argv, "--out"),
+      operationTag: requiredOption(argv, "--run-tag"),
+      sourceId: requiredOption(argv, "--source-id"),
+    };
+  }
   if (phase === "repair-local") {
     return {
       phase,
@@ -457,10 +521,15 @@ function requiredFlag(argv: readonly string[], name: string): void {
   }
 }
 
-main().catch((error: unknown) => {
-  const code = error instanceof HistoryMigrationError ? error.code : "UNEXPECTED_FAILURE";
-  process.stderr.write(
-    `历史迁移失败（${code}）。为避免泄露私有题目，命令行不显示文件名或正文；请在私有目录核对输入和确认文件。\n`,
-  );
-  process.exitCode = 1;
-});
+if (
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+) {
+  main().catch((error: unknown) => {
+    const code = error instanceof HistoryMigrationError ? error.code : "UNEXPECTED_FAILURE";
+    process.stderr.write(
+      `历史迁移失败（${code}）。为避免泄露私有题目，命令行不显示文件名或正文；请在私有目录核对输入和确认文件。\n`,
+    );
+    process.exitCode = 1;
+  });
+}

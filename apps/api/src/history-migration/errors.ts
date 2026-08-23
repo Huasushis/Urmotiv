@@ -31,6 +31,7 @@ export type HistoryMigrationErrorCode =
   | "SOURCE_INTENT_MISMATCH"
   | "LEASE_LOST"
   | "RECOVERY_PENDING"
+  | "RECOVERY_REJECTED"
   | "CLEANUP_FAILED"
   | "NOT_AUTHORIZED"
   | "INTERNAL_ERROR";

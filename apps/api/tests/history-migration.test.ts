@@ -26,6 +26,7 @@ import {
   HistoryNormalizationError,
   packageApprovedCandidates,
   prepareHistoryCandidates,
+  recoverActiveHistoryCandidate,
   sealHistoryAttachmentMapping,
   sealHistoryGrouping,
   sha256Hex,
@@ -415,6 +416,148 @@ describe("历史题目迁移安全核心", () => {
       completedSourceCount: 2,
       pendingSourceCount: 0,
     });
+  });
+
+  it("恢复 active-only 检查点追加第二次请求并兼容续跑", async () => {
+    const fixture = await createActiveOnlyFixture("恢复成功的合成正文。");
+    const activePath = join(fixture.prepareOutput, "requests", "source-000001.active.json");
+    const originalActive = await readFile(activePath, "utf8");
+
+    const result = await recoverActiveHistoryCandidate({
+      ...fixture.prepareOptions,
+      sourceId: "source-000001",
+      normalizer: fixedNormalizer(),
+    });
+
+    expect(result).toMatchObject({
+      status: "completed",
+      requestAttemptCount: 2,
+      candidateCount: 1,
+    });
+    expect(await readFile(activePath, "utf8")).toBe(originalActive);
+    const attempt = JSON.parse(
+      await readFile(
+        join(fixture.prepareOutput, "requests", "source-000001.attempt-02.active.json"),
+        "utf8",
+      ),
+    ) as { readonly sourceId: string; readonly status: string };
+    const completed = JSON.parse(
+      await readFile(join(fixture.prepareOutput, "requests", "source-000001.completed.json"), "utf8"),
+    ) as {
+      readonly activeSha256: string;
+      readonly requestAttemptSha256s: readonly string[];
+    };
+    expect(attempt).toMatchObject({ sourceId: "source-000001", status: "active" });
+    expect(completed.requestAttemptSha256s).toHaveLength(2);
+    expect(completed.activeSha256).toBe(
+      sha256Hex(JSON.stringify(JSON.parse(originalActive))),
+    );
+
+    let resumedCalls = 0;
+    const resumed = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      resume: true,
+      normalizer: {
+        async normalize() {
+          resumedCalls += 1;
+          return normalizedOutput();
+        },
+      },
+    });
+    expect(resumedCalls).toBe(0);
+    expect(resumed).toMatchObject({ complete: true, completedSourceCount: 1 });
+  });
+
+  it("恢复 active-only 的整理失败写入绑定失败回执并拒绝重复恢复", async () => {
+    const fixture = await createActiveOnlyFixture("恢复失败的合成正文。");
+    const result = await recoverActiveHistoryCandidate({
+      ...fixture.prepareOptions,
+      sourceId: "source-000001",
+      normalizer: {
+        async normalize() {
+          throw new HistoryNormalizationError("schema", "合成 schema 失败。");
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      failureKind: "schema",
+      requestAttemptCount: 2,
+    });
+    const failed = JSON.parse(
+      await readFile(join(fixture.prepareOutput, "requests", "source-000001.failed.json"), "utf8"),
+    ) as {
+      readonly activeSha256: string;
+      readonly requestAttemptSha256s: readonly string[];
+    };
+    expect(failed.activeSha256).toBe(
+      sha256Hex(
+        JSON.stringify(
+          JSON.parse(
+            await readFile(
+              join(fixture.prepareOutput, "requests", "source-000001.active.json"),
+              "utf8",
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(failed.requestAttemptSha256s).toHaveLength(2);
+    await expect(
+      recoverActiveHistoryCandidate({
+        ...fixture.prepareOptions,
+        sourceId: "source-000001",
+        normalizer: fixedNormalizer(),
+      }),
+    ).rejects.toMatchObject({ code: "RECOVERY_REJECTED" });
+
+    const resumed = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      resume: true,
+      normalizer: fixedNormalizer(),
+    });
+    expect(resumed).toMatchObject({
+      complete: false,
+      completedSourceCount: 0,
+      failedSourceCount: 1,
+      pendingSourceCount: 0,
+    });
+  });
+
+  it("拒绝已完成和 active 摘要不一致的恢复请求", async () => {
+    const completedFixture = await createFixture("已完成恢复拒绝正文。");
+    await prepareHistoryCandidates({
+      ...completedFixture.prepareOptions,
+      normalizer: fixedNormalizer(),
+    });
+    await expect(
+      recoverActiveHistoryCandidate({
+        ...completedFixture.prepareOptions,
+        sourceId: "source-000001",
+        normalizer: fixedNormalizer(),
+      }),
+    ).rejects.toMatchObject({ code: "RECOVERY_REJECTED" });
+
+    const mismatchFixture = await createActiveOnlyFixture("摘要不一致恢复拒绝正文。");
+    const activePath = join(
+      mismatchFixture.prepareOutput,
+      "requests",
+      "source-000001.active.json",
+    );
+    const active = JSON.parse(await readFile(activePath, "utf8")) as Record<string, unknown>;
+    await writeFile(
+      activePath,
+      `${JSON.stringify({ ...active, sourceIdentitySha256: "f".repeat(64) })}\n`,
+      "utf8",
+    );
+    await expect(
+      recoverActiveHistoryCandidate({
+        ...mismatchFixture.prepareOptions,
+        sourceId: "source-000001",
+        normalizer: fixedNormalizer(),
+      }),
+    ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
   });
 
   it("旧版无检查点输出与身份变化都不能假装续跑", async () => {
@@ -1261,6 +1404,30 @@ async function createFixture(sourceText: string): Promise<{
       exportedAt: "2026-07-30T00:00:00.000Z",
     },
   };
+}
+
+async function createActiveOnlyFixture(sourceText: string) {
+  const fixture = await createFixture(sourceText);
+  const requests = join(fixture.prepareOutput, "requests");
+  const heldRequests = join(fixture.prepareOutput, "requests-held");
+  const outsideDirectory = await mkdtemp(join(tmpdir(), "urmotiv-history-recovery-outside-"));
+  temporaryDirectories.push(outsideDirectory);
+
+  await expect(
+    prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize() {
+          await rename(requests, heldRequests);
+          await symlink(outsideDirectory, requests, "dir");
+          throw new HistoryNormalizationError("connection", "合成连接状态未知。");
+        },
+      },
+    }),
+  ).rejects.toMatchObject({ code: "INVALID_ARGUMENTS" });
+  await rm(requests, { force: true });
+  await rename(heldRequests, requests);
+  return fixture;
 }
 
 async function writeSyntheticMaterialization(options: {
