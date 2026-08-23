@@ -63,3 +63,50 @@ describe("recover-active CLI", () => {
     ).toThrow(/不接受调用方 run 标签/);
   });
 });
+
+describe("finalize-prepare CLI", () => {
+  it("parses only offline evidence inputs", () => {
+    expect(
+      parseCommand([
+        "finalize-prepare",
+        "--private-root",
+        "/private",
+        "--materialized",
+        "/private/materialized",
+        "--metadata",
+        "/private/metadata.private.json",
+        "--prepared",
+        "/private/prepared",
+        "--approval",
+        "/private/approval.private.json",
+      ]),
+    ).toEqual({
+      phase: "finalize-prepare",
+      privateRootDirectory: "/private",
+      materializedDirectory: "/private/materialized",
+      metadataFile: "/private/metadata.private.json",
+      preparedDirectory: "/private/prepared",
+      approvalFile: "/private/approval.private.json",
+    });
+  });
+
+  it("has no run tag or source/provider option", () => {
+    expect(() =>
+      parseCommand([
+        "finalize-prepare",
+        "--private-root",
+        "/private",
+        "--materialized",
+        "/private/materialized",
+        "--metadata",
+        "/private/metadata.private.json",
+        "--prepared",
+        "/private/prepared",
+        "--approval",
+        "/private/approval.private.json",
+        "--run-tag",
+        "untrusted-run",
+      ]),
+    ).toThrow(/不接受/);
+  });
+});

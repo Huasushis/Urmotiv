@@ -57,6 +57,18 @@ import {
 } from "./schema";
 
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/);
+const preparationFinalizationDirectories: Readonly<Record<string, true>> = {
+  candidates: true,
+  requests: true,
+  reports: true,
+};
+const preparationFinalizationFiles: Readonly<Record<string, true>> = {
+  "run.json": true,
+  PREPARE_INCOMPLETE: true,
+  PREPARE_RUN: true,
+  PREPARE_COMPLETE: true,
+  "review.json": true,
+};
 
 const historyPreparationExecutionIdentitySchema = z
   .object({
@@ -248,6 +260,19 @@ export interface PrepareHistoryCandidatesOptions {
   readonly resume?: boolean;
 }
 
+export interface FinalizeCompletedHistoryPreparationOptions {
+  readonly privateRootDirectory: string;
+  readonly materializedDirectory: string;
+  readonly metadataFile: string;
+  readonly preparedDirectory: string;
+  readonly approvalFile: string;
+}
+
+export interface FinalizeCompletedHistoryPreparationResult {
+  readonly sourceCount: number;
+  readonly candidateCount: number;
+  readonly approvedCandidateCount: number;
+}
 
 export interface PackageApprovedCandidatesOptions {
   readonly privateRootDirectory: string;
@@ -706,6 +731,172 @@ export async function prepareHistoryCandidates(
     pendingSourceCount: summary.pendingSourceCount,
     complete: summary.complete,
   };
+}
+
+/**
+ * 只读重算既有完成检查点并发布 prepare 收尾文件。此入口没有 normalizer，
+ * 不创建请求登记，也不删除或移动 PREPARE_INCOMPLETE 与逐请求历史证据。
+ */
+export async function finalizeCompletedHistoryPreparation(
+  options: FinalizeCompletedHistoryPreparationOptions,
+): Promise<FinalizeCompletedHistoryPreparationResult> {
+  await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
+    { path: options.materializedDirectory, kind: "existing" },
+    { path: options.metadataFile, kind: "existing" },
+    { path: options.preparedDirectory, kind: "existing" },
+    { path: options.approvalFile, kind: "existing" },
+  ]);
+  await Promise.all([
+    assertPrivateFileMode(options.metadataFile),
+    assertPrivateFileMode(options.approvalFile),
+  ]);
+  const materialization = await assertHistoryMaterializationComplete({
+    privateRootDirectory: options.privateRootDirectory,
+    materializedDirectory: options.materializedDirectory,
+  });
+  try {
+    const { confirmedSources } = await loadConfirmedInputs(
+      options.metadataFile,
+      await materialization.readSourceConfirmation(),
+    );
+    const preparedInventory = await inspectPreparationFinalizationTree(
+      options.preparedDirectory,
+      new Set(confirmedSources.map((source) => source.sourceId)),
+    );
+    const run = preparationRunSchema.parse(
+      await readPrivateJson(join(options.preparedDirectory, "run.json")),
+    );
+    const inputBatchSha256 = sha256Hex(
+      JSON.stringify(
+        confirmedSources.map((source) => ({
+          sourceId: source.sourceId,
+          sourceContentSha256: source.mapping.sourceSha256,
+          sourceMappingSha256: source.sourceMappingSha256,
+        })),
+      ),
+    );
+    const expectedRun = preparationRunSchema.parse({
+      version: 2,
+      phase: "prepare",
+      operationTagSha256: run.operationTagSha256,
+      inputBatchSha256,
+      sourceCount: confirmedSources.length,
+      executionIdentity: run.executionIdentity,
+    });
+    const runSha256 = sha256Hex(JSON.stringify(run));
+    if (runSha256 !== sha256Hex(JSON.stringify(expectedRun))) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "离线收尾的存储运行、输入或目标执行身份不一致。",
+      );
+    }
+    await assertPreparationRunMarkers(
+      options.privateRootDirectory,
+      options.preparedDirectory,
+      runSha256,
+    );
+    const summary = await summarizePreparation(
+      options.privateRootDirectory,
+      options.preparedDirectory,
+      confirmedSources,
+      sha256Hex(JSON.stringify(run.executionIdentity)),
+      run.operationTagSha256,
+    );
+    if (!summary.complete) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "离线收尾要求全部源已有完整且可核对的完成检查点。",
+      );
+    }
+    const expectedCandidateFiles = new Set(
+      summary.report.map((candidate) => `${candidate.candidateId}.json`),
+    );
+    if (
+      expectedCandidateFiles.size !== summary.report.length ||
+      preparedInventory.candidateFiles.size !== expectedCandidateFiles.size ||
+      [...expectedCandidateFiles].some((name) => !preparedInventory.candidateFiles.has(name))
+    ) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "离线收尾的候选文件集合与完成检查点不一致。",
+      );
+    }
+    const approvedCandidates = await loadApprovedCandidatesForSources(
+      options,
+      materialization,
+      confirmedSources,
+    );
+    const approvedById = new Map(
+      approvedCandidates.map(({ record }) => [record.candidateId, record.contentSha256]),
+    );
+    if (
+      approvedCandidates.length !== summary.report.length ||
+      summary.report.some(
+        (candidate) => approvedById.get(candidate.candidateId) !== candidate.contentSha256,
+      )
+    ) {
+      throw new HistoryMigrationError(
+        "INVALID_CANDIDATE_APPROVAL",
+        "离线收尾要求当前全部完成候选都有逐项匹配的人工批准。",
+      );
+    }
+
+    const batchSha256 = sha256Hex(
+      JSON.stringify({
+        version: 1,
+        candidates: summary.report.map((candidate) => ({
+          candidateId: candidate.candidateId,
+          sourceId: candidate.sourceId,
+          contentSha256: candidate.contentSha256,
+        })),
+      }),
+    );
+    const review = {
+      version: 2,
+      phase: "prepare",
+      batchSha256,
+      runSha256,
+      sourceCount: confirmedSources.length,
+      candidateCount: summary.report.length,
+      candidates: summary.report,
+    };
+    const complete = {
+      version: 2,
+      phase: "prepare",
+      batchSha256,
+      candidateCount: summary.report.length,
+      sourceCount: confirmedSources.length,
+      runSha256,
+    };
+    await assertPreparationJsonAbsentOrEqual(
+      options.privateRootDirectory,
+      join(options.preparedDirectory, "review.json"),
+      review,
+    );
+    await assertPreparationJsonAbsentOrEqual(
+      options.privateRootDirectory,
+      join(options.preparedDirectory, "PREPARE_COMPLETE"),
+      complete,
+    );
+    await materialization.assertUnchangedBeforePublish();
+    await writeOrValidatePreparationJson(
+      options.privateRootDirectory,
+      join(options.preparedDirectory, "review.json"),
+      review,
+    );
+    await writeOrValidatePreparationJson(
+      options.privateRootDirectory,
+      join(options.preparedDirectory, "PREPARE_COMPLETE"),
+      complete,
+    );
+    return {
+      sourceCount: confirmedSources.length,
+      candidateCount: summary.report.length,
+      approvedCandidateCount: approvedCandidates.length,
+    };
+  } finally {
+    await materialization.close();
+  }
 }
 
 export async function recoverActiveHistoryCandidate(
@@ -1584,6 +1775,111 @@ async function assertPreparationRunMarkers(
   }
 }
 
+async function inspectPreparationFinalizationTree(
+  preparedDirectory: string,
+  expectedSourceIds: ReadonlySet<string>,
+): Promise<{ readonly candidateFiles: ReadonlySet<string> }> {
+  await assertPrivateDirectoryMode(preparedDirectory);
+  const topLevelEntries = await readdir(preparedDirectory, { withFileTypes: true });
+  const expectedDirectoryNames = Object.keys(preparationFinalizationDirectories);
+  const foundDirectories = new Set<string>();
+  const foundFiles = new Set<string>();
+  for (const entry of topLevelEntries) {
+    const path = join(preparedDirectory, entry.name);
+    if (entry.isSymbolicLink()) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "离线收尾拒绝 prepare 目录中的符号链接。",
+      );
+    }
+    if (preparationFinalizationDirectories[entry.name] === true && entry.isDirectory()) {
+      foundDirectories.add(entry.name);
+      continue;
+    }
+    if (preparationFinalizationFiles[entry.name] === true && entry.isFile()) {
+      await assertPrivateFileMode(path);
+      foundFiles.add(entry.name);
+      continue;
+    }
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "离线收尾发现未登记或类型不正确的 prepare 输出。",
+    );
+  }
+  if (
+    foundDirectories.size !== expectedDirectoryNames.length ||
+    expectedDirectoryNames.some((name) => !foundDirectories.has(name)) ||
+    !foundFiles.has("run.json") ||
+    Number(foundFiles.has("PREPARE_INCOMPLETE")) + Number(foundFiles.has("PREPARE_RUN")) !== 1 ||
+    (foundFiles.has("PREPARE_COMPLETE") && !foundFiles.has("review.json"))
+  ) {
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "离线收尾的 prepare 目录或历史状态标记不完整。",
+    );
+  }
+
+  const candidateFiles = new Set<string>();
+  const candidateDirectory = join(preparedDirectory, "candidates");
+  await assertPrivateDirectoryMode(candidateDirectory);
+  for (const entry of await readdir(candidateDirectory, { withFileTypes: true })) {
+    if (
+      entry.isSymbolicLink() ||
+      !entry.isFile() ||
+      !/^candidate-[0-9]{6}\.json$/u.test(entry.name)
+    ) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "离线收尾发现未登记或类型不正确的候选输出。",
+      );
+    }
+    await assertPrivateFileMode(join(candidateDirectory, entry.name));
+    candidateFiles.add(entry.name);
+  }
+
+  const requestDirectory = join(preparedDirectory, "requests");
+  await assertPrivateDirectoryMode(requestDirectory);
+  for (const entry of await readdir(requestDirectory, { withFileTypes: true })) {
+    if (entry.isSymbolicLink() || !entry.isFile()) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "离线收尾拒绝请求目录中的链接或非普通文件。",
+      );
+    }
+    const base = /^(source-[0-9]{6})\.(active|completed|failed)\.json$/u.exec(entry.name);
+    const appended = /^(source-[0-9]{6})\.attempt-(0[2-9]|10)\.(active|failed)\.json$/u.exec(
+      entry.name,
+    );
+    const sourceId = base?.[1] ?? appended?.[1];
+    if (sourceId === undefined || !expectedSourceIds.has(sourceId)) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "离线收尾发现未登记来源或名称不正确的请求证据。",
+      );
+    }
+    await assertPrivateFileMode(join(requestDirectory, entry.name));
+  }
+
+  const reportDirectory = join(preparedDirectory, "reports");
+  await assertPrivateDirectoryMode(reportDirectory);
+  for (const entry of await readdir(reportDirectory, { withFileTypes: true })) {
+    if (
+      entry.isSymbolicLink() ||
+      !entry.isFile() ||
+      !/^attempt-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/u.test(
+        entry.name,
+      )
+    ) {
+      throw new HistoryMigrationError(
+        "PREPARE_RESUME_UNSAFE",
+        "离线收尾发现未登记或类型不正确的运行报告。",
+      );
+    }
+    await assertPrivateFileMode(join(reportDirectory, entry.name));
+  }
+  return { candidateFiles };
+}
+
 async function summarizePreparation(
   privateRootDirectory: string,
   outputDirectory: string,
@@ -1700,6 +1996,31 @@ function hasNodeErrorCode(error: unknown, code: string): boolean {
     "code" in error &&
     (error as { readonly code?: unknown }).code === code
   );
+}
+
+async function assertPreparationJsonAbsentOrEqual(
+  privateRootDirectory: string,
+  path: string,
+  value: unknown,
+): Promise<void> {
+  await assertPathsInsidePrivateRoot(privateRootDirectory, [
+    { path: dirname(path), kind: "existing" },
+  ]);
+  try {
+    await lstat(path);
+  } catch (error) {
+    if (hasNodeErrorCode(error, "ENOENT")) return;
+    throw new HistoryMigrationError("PREPARE_RESUME_UNSAFE", "prepare 收尾文件无法安全检查。");
+  }
+  await assertPathsInsidePrivateRoot(privateRootDirectory, [{ path, kind: "existing" }]);
+  await assertPrivateFileMode(path);
+  const existing = await readPrivateJson(path);
+  if (sha256Hex(JSON.stringify(existing)) !== sha256Hex(JSON.stringify(value))) {
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "prepare 收尾文件与检查点不一致，不能覆盖。",
+    );
+  }
 }
 
 async function writeOrValidatePreparationJson(
@@ -2172,14 +2493,11 @@ type VerifiedHistoryMaterialization = Awaited<
   ReturnType<typeof assertHistoryMaterializationComplete>
 >;
 
-async function loadAuthoritativelyApprovedCandidates(
+async function loadApprovedCandidatesForSources(
   options: VerifyApprovedPackageSourceIdentitiesOptions,
   materialization: VerifiedHistoryMaterialization,
+  confirmedSources: readonly ConfirmedSource[],
 ): Promise<readonly ApprovedCandidate[]> {
-  const { confirmedSources } = await loadConfirmedInputs(
-    options.metadataFile,
-    await materialization.readSourceConfirmation(),
-  );
   const sourcesById = new Map(confirmedSources.map((source) => [source.sourceId, source] as const));
   const approvals = parsePrivateInput(
     historyCandidateApprovalSchema,
@@ -2217,9 +2535,18 @@ async function loadAuthoritativelyApprovedCandidates(
         `${approval.candidateId} 没有对应的已确认源文件映射。`,
       );
     }
+    const expectedSourceBindingSha256 = sourceBindingDigest({
+      sourceId: candidate.sourceId,
+      sourceContentSha256: candidate.sourceContentSha256,
+      sourcePath: source.mapping.sourcePath,
+      sourceSha256: source.mapping.sourceSha256,
+      metadataNumber: source.mapping.metadataNumber,
+    });
     if (
       candidate.sourceContentSha256 !== source.mapping.sourceSha256 ||
-      candidate.sourceMappingSha256 !== source.sourceMappingSha256
+      candidate.sourceMappingSha256 !== source.sourceMappingSha256 ||
+      (candidate.sourceBindingSha256 !== undefined &&
+        candidate.sourceBindingSha256 !== expectedSourceBindingSha256)
     ) {
       throw new HistoryMigrationError(
         "SOURCE_MAPPING_CHANGED",
@@ -2248,6 +2575,22 @@ async function loadAuthoritativelyApprovedCandidates(
     assignedSourceIds.add(candidate.sourceId);
     approvedCandidates.push({ record: candidate, metadata: source.metadata, mapping: source.mapping });
   }
+  return approvedCandidates;
+}
+
+async function loadAuthoritativelyApprovedCandidates(
+  options: VerifyApprovedPackageSourceIdentitiesOptions,
+  materialization: VerifiedHistoryMaterialization,
+): Promise<readonly ApprovedCandidate[]> {
+  const { confirmedSources } = await loadConfirmedInputs(
+    options.metadataFile,
+    await materialization.readSourceConfirmation(),
+  );
+  const approvedCandidates = await loadApprovedCandidatesForSources(
+    options,
+    materialization,
+    confirmedSources,
+  );
   await loadPreparationMarker(
     options.privateRootDirectory,
     options.preparedDirectory,
@@ -2884,24 +3227,33 @@ async function loadPreparationMarker(
   preparedDirectory: string,
   confirmedSources: readonly ConfirmedSource[],
 ): Promise<void> {
-  const incompletePath = join(preparedDirectory, "PREPARE_INCOMPLETE");
-  try {
-    await lstat(incompletePath);
+  const stateMarkerPaths = [
+    join(preparedDirectory, "PREPARE_INCOMPLETE"),
+    join(preparedDirectory, "PREPARE_RUN"),
+  ];
+  const existingStateMarkers: string[] = [];
+  for (const path of stateMarkerPaths) {
+    try {
+      await lstat(path);
+    } catch (error) {
+      if (hasNodeErrorCode(error, "ENOENT")) continue;
+      throw new HistoryMigrationError("CANDIDATE_INVALID", "候选目录的运行状态标记无法检查。");
+    }
+    await assertPathsInsidePrivateRoot(privateRootDirectory, [{ path, kind: "existing" }]);
+    await assertPrivateFileMode(path);
+    existingStateMarkers.push(path);
+  }
+  if (existingStateMarkers.length !== 1) {
     throw new HistoryMigrationError(
       "CANDIDATE_INVALID",
-      "候选目录仍标记为不完整，不能生成题目包。",
+      "候选目录必须恰好保留一份可核对的历史运行状态标记。",
     );
-  } catch (error) {
-    if (error instanceof HistoryMigrationError || !hasNodeErrorCode(error, "ENOENT")) {
-      throw error;
-    }
   }
 
   const completePath = join(preparedDirectory, "PREPARE_COMPLETE");
   const runPath = join(preparedDirectory, "run.json");
-  const runMarkerPath = join(preparedDirectory, "PREPARE_RUN");
   const reviewPath = join(preparedDirectory, "review.json");
-  for (const path of [completePath, runPath, runMarkerPath, reviewPath]) {
+  for (const path of [completePath, runPath, reviewPath]) {
     await assertPathsInsidePrivateRoot(privateRootDirectory, [{ path, kind: "existing" }]);
     await assertPrivateFileMode(path);
   }
@@ -2915,16 +3267,24 @@ async function loadPreparationMarker(
   if (!run.success || sha256Hex(JSON.stringify(run.data)) !== marker.runSha256) {
     throw new HistoryMigrationError("CANDIDATE_INVALID", "候选目录的运行身份不完整或不一致。");
   }
-  const runMarker = z
-    .object({
-      version: z.literal(1),
-      phase: z.literal("prepare"),
-      status: z.literal("incomplete"),
-      runSha256: digestSchema,
-    })
-    .strict()
-    .safeParse(await readPrivateJson(runMarkerPath));
-  if (!runMarker.success || runMarker.data.runSha256 !== marker.runSha256) {
+  const stateMarkerPath = existingStateMarkers[0];
+  const runMarker =
+    stateMarkerPath === undefined
+      ? undefined
+      : z
+          .object({
+            version: z.literal(1),
+            phase: z.literal("prepare"),
+            status: z.literal("incomplete"),
+            runSha256: digestSchema,
+          })
+          .strict()
+          .safeParse(await readPrivateJson(stateMarkerPath));
+  if (
+    runMarker === undefined ||
+    !runMarker.success ||
+    runMarker.data.runSha256 !== marker.runSha256
+  ) {
     throw new HistoryMigrationError("CANDIDATE_INVALID", "候选目录的运行状态标记不一致。");
   }
   if (

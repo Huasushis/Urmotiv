@@ -25,6 +25,7 @@ import {
   historySourceMappingSchema,
   HistoryNormalizationError,
   packageApprovedCandidates,
+  finalizeCompletedHistoryPreparation,
   prepareHistoryCandidates,
   recoverActiveHistoryCandidate,
   sealHistoryAttachmentMapping,
@@ -980,6 +981,183 @@ describe("历史题目迁移安全核心", () => {
         normalizer: fixedNormalizer(),
       }),
     ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
+  });
+
+  it("离线收尾接受完整混合执行器链并原样保留历史证据", async () => {
+    const fixture = await createActiveOnlyFixture("离线收尾混合执行器正文。");
+    await recoverActiveHistoryCandidate({
+      ...fixture.prepareOptions,
+      sourceId: "source-000001",
+      normalizer: fixedNormalizer(),
+    });
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+    await chmod(fixture.approvalFile, 0o600);
+    await chmod(fixture.prepareOptions.metadataFile, 0o600);
+    const evidencePaths = [
+      join(fixture.prepareOutput, "PREPARE_INCOMPLETE"),
+      join(fixture.prepareOutput, "requests", "source-000001.active.json"),
+      join(fixture.prepareOutput, "requests", "source-000001.attempt-02.active.json"),
+      join(fixture.prepareOutput, "requests", "source-000001.completed.json"),
+    ];
+    const evidenceBefore = await Promise.all(evidencePaths.map((path) => readFile(path, "utf8")));
+
+    await expect(
+      finalizeCompletedHistoryPreparation({
+        privateRootDirectory: fixture.root,
+        materializedDirectory: fixture.materializedDirectory,
+        metadataFile: fixture.prepareOptions.metadataFile,
+        preparedDirectory: fixture.prepareOutput,
+        approvalFile: fixture.approvalFile,
+      }),
+    ).resolves.toEqual({
+      sourceCount: 1,
+      candidateCount: 1,
+      approvedCandidateCount: 1,
+    });
+
+    expect(await Promise.all(evidencePaths.map((path) => readFile(path, "utf8")))).toEqual(
+      evidenceBefore,
+    );
+    await expect(stat(join(fixture.prepareOutput, "PREPARE_COMPLETE"))).resolves.toBeDefined();
+    await expect(stat(join(fixture.prepareOutput, "review.json"))).resolves.toBeDefined();
+    await expect(
+      verifyApprovedPackageSourceIdentities({
+        privateRootDirectory: fixture.root,
+        materializedDirectory: fixture.materializedDirectory,
+        metadataFile: fixture.prepareOptions.metadataFile,
+        preparedDirectory: fixture.prepareOutput,
+        approvalFile: fixture.approvalFile,
+      }),
+    ).resolves.toHaveLength(1);
+  });
+
+  it("离线收尾遇到 pending 检查点时不发布任何输出", async () => {
+    const fixture = await createPreparedFixture();
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+    await chmod(fixture.approvalFile, 0o600);
+    await chmod(fixture.prepareOptions.metadataFile, 0o600);
+    await rm(join(fixture.prepareOutput, "review.json"));
+    await rm(join(fixture.prepareOutput, "PREPARE_COMPLETE"));
+    await rename(
+      join(fixture.prepareOutput, "PREPARE_RUN"),
+      join(fixture.prepareOutput, "PREPARE_INCOMPLETE"),
+    );
+    await resetPreparedSourcesToPending(fixture);
+
+    await expect(
+      finalizeCompletedHistoryPreparation({
+        privateRootDirectory: fixture.root,
+        materializedDirectory: fixture.materializedDirectory,
+        metadataFile: fixture.prepareOptions.metadataFile,
+        preparedDirectory: fixture.prepareOutput,
+        approvalFile: fixture.approvalFile,
+      }),
+    ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
+    await expect(stat(join(fixture.prepareOutput, "review.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(stat(join(fixture.prepareOutput, "PREPARE_COMPLETE"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("离线收尾遇到未登记符号链接时先失败且不发布输出", async () => {
+    const fixture = await createActiveOnlyFixture("离线收尾符号链接拒绝正文。");
+    await recoverActiveHistoryCandidate({
+      ...fixture.prepareOptions,
+      sourceId: "source-000001",
+      normalizer: fixedNormalizer(),
+    });
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+    await chmod(fixture.approvalFile, 0o600);
+    await chmod(fixture.prepareOptions.metadataFile, 0o600);
+    await symlink(
+      join(fixture.prepareOutput, "run.json"),
+      join(fixture.prepareOutput, "requests", "unaccounted.json"),
+    );
+
+    await expect(
+      finalizeCompletedHistoryPreparation({
+        privateRootDirectory: fixture.root,
+        materializedDirectory: fixture.materializedDirectory,
+        metadataFile: fixture.prepareOptions.metadataFile,
+        preparedDirectory: fixture.prepareOutput,
+        approvalFile: fixture.approvalFile,
+      }),
+    ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
+    await expect(stat(join(fixture.prepareOutput, "review.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(stat(join(fixture.prepareOutput, "PREPARE_COMPLETE"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("离线收尾遇到放宽权限时先失败且不发布输出", async () => {
+    const fixture = await createActiveOnlyFixture("离线收尾权限拒绝正文。");
+    await recoverActiveHistoryCandidate({
+      ...fixture.prepareOptions,
+      sourceId: "source-000001",
+      normalizer: fixedNormalizer(),
+    });
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+    await chmod(fixture.approvalFile, 0o600);
+    await chmod(fixture.prepareOptions.metadataFile, 0o600);
+    await chmod(join(fixture.prepareOutput, "requests", "source-000001.completed.json"), 0o640);
+
+    await expect(
+      finalizeCompletedHistoryPreparation({
+        privateRootDirectory: fixture.root,
+        materializedDirectory: fixture.materializedDirectory,
+        metadataFile: fixture.prepareOptions.metadataFile,
+        preparedDirectory: fixture.prepareOutput,
+        approvalFile: fixture.approvalFile,
+      }),
+    ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
+    await expect(stat(join(fixture.prepareOutput, "review.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(stat(join(fixture.prepareOutput, "PREPARE_COMPLETE"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("离线收尾遇到来源绑定不一致时先失败且不发布输出", async () => {
+    const fixture = await createActiveOnlyFixture("离线收尾来源绑定拒绝正文。");
+    await recoverActiveHistoryCandidate({
+      ...fixture.prepareOptions,
+      sourceId: "source-000001",
+      normalizer: fixedNormalizer(),
+    });
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeFile(
+      join(fixture.prepareOutput, "candidates", `${candidate.candidateId}.json`),
+      `${JSON.stringify({ ...candidate, sourceBindingSha256: "a".repeat(64) }, null, 2)}\n`,
+      "utf8",
+    );
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+    await chmod(fixture.approvalFile, 0o600);
+    await chmod(fixture.prepareOptions.metadataFile, 0o600);
+
+    await expect(
+      finalizeCompletedHistoryPreparation({
+        privateRootDirectory: fixture.root,
+        materializedDirectory: fixture.materializedDirectory,
+        metadataFile: fixture.prepareOptions.metadataFile,
+        preparedDirectory: fixture.prepareOutput,
+        approvalFile: fixture.approvalFile,
+      }),
+    ).rejects.toMatchObject({ code: "SOURCE_MAPPING_CHANGED" });
+    await expect(stat(join(fixture.prepareOutput, "review.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(stat(join(fixture.prepareOutput, "PREPARE_COMPLETE"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("源文件内容变化后使第一份人工确认失效", async () => {

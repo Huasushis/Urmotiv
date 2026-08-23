@@ -14,6 +14,7 @@ import {
   initializeHistoryGroupingWorksheet,
   initializeHistoryAttachmentMappingWorksheet,
   inventoryHistorySources,
+  finalizeCompletedHistoryPreparation,
   loadHistoryPreparationCodeSha256,
   materializeHistoryGrouping,
   packageApprovedCandidates,
@@ -122,6 +123,14 @@ type Command =
       readonly metadataFile: string;
       readonly outputDirectory: string;
       readonly sourceId: string;
+    }
+  | {
+      readonly phase: "finalize-prepare";
+      readonly privateRootDirectory: string;
+      readonly materializedDirectory: string;
+      readonly metadataFile: string;
+      readonly preparedDirectory: string;
+      readonly approvalFile: string;
     }
   | {
       readonly phase: "repair-local";
@@ -286,6 +295,14 @@ async function main(): Promise<void> {
     );
     return;
   }
+  if (command.phase === "finalize-prepare") {
+    const result = await finalizeCompletedHistoryPreparation(command);
+    process.stdout.write(
+      `已离线核对并收尾 ${result.sourceCount} 个完成源、${result.candidateCount} 个候选和 ${result.approvedCandidateCount} 项批准；未调用整理模型。\n`,
+    );
+    return;
+  }
+
   if (command.phase === "repair-local") {
     await assertHistoryMaterializationComplete({
       privateRootDirectory: command.privateRootDirectory,
@@ -471,6 +488,23 @@ export function parseCommand(argv: readonly string[]): Command {
       sourceId: requiredOption(argv, "--source-id"),
     };
   }
+  if (phase === "finalize-prepare") {
+    rejectUnsupportedOptions(argv, [
+      "--private-root",
+      "--materialized",
+      "--metadata",
+      "--prepared",
+      "--approval",
+    ]);
+    return {
+      phase,
+      privateRootDirectory: requiredOption(argv, "--private-root"),
+      materializedDirectory: requiredOption(argv, "--materialized"),
+      metadataFile: requiredOption(argv, "--metadata"),
+      preparedDirectory: requiredOption(argv, "--prepared"),
+      approvalFile: requiredOption(argv, "--approval"),
+    };
+  }
   if (phase === "repair-local") {
     return {
       phase,
@@ -501,8 +535,23 @@ export function parseCommand(argv: readonly string[]): Command {
   }
   throw new HistoryMigrationError(
     "INVALID_ARGUMENTS",
-    "必须明确选择 inventory、init-grouping、seal-grouping、confirm-grouping、materialize、init-attachments、seal-attachments、assert-attachments、prepare、repair-local 或 package 阶段。",
+    "必须明确选择 inventory、init-grouping、seal-grouping、confirm-grouping、materialize、init-attachments、seal-attachments、assert-attachments、prepare、recover-active、finalize-prepare、repair-local 或 package 阶段。",
   );
+}
+
+function rejectUnsupportedOptions(
+  argv: readonly string[],
+  allowedOptions: readonly string[],
+): void {
+  const unsupported = argv.find(
+    (value) => value.startsWith("--") && !allowedOptions.includes(value),
+  );
+  if (unsupported !== undefined) {
+    throw new HistoryMigrationError(
+      "INVALID_ARGUMENTS",
+      `finalize-prepare 不接受参数 ${unsupported}。`,
+    );
+  }
 }
 
 function requiredOption(argv: readonly string[], name: string): string {
