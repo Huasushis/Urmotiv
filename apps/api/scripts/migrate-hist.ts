@@ -232,7 +232,7 @@ async function main(): Promise<void> {
       outputDirectory: command.outputDirectory,
       operationTag: command.operationTag,
       resume: command.resume,
-      executionIdentity: normalizer.preparationIdentity,
+      executorIdentity: normalizer.preparationIdentity,
       normalizer,
     });
     if (!result.complete) {

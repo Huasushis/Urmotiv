@@ -30,6 +30,7 @@ import {
   sealHistoryAttachmentMapping,
   sealHistoryGrouping,
   sha256Hex,
+  verifyApprovedPackageSourceIdentities,
   writeHistoryGroupingConfirmation,
   type HistoryAttachmentMappingCapability,
   type HistoryCandidateRecord,
@@ -297,7 +298,7 @@ describe("历史题目迁移安全核心", () => {
     await expect(
       prepareHistoryCandidates({
         ...fixture.prepareOptions,
-        executionIdentity: normalizer.preparationIdentity,
+        executorIdentity: normalizer.preparationIdentity,
         normalizer,
       }),
     ).resolves.toMatchObject({ complete: true });
@@ -316,7 +317,7 @@ describe("历史题目迁移安全核心", () => {
     await expect(
       prepareHistoryCandidates({
         ...fixture.prepareOptions,
-        executionIdentity: normalizer.preparationIdentity,
+        executorIdentity: normalizer.preparationIdentity,
         resume: true,
         normalizer,
       }),
@@ -595,7 +596,7 @@ describe("历史题目迁移安全核心", () => {
     ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
   });
 
-  it("旧版无检查点输出与身份变化都不能假装续跑", async () => {
+  it("旧版无检查点与运行标签不能续跑，但执行器变化不改变存储目标", async () => {
     const legacy = await createFixture("旧版合成输出。");
     await mkdir(legacy.prepareOutput, { mode: 0o700 });
     let called = false;
@@ -644,14 +645,144 @@ describe("历史题目迁移安全核心", () => {
       prepareHistoryCandidates({
         ...current.prepareOptions,
         resume: true,
-        executionIdentity: {
-          ...current.prepareOptions.executionIdentity,
+        executorIdentity: {
+          ...current.prepareOptions.executorIdentity,
           configSha256: "5".repeat(64),
+        },
+        normalizer: fixedNormalizer(),
+      }),
+    ).resolves.toMatchObject({ complete: true });
+  });
+  it("current95 stored target with later executor identity is a targeted red case", async () => {
+    const fixture = await createFixture("current95 身份分离回归正文。");
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: fixedNormalizer(),
+    });
+    let resumedCalls = 0;
+    await expect(
+      prepareHistoryCandidates({
+        ...fixture.prepareOptions,
+        resume: true,
+        executorIdentity: {
+          ...fixture.prepareOptions.executorIdentity,
+          configSha256: "5".repeat(64),
+        },
+        normalizer: {
+          async normalize() {
+            resumedCalls += 1;
+            return normalizedOutput();
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ complete: true });
+    expect(resumedCalls).toBe(0);
+  });
+  it("续跑待处理源记录后来执行器并保留原目标运行摘要", async () => {
+    const fixture = await createFixture("续跑执行器证据正文。");
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: fixedNormalizer(),
+    });
+    await resetPreparedSourcesToPending(fixture);
+    const laterExecutor = {
+      ...fixture.prepareOptions.executorIdentity,
+      configSha256: "5".repeat(64),
+    };
+    await expect(
+      prepareHistoryCandidates({
+        ...fixture.prepareOptions,
+        resume: true,
+        executorIdentity: laterExecutor,
+        normalizer: fixedNormalizer(),
+      }),
+    ).resolves.toMatchObject({ complete: true });
+    const run = JSON.parse(
+      await readFile(join(fixture.prepareOutput, "run.json"), "utf8"),
+    ) as { readonly executionIdentity: unknown };
+    const active = JSON.parse(
+      await readFile(join(fixture.prepareOutput, "requests", "source-000001.active.json"), "utf8"),
+    ) as {
+      readonly executionIdentitySha256: string;
+      readonly executorIdentity: unknown;
+    };
+    const completed = JSON.parse(
+      await readFile(
+        join(fixture.prepareOutput, "requests", "source-000001.completed.json"),
+        "utf8",
+      ),
+    ) as { readonly executorIdentity: unknown };
+    expect(run.executionIdentity).toEqual(fixture.prepareOptions.executorIdentity);
+    expect(active.executionIdentitySha256).toBe(
+      sha256Hex(JSON.stringify(fixture.prepareOptions.executorIdentity)),
+    );
+    expect(active.executorIdentity).toEqual(laterExecutor);
+    expect(completed.executorIdentity).toEqual(laterExecutor);
+  });
+
+  it("续跑源校验失败仍记录后来执行器且不伪造目标回执", async () => {
+    const fixture = await createFixture("续跑失败执行器证据正文。");
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: fixedNormalizer(),
+    });
+    await resetPreparedSourcesToPending(fixture);
+    await writeFile(
+      join(fixture.sourceDirectory, syntheticSourceName),
+      "续跑时被替换的正文。",
+      "utf8",
+    );
+    const laterExecutor = {
+      ...fixture.prepareOptions.executorIdentity,
+      configSha256: "6".repeat(64),
+    };
+    const result = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      resume: true,
+      executorIdentity: laterExecutor,
+      normalizer: fixedNormalizer(),
+    });
+    expect(result).toMatchObject({
+      complete: false,
+      failedSourceCount: 1,
+      pendingSourceCount: 0,
+    });
+    const failed = JSON.parse(
+      await readFile(join(fixture.prepareOutput, "requests", "source-000001.failed.json"), "utf8"),
+    ) as {
+      readonly activeSha256: string | null;
+      readonly executorIdentity: unknown;
+    };
+    expect(failed.activeSha256).toBeNull();
+    expect(failed.executorIdentity).toEqual(laterExecutor);
+  });
+
+  it("续跑拒绝被改写的原请求摘要", async () => {
+    const fixture = await createFixture("续跑摘要拒绝正文。");
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: fixedNormalizer(),
+    });
+    const activePath = join(fixture.prepareOutput, "requests", "source-000001.active.json");
+    const active = JSON.parse(await readFile(activePath, "utf8")) as Record<string, unknown>;
+    await writeFile(
+      activePath,
+      `${JSON.stringify({ ...active, executionIdentitySha256: "f".repeat(64) })}\n`,
+      "utf8",
+    );
+    await expect(
+      prepareHistoryCandidates({
+        ...fixture.prepareOptions,
+        resume: true,
+        executorIdentity: {
+          ...fixture.prepareOptions.executorIdentity,
+          configSha256: "7".repeat(64),
         },
         normalizer: fixedNormalizer(),
       }),
     ).rejects.toMatchObject({ code: "PREPARE_RESUME_UNSAFE" });
   });
+
 
   it("续跑拒绝权限被放宽的目录或检查点", async () => {
     const fileFixture = await createFixture("权限检查合成正文一。");
@@ -1052,6 +1183,38 @@ describe("历史题目迁移安全核心", () => {
     });
   });
 
+  it("来源验证与打包接受目标与恢复执行器的混合证据", async () => {
+    const fixture = await createActiveOnlyFixture("混合执行器证据打包正文。");
+    await expect(
+      recoverActiveHistoryCandidate({
+        ...fixture.prepareOptions,
+        sourceId: "source-000001",
+        normalizer: fixedNormalizer(),
+      }),
+    ).resolves.toMatchObject({ status: "completed" });
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await expect(
+      prepareHistoryCandidates({
+        ...fixture.prepareOptions,
+        resume: true,
+        normalizer: fixedNormalizer(),
+      }),
+    ).resolves.toMatchObject({ complete: true });
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+    const authoritative = await verifyApprovedPackageSourceIdentities({
+      privateRootDirectory: fixture.packageOptions.privateRootDirectory,
+      materializedDirectory: fixture.packageOptions.materializedDirectory,
+      metadataFile: fixture.packageOptions.metadataFile,
+      preparedDirectory: fixture.packageOptions.preparedDirectory,
+      approvalFile: fixture.packageOptions.approvalFile,
+    });
+    expect(authoritative).toHaveLength(1);
+    await expect(packageApprovedCandidates(fixture.packageOptions)).resolves.toMatchObject({
+      packageCount: 1,
+      authorMappingCount: 1,
+    });
+  });
+
   it("批准后才生成题目包，作者学号只进入单独私有映射文件", async () => {
     const fixture = await createPreparedFixture();
     const candidate = await readCandidate(fixture.prepareOutput);
@@ -1341,7 +1504,7 @@ async function createFixture(sourceText: string): Promise<{
     readonly sourceConfirmationFile: string;
     readonly outputDirectory: string;
     readonly operationTag: string;
-    readonly executionIdentity: {
+    readonly executorIdentity: {
       readonly version: 1;
       readonly codeSha256: string;
       readonly promptSha256: string;
@@ -1419,7 +1582,7 @@ async function createFixture(sourceText: string): Promise<{
       sourceConfirmationFile,
       outputDirectory: prepareOutput,
       operationTag: "synthetic-run-001",
-      executionIdentity: {
+      executorIdentity: {
         version: 1,
         codeSha256: "1".repeat(64),
         promptSha256: "2".repeat(64),
@@ -1463,6 +1626,15 @@ async function createActiveOnlyFixture(sourceText: string) {
   await rm(requests, { force: true });
   await rename(heldRequests, requests);
   return fixture;
+}
+async function resetPreparedSourcesToPending(
+  fixture: Awaited<ReturnType<typeof createFixture>>,
+): Promise<void> {
+  for (const name of ["candidates", "requests", "reports"]) {
+    const path = join(fixture.prepareOutput, name);
+    await rm(path, { recursive: true, force: true });
+    await mkdir(path, { mode: 0o700 });
+  }
 }
 
 async function writeSyntheticMaterialization(options: {

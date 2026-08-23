@@ -240,7 +240,7 @@ interface BaseFixture {
     readonly outputDirectory: string;
     readonly approvalFile: string;
     readonly operationTag: string;
-    readonly executionIdentity: {
+    readonly executorIdentity: {
       readonly version: 1;
       readonly codeSha256: string;
       readonly promptSha256: string;
@@ -694,7 +694,7 @@ async function createBaseFixture(options?: {
     outputDirectory: prepareOutput,
     approvalFile,
     operationTag: "synthetic-run-001",
-    executionIdentity: {
+    executorIdentity: {
       version: 1 as const,
       codeSha256: "1".repeat(64),
       promptSha256: "2".repeat(64),

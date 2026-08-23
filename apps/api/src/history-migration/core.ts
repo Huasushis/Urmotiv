@@ -78,6 +78,12 @@ const preparationRunSchema = z
     executionIdentity: historyPreparationExecutionIdentitySchema,
   })
   .strict();
+const preparationExecutorEvidenceSchema = z
+  .object({
+    executorIdentity: historyPreparationExecutionIdentitySchema.optional(),
+    recoveryExecutorIdentity: historyPreparationExecutionIdentitySchema.optional(),
+  })
+  .strict();
 
 const preparationActiveSchema = z
   .object({
@@ -87,7 +93,7 @@ const preparationActiveSchema = z
     sourceIdentitySha256: digestSchema,
     executionIdentitySha256: digestSchema,
     operationSha256: digestSchema,
-    recoveryExecutorIdentity: historyPreparationExecutionIdentitySchema.optional(),
+    ...preparationExecutorEvidenceSchema.shape,
   })
   .strict();
 
@@ -109,7 +115,7 @@ const preparationCompletedSchema = z
       )
       .min(1)
       .max(30),
-    recoveryExecutorIdentity: historyPreparationExecutionIdentitySchema.optional(),
+    ...preparationExecutorEvidenceSchema.shape,
   })
   .strict();
 
@@ -121,7 +127,7 @@ const preparationFailureSchema = z
     activeSha256: digestSchema.nullable(),
     requestAttemptSha256s: z.array(digestSchema).max(10),
     failureKind: z.enum(historyNormalizationFailureKinds),
-    recoveryExecutorIdentity: historyPreparationExecutionIdentitySchema.optional(),
+    ...preparationExecutorEvidenceSchema.shape,
   })
   .strict();
 
@@ -206,6 +212,26 @@ export interface HistoryPreparationExecutionIdentity {
   readonly modelSha256: string;
   readonly configSha256: string;
 }
+type PreparationExecutorEvidence = z.infer<typeof preparationExecutorEvidenceSchema>;
+
+function preparationExecutorIdentity(
+  evidence: PreparationExecutorEvidence,
+): HistoryPreparationExecutionIdentity | undefined {
+  if (evidence.executorIdentity !== undefined && evidence.recoveryExecutorIdentity !== undefined) {
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "prepare 检查点同时声明了普通执行器和恢复执行器身份，不能继续。",
+    );
+  }
+  return evidence.executorIdentity ?? evidence.recoveryExecutorIdentity;
+}
+
+function preparationExecutorIdentitySha256(
+  evidence: PreparationExecutorEvidence,
+): string | null {
+  const identity = preparationExecutorIdentity(evidence);
+  return identity === undefined ? null : sha256Hex(JSON.stringify(identity));
+}
 
 export interface PrepareHistoryCandidatesOptions {
   readonly privateRootDirectory: string;
@@ -216,10 +242,12 @@ export interface PrepareHistoryCandidatesOptions {
   readonly normalizer: HistoryNormalizer;
   /** 每次新运行必须使用新的非空标签；检查点只保存其摘要。 */
   readonly operationTag: string;
-  readonly executionIdentity: HistoryPreparationExecutionIdentity;
-  /** 只允许在同一输出目录、同一标签和同一执行身份下续跑。 */
+  /** 当前进程的执行身份；续跑时目标身份只从存储的 run.json 读取。 */
+  readonly executorIdentity: HistoryPreparationExecutionIdentity;
+  /** 只允许在同一输出目录、同一标签和同一存储目标运行下续跑。 */
   readonly resume?: boolean;
 }
+
 
 export interface PackageApprovedCandidatesOptions {
   readonly privateRootDirectory: string;
@@ -319,16 +347,16 @@ export async function prepareHistoryCandidates(
       "prepare 必须提供本次运行唯一且长度合规的操作标签。",
     );
   }
-  const parsedExecutionIdentity = historyPreparationExecutionIdentitySchema.safeParse(
-    options.executionIdentity,
+  const parsedExecutorIdentity = historyPreparationExecutionIdentitySchema.safeParse(
+    options.executorIdentity,
   );
-  if (!parsedExecutionIdentity.success) {
+  if (!parsedExecutorIdentity.success) {
     throw new HistoryMigrationError(
       "INVALID_ARGUMENTS",
       "prepare 的代码、提示词、模型或配置身份不完整。",
     );
   }
-  const executionIdentity = parsedExecutionIdentity.data;
+  const executorIdentity = parsedExecutorIdentity.data;
   await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
     { path: options.sourceDirectory, kind: "existing" },
     { path: options.metadataFile, kind: "existing" },
@@ -349,16 +377,8 @@ export async function prepareHistoryCandidates(
       })),
     ),
   );
-  const run = preparationRunSchema.parse({
-    version: 2,
-    phase: "prepare",
-    operationTagSha256,
-    inputBatchSha256,
-    sourceCount: confirmedSources.length,
-    executionIdentity,
-  });
-  const runSha256 = sha256Hex(JSON.stringify(run));
-
+  let run: z.infer<typeof preparationRunSchema>;
+  let targetExecutionIdentity: HistoryPreparationExecutionIdentity;
   if (options.resume === true) {
     let savedRun: z.infer<typeof preparationRunSchema>;
     try {
@@ -373,12 +393,28 @@ export async function prepareHistoryCandidates(
         "旧 prepare 输出没有可验证检查点；必须使用新的输出目录和新的运行标签。",
       );
     }
-    if (sha256Hex(JSON.stringify(savedRun)) !== runSha256) {
+    const expectedRun = preparationRunSchema.parse({
+      version: 2,
+      phase: "prepare",
+      operationTagSha256,
+      inputBatchSha256,
+      sourceCount: confirmedSources.length,
+      executionIdentity: savedRun.executionIdentity,
+    });
+    const savedRunSha256 = sha256Hex(JSON.stringify(savedRun));
+    if (savedRunSha256 !== sha256Hex(JSON.stringify(expectedRun))) {
       throw new HistoryMigrationError(
         "PREPARE_RESUME_UNSAFE",
-        "prepare 的输入、运行标签、代码、提示词、模型或配置身份已经变化，不能续跑。",
+        "prepare 的输入、运行标签或存储目标身份已经变化，不能续跑。",
       );
     }
+    await assertPreparationRunMarkers(
+      options.privateRootDirectory,
+      options.outputDirectory,
+      savedRunSha256,
+    );
+    run = savedRun;
+    targetExecutionIdentity = savedRun.executionIdentity;
     try {
       await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
         { path: join(options.outputDirectory, "candidates"), kind: "existing" },
@@ -397,6 +433,19 @@ export async function prepareHistoryCandidates(
       );
     }
   } else {
+    targetExecutionIdentity = executorIdentity;
+    run = preparationRunSchema.parse({
+      version: 2,
+      phase: "prepare",
+      operationTagSha256,
+      inputBatchSha256,
+      sourceCount: confirmedSources.length,
+      executionIdentity: targetExecutionIdentity,
+    });
+  }
+  const runSha256 = sha256Hex(JSON.stringify(run));
+
+  if (options.resume !== true) {
     await createNewPrivateDirectory(options.outputDirectory);
     await createNewPrivateDirectory(join(options.outputDirectory, "candidates"));
     await createNewPrivateDirectory(join(options.outputDirectory, "requests"));
@@ -410,15 +459,17 @@ export async function prepareHistoryCandidates(
     });
   }
 
-  const executionIdentitySha256 = sha256Hex(JSON.stringify(executionIdentity));
+  const targetExecutionIdentitySha256 = sha256Hex(JSON.stringify(targetExecutionIdentity));
+  const resumeExecutorEvidence: PreparationExecutorEvidence =
+    options.resume === true ? { executorIdentity } : {};
   for (const [sourceIndex, source] of confirmedSources.entries()) {
     const existingState = await loadPreparationSourceState(
       options.privateRootDirectory,
       options.outputDirectory,
       source.sourceId,
+      targetExecutionIdentitySha256,
     );
     if (existingState !== "pending") continue;
-
     let sourceContent: Awaited<ReturnType<typeof readConfirmedSource>>;
     try {
       sourceContent = await readConfirmedSource(
@@ -435,6 +486,7 @@ export async function prepareHistoryCandidates(
         null,
         [],
         "source_validation",
+        resumeExecutorEvidence,
       );
       continue;
     }
@@ -451,10 +503,11 @@ export async function prepareHistoryCandidates(
       status: "active",
       sourceId: source.sourceId,
       sourceIdentitySha256,
-      executionIdentitySha256,
+      executionIdentitySha256: targetExecutionIdentitySha256,
       operationSha256: sha256Hex(
         JSON.stringify({ operationTagSha256, sourceId: source.sourceId, attempt: 1 }),
       ),
+      ...resumeExecutorEvidence,
     });
     await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
       { path: join(options.outputDirectory, "requests"), kind: "existing" },
@@ -555,6 +608,7 @@ export async function prepareHistoryCandidates(
           activeSha256,
           requestAttemptSha256s,
           candidates,
+          ...resumeExecutorEvidence,
         }),
       );
     } catch (error) {
@@ -565,6 +619,7 @@ export async function prepareHistoryCandidates(
         activeSha256,
         requestAttemptSha256s,
         classifyPreparationFailure(error),
+        resumeExecutorEvidence,
       );
       if (error instanceof HistoryNormalizationError && error.failureKind === "cancelled") {
         break;
@@ -576,6 +631,7 @@ export async function prepareHistoryCandidates(
     options.privateRootDirectory,
     options.outputDirectory,
     confirmedSources,
+    targetExecutionIdentitySha256,
   );
   await assertPathsInsidePrivateRoot(options.privateRootDirectory, [
     { path: join(options.outputDirectory, "reports"), kind: "existing" },
@@ -922,7 +978,7 @@ export async function recoverActiveHistoryCandidate(
       activeSha256,
       requestAttemptSha256s,
       failureKind,
-      recoveryExecutorIdentity,
+      { recoveryExecutorIdentity },
     );
     return {
       sourceId: source.sourceId,
@@ -955,6 +1011,7 @@ async function loadPreparationSourceState(
   privateRootDirectory: string,
   outputDirectory: string,
   sourceId: string,
+  targetExecutionIdentitySha256?: string,
 ): Promise<PreparationSourceState> {
   const active = await readOptionalPreparationRecord(
     privateRootDirectory,
@@ -990,12 +1047,14 @@ async function loadPreparationSourceState(
         "prepare 完成检查点与请求登记不一致，不能继续。",
       );
     }
-    await assertPreparationAttemptChain(
+    const attempts = await assertPreparationAttemptChain(
       privateRootDirectory,
       outputDirectory,
       sourceId,
       completed.requestAttemptSha256s,
+      targetExecutionIdentitySha256,
     );
+    assertPreparationTerminalExecutorEvidence(completed, attempts);
     return { kind: "completed", record: completed };
   }
   if (failed !== null) {
@@ -1009,13 +1068,18 @@ async function loadPreparationSourceState(
         "prepare 失败检查点与请求登记不一致，不能继续。",
       );
     }
-    await assertPreparationAttemptChain(
+    const attempts = await assertPreparationAttemptChain(
       privateRootDirectory,
       outputDirectory,
       sourceId,
       failed.requestAttemptSha256s,
+      targetExecutionIdentitySha256,
     );
+    assertPreparationTerminalExecutorEvidence(failed, attempts);
     return { kind: "failed", record: failed };
+  }
+  if (active !== null) {
+    assertPreparationActiveRecord(active, targetExecutionIdentitySha256);
   }
   return active === null ? "pending" : { kind: "active", record: active };
 }
@@ -1080,13 +1144,49 @@ async function removeSupersededFailureReceipt(
   await rm(preparationStatePath(outputDirectory, sourceId, "failed"), { force: true });
 }
 
+type PreparationActiveRecord = z.infer<typeof preparationActiveSchema>;
+
+function assertPreparationActiveRecord(
+  record: PreparationActiveRecord,
+  targetExecutionIdentitySha256?: string,
+): void {
+  preparationExecutorIdentity(record);
+  if (
+    targetExecutionIdentitySha256 !== undefined &&
+    record.executionIdentitySha256 !== targetExecutionIdentitySha256
+  ) {
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "prepare 请求登记没有绑定存储的目标执行身份，不能继续。",
+    );
+  }
+}
+
+function assertPreparationTerminalExecutorEvidence(
+  receipt: PreparationExecutorEvidence,
+  attempts: readonly PreparationActiveRecord[],
+): void {
+  const receiptExecutorSha256 = preparationExecutorIdentitySha256(receipt);
+  if (receiptExecutorSha256 === null || attempts.length === 0) return;
+  const latestAttempt = attempts[attempts.length - 1];
+  if (latestAttempt === undefined) return;
+  const latestExecutorSha256 = preparationExecutorIdentitySha256(latestAttempt);
+  if (latestExecutorSha256 === null || latestExecutorSha256 !== receiptExecutorSha256) {
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "prepare 终态回执的执行器身份与最后一次请求登记不一致。",
+    );
+  }
+}
+
 async function assertPreparationAttemptChain(
   privateRootDirectory: string,
   outputDirectory: string,
   sourceId: string,
   expectedSha256s: readonly string[],
-): Promise<void> {
-  if (expectedSha256s.length === 0) return;
+  targetExecutionIdentitySha256?: string,
+): Promise<readonly PreparationActiveRecord[]> {
+  const records: PreparationActiveRecord[] = [];
   for (const [index, expectedSha256] of expectedSha256s.entries()) {
     const path =
       index === 0
@@ -1111,7 +1211,10 @@ async function assertPreparationAttemptChain(
         "prepare 的逐请求登记链不完整或摘要不一致，不能继续。",
       );
     }
+    assertPreparationActiveRecord(record, targetExecutionIdentitySha256);
+    records.push(record);
   }
+  return records;
 }
 
 async function writePreparationFailure(
@@ -1121,11 +1224,13 @@ async function writePreparationFailure(
   activeSha256: string | null,
   requestAttemptSha256s: readonly string[],
   failureKind: HistoryNormalizationFailureKind,
-  recoveryExecutorIdentity?: HistoryPreparationExecutionIdentity,
+  executorEvidence: PreparationExecutorEvidence = {},
 ): Promise<void> {
   await assertPathsInsidePrivateRoot(privateRootDirectory, [
     { path: join(outputDirectory, "requests"), kind: "existing" },
   ]);
+  const parsedExecutorEvidence = preparationExecutorEvidenceSchema.parse(executorEvidence);
+  preparationExecutorIdentity(parsedExecutorEvidence);
   await writeNewPrivateJson(
     preparationStatePath(outputDirectory, sourceId, "failed"),
     preparationFailureSchema.parse({
@@ -1135,7 +1240,7 @@ async function writePreparationFailure(
       activeSha256,
       requestAttemptSha256s,
       failureKind,
-      ...(recoveryExecutorIdentity === undefined ? {} : { recoveryExecutorIdentity }),
+      ...parsedExecutorEvidence,
     }),
   );
 }
@@ -1151,11 +1256,42 @@ function classifyPreparationFailure(error: unknown): HistoryNormalizationFailure
   }
   return "internal";
 }
+async function assertPreparationRunMarkers(
+  privateRootDirectory: string,
+  outputDirectory: string,
+  expectedRunSha256: string,
+): Promise<void> {
+  const markerSchema = z.object({ runSha256: digestSchema }).passthrough();
+  for (const name of ["PREPARE_INCOMPLETE", "PREPARE_RUN", "PREPARE_COMPLETE", "review.json"]) {
+    const path = join(outputDirectory, name);
+    try {
+      await lstat(path);
+    } catch (error) {
+      if (hasNodeErrorCode(error, "ENOENT")) continue;
+      throw new HistoryMigrationError("PREPARE_RESUME_UNSAFE", "prepare 运行标记无法安全检查。");
+    }
+    try {
+      await assertPathsInsidePrivateRoot(privateRootDirectory, [{ path, kind: "existing" }]);
+      await assertPrivateFileMode(path);
+      const parsed = markerSchema.safeParse(await readPrivateJson(path));
+      if (!parsed.success || parsed.data.runSha256 !== expectedRunSha256) {
+        throw new HistoryMigrationError(
+          "PREPARE_RESUME_UNSAFE",
+          "prepare 运行标记与存储的目标运行摘要不一致，不能继续。",
+        );
+      }
+    } catch (error) {
+      if (error instanceof HistoryMigrationError) throw error;
+      throw new HistoryMigrationError("PREPARE_RESUME_UNSAFE", "prepare 运行标记无法安全验证。");
+    }
+  }
+}
 
 async function summarizePreparation(
   privateRootDirectory: string,
   outputDirectory: string,
   confirmedSources: readonly ConfirmedSource[],
+  targetExecutionIdentitySha256?: string,
 ): Promise<{
   readonly complete: boolean;
   readonly completedSourceCount: number;
@@ -1197,6 +1333,7 @@ async function summarizePreparation(
       privateRootDirectory,
       outputDirectory,
       source.sourceId,
+      targetExecutionIdentitySha256,
     );
     if (state === "pending") {
       pendingSourceCount += 1;
@@ -2498,11 +2635,20 @@ async function loadPreparationMarker(
     throw new HistoryMigrationError("CANDIDATE_INVALID", "候选目录的源文件计数不一致。");
   }
 
-  const summary = await summarizePreparation(
-    privateRootDirectory,
-    preparedDirectory,
-    confirmedSources,
-  );
+  let summary: Awaited<ReturnType<typeof summarizePreparation>>;
+  try {
+    summary = await summarizePreparation(
+      privateRootDirectory,
+      preparedDirectory,
+      confirmedSources,
+      sha256Hex(JSON.stringify(run.data.executionIdentity)),
+    );
+  } catch (error) {
+    if (error instanceof HistoryMigrationError && error.code === "PREPARE_RESUME_UNSAFE") {
+      throw new HistoryMigrationError("CANDIDATE_INVALID", "候选目录的执行身份证据不一致。");
+    }
+    throw error;
+  }
   if (!summary.complete || summary.report.length !== marker.candidateCount) {
     throw new HistoryMigrationError("CANDIDATE_INVALID", "候选目录的逐题检查点尚未完整结束。");
   }

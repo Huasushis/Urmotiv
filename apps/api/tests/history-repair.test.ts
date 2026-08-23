@@ -164,7 +164,7 @@ async function createRepairFixture(): Promise<RepairFixture> {
     sourceConfirmationFile,
     outputDirectory: preparedDirectory,
     operationTag: "synthetic-repair-run-001",
-    executionIdentity: {
+    executorIdentity: {
       version: 1,
       codeSha256: "1".repeat(64),
       promptSha256: "2".repeat(64),

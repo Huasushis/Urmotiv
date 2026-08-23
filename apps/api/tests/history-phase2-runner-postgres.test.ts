@@ -508,7 +508,7 @@ async function createSyntheticBatch(count: number): Promise<SyntheticBatch> {
     outputDirectory: preparedDirectory,
     normalizer: syntheticNormalizer(),
     operationTag: `phase2-${randomUUID()}`,
-    executionIdentity: {
+    executorIdentity: {
       version: 1,
       codeSha256: sha256Hex("synthetic-normalizer-code"),
       promptSha256: sha256Hex("synthetic-normalizer-prompt"),
