@@ -61,18 +61,24 @@ afterEach(async () => {
   await Promise.all(openApps.splice(0).map((app) => app.close()));
 });
 
-async function makeHarness(options: { profileBody?: string } = {}) {
+async function makeHarness(options: { profileBody?: string; tokenStatus?: number; profileStatus?: number; networkFailure?: boolean } = {}) {
   const states = new TrackingStates();
   let profileBody = options.profileBody ?? profileWith({});
   const fetch = vi.fn(async (input: string | URL | Request) => {
+    if (options.networkFailure === true) {
+      throw new Error("synthetic USTC OAuth transport failure");
+    }
     const url = String(input);
     if (url.endsWith("/accessToken")) {
-      return new Response(JSON.stringify({ access_token: "synthetic-access-token" }), {
-        status: 200,
-      });
+      return new Response(
+        options.tokenStatus === undefined
+          ? JSON.stringify({ access_token: "synthetic-access-token" })
+          : "denied",
+        { status: options.tokenStatus ?? 200 },
+      );
     }
     if (url.endsWith("/profile")) {
-      return new Response(profileBody, { status: 200 });
+      return new Response(profileBody, { status: options.profileStatus ?? 200 });
     }
     return new Response("not found", { status: 404 });
   });
@@ -293,6 +299,59 @@ describe("USTC OAuth2 应用级流程", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(wrongCookie.headers["set-cookie"]).toBeUndefined();
     expect(states.consumeCalls).toBeLessThanOrEqual(2);
+  });
+
+  it("令牌端点拒绝授权码时按统一 401 失败关闭且不建账号", async () => {
+    const { app, fetch, states } = await makeHarness({ tokenStatus: 502 });
+    const flow = await startFlow(app);
+    const callback = await app.inject({
+      method: "GET",
+      url: callbackRequest(flow.state, "code-token-rejected"),
+      headers: { cookie: flow.cookiePair },
+    });
+    expect(callback.statusCode).toBe(401);
+    expect(publicFailure(callback)).toBe("UNAUTHENTICATED");
+    expect(callback.headers["cache-control"]).toBe("no-store");
+    expect(callback.headers["referrer-policy"]).toBe("no-referrer");
+    expect(callback.headers["set-cookie"]).toBeUndefined();
+    expect(callback.body).not.toContain("code-token-rejected");
+    expect(callback.body).not.toContain("synthetic-access-token");
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(states.consumeCalls).toBe(1);
+  });
+
+  it("资料端点拒绝令牌时按统一 401 失败关闭且不建账号", async () => {
+    const { app, fetch, states } = await makeHarness({ profileStatus: 502 });
+    const flow = await startFlow(app);
+    const callback = await app.inject({
+      method: "GET",
+      url: callbackRequest(flow.state, "code-profile-rejected"),
+      headers: { cookie: flow.cookiePair },
+    });
+    expect(callback.statusCode).toBe(401);
+    expect(publicFailure(callback)).toBe("UNAUTHENTICATED");
+    expect(callback.headers["set-cookie"]).toBeUndefined();
+    expect(callback.body).not.toContain("code-profile-rejected");
+    expect(callback.body).not.toContain("synthetic-access-token");
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(states.consumeCalls).toBe(1);
+  });
+
+  it("令牌与资料端点传输异常按统一 401 失败关闭，不泄露关键词", async () => {
+    const { app, fetch, states } = await makeHarness({ networkFailure: true });
+    const flow = await startFlow(app);
+    const callback = await app.inject({
+      method: "GET",
+      url: callbackRequest(flow.state, "code-transport-failure"),
+      headers: { cookie: flow.cookiePair },
+    });
+    expect(callback.statusCode).toBe(401);
+    expect(publicFailure(callback)).toBe("UNAUTHENTICATED");
+    expect(callback.headers["set-cookie"]).toBeUndefined();
+    expect(callback.body).not.toContain("code-transport-failure");
+    expect(callback.body).not.toContain("synthetic");
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(states.consumeCalls).toBe(1);
   });
 
   it("会话响应暴露 ustcOAuth 能力开关但不暴露任何密钥", async () => {
