@@ -389,4 +389,39 @@ describe("冻结字段管理员覆盖", () => {
       error: expect.objectContaining({ code: "NOT_FOUND" })
     });
   });
+
+  it("审核前草稿阶段普通用户仍可修改基础题面/基础题解", async () => {
+    const { app } = await makeApp(createDemoUsers());
+    const authorCookie = await login(app, "author");
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/problems",
+      headers: { cookie: authorCookie, origin },
+      payload: {
+        title: "草稿题目",
+        type: "traditional",
+        tagIds: ["algorithm.implementation"],
+        content: { basicStatement: "初稿题面", basicSolution: "初稿题解" }
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const draft = created.json() as ProblemResult;
+    expect(draft.status).toBe("draft");
+
+    const edited = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${draft.id}`,
+      headers: { cookie: authorCookie, origin },
+      payload: {
+        expectedRevision: draft.revision,
+        content: { basicStatement: "修订后的题面", basicSolution: "修订后的题解" }
+      }
+    });
+    expect(edited.statusCode).toBe(200);
+    const result = edited.json() as ProblemResult;
+    expect(result.status).toBe("draft");
+    expect(result.revision).toBe(draft.revision + 1);
+    expect(result.content.basicStatement).toBe("修订后的题面");
+    expect(result.content.basicSolution).toBe("修订后的题解");
+  });
 });
