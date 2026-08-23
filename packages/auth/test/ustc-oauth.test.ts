@@ -270,6 +270,110 @@ describe("USTC OAuth2 授权码流程", () => {
     ).rejects.toThrow();
   });
 
+  it("令牌端点 HTTP 失败、无效 JSON 或传输异常按专用错误码失败而不暴露明文", async () => {
+    const tokenRejected = makeClient({
+      fetch: async (input) =>
+        String(input).endsWith("/accessToken")
+          ? new Response("denied", { status: 502 })
+          : new Response("unexpected", { status: 500 }),
+    });
+    const tokenRejectedStart = await tokenRejected.client.startLogin("/");
+    await expect(
+      tokenRejected.client.finishLogin({
+        state: tokenRejectedStart.state,
+        code: "c",
+        browserBinding: tokenRejectedStart.browserBindingCookie.value,
+      }),
+    ).rejects.toMatchObject({ code: "token_rejected" });
+
+    const badTokenJson = makeClient({
+      fetch: async (input) =>
+        String(input).endsWith("/accessToken")
+          ? new Response("not-json", { status: 200 })
+          : new Response("unexpected", { status: 500 }),
+    });
+    const badTokenJsonStart = await badTokenJson.client.startLogin("/");
+    await expect(
+      badTokenJson.client.finishLogin({
+        state: badTokenJsonStart.state,
+        code: "c",
+        browserBinding: badTokenJsonStart.browserBindingCookie.value,
+      }),
+    ).rejects.toMatchObject({ code: "token_bad_json" });
+
+    const tokenNetwork = makeClient({
+      fetch: async (input) => {
+        if (String(input).endsWith("/accessToken")) {
+          throw new Error("synthetic token transport failure");
+        }
+        return new Response("unexpected", { status: 500 });
+      },
+    });
+    const tokenNetworkStart = await tokenNetwork.client.startLogin("/");
+    await expect(
+      tokenNetwork.client.finishLogin({
+        state: tokenNetworkStart.state,
+        code: "c",
+        browserBinding: tokenNetworkStart.browserBindingCookie.value,
+      }),
+    ).rejects.toMatchObject({ code: "token_network" });
+  });
+
+  it("资料端点 HTTP 失败、无效 JSON 或传输异常按专用错误码失败而不暴露明文", async () => {
+    const profileRejected = makeClient({
+      fetch: async (input) =>
+        String(input).endsWith("/profile")
+          ? new Response("denied", { status: 502 })
+          : new Response(JSON.stringify({ access_token: "synthetic-access-token" }), {
+              status: 200,
+            }),
+    });
+    const profileRejectedStart = await profileRejected.client.startLogin("/");
+    await expect(
+      profileRejected.client.finishLogin({
+        state: profileRejectedStart.state,
+        code: "c",
+        browserBinding: profileRejectedStart.browserBindingCookie.value,
+      }),
+    ).rejects.toMatchObject({ code: "profile_rejected" });
+
+    const badProfileJson = makeClient({
+      fetch: async (input) =>
+        String(input).endsWith("/profile")
+          ? new Response("not-json", { status: 200 })
+          : new Response(JSON.stringify({ access_token: "synthetic-access-token" }), {
+              status: 200,
+            }),
+    });
+    const badProfileJsonStart = await badProfileJson.client.startLogin("/");
+    await expect(
+      badProfileJson.client.finishLogin({
+        state: badProfileJsonStart.state,
+        code: "c",
+        browserBinding: badProfileJsonStart.browserBindingCookie.value,
+      }),
+    ).rejects.toMatchObject({ code: "profile_bad_json" });
+
+    const profileNetwork = makeClient({
+      fetch: async (input) => {
+        if (String(input).endsWith("/profile")) {
+          throw new Error("synthetic profile transport failure");
+        }
+        return new Response(JSON.stringify({ access_token: "synthetic-access-token" }), {
+          status: 200,
+        });
+      },
+    });
+    const profileNetworkStart = await profileNetwork.client.startLogin("/");
+    await expect(
+      profileNetwork.client.finishLogin({
+        state: profileNetworkStart.state,
+        code: "c",
+        browserBinding: profileNetworkStart.browserBindingCookie.value,
+      }),
+    ).rejects.toMatchObject({ code: "profile_network" });
+  });
+
   it("实例与返回对象不暴露 client_secret，令牌不进入返回值", async () => {
     const { client, recording } = makeClient();
     const start = await client.startLogin("/");
