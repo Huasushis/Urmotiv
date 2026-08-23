@@ -499,6 +499,76 @@ describe("历史题目迁移安全核心", () => {
     expect(resumed).toMatchObject({ complete: true, completedSourceCount: 1 });
   });
 
+  it("保留失败回执与 active 前缀时只追加一次恢复请求", async () => {
+    const fixture = await createFixture("失败前缀恢复成功的合成正文。");
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize() {
+          throw new HistoryNormalizationError("schema", "合成 schema 失败。");
+        },
+      },
+    });
+    const activePath = join(fixture.prepareOutput, "requests", "source-000001.active.json");
+    const failedPath = join(fixture.prepareOutput, "requests", "source-000001.failed.json");
+    const originalActive = await readFile(activePath, "utf8");
+    const originalFailed = await readFile(failedPath, "utf8");
+
+    const result = await recoverActiveHistoryCandidate({
+      ...fixture.prepareOptions,
+      sourceId: "source-000001",
+      normalizer: fixedNormalizer(),
+    });
+
+    expect(result).toMatchObject({ status: "completed", requestAttemptCount: 2 });
+    expect(await readFile(activePath, "utf8")).toBe(originalActive);
+    expect(await readFile(failedPath, "utf8")).toBe(originalFailed);
+    await expect(
+      stat(join(fixture.prepareOutput, "requests", "source-000001.attempt-02.active.json")),
+    ).resolves.toBeDefined();
+    const completed = JSON.parse(
+      await readFile(join(fixture.prepareOutput, "requests", "source-000001.completed.json"), "utf8"),
+    ) as { readonly requestAttemptSha256s: readonly string[] };
+    expect(completed.requestAttemptSha256s).toHaveLength(2);
+    const resumed = await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      resume: true,
+      normalizer: fixedNormalizer(),
+    });
+    expect(resumed).toMatchObject({ complete: true, completedSourceCount: 1 });
+    const candidate = await readCandidate(fixture.prepareOutput);
+    await writeApproval(fixture.approvalFile, candidate.candidateId, candidate.contentSha256);
+    await expect(packageApprovedCandidates(fixture.packageOptions)).resolves.toMatchObject({
+      packageCount: 1,
+      authorMappingCount: 1,
+    });
+  });
+
+  it("拒绝失败前缀之外已有追加 active 的歧义状态", async () => {
+    const fixture = await createFixture("失败前缀歧义拒绝的合成正文。");
+    await prepareHistoryCandidates({
+      ...fixture.prepareOptions,
+      normalizer: {
+        async normalize() {
+          throw new HistoryNormalizationError("schema", "合成 schema 失败。");
+        },
+      },
+    });
+    const activePath = join(fixture.prepareOutput, "requests", "source-000001.active.json");
+    await writeFile(
+      join(fixture.prepareOutput, "requests", "source-000001.attempt-02.active.json"),
+      await readFile(activePath, "utf8"),
+      "utf8",
+    );
+    await expect(
+      recoverActiveHistoryCandidate({
+        ...fixture.prepareOptions,
+        sourceId: "source-000001",
+        normalizer: fixedNormalizer(),
+      }),
+    ).rejects.toMatchObject({ code: "RECOVERY_REJECTED" });
+  });
+
   it("恢复 active-only 的整理失败写入绑定失败回执并拒绝重复恢复", async () => {
     const fixture = await createActiveOnlyFixture("恢复失败的合成正文。");
     const result = await recoverActiveHistoryCandidate({

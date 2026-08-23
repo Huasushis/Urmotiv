@@ -792,10 +792,19 @@ export async function recoverActiveHistoryCandidate(
       "recover-active 只接受仍有 active 请求登记的源。",
     );
   }
-  if (state.kind !== "active") {
+  let active: z.infer<typeof preparationActiveSchema> | null =
+    state.kind === "active" ? state.record : null;
+  if (state.kind === "failed") {
+    active = await loadRecoverableFailedActiveState(
+      options.privateRootDirectory,
+      options.outputDirectory,
+      source.sourceId,
+    );
+  }
+  if (active === null || state.kind === "completed") {
     throw new HistoryMigrationError(
       "RECOVERY_REJECTED",
-      "recover-active 拒绝已完成或已有失败回执的源。",
+      "recover-active 拒绝已完成、歧义或不具备完整 active 前缀的源。",
     );
   }
   const requestDirectory = join(options.outputDirectory, "requests");
@@ -812,7 +821,6 @@ export async function recoverActiveHistoryCandidate(
     );
   }
 
-  const active = state.record;
   const activeSha256 = sha256Hex(JSON.stringify(active));
   const targetExecutionIdentitySha256 = sha256Hex(
     JSON.stringify(savedRun.executionIdentity),
@@ -861,9 +869,16 @@ export async function recoverActiveHistoryCandidate(
       "recover-active 的 active 源身份摘要不一致。",
     );
   }
+  if (active.recoveryExecutorIdentity !== undefined) {
+    throw new HistoryMigrationError(
+      "RECOVERY_REJECTED",
+      "recover-active 拒绝已经使用恢复执行器身份的 active 请求。",
+    );
+  }
+  const activeTarget = { ...active, executorIdentity: undefined };
 
   const retryActive = preparationActiveSchema.parse({
-    ...active,
+    ...activeTarget,
     operationSha256: sha256Hex(
       JSON.stringify({
         operationTagSha256: savedRun.operationTagSha256,
@@ -889,7 +904,7 @@ export async function recoverActiveHistoryCandidate(
           if (attempt < 2) return;
           const operationAttempt = attempt + 1;
           const retry = preparationActiveSchema.parse({
-            ...active,
+            ...activeTarget,
             operationSha256: sha256Hex(
               JSON.stringify({
                 operationTagSha256: savedRun.operationTagSha256,
@@ -998,6 +1013,17 @@ type PreparationSourceState =
       readonly kind: "completed";
       readonly record: z.infer<typeof preparationCompletedSchema>;
     };
+function preparationFailureMatchesActivePrefix(
+  failed: z.infer<typeof preparationFailureSchema>,
+  active: z.infer<typeof preparationActiveSchema>,
+): boolean {
+  const activeSha256 = sha256Hex(JSON.stringify(active));
+  return (
+    failed.activeSha256 === activeSha256 &&
+    failed.requestAttemptSha256s.length === 1 &&
+    failed.requestAttemptSha256s[0] === activeSha256
+  );
+}
 
 function preparationStatePath(
   outputDirectory: string,
@@ -1037,9 +1063,13 @@ async function loadPreparationSourceState(
     }
   }
   if (completed !== null) {
+    const failedPrefix =
+      failed !== null &&
+      active !== null &&
+      preparationFailureMatchesActivePrefix(failed, active);
     if (
       active === null ||
-      failed !== null ||
+      (failed !== null && !failedPrefix) ||
       completed.activeSha256 !== sha256Hex(JSON.stringify(active))
     ) {
       throw new HistoryMigrationError(
@@ -1054,6 +1084,16 @@ async function loadPreparationSourceState(
       completed.requestAttemptSha256s,
       targetExecutionIdentitySha256,
     );
+    if (failed !== null) {
+      const failedAttempts = await assertPreparationAttemptChain(
+        privateRootDirectory,
+        outputDirectory,
+        sourceId,
+        failed.requestAttemptSha256s,
+        targetExecutionIdentitySha256,
+      );
+      assertPreparationTerminalExecutorEvidence(failed, failedAttempts);
+    }
     assertPreparationTerminalExecutorEvidence(completed, attempts);
     return { kind: "completed", record: completed };
   }
@@ -1082,6 +1122,38 @@ async function loadPreparationSourceState(
     assertPreparationActiveRecord(active, targetExecutionIdentitySha256);
   }
   return active === null ? "pending" : { kind: "active", record: active };
+}
+async function loadRecoverableFailedActiveState(
+  privateRootDirectory: string,
+  outputDirectory: string,
+  sourceId: string,
+): Promise<z.infer<typeof preparationActiveSchema> | null> {
+  const active = await readOptionalPreparationRecord(
+    privateRootDirectory,
+    preparationStatePath(outputDirectory, sourceId, "active"),
+    preparationActiveSchema,
+  );
+  const failed = await readOptionalPreparationRecord(
+    privateRootDirectory,
+    preparationStatePath(outputDirectory, sourceId, "failed"),
+    preparationFailureSchema,
+  );
+  if (active === null || failed === null) return null;
+  if (!preparationFailureMatchesActivePrefix(failed, active)) {
+    if (failed.requestAttemptSha256s.length !== 1) return null;
+    throw new HistoryMigrationError(
+      "PREPARE_RESUME_UNSAFE",
+      "recover-active 的失败回执不是原 active 请求的完整前缀。",
+    );
+  }
+  const attempts = await assertPreparationAttemptChain(
+    privateRootDirectory,
+    outputDirectory,
+    sourceId,
+    failed.requestAttemptSha256s,
+  );
+  assertPreparationTerminalExecutorEvidence(failed, attempts);
+  return active;
 }
 
 async function readOptionalPreparationRecord<T>(
