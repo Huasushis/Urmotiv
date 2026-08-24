@@ -14,7 +14,10 @@ const browserBindingDigestContext = "urmotiv:ustc-oauth:browser-binding:v1\0";
 const browserBindingSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const tokenResponseCap = 8_192;
 const profileResponseCap = 16_384;
-const callbackPath = "/api/v1/auth/ustc/callback";
+const ustcOAuthCallbackPaths = {
+  "/api/v1/auth/ustc/callback": true,
+  "/oauth/ustc/callback": true
+} as const;
 
 const httpUrlSchema = z.string().url().refine((value) => {
   const url = new URL(value);
@@ -36,13 +39,27 @@ export const ustcOAuthConfigurationSchema = z
     profileUrl: httpUrlSchema,
     redirectUri: httpUrlSchema.refine((value) => {
       const url = new URL(value);
+      const schemeEnd = value.indexOf("://");
+      const authorityStart = schemeEnd + 3;
+      const pathStart = value.indexOf("/", authorityStart);
+      const queryStart = value.indexOf("?", authorityStart);
+      const hashStart = value.indexOf("#", authorityStart);
+      const pathEnd = Math.min(
+        queryStart === -1 ? value.length : queryStart,
+        hashStart === -1 ? value.length : hashStart
+      );
+      const rawPath =
+        pathStart === -1 || pathStart > pathEnd ? "/" : value.slice(pathStart, pathEnd);
       return (
         url.protocol === "https:" &&
-        url.pathname === callbackPath &&
+        url.username.length === 0 &&
+        url.password.length === 0 &&
+        Object.hasOwn(ustcOAuthCallbackPaths, rawPath) &&
+        url.pathname === rawPath &&
         url.search.length === 0 &&
         url.hash.length === 0
       );
-    }, "回调地址必须精确指向 /api/v1/auth/ustc/callback，不能带查询参数或片段。"),
+    }, "回调地址必须是 HTTPS 且精确指向 /api/v1/auth/ustc/callback 或 /oauth/ustc/callback，不能带查询参数或片段。"),
     clientId: z.string().trim().min(1, "client_id 不能为空。").max(200),
     clientSecret: z
       .string()

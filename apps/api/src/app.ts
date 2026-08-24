@@ -1190,7 +1190,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       return reply.redirect(start.authorizeUrl);
     });
 
-    app.get("/api/v1/auth/ustc/callback", async (request, reply) => {
+    const handleUstcOAuthCallback = async (
+      request: FastifyRequest,
+      reply: FastifyReply
+    ) => {
       reply.header("cache-control", "no-store");
       reply.header("referrer-policy", "no-referrer");
       try {
@@ -1250,7 +1253,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       } catch {
         throw unauthorized();
       }
-    });
+    };
+
+    app.get("/api/v1/auth/ustc/callback", handleUstcOAuthCallback);
+    app.get("/oauth/ustc/callback", handleUstcOAuthCallback);
   }
 
   if (dependencies.casClient !== undefined) {
