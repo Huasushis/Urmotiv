@@ -47,6 +47,9 @@ importers:
       '@urmotiv/plugin-fermata-control':
         specifier: workspace:*
         version: link:../../plugins/fermata-control
+      '@urmotiv/plugin-fps-format':
+        specifier: workspace:*
+        version: link:../../plugins/fps-format
       '@urmotiv/plugin-hydro-format':
         specifier: workspace:*
         version: link:../../plugins/hydro-format
@@ -361,6 +364,31 @@ importers:
       '@urmotiv/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      zod:
+        specifier: latest
+        version: 4.4.3
+    devDependencies:
+      '@types/node':
+        specifier: latest
+        version: 26.1.1
+      typescript:
+        specifier: latest
+        version: 7.0.2
+      vitest:
+        specifier: latest
+        version: 4.1.10(@types/node@26.1.1)(jsdom@29.1.1)(vite@8.1.5(@types/node@26.1.1)(esbuild@0.28.1)(tsx@4.23.1)(yaml@2.9.0))
+
+  plugins/fps-format:
+    dependencies:
+      '@urmotiv/plugin-sdk':
+        specifier: workspace:*
+        version: link:../../packages/plugin-sdk
+      '@urmotiv/problem-package':
+        specifier: workspace:*
+        version: link:../../packages/problem-package
+      fast-xml-parser:
+        specifier: latest
+        version: 5.10.1
       zod:
         specifier: latest
         version: 4.4.3
