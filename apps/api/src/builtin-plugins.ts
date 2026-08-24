@@ -16,6 +16,11 @@ import {
   hydroAdapterVersion,
   registerHydroFormatPlugin
 } from "@urmotiv/plugin-hydro-format";
+import {
+  fpsAdapterVersion,
+  registerFpsFormatPlugin
+} from "@urmotiv/plugin-fps-format";
+
 import type { PluginRegistry } from "@urmotiv/plugin-sdk";
 import type { TrustedPluginDefinition } from "./plugin-host";
 
@@ -44,6 +49,7 @@ export const anklangServiceTokenSecretName = "serviceToken";
 export const fermataPluginId = "org.ustc.urmotiv.fermata-control";
 export const fermataManagementTokenSecretName = "managementToken";
 export const hydroFormatPluginId = "org.ustc.urmotiv.hydro-format";
+export const fpsFormatPluginId = "org.ustc.urmotiv.fps-format";
 
 export function createBuiltinPluginDefinitions(
   runtime: BuiltinPluginRuntime = {}
@@ -172,6 +178,12 @@ export function createBuiltinPluginDefinitions(
       requiresRestart: false,
       manifest: { id: hydroFormatPluginId, name: "Hydro 题目包格式", version: hydroAdapterVersion, apiVersion: "1", serverEntry: "dist/index.js", permissions: [] },
       registerHooks: registerHydroFormatPlugin
+    },
+    {
+      source: "builtin:fps-format",
+      requiresRestart: false,
+      manifest: { id: fpsFormatPluginId, name: "FPS XML 题目包格式", version: fpsAdapterVersion, apiVersion: "1", serverEntry: "dist/index.js", permissions: [] },
+      registerHooks: registerFpsFormatPlugin
     }
   ];
 }
