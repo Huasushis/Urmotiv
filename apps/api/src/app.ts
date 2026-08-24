@@ -49,7 +49,8 @@ import {
   updateTagCatalogItemInputSchema,
   uploadProblemFileQuerySchema,
   withdrawProblemInputSchema,
-  batchAccountCreateInputSchema
+  batchAccountCreateInputSchema,
+  createServiceAccountTokenInputSchema
 } from "@urmotiv/contracts";
 import {
   CasAuthenticationError,
@@ -133,6 +134,7 @@ import {
   type RobotCompletionResult,
   type RobotTokenIdentity,
 } from "./robot-store";
+import { DatabaseServiceAccountTokenStore } from "./service-account-store";
 import { PluginReviewDecisionRunner } from "./review-decision";
 import { ReviewPolicyService } from "./review-policy-service";
 import { DatabaseTagCatalogService } from "./tag-catalog-service";
@@ -152,6 +154,7 @@ const problemIdSchema = z.string().refine(
 );
 const contestIdSchema = z.string().regex(/^[1-9]\d*$/);
 const fileIdSchema = z.string().uuid();
+const serviceAccountUserIdSchema = z.string().regex(/^(0|[1-9]\d*)$/);
 const adminPluginIdSchema = z
   .string()
   .min(3)
@@ -189,6 +192,7 @@ export interface ApiAppOptions {
   transfer?: TransferService;
   reviewItems?: ReviewItemStore;
   robots?: DatabaseRobotStore;
+  serviceAccountTokens?: DatabaseServiceAccountTokenStore;
   tagCatalog?: DatabaseTagCatalogService;
   trustedProxyCidrs?: readonly string[];
   /** 对外抓取（如 QQ 头像 CDN）使用的实现；默认 globalThis.fetch，测试可注入。 */
@@ -220,6 +224,7 @@ interface AppDependencies {
   transfer?: TransferService;
   reviewItemStore: ReviewItemStore;
   robots?: DatabaseRobotStore;
+  serviceAccountTokens?: DatabaseServiceAccountTokenStore;
   tagCatalog?: DatabaseTagCatalogService;
   trustedProxyCidrs: readonly string[];
   fetchImpl: typeof fetch;
@@ -268,6 +273,23 @@ function parseProblemId(request: FastifyRequest): string {
 function parseContestId(request: FastifyRequest): string {
   const params = request.params as { contestId?: unknown };
   const result = contestIdSchema.safeParse(params.contestId);
+  if (!result.success) {
+    throw notFound();
+  }
+  return result.data;
+}
+
+function parseServiceAccountUserId(request: FastifyRequest): string {
+  const params = request.params as { userId?: unknown };
+  const result = serviceAccountUserIdSchema.safeParse(params.userId);
+  if (!result.success) {
+    throw notFound();
+  }
+  return result.data;
+}
+function parseServiceAccountTokenId(request: FastifyRequest): string {
+  const params = request.params as { tokenId?: unknown };
+  const result = fileIdSchema.safeParse(params.tokenId);
   if (!result.success) {
     throw notFound();
   }
@@ -548,6 +570,9 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     ...(options.transfer === undefined ? {} : { transfer: options.transfer }),
     reviewItemStore: reviewItems,
     ...(options.robots === undefined ? {} : { robots: options.robots }),
+    ...(options.serviceAccountTokens === undefined
+      ? {}
+      : { serviceAccountTokens: options.serviceAccountTokens }),
     ...(options.tagCatalog === undefined ? {} : { tagCatalog: options.tagCatalog }),
     trustedProxyCidrs: options.trustedProxyCidrs ?? [],
     allowedOrigins: options.allowedOrigins ?? [
@@ -732,6 +757,24 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     return dependencies.tagCatalog;
   }
 
+  async function requireServiceAccountManager(request: FastifyRequest): Promise<StoredUser> {
+    const user = await requireUser(request);
+    if (
+      user.accountType !== "human"
+      || !hasPermission(user, "service_account.manage", {}, dependencies.now())
+    ) {
+      throw notFound();
+    }
+    return user;
+  }
+
+  function requireServiceAccountTokenStore(): DatabaseServiceAccountTokenStore {
+    if (dependencies.serviceAccountTokens === undefined) {
+      throw new ApiError(503, "SERVICE_UNAVAILABLE", "机器人令牌管理服务暂不可用。");
+    }
+    return dependencies.serviceAccountTokens;
+  }
+
   async function recordPluginUpdateAttemptSafely(input: {
     actorUserId: string;
     requestId: string;
@@ -828,12 +871,85 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     const user = await currentUser(request);
     return authSummary(user);
   });
+  app.get("/api/v1/admin/service-accounts/:userId/tokens", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requireServiceAccountManager(request);
+    const userId = parseServiceAccountUserId(request);
+    const tokens = await requireServiceAccountTokenStore().listTokens(userId);
+    if (tokens === undefined) {
+      throw notFound();
+    }
+    return tokens;
+  });
+
+  app.post("/api/v1/admin/service-accounts/:userId/tokens", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const actor = await requireServiceAccountManager(request);
+    const userId = parseServiceAccountUserId(request);
+    const input = createServiceAccountTokenInputSchema.parse(request.body);
+    if (input.expiresAt !== null && Date.parse(input.expiresAt) <= dependencies.now().getTime()) {
+      throw new ApiError(422, "INVALID_INPUT", "机器人令牌的到期时间必须晚于当前时间。");
+    }
+    const created = await requireServiceAccountTokenStore().createToken(userId, {
+      actorUserId: actor.id,
+      requestId: request.id,
+      token: input
+    });
+    if (created === undefined) {
+      throw notFound();
+    }
+    return created;
+  });
+
+  app.post(
+    "/api/v1/admin/service-accounts/:userId/tokens/:tokenId/rotate",
+    async (request, reply) => {
+      reply.header("cache-control", "private, no-store");
+      const actor = await requireServiceAccountManager(request);
+      const userId = parseServiceAccountUserId(request);
+      const tokenId = parseServiceAccountTokenId(request);
+      const input = createServiceAccountTokenInputSchema.parse(request.body);
+      if (input.expiresAt !== null && Date.parse(input.expiresAt) <= dependencies.now().getTime()) {
+        throw new ApiError(422, "INVALID_INPUT", "机器人令牌的到期时间必须晚于当前时间。");
+      }
+      const rotated = await requireServiceAccountTokenStore().rotateToken(userId, tokenId, {
+        actorUserId: actor.id,
+        requestId: request.id,
+        token: input
+      });
+      if (rotated === undefined) {
+        throw notFound();
+      }
+      return rotated;
+    }
+  );
+
+  app.delete(
+    "/api/v1/admin/service-accounts/:userId/tokens/:tokenId",
+    async (request, reply) => {
+      reply.header("cache-control", "private, no-store");
+      const actor = await requireServiceAccountManager(request);
+      const userId = parseServiceAccountUserId(request);
+      const tokenId = parseServiceAccountTokenId(request);
+      const revoked = await requireServiceAccountTokenStore().revokeToken(
+        userId,
+        tokenId,
+        actor.id,
+        request.id
+      );
+      if (revoked === undefined) {
+        throw notFound();
+      }
+      return { item: revoked };
+    }
+  );
 
   app.get("/api/v1/admin/plugins", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
     await requirePluginManager(request);
     return { items: await dependencies.pluginHost.list() };
   });
+
 
   app.patch("/api/v1/admin/plugins/:pluginId", async (request, reply) => {
     reply.header("cache-control", "private, no-store");

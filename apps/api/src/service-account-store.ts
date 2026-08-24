@@ -148,6 +148,59 @@ async function readTokens(
   }));
 }
 
+async function insertToken(
+  transaction: DatabaseExecutor,
+  userId: bigint,
+  operation: CreateServiceAccountTokenRecordInput,
+  now: () => Date,
+  action: "service_account.token.create" | "service_account.token.rotate"
+): Promise<CreatedServiceAccountToken> {
+  const input = createServiceAccountTokenInputSchema.parse(operation.token);
+  if (input.expiresAt !== null && Date.parse(input.expiresAt) <= now().getTime()) {
+    throw new Error("机器人令牌的到期时间必须晚于当前时间。");
+  }
+  const sourceCidrs = [...input.sourceCidrs];
+  const permissions = [...input.permissions].sort();
+  const actorUserId = requireDatabaseId(operation.actorUserId, "令牌创建者编号");
+  const tokenId = randomUUID();
+  const created = createApiToken();
+  await transaction.execute(sql`
+    INSERT INTO api_tokens (
+      id, user_id, name, token_prefix, token_digest, source_cidrs,
+      expires_at, created_by_user_id
+    ) VALUES (
+      ${tokenId}::uuid, ${userId}, ${input.name}, ${created.displayPrefix},
+      ${created.digest}, ${JSON.stringify(sourceCidrs)}::jsonb,
+      ${input.expiresAt}::timestamptz, ${actorUserId}
+    )
+  `);
+  for (const permission of permissions) {
+    await transaction.execute(sql`
+      INSERT INTO api_token_permissions (
+        id, token_id, permission_name, effect, scope
+      ) VALUES (
+        ${randomUUID()}::uuid, ${tokenId}::uuid, ${permission}, 'allow', 'global'
+      )
+    `);
+  }
+  await transaction.execute(sql`
+    INSERT INTO audit_events (
+      actor_user_id, subject_user_id, request_id, action, object_type,
+      object_id, result, metadata
+    ) VALUES (
+      ${actorUserId}, ${userId}, ${operation.requestId}::uuid,
+      ${action}, 'api_token', ${tokenId}, 'success',
+      ${JSON.stringify({
+        permissionCount: permissions.length,
+        sourceCidrCount: sourceCidrs.length,
+        hasExpiry: input.expiresAt !== null
+      })}::jsonb
+    )
+  `);
+  const item = (await readTokens(transaction, userId, tokenId))[0];
+  if (item === undefined) throw new Error("机器人令牌创建后无法读取。");
+  return createdServiceAccountTokenSchema.parse({ item, token: created.token });
+}
 export class DatabaseServiceAccountTokenStore {
   public constructor(
     private readonly database: DatabaseHandle,
@@ -176,51 +229,51 @@ export class DatabaseServiceAccountTokenStore {
     if (userId === undefined) return undefined;
     return this.database.transaction(async (transaction) => {
       if (!await activeRobotExists(transaction, userId, true)) return undefined;
-      const input = createServiceAccountTokenInputSchema.parse(operation.token);
-      if (input.expiresAt !== null && Date.parse(input.expiresAt) <= this.now().getTime()) {
-        throw new Error("机器人令牌的到期时间必须晚于当前时间。");
-      }
-      const sourceCidrs = [...input.sourceCidrs];
-      const permissions = [...input.permissions].sort();
-      const actorUserId = requireDatabaseId(operation.actorUserId, "令牌创建者编号");
-      const tokenId = randomUUID();
-      const created = createApiToken();
-      await transaction.execute(sql`
-        INSERT INTO api_tokens (
-          id, user_id, name, token_prefix, token_digest, source_cidrs,
-          expires_at, created_by_user_id
-        ) VALUES (
-          ${tokenId}::uuid, ${userId}, ${input.name}, ${created.displayPrefix},
-          ${created.digest}, ${JSON.stringify(sourceCidrs)}::jsonb,
-          ${input.expiresAt}::timestamptz, ${actorUserId}
-        )
+      return insertToken(transaction, userId, operation, this.now, "service_account.token.create");
+    });
+  }
+
+  /**
+   * Rotation creates and audits the replacement before revoking the old token
+   * in the same transaction. The replacement secret is returned only here.
+   */
+  public async rotateToken(
+    serviceAccountUserId: string,
+    tokenId: string,
+    operation: CreateServiceAccountTokenRecordInput
+  ): Promise<CreatedServiceAccountToken | undefined> {
+    const userId = parseDatabaseId(serviceAccountUserId);
+    if (userId === undefined || !uuidPattern.test(tokenId)) return undefined;
+    return this.database.transaction(async (transaction) => {
+      if (!await activeRobotExists(transaction, userId, true)) return undefined;
+      const activeToken = await transaction.query<{ id: string }>(sql`
+        SELECT id::text AS id
+        FROM api_tokens
+        WHERE id = ${tokenId}::uuid
+          AND user_id = ${userId}
+          AND revoked_at IS NULL
+        FOR UPDATE
       `);
-      for (const permission of permissions) {
-        await transaction.execute(sql`
-          INSERT INTO api_token_permissions (
-            id, token_id, permission_name, effect, scope
-          ) VALUES (
-            ${randomUUID()}::uuid, ${tokenId}::uuid, ${permission}, 'allow', 'global'
-          )
-        `);
-      }
-      await transaction.execute(sql`
-        INSERT INTO audit_events (
-          actor_user_id, subject_user_id, request_id, action, object_type,
-          object_id, result, metadata
-        ) VALUES (
-          ${actorUserId}, ${userId}, ${operation.requestId}::uuid,
-          'service_account.token.create', 'api_token', ${tokenId}, 'success',
-          ${JSON.stringify({
-            permissionCount: permissions.length,
-            sourceCidrCount: sourceCidrs.length,
-            hasExpiry: input.expiresAt !== null
-          })}::jsonb
-        )
+      if (activeToken.length !== 1) return undefined;
+      const replacement = await insertToken(
+        transaction,
+        userId,
+        operation,
+        this.now,
+        "service_account.token.rotate"
+      );
+      const revoked = await transaction.query<{ id: string }>(sql`
+        UPDATE api_tokens
+        SET revoked_at = ${this.now().toISOString()}::timestamptz
+        WHERE id = ${tokenId}::uuid
+          AND user_id = ${userId}
+          AND revoked_at IS NULL
+        RETURNING id::text AS id
       `);
-      const item = (await readTokens(transaction, userId, tokenId))[0];
-      if (item === undefined) throw new Error("机器人令牌创建后无法读取。");
-      return createdServiceAccountTokenSchema.parse({ item, token: created.token });
+      if (revoked.length !== 1) {
+        throw new Error("机器人令牌轮换时旧令牌状态发生变化。");
+      }
+      return replacement;
     });
   }
 

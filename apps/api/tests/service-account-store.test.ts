@@ -251,6 +251,31 @@ describe("机器人令牌事务存储", () => {
       { action: "service_account.token.revoke", metadata: {} }
     ]);
   });
+  it("轮换审计失败会回滚新旧令牌状态", async () => {
+    const { database, store } = await createStore();
+    const created = await store.createToken(activeRobotId, createOperation());
+    expect(created).toBeDefined();
+
+    await expect(store.rotateToken(activeRobotId, created!.item.id, {
+      ...createOperation({ name: "轮换失败令牌" }),
+      requestId: "not-a-request-id"
+    })).rejects.toBeDefined();
+
+    const rows = await database.query<{
+      token_count: number;
+      revoked_at: string | null;
+    }>(sql`
+      SELECT
+        (SELECT count(*)::integer FROM api_tokens
+         WHERE user_id = ${BigInt(activeRobotId)}) AS token_count,
+        revoked_at
+      FROM api_tokens
+      WHERE id = ${created!.item.id}::uuid
+    `);
+    expect(rows).toEqual([{ token_count: 1, revoked_at: null }]);
+    expect(await counts(database)).toEqual({ tokens: 1, permissions: 3, audits: 1 });
+  });
+
 
   it("审计写入失败会回滚令牌创建和撤销", async () => {
     const { database, store } = await createStore();

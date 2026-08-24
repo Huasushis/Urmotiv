@@ -42,6 +42,7 @@ import {
 } from "./builtin-plugins";
 import { DatabaseReviewItemStore } from "./review-item-store";
 import { DatabaseRobotStore } from "./robot-store";
+import { DatabaseServiceAccountTokenStore } from "./service-account-store";
 import { DatabaseTagCatalogService } from "./tag-catalog-service";
 import { createPluginSecretBox, TrustedPluginHost } from "./plugin-host";
 import { TrustedProblemFormatAdapterCatalog } from "./problem-format-adapters";
@@ -200,6 +201,7 @@ try {
     transfer: transferService,
     reviewItems: new DatabaseReviewItemStore(database),
     robots: new DatabaseRobotStore(database),
+    serviceAccountTokens: new DatabaseServiceAccountTokenStore(database),
     tagCatalog: new DatabaseTagCatalogService(database)
   });
   void packageWorker.run();
