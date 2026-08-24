@@ -41,6 +41,7 @@ import {
   tagDeactivationPreviewInputSchema,
   updatePluginInputSchema,
   updateContestInputSchema,
+  updateFermataPublicSettingsInputSchema,
   updateProblemInputSchema,
   updateReviewPolicyInputSchema,
   updateProfileInputSchema,
@@ -102,12 +103,14 @@ import {
   type AnklangCache,
   type AnklangCompletionStatus
 } from "@urmotiv/plugin-anklang";
+import type { FermataFetch } from "@urmotiv/plugin-fermata-control";
 import {
   anklangPluginId,
   anklangServiceTokenSecretName,
   createBuiltinPluginDefinitions,
   type AnklangHookRuntime
 } from "./builtin-plugins";
+import { FermataControlError, FermataControlService } from "./fermata-control-service";
 import {
   InMemoryReviewItemStore,
   type ReviewItemStore,
@@ -181,6 +184,7 @@ export interface ApiAppOptions {
   demoUserIds?: readonly string[];
   demoLoginUserIds?: Readonly<Record<string, string>>;
   pluginHost?: TrustedPluginHost;
+  fermataFetch?: FermataFetch;
   problemFiles?: ProblemFilePartsOptions;
   transfer?: TransferService;
   reviewItems?: ReviewItemStore;
@@ -211,6 +215,7 @@ interface AppDependencies {
   demoLoginUserIds: ReadonlyMap<string, string>;
   now: () => Date;
   pluginHost: TrustedPluginHost;
+  fermataControl: FermataControlService;
   problemFiles?: ProblemFileService;
   transfer?: TransferService;
   reviewItemStore: ReviewItemStore;
@@ -496,6 +501,10 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     new InMemoryPluginStore()
   );
   pluginHostReference = pluginHost;
+  const fermataControl = new FermataControlService({
+    pluginHost,
+    ...(options.fermataFetch === undefined ? {} : { fetch: options.fermataFetch })
+  });
   const submitChecks = createSubmitCheckRunner(pluginHost);
   const reviewDecisions = new PluginReviewDecisionRunner(pluginHost);
   const emailRegistrationEnabled = options.emailRegistrationEnabled ?? false;
@@ -565,6 +574,7 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     demoUserIds: new Set(options.demoUserIds ?? defaultDemoUsers.map((user) => user.id)),
     demoLoginUserIds: new Map(Object.entries(options.demoLoginUserIds ?? {})),
     pluginHost,
+    fermataControl,
     fetchImpl: options.fetchImpl ?? globalThis.fetch,
     now
   };
@@ -631,6 +641,15 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     }
     if (error instanceof ApiError) {
       sendError(reply, request.id, error);
+      return;
+    }
+
+    if (error instanceof FermataControlError) {
+      app.log.error(
+        { requestId: request.id, code: error.code, internalMessage: error.internalMessage },
+        "Fermata control request failed"
+      );
+      sendError(reply, request.id, new ApiError(error.statusCode, error.code, error.message));
       return;
     }
 
@@ -905,6 +924,44 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     }
     return { item: plugin };
   });
+  // ---- Fermata 管理接口 ----
+  // 这四个路由实际调用 Fermata 的版本 1 管理端口。权限检查与插件管理一致：
+  // 没有 plugin.manage 权限的请求统一返回 404，不泄露端点存在性。
+  // 插件未启用、未配置地址或缺少管理令牌时返回 503 FERMATA_NOT_CONFIGURED。
+  // Fermata 不可达、超时或返回不符合契约时返回 503/502，不泄露令牌或原始错误体。
+
+  app.get("/api/v1/admin/fermata/health", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requirePluginManager(request);
+    const health = await dependencies.fermataControl.getHealth();
+    return { health };
+  });
+
+  app.get("/api/v1/admin/fermata/settings", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requirePluginManager(request);
+    const snapshot = await dependencies.fermataControl.getSettings();
+    return { settings: snapshot };
+  });
+
+  app.put("/api/v1/admin/fermata/settings", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requirePluginManager(request);
+    const input = updateFermataPublicSettingsInputSchema.parse(request.body);
+    const snapshot = await dependencies.fermataControl.updateSettings(
+      input.expectedRevision,
+      input.settings
+    );
+    return { settings: snapshot };
+  });
+
+  app.post("/api/v1/admin/fermata/wake", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requirePluginManager(request);
+    await dependencies.fermataControl.wake();
+    reply.code(204);
+  });
+
 
   app.get("/api/v1/review-policy", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
