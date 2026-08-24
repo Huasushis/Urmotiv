@@ -291,6 +291,17 @@ describe("认证启动配置", () => {
     );
   });
 
+  it("OAuth2 接受已登记的旧回调路径并保留精确地址", () => {
+    const legacyEnvironment = {
+      ...validUstcOAuthEnvironment,
+      URMOTIV_USTC_OAUTH_REDIRECT_URI:
+        "https://problems.example/oauth/ustc/callback"
+    };
+    expect(
+      readServerAuthenticationOptions(legacyEnvironment).ustcOAuth?.configuration.redirectUri
+    ).toBe("https://problems.example/oauth/ustc/callback");
+  });
+
   it("OAuth2 配置错误只返回固定错误码，不回显 client_secret 或地址", () => {
     for (const environment of [
       {
@@ -301,6 +312,26 @@ describe("认证启动配置", () => {
         ...validUstcOAuthEnvironment,
         URMOTIV_USTC_OAUTH_REDIRECT_URI:
           "https://other.example/api/v1/auth/ustc/callback"
+      },
+      {
+        ...validUstcOAuthEnvironment,
+        URMOTIV_USTC_OAUTH_REDIRECT_URI:
+          "https://problems.example/oauth/ustc/callback/extra"
+      },
+      {
+        ...validUstcOAuthEnvironment,
+        URMOTIV_USTC_OAUTH_REDIRECT_URI:
+          "https://problems.example/oauth/%75stc/callback"
+      },
+      {
+        ...validUstcOAuthEnvironment,
+        URMOTIV_USTC_OAUTH_REDIRECT_URI:
+          "https://problems.example/api/v1/auth/ustc/callback/../callback"
+      },
+      {
+        ...validUstcOAuthEnvironment,
+        URMOTIV_USTC_OAUTH_REDIRECT_URI:
+          "http://problems.example/oauth/ustc/callback"
       },
       {
         ...validUstcOAuthEnvironment,

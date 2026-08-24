@@ -9,6 +9,8 @@ import {
 import { createApp } from "../src/app";
 
 const callbackPath = "/api/v1/auth/ustc/callback";
+const registeredCallbackPath = "/oauth/ustc/callback";
+const registeredCallbackUrl = `https://site.example.test${registeredCallbackPath}`;
 const callbackUrl = `https://site.example.test${callbackPath}`;
 const clientSecret = "synthetic-client-secret-value";
 
@@ -61,7 +63,15 @@ afterEach(async () => {
   await Promise.all(openApps.splice(0).map((app) => app.close()));
 });
 
-async function makeHarness(options: { profileBody?: string; tokenStatus?: number; profileStatus?: number; networkFailure?: boolean } = {}) {
+async function makeHarness(
+  options: {
+    profileBody?: string;
+    tokenStatus?: number;
+    profileStatus?: number;
+    networkFailure?: boolean;
+    redirectUri?: string;
+  } = {},
+) {
   const states = new TrackingStates();
   let profileBody = options.profileBody ?? profileWith({});
   const fetch = vi.fn(async (input: string | URL | Request) => {
@@ -83,7 +93,10 @@ async function makeHarness(options: { profileBody?: string; tokenStatus?: number
     return new Response("not found", { status: 404 });
   });
   const client = new UstcOAuthClient({
-    configuration,
+    configuration: {
+      ...configuration,
+      redirectUri: options.redirectUri ?? configuration.redirectUri,
+    },
     stateSecret: Buffer.alloc(32, 9),
     states,
     fetch: fetch as unknown as typeof globalThis.fetch,
@@ -102,6 +115,7 @@ async function makeHarness(options: { profileBody?: string; tokenStatus?: number
 
 interface StartedFlow {
   state: string;
+  authorizeUrl: string;
   cookieName: string;
   cookiePair: string;
 }
@@ -128,11 +142,16 @@ async function startFlow(app: FastifyInstance, returnPath = "/problems"): Promis
   );
   expect(line).toBeDefined();
   const cookiePair = line!.split(";", 1)[0]!;
-  return { state, cookieName: expectedCookieName, cookiePair };
+  return {
+    state,
+    authorizeUrl: loginLocation.toString(),
+    cookieName: expectedCookieName,
+    cookiePair,
+  };
 }
 
-function callbackRequest(state: string, code: string): string {
-  return `${callbackPath}?state=${encodeURIComponent(state)}&code=${encodeURIComponent(code)}`;
+function callbackRequest(state: string, code: string, path = callbackPath): string {
+  return `${path}?state=${encodeURIComponent(state)}&code=${encodeURIComponent(code)}`;
 }
 
 function publicFailure(response: { statusCode: number; json(): unknown }): unknown {
@@ -174,6 +193,51 @@ describe("USTC OAuth2 应用级流程", () => {
         studentIds: [{ attribute: "zjhm", value: "PB21000077" }],
       }),
     );
+  });
+
+  it("已登记的旧回调路径复用同一 state、浏览器绑定和换码处理器", async () => {
+    const { app, fetch, states } = await makeHarness({ redirectUri: registeredCallbackUrl });
+    const flow = await startFlow(app, "/problems?tab=2");
+    expect(new URL(flow.authorizeUrl).searchParams.get("redirect_uri")).toBe(
+      registeredCallbackUrl,
+    );
+
+    const callback = await app.inject({
+      method: "GET",
+      url: callbackRequest(flow.state, "legacy-code", registeredCallbackPath),
+      headers: { cookie: flow.cookiePair },
+    });
+    expect(callback.statusCode).toBe(302);
+    expect(callback.headers.location).toContain("/problems?tab=2");
+    expect(states.consumeCalls).toBe(1);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(callback.body).not.toContain("legacy-code");
+    expect(callback.body).not.toContain(clientSecret);
+  });
+
+  it("旧回调路径的非法 state 与非精确路径统一拒绝且不调用 IdP", async () => {
+    const { app, fetch, states } = await makeHarness({ redirectUri: registeredCallbackUrl });
+    const invalidState = await app.inject({
+      method: "GET",
+      url: callbackRequest("invalid-state", "legacy-secret-code", registeredCallbackPath),
+    });
+    expect(invalidState.statusCode).toBe(401);
+    expect(publicFailure(invalidState)).toBe("UNAUTHENTICATED");
+    expect(invalidState.body).not.toContain("legacy-secret-code");
+    expect(fetch).not.toHaveBeenCalled();
+    expect(states.consumeCalls).toBe(0);
+
+    const wrongPath = await app.inject({
+      method: "GET",
+      url: callbackRequest(
+        "invalid-state",
+        "legacy-secret-code",
+        `${registeredCallbackPath}/extra`,
+      ),
+    });
+    expect(wrongPath.statusCode).toBe(404);
+    expect(wrongPath.body).not.toContain("legacy-secret-code");
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("重复登录同一 gid 复用账号，不新建、不覆盖现有昵称", async () => {

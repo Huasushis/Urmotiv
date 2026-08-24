@@ -97,7 +97,7 @@ function makeClient(
 }
 
 describe("USTC OAuth2 授权码流程", () => {
-  it("配置校验：clientId 必填、clientSecret 至少 16 字节、回调只接受固定路径", () => {
+  it("配置校验：只接受两个精确回调路径，拒绝编码、查询参数和其他路径", () => {
     expect(() =>
       ustcOAuthConfigurationSchema.parse({ ...baseConfig, clientId: "" }),
     ).toThrow();
@@ -107,16 +107,22 @@ describe("USTC OAuth2 授权码流程", () => {
     expect(() =>
       ustcOAuthConfigurationSchema.parse({
         ...baseConfig,
-        redirectUri: "https://site.example.test/other/callback",
+        redirectUri: "https://site.example.test/oauth/ustc/callback",
       }),
-    ).toThrow();
-    expect(
-      () =>
-        ustcOAuthConfigurationSchema.parse({
-          ...baseConfig,
-          redirectUri: "https://site.example.test/api/v1/auth/ustc/callback?extra=1",
-        }),
-    ).toThrow();
+    ).not.toThrow();
+    for (const redirectUri of [
+      "https://site.example.test/other/callback",
+      "https://site.example.test/oauth/ustc/callback/extra",
+      "https://site.example.test/oauth/%75stc/callback",
+      "https://site.example.test/api/v1/auth/ustc/%63allback",
+      "https://site.example.test/api/v1/auth/ustc/callback/../callback",
+      "https://site.example.test/api/v1/auth/ustc/callback?extra=1",
+      "http://site.example.test/oauth/ustc/callback",
+    ]) {
+      expect(() =>
+        ustcOAuthConfigurationSchema.parse({ ...baseConfig, redirectUri }),
+      ).toThrow();
+    }
     expect(() => ustcOAuthConfigurationSchema.parse(baseConfig)).not.toThrow();
   });
 
