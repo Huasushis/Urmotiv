@@ -20,7 +20,7 @@ test("组长可以查看资料并保存昵称与 QQ 号码", async ({ page }, te
   const qqInput = page.locator('input[placeholder*="5–11"]');
   await expect(nicknameInput).toBeVisible();
   await expect(qqInput).toBeVisible();
-  await expect(page.locator('input[readonly]')).toBeDisabled();
+  await expect(page.locator('[data-testid="profile-username"]')).toBeDisabled();
 
   await nicknameInput.fill("端到端测评组长");
   await qqInput.fill("123456789");

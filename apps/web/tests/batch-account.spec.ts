@@ -1,4 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
+import { randomUUID } from "node:crypto";
+
+const mailSuffix = (): string => randomUUID().replaceAll("-", "").slice(0, 16);
 
 async function loginAsLeader(page: Page): Promise<void> {
   await page.goto("/demo-login");
@@ -13,11 +16,12 @@ test.describe("批量创建账号", () => {
     await expect(page).toHaveURL(/\/admin\/accounts$/);
     await expect(page.getByRole("heading", { name: "批量创建账号" })).toBeVisible();
 
+    const unique = mailSuffix();
     const passwordA = "SyntheticBrowserPass-A-123";
     const passwordB = "SyntheticBrowserPass-B-456";
     const input = [
-      `PB-SYNTH-BROWSER-1\t浏览器甲\tbrowser-a@example.test\t${passwordA}`,
-      `PB-SYNTH-BROWSER-2\t浏览器乙\tbrowser-b@example.test\t${passwordB}`
+      `PB-SYNTH-${unique}\t浏览器甲\tbrowser-a-${unique}@example.test\t${passwordA}`,
+      `PB-SYNTH-${unique}2\t浏览器乙\tbrowser-b-${unique}@example.test\t${passwordB}`
     ].join("\n");
     const textarea = page.getByTestId("batch-account-input");
     await textarea.fill(input);
@@ -32,10 +36,11 @@ test.describe("批量创建账号", () => {
   test("混合无效行整批失败并保留输入，不回显账号数据", async ({ page }) => {
     await loginAsLeader(page);
     await page.goto("/admin/accounts");
+    const unique = mailSuffix();
     const secret = "SyntheticBrowserPass-C-789";
     const input = [
-      `PB-SYNTH-BROWSER-3\t浏览器丙\tbrowser-c@example.test\t${secret}`,
-      "PB-SYNTH-BROWSER-4\t浏览器丁\tbad-email\tshort"
+      `PB-SYNTH-${unique}3\t浏览器丙\tbrowser-c-${unique}@example.test\t${secret}`,
+      `PB-SYNTH-${unique}4\t浏览器丁\tbad-email\tshort`
     ].join("\n");
     const textarea = page.getByTestId("batch-account-input");
     await textarea.fill(input);
@@ -44,7 +49,7 @@ test.describe("批量创建账号", () => {
     const feedback = page.getByRole("alert");
     await expect(feedback).toContainText("第 2 行");
     await expect(textarea).toHaveValue(input);
-    await expect(feedback).not.toContainText("browser-c@example.test");
+    await expect(feedback).not.toContainText(`browser-c-${unique}@example.test`);
     await expect(feedback).not.toContainText(secret);
   });
 });
