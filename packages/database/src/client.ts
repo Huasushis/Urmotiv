@@ -51,6 +51,18 @@ export interface LocalDatabaseOptions {
   /** Omit this value only for short-lived tests. A normal local setup should use a file path. */
   readonly dataDirectory?: string;
 }
+class ReleasingPGlite extends PGlite {
+  public override async close(): Promise<void> {
+    try {
+      await super.close();
+    } finally {
+      // PGlite 0.5.4 keeps the exited WASM runtime reachable after close.
+      // Release it so sequential local databases do not retain hundreds of MiB each.
+      delete this.mod;
+      delete this.fs;
+    }
+  }
+}
 
 export function createPostgresDatabase(
   options: PostgresDatabaseOptions
@@ -104,7 +116,8 @@ export function createLocalDatabase(options: LocalDatabaseOptions = {}): LocalDa
     mkdirSync(dirname(dataDirectory), { recursive: true });
   }
 
-  const client = dataDirectory === undefined ? new PGlite() : new PGlite(dataDirectory);
+  const client =
+    dataDirectory === undefined ? new ReleasingPGlite() : new ReleasingPGlite(dataDirectory);
   const database = createPgliteDrizzle(client, { schema });
 
   return {
