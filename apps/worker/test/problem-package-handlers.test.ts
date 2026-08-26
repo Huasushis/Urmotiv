@@ -321,6 +321,28 @@ function makeContext(
   };
 }
 
+function secondProblem(): CanonicalProblem {
+  return canonicalProblemSchema.parse({
+    title: "Handler fixture two",
+    type: "traditional",
+    tags: ["graph"],
+    difficulty: { codeforces: 1700 },
+    content: {
+      basicStatement: `${statementText} (second)`,
+      basicSolution: solutionText
+    },
+    samples: [{ input: "2 3", output: "5", explanation: "" }],
+    files: [
+      {
+        path: "judge/testdata/001.in",
+        category: "testdata",
+        content: new TextEncoder().encode("2 3\n")
+      }
+    ],
+    extensions: {}
+  });
+}
+
 function fixtureProblem(): CanonicalProblem {
   return canonicalProblemSchema.parse({
     title: "Handler fixture",
@@ -416,6 +438,111 @@ describe("题目包导入任务处理器", () => {
     );
     expect(store.importItems.get(job.id)?.[0]).toEqual(
       expect.objectContaining({ state: "succeeded", importedProblemId: "42" })
+    );
+  });
+
+  it("部分提交的多题导入不得提前封存成功，重试续写剩余题目", async () => {
+    const store = new FakeProblemPackageJobStore();
+    const job = store.seedImport({
+      selectedFormat: "two.test",
+      selectedFormatVersion: "1.0.0",
+      itemCount: 2
+    });
+    // 与真实多题创建流一致：position 0/1 各有一条持久化的排队项目行。
+    store.importItems.set(job.id, [
+      problemPackageImportItemSchema.parse({
+        jobId: job.id,
+        position: 0,
+        state: "queued",
+        importedProblemId: null,
+        failure: null,
+        finishedAt: null
+      }),
+      problemPackageImportItemSchema.parse({
+        jobId: job.id,
+        position: 1,
+        state: "queued",
+        importedProblemId: null,
+        failure: null,
+        finishedAt: null
+      })
+    ]);
+    const reader = new InMemoryVerifiedImportArchiveReader();
+    reader.put(job.sourceFileId, job.inputDigest, await nativeArchiveOf(fixtureProblem()));
+    let writeCount = 0;
+    const writes: Array<{ position: number; title: string }> = [];
+    const handler = createProblemPackageImportHandler({
+      jobs: store,
+      archives: reader,
+      writer: {
+        write: async (input) => {
+          writes.push({ position: input.position, title: input.problem.title });
+          writeCount += 1;
+          if (writeCount === 2) {
+            throw new Error("transient persistence outage");
+          }
+          return { problemId: String(40 + input.position) };
+        }
+      },
+      adapterCatalog: createStaticProblemFormatAdapterCatalog(
+        new Map([
+          [
+            "two.test",
+            {
+              id: "two.test",
+              displayName: "两题测试格式",
+              version: "1.0.0",
+              inputKind: "zip",
+              detect: async () => ({ confidence: 1, reason: "测试" }),
+              inspect: async () => ({
+                formatId: "two.test",
+                problemCount: 2,
+                files: [],
+                issues: []
+              }),
+              import: async () => [fixtureProblem(), secondProblem()],
+              validateExport: async () => ({
+                targetFormat: "two.test",
+                canExport: true,
+                items: []
+              }),
+              export: async () => {
+                throw new Error("这个测试不会导出文件。");
+              }
+            } satisfies ProblemFormatAdapter
+          ]
+        ])
+      )
+    });
+
+    const firstAttempt = makeContext({ attempt: 1, maxAttempts: 3 });
+    // 第一次尝试以可重试的持久化错误收场，任务保持 running，等待队列续做。
+    let firstFailure: unknown;
+    try {
+      await handler({ importJobId: job.id }, firstAttempt);
+    } catch (error) {
+      firstFailure = error;
+    }
+    expect(firstFailure).toBeInstanceOf(ProblemPackageTemporaryError);
+    expect(store.imports.get(job.id)?.state).not.toBe("succeeded");
+    expect(store.importItems.get(job.id)?.[0]).toEqual(
+      expect.objectContaining({ state: "succeeded", importedProblemId: "40" })
+    );
+
+    // 第二次尝试：已提交的 position 0 不得重复写入，position 1 续写成功。
+    const retryContext = makeContext({ attempt: 2, maxAttempts: 3 });
+    await expect(handler({ importJobId: job.id }, retryContext)).resolves.toEqual({
+      result: { importedProblemCount: 2, failedProblemCount: 0 }
+    });
+    expect(writes.map((entry) => entry.position)).toEqual([0, 1, 1]);
+    expect(store.imports.get(job.id)).toEqual(
+      expect.objectContaining({
+        state: "succeeded",
+        report: expect.objectContaining({ phase: "completed", completedItems: 2, failedItems: 0 })
+      })
+    );
+    expect(store.importItems.get(job.id)?.[1]).toEqual(
+      expect.objectContaining({ state: "succeeded", importedProblemId: "41" })
     );
   });
 

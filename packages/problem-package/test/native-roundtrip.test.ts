@@ -85,9 +85,10 @@ describe("Urmotiv native problem package", () => {
     const first = await urmotivNativeAdapter.export(completeProblem, {
       exportedAt: "2026-07-25T00:00:00.000Z"
     });
-    const imported = await urmotivNativeAdapter.import(toSafeArchive(first), {
+    const importedList = await urmotivNativeAdapter.import(toSafeArchive(first), {
       conflictAction: "create"
     });
+    const imported = importedList[0]!;
     const second = await urmotivNativeAdapter.export(imported, {
       exportedAt: "2026-07-25T00:00:00.000Z"
     });
@@ -145,9 +146,10 @@ describe("Urmotiv native problem package", () => {
       content: { ...completeProblem.content, basicSolution: "" }
     });
     const generated = await urmotivNativeAdapter.export(explicitEmpty, {});
-    const imported = await urmotivNativeAdapter.import(toSafeArchive(generated), {
+    const importedList = await urmotivNativeAdapter.import(toSafeArchive(generated), {
       conflictAction: "create"
     });
+    const imported = importedList[0]!;
     expect(imported.content.basicSolution).toBe("");
   });
 });

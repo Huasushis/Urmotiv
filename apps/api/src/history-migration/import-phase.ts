@@ -655,10 +655,17 @@ async function importSinglePackage(input: {
     throw new HistoryMigrationError("CANDIDATE_INVALID", "题目包没有通过压缩包安全检查。");
   }
 
-  // urmotiv 原生适配器转换。
-  const canonical = await urmotivNativeAdapter.import(archive, {
+  // urmotiv 原生适配器转换；原生包恰好一题，数组契约下取唯一元素。
+  const canonicalList = await urmotivNativeAdapter.import(archive, {
     conflictAction: "create",
   });
+  if (canonicalList.length !== 1) {
+    throw new HistoryMigrationError(
+      "CANDIDATE_INVALID",
+      "题目包没有转换出恰好一道题目。",
+    );
+  }
+  const canonical = canonicalList[0]!;
 
   // 历史整理模型不选标签：按操作员指定注入目录标签。
   const problem: CanonicalProblem = canonicalProblemSchema.parse({

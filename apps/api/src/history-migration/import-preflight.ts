@@ -76,7 +76,7 @@ export async function scanPackageDirectory(
   let expectedProblemFileRows = 0;
   const revisionPackages: Array<{
     readonly candidateId: string;
-    readonly problem: Awaited<ReturnType<typeof urmotivNativeAdapter.import>>;
+    readonly problem: CanonicalProblem;
   }> = [];
   let expectedStoredFilesRows = 0;
   let expectedStoredBytes = 0;
@@ -89,7 +89,16 @@ export async function scanPackageDirectory(
       const bytes = await readPrivateRegularBytes(packagePath, maximumImportPackageBytes);
       const packageSha256 = sha256Hex(bytes);
       const archive = readZipArchive(bytes);
-      const imported = await urmotivNativeAdapter.import(archive, { conflictAction: "create" });
+      const importedList = await urmotivNativeAdapter.import(archive, {
+        conflictAction: "create",
+      });
+      if (importedList.length !== 1) {
+        throw new HistoryMigrationError(
+          "CANDIDATE_INVALID",
+          "题目包没有转换出恰好一道题目。",
+        );
+      }
+      const imported = importedList[0]!;
       entryNames.push(archive.summary.entries.map((item) => item.path));
       expectedSampleRows += imported.samples.length;
       expectedProblemFileRows += imported.files.length;
