@@ -847,10 +847,10 @@ describe("题目包导入任务处理器", () => {
         files: [],
         issues: []
       }),
-      import: async (archive) => {
+      import: async (archive, _choices) => {
         seenPaths.push(archive.list().map((entry) => entry.path));
         expect(archive.read(singleFileProblemPackagePath)).toBeDefined();
-        return fixtureProblem();
+        return [fixtureProblem()];
       },
       validateExport: async () => ({
         targetFormat: "single.test",
