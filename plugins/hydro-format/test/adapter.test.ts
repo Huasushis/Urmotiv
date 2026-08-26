@@ -16,7 +16,9 @@ describe("Hydro 题目包格式适配器", () => {
   it("导入人工构造的最小公开夹具，并保留可恢复的 Hydro 设置", async () => {
     const archive = hydroFixture();
     const preview = await hydroProblemFormatAdapter.inspect(archive);
-    const imported = await hydroProblemFormatAdapter.import(archive, { conflictAction: "create" });
+    const importedList = await hydroProblemFormatAdapter.import(archive, { conflictAction: "create" });
+    expect(importedList).toHaveLength(1);
+    const imported = importedList[0]!;
 
     expect(preview).toMatchObject({
       formatId: "hydro",
@@ -59,13 +61,15 @@ describe("Hydro 题目包格式适配器", () => {
   });
 
   it("导出后可再次导入，题面、样例、数据点和来源设置保持一致", async () => {
-    const first = await hydroProblemFormatAdapter.import(hydroFixture(), {
+    const firstList = await hydroProblemFormatAdapter.import(hydroFixture(), {
       conflictAction: "create"
     });
+    const first = firstList[0]!;
     const generated = await hydroProblemFormatAdapter.export(first, {});
-    const second = await hydroProblemFormatAdapter.import(archiveFromGenerated(generated), {
+    const secondList = await hydroProblemFormatAdapter.import(archiveFromGenerated(generated), {
       conflictAction: "create"
     });
+    const second = secondList[0]!;
 
     if (generated.kind !== "zip") {
       throw new Error("Hydro 题目包必须导出为 ZIP。");
@@ -98,17 +102,19 @@ describe("Hydro 题目包格式适配器", () => {
       "fixture/problem.yaml": "name: 人工构造的标题后备字段\n",
       "fixture/problem.md": "# Description\n\n这不是一道真实题目。\n"
     });
-    const imported = await hydroProblemFormatAdapter.import(archive, {
+    const importedList = await hydroProblemFormatAdapter.import(archive, {
       conflictAction: "create"
     });
-
+    expect(importedList).toHaveLength(1);
+    const imported = importedList[0]!;
     expect(imported.title).toBe("人工构造的标题后备字段");
   });
 
   it("在 Hydro 不能安全表达内部附件时阻止导出并给出丢失信息报告", async () => {
-    const imported = await hydroProblemFormatAdapter.import(hydroFixture(), {
+    const importedList = await hydroProblemFormatAdapter.import(hydroFixture(), {
       conflictAction: "create"
     });
+    const imported = importedList[0]!;
     const withInternalAttachment: CanonicalProblem = {
       ...imported,
       files: [

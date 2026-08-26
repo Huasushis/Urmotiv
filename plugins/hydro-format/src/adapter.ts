@@ -170,7 +170,7 @@ export const hydroProblemFormatAdapter: ProblemFormatAdapter = {
     }
   },
 
-  async import(input: SafeArchive, choices: ImportChoices): Promise<CanonicalProblem> {
+  async import(input: SafeArchive, choices: ImportChoices): Promise<readonly CanonicalProblem[]> {
     const parsedChoices = hydroImportChoicesSchema.parse(choices);
     const loaded = loadHydroPackage(input, parsedChoices.values?.statementFile, false);
     const problemType = canonicalProblemType(loaded.config.type);
@@ -207,7 +207,7 @@ export const hydroProblemFormatAdapter: ProblemFormatAdapter = {
       throw new ProblemPackageError("Hydro 题目包含超过 30 个标签，不能无提示截断。请先减少标签数量。");
     }
 
-    return canonicalProblemSchema.parse({
+    const problem = canonicalProblemSchema.parse({
       title: loaded.metadata.title,
       type: problemType,
       tags,
@@ -223,6 +223,7 @@ export const hydroProblemFormatAdapter: ProblemFormatAdapter = {
       },
       extensions: { hydro: extension }
     });
+    return [problem];
   },
 
   async validateExport(problem: CanonicalProblem, options: ExportOptions): Promise<LossReport> {

@@ -896,10 +896,11 @@ describe("题目包导入", () => {
     expect(downloaded.headers["content-type"]).toBe("application/zip");
     expect(downloaded.headers["x-content-type-options"]).toBe("nosniff");
 
-    const roundTripped = await urmotivNativeAdapter.import(
+    const roundTrippedList = await urmotivNativeAdapter.import(
       readZipArchive(new Uint8Array(downloaded.rawPayload)),
       { conflictAction: "create" }
     );
+    const roundTripped = roundTrippedList[0]!;
     expect(roundTripped.title).toBe("导入的演示题目");
     expect(roundTripped.content.basicStatement).toBe(statementText);
     expect(roundTripped.content.basicSolution).toBe(solutionText);
@@ -2642,11 +2643,11 @@ describe("题目包导出", () => {
       if (innerBytes === undefined) {
         continue;
       }
-      const imported = await urmotivNativeAdapter.import(
+      const importedList = await urmotivNativeAdapter.import(
         readZipArchive(innerBytes),
         { conflictAction: "create" }
       );
-      titles.push(imported.title);
+      titles.push(...importedList.map((problem) => problem.title));
     }
     expect(titles.sort()).toEqual(
       ["导入的演示题目", "导入的第二道演示题目"].sort()

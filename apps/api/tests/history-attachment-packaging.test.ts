@@ -119,7 +119,9 @@ describe("历史附件第二阶段打包", () => {
     );
 
     // 题目包能按原生格式重新导入，附件按类别落位。
-    const imported = await urmotivNativeAdapter.import(archive, { conflictAction: "create" });
+    const importedList = await urmotivNativeAdapter.import(archive, { conflictAction: "create" });
+    expect(importedList).toHaveLength(1);
+    const imported = importedList[0]!;
     expect(imported.extensions).toEqual({});
     expect(imported.provenance?.sourceSystem).toBe("ustc-history-private");
 

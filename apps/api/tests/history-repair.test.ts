@@ -427,7 +427,9 @@ describe("受控本地源文修复端到端", () => {
     expect(archive.read("content/solution.md")).toBeUndefined();
 
     // 导入层：包经原生适配器导入后，缺失依然保持结构性缺失，题面精确。
-    const imported = await urmotivNativeAdapter.import(archive, { conflictAction: "create" });
+    const importedList = await urmotivNativeAdapter.import(archive, { conflictAction: "create" });
+    expect(importedList).toHaveLength(1);
+    const imported = importedList[0]!;
     expect(imported.content.basicStatement).toBe(fixture.mappings[FAILING_FIRST_INDEX]!.text);
     expect(imported.content.basicSolution).toBeNull();
     expect(imported.content.solution).toBe("");
@@ -487,9 +489,9 @@ describe("受控本地源文修复端到端", () => {
     }
     const archive = readZipArchive(writeZipArchive(generated.files));
     expect(archive.read("content/basic-solution.md")).toBeDefined();
-    expect(new TextDecoder().decode(archive.read("content/basic-solution.md"))).toBe("1+1=2，直接计算即可。");
-
-    const imported = await urmotivNativeAdapter.import(archive, { conflictAction: "create" });
+    const importedList = await urmotivNativeAdapter.import(archive, { conflictAction: "create" });
+    expect(importedList).toHaveLength(1);
+    const imported = importedList[0]!;
     expect(imported.content.basicSolution).toBe("1+1=2，直接计算即可。");
     expect(imported.content.basicStatement).toBe("求 1+1 的值。");
   });

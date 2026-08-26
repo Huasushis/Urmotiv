@@ -43,9 +43,10 @@ const testdataDirectory = "judge/testdata/";
 const testOutputSuffix = ".out";
 
 /**
- * 最小 FPS 语义适配器。导入只接受恰好一道题；原包中的评测程序正文、多份
- * solution、prepend/template/append、来源信息等统一结构没有对应项的字段
- * 只写入带 fps 来源标记的扩展，绝不猜测评测行为或编造难度。
+ * 最小 FPS 语义适配器。导入支持一个文件中的多个 item，每个 item 完整转换
+ * 为一道题目，绝不静默截取第一题；统一结构没有对应项的字段（评测程序正文、
+ * 多份 solution、prepend/template/append、来源信息等）只写入带 fps 来源标记
+ * 的扩展，绝不猜测评测行为或编造难度。
  */
 export const fpsProblemFormatAdapter: ProblemFormatAdapter = {
   id: fpsAdapterId,
@@ -67,32 +68,34 @@ export const fpsProblemFormatAdapter: ProblemFormatAdapter = {
     const files = input.list().map((entry) => entry.path).sort();
     try {
       const document = parseFpsPackage(input);
-      if (document.itemCount !== 1) {
+      if (document.items.length === 0) {
         return {
           formatId: fpsAdapterId,
-          problemCount: document.itemCount,
+          problemCount: 0,
           files,
           issues: [
             {
-              severity: "error",
-              message:
-                document.itemCount === 0
-                  ? "FPS 文件不包含任何 item。"
-                  : `FPS 文件包含 ${document.itemCount} 道题；当前导入任务一次只能导入一道题。`
+              severity: "warning",
+              message: "FPS 文件不包含任何 item。"
             }
           ]
         };
       }
-      const item = document.items[0];
-      if (item === undefined) {
-        throw new ProblemPackageError("FPS item 读取失败。");
-      }
+      const multiple = document.items.length > 1;
       return {
         formatId: fpsAdapterId,
-        problemCount: 1,
-        title: item.title,
+        problemCount: document.items.length,
+        ...(multiple || document.items[0]?.title === undefined
+          ? {}
+          : { title: document.items[0].title }),
         files,
-        issues: inspectIssues(document, item)
+        issues: document.items.flatMap((item, index) =>
+          inspectIssues(document, item).map((issue) =>
+            multiple && issue.path !== undefined
+              ? { ...issue, path: `item${index}.${issue.path}` }
+              : issue
+          )
+        )
       };
     } catch (error) {
       return {
@@ -108,47 +111,44 @@ export const fpsProblemFormatAdapter: ProblemFormatAdapter = {
       };
     }
   },
-
-  async import(input: SafeArchive, choices: ImportChoices): Promise<CanonicalProblem> {
+  async import(input: SafeArchive, choices: ImportChoices): Promise<readonly CanonicalProblem[]> {
     fpsImportChoicesSchema.parse(choices);
     const document = parseFpsPackage(input);
-    if (document.itemCount !== 1) {
-      throw new ProblemPackageError(
-        document.itemCount === 0
-          ? "FPS 文件不包含任何 item。"
-          : "FPS 文件包含多道题；当前导入任务一次只能导入一道题。"
-      );
+    if (document.items.length === 0) {
+      throw new ProblemPackageError("FPS 文件不包含任何 item。");
     }
-    const item = document.items[0];
-    if (item === undefined) {
-      throw new ProblemPackageError("FPS item 读取失败。");
-    }
-    const files = collectCanonicalFiles(item);
-    const extension = buildExtension(item);
-    return canonicalProblemSchema.parse({
-      title: item.title,
-      type: "traditional",
-      tags: [],
-      difficulty: {},
-      content: {
-        basicStatement: item.description,
-        basicSolution: "原题包未包含说明性题解。",
-        background: "",
-        statement: item.description,
-        ...(item.inputFormat === undefined ? { inputFormat: "" } : { inputFormat: item.inputFormat }),
-        ...(item.outputFormat === undefined ? { outputFormat: "" } : { outputFormat: item.outputFormat }),
-        constraints: "",
-        solution: "",
-        ...(item.hint === undefined ? { hints: "" } : { hints: item.hint })
-      },
-      samples: pairSamples(item),
-      files,
-      provenance: {
-        sourceSystem: "fps",
-        ...(item.remoteId === undefined ? {} : { sourceProblemId: item.remoteId }),
-        sourceRevision: fpsSupportedRevision
-      },
-      extensions: { fps: extension }
+    return document.items.map((item) => {
+      const files = collectCanonicalFiles(item);
+      const extension = buildExtension(item);
+      return canonicalProblemSchema.parse({
+        title: item.title,
+        type: "traditional",
+        tags: [],
+        difficulty: {},
+        content: {
+          basicStatement: item.description,
+          basicSolution: "原题包未包含说明性题解。",
+          background: "",
+          statement: item.description,
+          ...(item.inputFormat === undefined
+            ? { inputFormat: "" }
+            : { inputFormat: item.inputFormat }),
+          ...(item.outputFormat === undefined
+            ? { outputFormat: "" }
+            : { outputFormat: item.outputFormat }),
+          constraints: "",
+          solution: "",
+          ...(item.hint === undefined ? { hints: "" } : { hints: item.hint })
+        },
+        samples: pairSamples(item),
+        files,
+        provenance: {
+          sourceSystem: "fps",
+          ...(item.remoteId === undefined ? {} : { sourceProblemId: item.remoteId }),
+          sourceRevision: fpsSupportedRevision
+        },
+        extensions: { fps: extension }
+      });
     });
   },
 

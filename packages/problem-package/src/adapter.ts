@@ -81,7 +81,7 @@ export interface ProblemFormatAdapter {
 
   detect(input: ArchiveSummary): Promise<DetectionResult>;
   inspect(input: SafeArchive): Promise<ImportPreview>;
-  import(input: SafeArchive, choices: ImportChoices): Promise<CanonicalProblem>;
+  import(input: SafeArchive, choices: ImportChoices): Promise<readonly CanonicalProblem[]>;
   validateExport(problem: CanonicalProblem, options: ExportOptions): Promise<LossReport>;
   export(problem: CanonicalProblem, options: ExportOptions): Promise<GeneratedArchive>;
 }

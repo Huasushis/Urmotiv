@@ -11,9 +11,11 @@ describe("FPS XML 题目包格式适配器", () => {
   it("导入人工构造的最小公开夹具，程序正文只留在来源信息中", async () => {
     const archive = fpsFixture();
     const preview = await fpsProblemFormatAdapter.inspect(archive);
-    const imported = await fpsProblemFormatAdapter.import(archive, {
+    const importedList = await fpsProblemFormatAdapter.import(archive, {
       conflictAction: "create"
     });
+    expect(importedList).toHaveLength(1);
+    const imported = importedList[0]!;
 
     expect(preview).toMatchObject({
       formatId: "fps",
@@ -56,21 +58,22 @@ describe("FPS XML 题目包格式适配器", () => {
   });
 
   it("导出后的 XML 可再次导入，保留已支持字段和来源信息", async () => {
-    const first = await fpsProblemFormatAdapter.import(fpsFixture(), {
+    const firstList = await fpsProblemFormatAdapter.import(fpsFixture(), {
       conflictAction: "create"
     });
+    const first = firstList[0]!;
     const generated = await fpsProblemFormatAdapter.export(first, {});
-
     if (generated.kind !== "single_file") {
       throw new Error("FPS 题目包必须导出为单个原始 XML。");
     }
     expect(generated.fileName).toBe("problem.xml");
     expect(new TextDecoder().decode(generated.content)).toMatch(/<fps>/);
 
-    const second = await fpsProblemFormatAdapter.import(
+    const secondList = await fpsProblemFormatAdapter.import(
       archiveFromSingleFile(generated.fileName, generated.content),
       { conflictAction: "create" }
     );
+    const second = secondList[0]!;
     expect(second.title).toBe(first.title);
     expect(second.content).toEqual(first.content);
     expect(second.samples).toEqual(first.samples);
@@ -79,10 +82,12 @@ describe("FPS XML 题目包格式适配器", () => {
     expect(second.provenance).toEqual(first.provenance);
   });
 
+
   it("原包没有题解时如实标记，导出不会凭空生成 solution 元素", async () => {
-    const imported = await fpsProblemFormatAdapter.import(fpsFixtureWithoutSolution(), {
+    const importedList = await fpsProblemFormatAdapter.import(fpsFixtureWithoutSolution(), {
       conflictAction: "create"
     });
+    const imported = importedList[0]!;
     expect(imported.content.basicSolution).toBe("原题包未包含说明性题解。");
     expect(imported.extensions.fps).toMatchObject({ solutions: [] });
 
@@ -114,7 +119,7 @@ describe("FPS XML 题目包格式适配器", () => {
     ).rejects.toThrow("根元素");
   });
 
-  it("多题和空题包被拒绝，不默默取第一道", async () => {
+  it("多题包完整导入为多道题，空题包被拒绝，不默默取第一道", async () => {
     const multiple = archiveFromText(
       [
         "<fps>",
@@ -135,9 +140,15 @@ describe("FPS XML 题目包格式适配器", () => {
     );
     const preview = await fpsProblemFormatAdapter.inspect(multiple);
     expect(preview.problemCount).toBe(2);
-    await expect(
-      fpsProblemFormatAdapter.import(multiple, { conflictAction: "create" })
-    ).rejects.toThrow(/多道题/);
+    expect(preview.issues.filter((issue) => issue.severity === "error")).toEqual([]);
+    const importedMultiple = await fpsProblemFormatAdapter.import(multiple, {
+      conflictAction: "create"
+    });
+    expect(importedMultiple.map((problem) => problem.title)).toEqual(["one", "two"]);
+    expect(importedMultiple.map((problem) => problem.content.basicStatement)).toEqual([
+      "一",
+      "二"
+    ]);
 
     const empty = archiveFromText("<fps></fps>");
     const emptyPreview = await fpsProblemFormatAdapter.inspect(empty);
@@ -240,9 +251,10 @@ describe("FPS XML 题目包格式适配器", () => {
   });
 
   it("包含内部或公开附件时阻止导出并给出丢失信息报告", async () => {
-    const imported = await fpsProblemFormatAdapter.import(fpsFixture(), {
+    const importedList = await fpsProblemFormatAdapter.import(fpsFixture(), {
       conflictAction: "create"
     });
+    const imported = importedList[0]!;
     const withAttachment: CanonicalProblem = {
       ...imported,
       files: [
@@ -264,9 +276,10 @@ describe("FPS XML 题目包格式适配器", () => {
   });
 
   it("导出只增加警告的字段：标签、难度和约束不会写入导出包", async () => {
-    const imported = await fpsProblemFormatAdapter.import(fpsFixtureWithoutSolution(), {
+    const importedList = await fpsProblemFormatAdapter.import(fpsFixtureWithoutSolution(), {
       conflictAction: "create"
     });
+    const imported = importedList[0]!;
     const enriched: CanonicalProblem = {
       ...imported,
       tags: ["math"],

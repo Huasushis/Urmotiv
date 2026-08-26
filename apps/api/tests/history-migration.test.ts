@@ -884,9 +884,11 @@ describe("历史题目迁移安全核心", () => {
 
     const packagePath = join(fixture.packageOutput, "packages", "candidate-000001.zip");
     const archive = readZipArchive(new Uint8Array(await readFile(packagePath)));
-    const imported = await urmotivNativeAdapter.import(archive, {
+    const importedList = await urmotivNativeAdapter.import(archive, {
       conflictAction: "create",
     });
+    expect(importedList).toHaveLength(1);
+    const imported = importedList[0]!;
     expect(imported.extensions).toEqual({});
     expect(imported.provenance).toEqual({
       sourceSystem: "ustc-history-private",

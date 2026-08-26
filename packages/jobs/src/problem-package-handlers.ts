@@ -238,7 +238,9 @@ export function createProblemPackageImportHandler(
     const { importJobId } = problemImportJobPayloadSchema.parse(payload);
     let job: ProblemPackageImportJob | undefined;
     let itemSucceeded = false;
-
+    // 本次运行已确认的题目总数：适配器返回后设置；用于把“部分提交”与
+    // “整任务成功”区分开，只有提交数达到预期才允许封存成功。
+    let expectedProblemCount: number | undefined = undefined;
     try {
       job = await startImportOrRetry(dependencies.jobs, importJobId);
       if (job === undefined) {
@@ -257,12 +259,28 @@ export function createProblemPackageImportHandler(
       } catch {
         throw new TaskStatePersistenceError();
       }
-      const existingItem = existingItems.find((item) => item.position === 0);
-      if (existingItem?.state === "succeeded" && existingItem.importedProblemId !== null) {
-        itemSucceeded = true;
-        await completeImportOrRetry(dependencies.jobs, importJobId);
-        await reportCompletedImport(context, existingItem.importedProblemId);
-        return { result: { importedProblemCount: 1, failedProblemCount: 0 } };
+      const succeededPositionSet = new Set<number>();
+      const importedIdByPosition = new Map<number, string>();
+      for (const item of existingItems) {
+        if (item.state === "succeeded" && item.importedProblemId !== null) {
+          succeededPositionSet.add(item.position);
+          importedIdByPosition.set(item.position, item.importedProblemId);
+        }
+      }
+      // 恢复快路径：持久化项目显示全部预期题目都已提交时，直接封存完成，
+      // 不再读取归档，也不再次调用写入器；部分提交时继续走常规续做。
+      if (job.itemCount > 0 && succeededPositionSet.size === job.itemCount) {
+        await completeImportOrRetry(dependencies.jobs, importJobId, job.itemCount, 0);
+        await reportCompletedImport(
+          context,
+          [...succeededPositionSet]
+            .sort((left, right) => left - right)
+            .map((position) => ({
+              position,
+              importedProblemId: importedIdByPosition.get(position)
+            }))
+        );
+        return { result: { importedProblemCount: job.itemCount, failedProblemCount: 0 } };
       }
 
       await requireImportExecutionAccess(
@@ -270,8 +288,6 @@ export function createProblemPackageImportHandler(
         job.requestedByUserId,
         context.signal
       );
-      assertActive(context.signal);
-      await putRunningItemOrRetry(context, "0");
       const packageInput = await dependencies.archives.read({
         sourceFileId: job.sourceFileId,
         expectedDigest: job.inputDigest,
@@ -297,43 +313,78 @@ export function createProblemPackageImportHandler(
         dependencies.jobs,
         importJobId,
         30,
-        report("converting", 0, 0)
+        report("converting", succeededPositionSet.size, 0)
       );
       assertActive(context.signal);
-      const problem = await adapter.import(
+      const imported = await adapter.import(
         packageInput.archive,
         toAdapterImportChoices(job.choices)
       );
       assertActive(context.signal);
+      // 接口第一版只返回一题；保持这类适配器可用，同时新契约返回有序数组。
+      const problems: readonly CanonicalProblem[] = Array.isArray(imported)
+        ? imported
+        : [imported];
+      expectedProblemCount = problems.length;
 
+      const pendingPositions = [...problems.keys()].filter(
+        (position) => !succeededPositionSet.has(position)
+      );
+      if (pendingPositions.length === 0) {
+        await completeImportOrRetry(dependencies.jobs, importJobId, problems.length, 0);
+        await reportCompletedImport(
+          context,
+          problems.map((_, position) => ({
+            position,
+            importedProblemId: importedIdByPosition.get(position)
+          }))
+        );
+        return { result: { importedProblemCount: problems.length, failedProblemCount: 0 } };
+      }
+      for (const position of pendingPositions) {
+        await putRunningItemOrRetry(context, String(position));
+      }
       await updateImportOrRetry(
         dependencies.jobs,
         importJobId,
         60,
-        report("writing", 0, 0)
+        report("writing", succeededPositionSet.size, 0)
       );
-      await requireImportExecutionAccess(
-        dependencies.authorization,
-        job.requestedByUserId,
-        context.signal
+      for (const position of pendingPositions) {
+        await requireImportExecutionAccess(
+          dependencies.authorization,
+          job.requestedByUserId,
+          context.signal
+        );
+        const problem = problems[position];
+        if (problem === undefined) {
+          throw new PackageTaskError("import_invalid");
+        }
+        const committed = await dependencies.writer.write({
+          importJobId,
+          position,
+          requestedByUserId: job.requestedByUserId,
+          choices: job.choices,
+          problem,
+          signal: context.signal
+        });
+        const importedProblemId = requireDatabaseId(committed.problemId);
+        await dependencies.jobs.recordImportItem(importJobId, position, {
+          state: "succeeded",
+          importedProblemId
+        });
+        importedIdByPosition.set(position, importedProblemId);
+        itemSucceeded = true;
+      }
+      await completeImportOrRetry(dependencies.jobs, importJobId, problems.length, 0);
+      await reportCompletedImport(
+        context,
+        problems.map((_, position) => ({
+          position,
+          importedProblemId: importedIdByPosition.get(position)
+        }))
       );
-      const committed = await dependencies.writer.write({
-        importJobId,
-        position: 0,
-        requestedByUserId: job.requestedByUserId,
-        choices: job.choices,
-        problem,
-        signal: context.signal
-      });
-      const importedProblemId = requireDatabaseId(committed.problemId);
-      itemSucceeded = true;
-      await dependencies.jobs.recordImportItem(importJobId, 0, {
-        state: "succeeded",
-        importedProblemId
-      });
-      await completeImportOrRetry(dependencies.jobs, importJobId);
-      await reportCompletedImport(context, importedProblemId);
-      return { result: { importedProblemCount: 1, failedProblemCount: 0 } };
+      return { result: { importedProblemCount: problems.length, failedProblemCount: 0 } };
     } catch (error) {
       if (error instanceof PermanentJobError) {
         throw error;
@@ -363,41 +414,48 @@ export function createProblemPackageImportHandler(
         if (current?.state !== "running") {
           throw new TaskStatePersistenceError();
         }
-        const committedProblemId = await completedImportIdOrRetry(
+        const committedCount = await completedImportCountOrRetry(
           dependencies.jobs,
           importJobId
         );
-        if (committedProblemId !== undefined) {
-          await completeImportOrRetry(dependencies.jobs, importJobId);
-          await reportCompletedImport(context, committedProblemId);
-          return { result: { importedProblemCount: 1, failedProblemCount: 0 } };
+        if (expectedProblemCount !== undefined && committedCount === expectedProblemCount) {
+          await completeImportOrRetry(dependencies.jobs, importJobId, committedCount, 0);
+          await reportCompletedImport(context, [{ position: 0 }]);
+          return { result: { importedProblemCount: committedCount, failedProblemCount: 0 } };
+        }
+        if (committedCount > 0) {
+          // 部分提交：保持任务可续做，等待下一次尝试补齐剩余题目。
+          throw new ImportResultSaveError();
         }
         const code: ProblemPackageFailureCode = "import_write_failed";
         try {
           await failImportSafely(dependencies.jobs, importJobId, code);
         } catch (failureError) {
-          const racedProblemId = await completedImportIdOrRetry(
+          const racedCount = await completedImportCountOrRetry(
             dependencies.jobs,
             importJobId
           );
-          if (racedProblemId !== undefined) {
-            await completeImportOrRetry(dependencies.jobs, importJobId);
-            await reportCompletedImport(context, racedProblemId);
-            return { result: { importedProblemCount: 1, failedProblemCount: 0 } };
-          }
+          if (
+            expectedProblemCount !== undefined &&
+            racedCount === expectedProblemCount
+          ) {
+          await completeImportOrRetry(dependencies.jobs, importJobId, racedCount, 0);
+          await reportCompletedImport(context, [{ position: 0 }]);
+          return { result: { importedProblemCount: racedCount, failedProblemCount: 0 } };
+        }
           throw failureError;
         }
         await putFailureReport(context, "0", code);
         throw permanentFailure(code);
       }
-      const committedProblemId = await completedImportIdOrRetry(
+      const committedCount = await completedImportCountOrRetry(
         dependencies.jobs,
         importJobId
       );
-      if (committedProblemId !== undefined) {
-        await completeImportOrRetry(dependencies.jobs, importJobId);
-        await reportCompletedImport(context, committedProblemId);
-        return { result: { importedProblemCount: 1, failedProblemCount: 0 } };
+      if (expectedProblemCount !== undefined && committedCount === expectedProblemCount) {
+        await completeImportOrRetry(dependencies.jobs, importJobId, committedCount, 0);
+        await reportCompletedImport(context, [{ position: 0 }]);
+        return { result: { importedProblemCount: committedCount, failedProblemCount: 0 } };
       }
       const code = classifyImportFailure(error, context.signal);
       if (itemSucceeded) {
@@ -1086,20 +1144,19 @@ async function failImportSafely(
   }
 }
 
-async function completedImportIdOrRetry(
+async function completedImportCountOrRetry(
   jobs: ProblemPackageJobStore,
   jobId: string
-): Promise<string | undefined> {
+): Promise<number> {
   let items: readonly ProblemPackageImportItem[];
   try {
     items = await jobs.getImportItems(jobId);
   } catch {
     throw new TaskStatePersistenceError();
   }
-  const completed = items.find(
+  return items.filter(
     (item) => item.state === "succeeded" && item.importedProblemId !== null
-  );
-  return completed?.importedProblemId ?? undefined;
+  ).length;
 }
 
 async function getImportOrRetry(
@@ -1208,10 +1265,12 @@ async function failExportSafely(
 
 async function completeImportOrRetry(
   jobs: ProblemPackageJobStore,
-  jobId: string
+  jobId: string,
+  completedItems: number,
+  failedItems: number
 ): Promise<void> {
   try {
-    await jobs.completeImportJob(jobId, report("completed", 1, 0));
+    await jobs.completeImportJob(jobId, report("completed", completedItems, failedItems));
   } catch {
     const current = await getImportOrRetry(jobs, jobId);
     if (current?.state === "succeeded") {
@@ -1221,17 +1280,27 @@ async function completeImportOrRetry(
   }
 }
 
+interface CompletedImportItemReport {
+  readonly position: number;
+  readonly importedProblemId?: string | undefined;
+}
+
 async function reportCompletedImport(
   context: Parameters<JobHandler>[1],
-  importedProblemId: string
+  items: readonly CompletedImportItemReport[]
 ): Promise<void> {
-  await Promise.all([
-    context.updateProgress(100).catch(() => undefined),
-    context
-      .putItemReport({ itemId: "0", state: "succeeded", resultId: importedProblemId })
-      .catch(() => undefined)
-  ]);
+  await context.updateProgress(100).catch(() => undefined);
+  for (const item of items) {
+    await context
+      .putItemReport({
+        itemId: String(item.position),
+        state: "succeeded",
+        ...(item.importedProblemId === undefined ? {} : { resultId: item.importedProblemId })
+      })
+      .catch(() => undefined);
+  }
 }
+
 
 async function reportCompletedExport(
   context: Parameters<JobHandler>[1]

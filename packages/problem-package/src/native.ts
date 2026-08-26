@@ -148,7 +148,7 @@ export const urmotivNativeAdapter: ProblemFormatAdapter = {
     }
   },
 
-  async import(input: SafeArchive, choices: ImportChoices): Promise<CanonicalProblem> {
+  async import(input: SafeArchive, choices: ImportChoices): Promise<readonly CanonicalProblem[]> {
     importChoicesSchema.parse(choices);
     const manifest = loadManifest(input);
     const content = loadContent(input, manifest);
@@ -160,7 +160,7 @@ export const urmotivNativeAdapter: ProblemFormatAdapter = {
       validateJudgeConfig(manifest.problem.type, judge, new Set(files.map((file) => file.path)));
     }
 
-    return canonicalProblemSchema.parse({
+    const problem = canonicalProblemSchema.parse({
       title: manifest.problem.title,
       type: manifest.problem.type,
       tags: manifest.problem.tags,
@@ -172,6 +172,7 @@ export const urmotivNativeAdapter: ProblemFormatAdapter = {
       provenance: manifest.provenance,
       extensions: manifest.problem.extensions
     });
+    return [problem];
   },
 
   async validateExport(problem: CanonicalProblem, options: ExportOptions): Promise<LossReport> {
