@@ -128,7 +128,7 @@ function scratchName(label: string): string {
     runToken !== undefined && runToken.length > 0
       ? runToken
       : `${process.pid}${randomUUID().replaceAll("-", "").slice(0, 8)}`;
-  const suffix = `${label}${idPart}`.slice(0, 57);
+  const suffix = `${label}${idPart}`.slice(0, 20);
   return `urmotiv_history_import_${suffix}`;
 }
 function formalDbName(label: string): string {
@@ -197,7 +197,6 @@ async function startTcpProxy(initialTargetPort: number): Promise<TcpProxyHandle>
     throw new Error("活身份代理需要 URMOTIV_TEST_POSTGRES_ADMIN_URL。");
   }
   const parsed = new URL(adminUrl);
-  const proxyPassword = decodeURIComponent(parsed.password);
   // 上游主机：主集群容器 DNS 名（adminUrl 主机名）。
   const upstreamHost = parsed.hostname;
   // 监听主机：runner 本地回环——代理进程与主集群在不同网络命名空间，
@@ -239,8 +238,10 @@ async function startTcpProxy(initialTargetPort: number): Promise<TcpProxyHandle>
   if (typeof address === "string" || address === null) {
     throw new Error("活身份代理端口不可用。");
   }
+  parsed.hostname = listenerHost;
+  parsed.port = String(address.port);
   return {
-    url: `postgres://postgres:${encodeURIComponent(proxyPassword)}@${listenerHost}:${address.port}/postgres`,
+    url: parsed.href,
     setTarget(portOrHost: number | string, port?: number) {
       if (typeof portOrHost === "string" && typeof port === "number") {
         targetHost = portOrHost;
