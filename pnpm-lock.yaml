@@ -44,6 +44,9 @@ importers:
       '@urmotiv/plugin-anklang':
         specifier: workspace:*
         version: link:../../plugins/anklang
+      '@urmotiv/plugin-fermata-control':
+        specifier: workspace:*
+        version: link:../../plugins/fermata-control
       '@urmotiv/plugin-hydro-format':
         specifier: workspace:*
         version: link:../../plugins/hydro-format
