@@ -427,11 +427,12 @@ h3 {
   background: #eef4f2;
 }
 
-.login-intro h1 {
+ .login-intro h1 {
   max-width: 650px;
   margin-bottom: 20px;
   font-size: 42px;
   line-height: 1.2;
+  text-wrap: balance;
 }
 
 .login-intro > p {
