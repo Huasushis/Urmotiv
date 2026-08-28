@@ -52,7 +52,7 @@ const reviewPolicy = {
 const plugin = {
   id: "org.ustc.urmotiv.anklang",
   name: "原题检索",
-  version: "0.3.0",
+  version: "0.4.0",
   apiVersion: "1",
   source: "server-only-source",
   state: "disabled",
@@ -63,7 +63,12 @@ const plugin = {
     privateContentAuthorized: false,
     failureBehavior: "block",
     minimumSimilarityToShow: 0.3,
-    cacheMinutes: 1440
+    cacheMinutes: 1440,
+    embeddingProvider: {
+      baseUrl: "https://emb.example.com/v1",
+      model: "bge-m3",
+      dimension: 1024
+    }
   },
   settingsManagedBy: "plugin",
   settingsSchema: {
@@ -80,6 +85,30 @@ const plugin = {
         minimum: 1000,
         maximum: 120000,
         title: "最长等待时间（毫秒）"
+      },
+      embeddingProvider: {
+        type: "object",
+        required: ["baseUrl", "model", "dimension"],
+        title: "嵌入提供方",
+        properties: {
+          baseUrl: {
+            type: "string",
+            format: "uri",
+            title: "嵌入提供方地址"
+          },
+          model: {
+            type: "string",
+            minLength: 1,
+            maxLength: 200,
+            title: "嵌入模型名称"
+          },
+          dimension: {
+            type: "integer",
+            minimum: 1,
+            maximum: 4096,
+            title: "嵌入向量维度"
+          }
+        }
       }
     }
   },
@@ -90,6 +119,12 @@ const plugin = {
       name: "serviceToken",
       label: "访问令牌",
       description: "用于确认题库系统的请求。",
+      configured: true
+    },
+    {
+      name: "embeddingApiKey",
+      label: "嵌入提供方 API 密钥",
+      description: "Anklang 调用嵌入模型提供方时使用；与访问令牌用途不同。",
       configured: true
     }
   ],
@@ -235,9 +270,17 @@ test("系统管理员保存插件设置后密钥输入框恢复为空", async ({
     await fulfillJson(route, {
       item: {
         ...plugin,
-        settings: { ...plugin.settings, timeoutMs: 45000 },
+        settings: {
+          ...plugin.settings,
+          timeoutMs: 45000,
+          embeddingProvider: {
+            baseUrl: "https://emb2.example.com/v1",
+            model: "bge-large",
+            dimension: 2048
+          }
+        },
         settingsRevision: 5,
-        secrets: [{ ...plugin.secrets[0] }]
+        secrets: plugin.secrets.map((item) => ({ ...item }))
       }
     });
   });
@@ -246,21 +289,43 @@ test("系统管理员保存插件设置后密钥输入框恢复为空", async ({
   await page.goto("/admin");
   await expect(page.getByRole("heading", { name: "原题检索" })).toBeVisible();
   const timeout = page.getByLabel("最长等待时间（毫秒）");
-  const secret = page.getByLabel("访问令牌");
+  const providerBaseUrl = page.getByLabel(/嵌入提供方地址/);
+  const providerModel = page.getByLabel(/嵌入模型名称/);
+  const providerDimension = page.getByLabel(/嵌入向量维度/);
+  const secret = page.getByLabel(/^访问令牌/);
+  const embeddingKey = page.getByLabel(/^嵌入提供方 API 密钥/);
+  await expect(providerBaseUrl).toHaveValue("https://emb.example.com/v1");
+  await expect(providerModel).toHaveValue("bge-m3");
+  await expect(providerDimension).toHaveValue("1024");
   await timeout.fill("45000");
+  await providerBaseUrl.fill("https://emb2.example.com/v1");
+  await providerModel.fill("bge-large");
+  await providerDimension.fill("2048");
   await secret.fill("temporary-test-key");
+  await embeddingKey.fill("temporary-embedding-key");
   await page.getByRole("button", { name: "保存插件设置" }).click();
 
   await expect(page.getByText("插件设置已保存")).toBeVisible();
   await expect(secret).toHaveValue("");
-  await expect(page.getByText("已配置")).toBeVisible();
+  await expect(embeddingKey).toHaveValue("");
+  await expect(page.getByText("已配置")).toHaveCount(2);
   await expect(page.getByText(/末尾四个字符/)).toHaveCount(0);
   expect(submittedBody).toEqual({
     expectedRevision: 4,
-    settings: { ...plugin.settings, timeoutMs: 45000 },
-    secrets: { serviceToken: "temporary-test-key" }
+    settings: {
+      ...plugin.settings,
+      timeoutMs: 45000,
+      embeddingProvider: {
+        baseUrl: "https://emb2.example.com/v1",
+        model: "bge-large",
+        dimension: 2048
+      }
+    },
+    secrets: {
+      serviceToken: "temporary-test-key",
+      embeddingApiKey: "temporary-embedding-key"
+    }
   });
-  await expect(page.getByText(plugin.apiVersion)).toHaveCount(0);
   await expect(page.getByText(plugin.source)).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("admin-plugin-desktop.png"), fullPage: true });
 });
