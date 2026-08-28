@@ -344,6 +344,6 @@ pnpm --filter @urmotiv/plugin-example-title-guard test
 1. `urmotiv-plugin.json` 通过清单模式，版本和 `apiVersion: "1"` 正确，所有注册编号以插件 ID 开头。
 2. 所有设置和审核条目有严格运行时模式；外部调用有超时、取消和有界重试。
 3. 插件不声明核心权限，不读取跨插件密钥/数据库，不绕过题目文件可见性。
-4. 最小测试、插件包 typecheck/build 和 API/Worker 构建通过；插件进入 `createBuiltinPluginDefinitions()` 并由代码审查批准。Docker 镜像依赖阶段使用显式插件清单，新增包还必须在 `Dockerfile.api` 和 `Dockerfile.worker` 的依赖复制列表中登记 `package.json`，否则干净构建不会安装该包。
+4. 最小测试、插件包 typecheck/build 和 API/Worker 构建通过；插件进入 `createBuiltinPluginDefinitions()` 并由代码审查批准。发布前必须重新构建 API/Worker 镜像，并在全新镜像中执行插件导入/启动 smoke 检查且通过，确认目标插件能正常加载。
 5. 在隔离环境先安装/启用/停用/设置更新，确认 `settingsRevision` 冲突和 `requiresRestart` 行为，再发布镜像并按[部署指南](deployment.md)升级。
 6. 更新插件版本或清单后，旧数据库记录不能被静默当作新代码；宿主会比较版本、API 版本、来源和清单摘要，不一致时保持不可用。
