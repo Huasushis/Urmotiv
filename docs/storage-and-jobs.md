@@ -1,79 +1,36 @@
 # 文件存储与后台任务
 
-本文说明文件、任务队列和 worker 的公共边界。接口细节分别见
-[`@urmotiv/storage`](../packages/storage/README.md)、[`@urmotiv/jobs`](../packages/jobs/README.md) 和
-[`@urmotiv/worker`](../apps/worker/README.md)。
+Urmotiv 的文件元数据在 PostgreSQL，文件正文在兼容 S3 的私有对象存储；导入导出等耗时操作由 Redis 队列交给 Worker。S3（保存对象的服务）和 Redis（保存队列状态的服务）只作为实现依赖，不能替 API 决定权限。
 
-## 运行方式
+## 运行边界
 
-轻量模式使用 `.data/storage` 和单进程内存队列，不需要 Docker。正式服务器使用兼容 S3 的对象存储和 Redis。
-S3 是保存文件的服务；Redis 是保存排队状态并协调多个 worker 的服务。两种模式通过相同 TypeScript 接口调用。
+生产环境的 Worker 必须有 `REDIS_URL`；对象存储至少需要 `S3_ENDPOINT`、`S3_REGION`、`S3_BUCKET`、`S3_ACCESS_KEY` 和 `S3_SECRET_KEY`。存储桶不能公开读取，浏览器不能根据内部 `storageKey` 直接下载。API 在上传、题目提交、导入导出任务创建、Worker 读取和最终下载时分别重算权限。
 
-生产环境必须满足：
+轻量开发模式可以使用本地 `STORAGE_LOCAL_ROOT` 和进程内队列；该模式不适合多实例生产或保存真实题目资料。生产 Compose 默认使用 MinIO 与 Redis，并通过网络别名连接：
 
-- worker 设置 `REDIS_URL`，没有时拒绝启动；
-- 文件服务使用 `S3_ENDPOINT`、`S3_REGION`、`S3_BUCKET` 和服务器提供的访问凭据；
-- S3 存储桶不能公开读取，浏览器不能直接根据内部位置下载；
-- API 在上传、发布、读取、导出任务创建和导出下载时分别检查权限；
-- worker 只接收已经固定的任务编号和版本编号，不把题面或密钥放入日志和任务报告。
+| 变量 | 用途 | 默认/要求 |
+| --- | --- | --- |
+| `REDIS_URL` | Worker 与 API 的队列连接 | 生产必填 |
+| `JOB_REDIS_PREFIX` | 队列键共同前缀 | 默认 `urmotiv:jobs` |
+| `JOB_LEASE_MS` | 任务租约时长 | 默认 30,000 毫秒 |
+| `JOB_RETRY_DELAY_MS` | 可重试失败的等待时间 | 默认 1,000 毫秒 |
+| `WORKER_ID` | Worker 实例标识 | 未设置时运行时生成 |
+| `WORKER_POLL_INTERVAL_MS` | 空队列轮询间隔 | 默认 500 毫秒 |
+| `STORAGE_LOCAL_ROOT` | 轻量模式文件根目录 | 默认 `.data/storage` |
+| `STORAGE_MAX_FILE_BYTES` | 存储入口单文件上限 | 由部署设置 |
+| `S3_ENDPOINT` | S3 兼容服务地址 | 生产必填 |
+| `S3_REGION` | S3 区域 | 生产必填 |
+| `S3_BUCKET` | 私有存储桶 | 生产必填 |
+| `S3_FORCE_PATH_STYLE` | 是否使用路径式 S3 请求 | 兼容服务按需设为 `true` |
 
-## 配置字段
+`S3_ACCESS_KEY` 和 `S3_SECRET_KEY` 只放在私有环境文件，不能放进插件设置、题目包、日志或 API 响应。上传入口还会按文件类别检查媒体类型、逻辑路径和大小；题目包另有 128 MiB 解压安全边界。
 
-`.env.example` 只列字段名，不给出可误用的开发值。具体含义如下：
+## 任务一致性和权限
 
-| 字段 | 含义 |
-| --- | --- |
-| `REDIS_URL` | Redis 连接地址；生产 worker 必填 |
-| `JOB_REDIS_PREFIX` | Redis 中任务键的共同前缀，默认 `urmotiv:jobs`；当前布局实际使用其下的 `v2` 命名空间 |
-| `JOB_LEASE_MS` | 一次领取任务的有效时间，默认 30000 毫秒 |
-| `JOB_RETRY_DELAY_MS` | 可重试失败后再次领取前的等待时间，默认 1000 毫秒 |
-| `WORKER_ID` | worker 实例编号；未设置时运行时随机生成 |
-| `WORKER_POLL_INTERVAL_MS` | 没有任务时再次检查的间隔，默认 500 毫秒 |
-| `STORAGE_LOCAL_ROOT` | 轻量模式文件目录，默认 `.data/storage` |
-| `STORAGE_MAX_FILE_BYTES` | 上传入口允许的单文件最大字节数 |
-| `S3_ENDPOINT` | S3 兼容服务地址 |
-| `S3_REGION` | S3 区域；兼容服务也应给出固定值 |
-| `S3_BUCKET` | 私有存储桶名称 |
-| `S3_ACCESS_KEY` | S3 访问编号，只能在服务器环境中提供 |
-| `S3_SECRET_KEY` | S3 密钥，只能在服务器环境中提供 |
-| `S3_FORCE_PATH_STYLE` | 兼容服务需要路径形式访问时设为 `true` |
+任务记录包含固定题目修订、输入摘要、适配器 ID/版本、文件类别和幂等键。Redis 租约和重试时间使用 Redis 服务端时钟；重试必须复用原任务编号和幂等键，不能覆盖运行中或已结束任务。停用插件、版本不一致、题目修订变化或权限撤销都会让 Worker 失败，不会静默换用新内容。
 
-大小、媒体类型和压缩包安全上限应由调用方按文件类别传给存储接口，不能只依赖一个全站默认值。例如题面图片、公开附件、
-测试数据和导入 ZIP 应分别设置允许类型和大小。
+导出和下载有三次权限检查：创建任务时、Worker 读取文件时、用户换取下载时。权限撤销后，旧任务编号、对象地址和下载链接都不能绕过 `404` 掩码。失败报告只保存稳定错误编号、计数和必要相对位置，不保存题面、题解、测试数据、程序正文、密码、令牌或密钥。
 
-## 权限与任务结果
+## 运维检查
 
-存储包没有用户信息，因此不能替 API 做权限检查。数据库保存的 `storageKey` 只是内部位置，不是下载凭据。读取文件前必须从
-文件关系查到题目和类别，再执行 `docs/permissions.md` 中的权限规则。导出任务创建时检查一次，worker 读取每道题和每个文件时
-再检查一次，用户换取下载内容时还要再检查一次。权限撤销后，旧任务编号和旧下载入口都不能继续使用。
-
-worker 失败时只记录稳定错误编号和普通说明。逐项报告可以保存来源条目编号、导入后的题目编号或导出文件编号，但不得保存
-题面全文、题解、测试数据、原始压缩包内容、密码、令牌或密钥。
-
-生产任务编号必须由业务数据库或 API 在入队前生成，并在重投时保持不变。Redis 会在一个脚本中同时核对任务编号、请求摘要
-和幂等索引；只允许相同任务修复单边缺失的索引或任务记录，不能把运行中或已结束的任务覆盖成新任务。Redis 的租约与重试
-时间只使用 Redis 服务器时钟，API 和 worker 的本地时钟偏移不参与到期判断。当前队列只直接连接单个 Redis 主节点；如果
-部署层或 Sentinel 对外提供一个当前主节点的连接地址，可以使用该地址，但客户端本身不发现或管理 Sentinel，也不支持
-Redis Cluster。切换前缀或从旧键布局升级时必须先让旧 worker 停止领取，并明确处理旧队列，不能直接假定旧键会被 `v2`
-worker 消费。
-
-## USTC 服务器检查
-
-依赖安装和所有执行都在 `ssh ustc` 指向的服务器完成。本机只编辑和静态检查。服务器同步代码后运行：
-
-```bash
-pnpm install
-pnpm --filter @urmotiv/storage typecheck
-pnpm --filter @urmotiv/storage test
-pnpm --filter @urmotiv/storage build
-pnpm --filter @urmotiv/jobs typecheck
-pnpm --filter @urmotiv/jobs test
-pnpm --filter @urmotiv/jobs build
-pnpm --filter @urmotiv/worker typecheck
-pnpm --filter @urmotiv/worker test
-pnpm --filter @urmotiv/worker build
-```
-
-S3 和 Redis 的单元测试使用内存或假实现，不需要连接真实服务。正式接线完成后，再在 USTC 的隔离测试桶和 Redis 测试库做
-连接检查；不能使用协会真实题目作为测试文件。Redis 集成测试设置 `URMOTIV_REDIS_TEST_URL` 后运行
-`pnpm --filter @urmotiv/jobs test -- redis.integration.test.ts`；测试只删除自己的随机前缀，不能使用 `FLUSHDB` 或 `FLUSHALL`。
+部署和健康检查命令见[部署指南](deployment.md)。备份时要同时备份 PostgreSQL 和对象存储；数据库 dump 不包含附件正文，恢复数据库后必须从对象存储快照恢复对应对象。不要使用 `docker compose down -v` 进行排障或升级。

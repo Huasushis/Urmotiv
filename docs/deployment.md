@@ -1,271 +1,175 @@
-# 服务器部署与升级
+# 部署指南
 
-本系统的正式部署由网站、API、后台任务进程、PostgreSQL、Redis 和 MinIO 组成。Docker Compose 是把这些相互依赖的服务按同一份配置一起启动和检查的工具。MinIO 是一个兼容 S3 的私有文件服务，用来保存测试数据、附件和导入导出包；浏览器不能直接访问它。
+本指南描述当前仓库的 Docker Compose 部署。Compose（用一个 YAML 文件编排多个容器的工具）包含 PostgreSQL、Redis、MinIO、迁移任务、API、异步 Worker 和 Web；Anklang、Fermata 作为显式 profile（可选服务组）启动。所有密码、令牌、外部服务地址和题目资料都放在 Git 之外。
 
-所有命令都在 `ssh ustc` 的专用目录运行。下面的示例使用 `/home/ubuntu/urmotiv-codex/repo`，不要在其他项目目录执行，也不要把私有环境文件放进 Git 仓库。
+> **当前构建/迁移阻塞项**：起始提交的 `apps/api/package.json` 声明了 `@urmotiv/plugin-fps-format`，但 `Dockerfile.api` 与 `Dockerfile.worker` 的依赖复制白名单没有复制 `plugins/fps-format/package.json`。因此干净 Docker 构建可能在 `pnpm install --frozen-lockfile` 阶段失败；维护者必须先同步白名单。另，数据库迁移的 `plugin_state` 枚举使用 `unavailable`，运行时宿主使用 `failed`，插件状态持久化可能失败，需维护者先完成枚举迁移。本次文档分支不改构建配置或数据库行为。
 
-## 初次部署
+## 环境文件
 
-1. 在服务器上准备私有环境文件和备份目录。环境文件含有数据库、认证和文件服务的访问凭据，必须只允许当前账号读取。
-
-   ```bash
-   install -d -m 700 /home/ubuntu/urmotiv-codex/private /home/ubuntu/urmotiv-codex/backups
-   cp /home/ubuntu/urmotiv-codex/repo/deploy/env.production.example /home/ubuntu/urmotiv-codex/private/urmotiv.env
-   chmod 600 /home/ubuntu/urmotiv-codex/private/urmotiv.env
-   ```
-
-   填写 `urmotiv.env` 时请使用密码管理器生成随机值。`URMOTIV_PLUGIN_SECRET_KEY` 必须是 32 字节随机值的 Base64URL 编码（把随机字节写成只含字母、数字、下划线和短横线的文本），用于加密保存插件令牌，不能复用数据库或 MinIO 密码。网页会话使用服务端生成的随机令牌，数据库只保存摘要，不需要另配一个未使用的 `SESSION_SECRET`。启用 OAuth2 时，`URMOTIV_USTC_OAUTH_CLIENT_SECRET` 只写入这个权限为 600 的私有环境文件，`URMOTIV_USTC_OAUTH_STATE_SECRET` 必须单独生成恰好 32 字节的无填充 Base64URL 值；两者都不能与插件密钥或经典 CAS 状态密钥复用。启用经典 CAS 兼容模式时，`URMOTIV_CAS_STATE_SECRET` 也必须独立生成。PostgreSQL 密码会进入连接地址，因此只使用字母、数字、连字符和下划线。`URMOTIV_WEB_ORIGIN` 写用户实际打开的网站地址，例如 `https://problems.example.edu.cn`，不能带路径。
-
-2. 检查私有环境文件。脚本只报告缺少的字段，不会打印字段值。
-
-   ```bash
-   cd /home/ubuntu/urmotiv-codex/repo
-   bash scripts/deploy/validate-env.sh /home/ubuntu/urmotiv-codex/private/urmotiv.env
-   ```
-
-3. 构建镜像并先启动基础服务，再单独运行迁移。全新数据库迁移完成后会进入一次性的
-   `open` 状态；此时 API 固定拒绝监听端口。`root` 只是不可登录的内部初始化授权者，永远不绑定
-   密码、邮箱或 CAS 身份。
-
-   ```bash
-   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env build
-   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env up -d postgres redis minio minio-init
-   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env run --rm migrate
-   ```
-
-4. 在服务器的真实终端中创建独立的首位系统管理员。不要添加 `-T`，不要通过管道或重定向提供输入；
-   命令不接受邮箱或密码参数、环境变量、JSON 和密码文件。邮箱与密码各输入两次，输入均不回显。
-
-   ```bash
-   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env run --rm --no-deps api \
-     pnpm --filter @urmotiv/api bootstrap-admin
-   ```
-
-   只有固定结果 `BOOTSTRAP_ADMIN_OK` 表示已明确完成。若返回 `OUTCOME_UNKNOWN`，连接或提交结果无法确认，
-   命令不会自动重试；恢复连接后重新运行会先只读检查状态，已经完成时不会再次读取凭据或创建账号。
-
-5. 初始化明确完成后启动应用并检查状态。
-
-   ```bash
-   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env up -d api worker web
-   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env ps
-   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env exec -T web \
-     wget -qO- http://127.0.0.1/api/v1/health
-   ```
-
-   生产 API 不允许设置 `URMOTIV_DATABASE_MIGRATE=true`；迁移必须使用上面的独立命令，避免空数据库被
-   普通 API 启动永久标成不可初始化。
-
-   网站默认只监听 `127.0.0.1:8080`，不会直接暴露 PostgreSQL、Redis、MinIO 或 API。对外访问应由服务器已有的 HTTPS 反向代理转发到这个地址；反向代理负责证书和 HTTP 到 HTTPS 的跳转。调试时可用 SSH 转发访问：`ssh -L 8080:127.0.0.1:8080 ustc`。
-
-   API 默认不信任 `X-Forwarded-For` 等转发头，只把直接建立连接的 socket 地址当作请求来源。这是安全默认值，普通部署和 SSH 调试不需要改。只有后续功能确实要按最终客户端地址限制访问，并且已经逐层确认反向代理拓扑时，才在私有环境文件中设置 `URMOTIV_TRUSTED_PROXY_CIDRS`。它只接受最多 32 个逗号分隔的 IPv4/IPv6 CIDR，不接受主机名、代理跳数、`true`、`0.0.0.0/0` 或 `::/0`。例如文档保留地址可写成 `192.0.2.0/24,2001:db8::/64`；部署时必须替换成实际代理范围，不能照抄示例。
-
-   启用后，专用的来源地址解析器从直接 socket 开始沿 `X-Forwarded-For` 由右向左检查，只跨过明确列入清单的代理，并在第一个不可信地址停止。不能把客户端网段、整个共享容器网络或“可能用到”的私网范围加入清单，否则能直接访问 API 的进程可能伪造来源。每一层可信代理都必须安全追加 `X-Forwarded-For`；标准 `Forwarded` 头不会单独用于来源判断。Fastify 本身始终保持不信任代理模式，因此 `X-Forwarded-Host` 和 `X-Forwarded-Proto` 也不会改变应用看到的主机名或协议。调整后先在测试环境核对实际链路，再用于令牌来源限制。
-
-## 升级与恢复
-
-升级前先把经过审查的代码同步到专用目录并检查当前提交；升级脚本不会自行执行 `git pull`，以免在未知代码上自动修改运行中的服务。
-
-包含 `0009_robot_review_leases` 的升级必须安排维护窗口。先停止 Fermata 的新轮询，但保持旧版 Urmotiv API
-可用，让已经发出的付费模型请求继续流式读取到服务端真正结束并提交完成结果；不能主动取消，也不能恢复 120 秒
-总时限。待它们全部提交完成或租约自然过期，并确认数据库中没有尚未到期或没有到期时间的机器人租约后，再完整
-停止旧版 Urmotiv API，等待它属于本项目的数据库事务全部结束，然后运行迁移。
-
-迁移发现活租约会固定失败，不会猜测其是否已经完成；发现涉及的表仍被旧请求或其他事务占用也会立即安全失败，
-不会一边持锁一边等待而与旧版领取形成死锁。取得全部独占锁后，迁移会阻止旧版写入直到提交；已经自然过期的
-旧租约归档为 `expired`，迁移前已经撤销的旧记录归档为 `legacy_closed`，人工审核意见保持不变。锁忙时应确认占用
-事务属于本项目并等待它自然结束，再重试原迁移；不要批量结束数据库进程，也不要手工跳过门禁或删除领取记录。
+从模板复制一份只由部署管理员读取的环境文件：
 
 ```bash
-cd /home/ubuntu/urmotiv-codex/repo
-bash scripts/deploy/upgrade.sh \
-  /home/ubuntu/urmotiv-codex/private/urmotiv.env \
-  /home/ubuntu/urmotiv-codex/backups
+cp deploy/env.production.example /secure/path/urmotiv.env
+chmod 600 /secure/path/urmotiv.env
+bash scripts/deploy/validate-env.sh /secure/path/urmotiv.env
 ```
 
-脚本先验证私有配置并构建镜像；构建成功后明确停止旧 `api`、`worker`、`web` 容器并排空其数据库事务，再创建
-与停机切换点一致的 PostgreSQL 备份，然后单独运行迁移、启动服务并检查健康状态。若迁移失败，应用容器保持停止而数据库等基础服务保留，
-不能绕过失败强行启动；若健康检查失败，新容器保持原状以便检查。不要通过删除数据库表来“回滚”迁移；应先停止
-服务、恢复升级前的备份，再切换回已经验证过的代码版本。
+`validate-env.sh` 会检查文件确实存在、权限为 `600`，并检查这些必填变量：
 
-示例恢复命令需要在确认目标备份与停机窗口后手工执行：
+```dotenv
+POSTGRES_USER=change-me
+POSTGRES_PASSWORD=change-me
+POSTGRES_DB=urmotiv
+MINIO_ROOT_USER=change-me
+MINIO_ROOT_PASSWORD=change-me
+S3_BUCKET=urmotiv
+URMOTIV_PLUGIN_SECRET_KEY=由本地随机生成器产生的32字节Base64URL值
+URMOTIV_WEB_ORIGIN=https://urmotiv.example.org
+```
+
+上面是结构示例，不是可直接用于生产的凭据。`URMOTIV_PLUGIN_SECRET_KEY` 必须是恰好 32 字节随机值的无填充 Base64URL；不要与 `URMOTIV_USTC_OAUTH_STATE_SECRET` 或 `URMOTIV_CAS_STATE_SECRET` 复用。模板还提供 `S3_REGION`、`JOB_REDIS_PREFIX`、`URMOTIV_EMAIL_LOGIN_ENABLED`、`URMOTIV_EMAIL_REGISTRATION_ENABLED` 等可选设置。
+
+先在不输出私有值的前提下渲染 Compose：
 
 ```bash
-docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env stop api worker web
-docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env exec -T postgres \
-  sh -ec 'dropdb --if-exists --username="$POSTGRES_USER" "$POSTGRES_DB" && createdb --username="$POSTGRES_USER" "$POSTGRES_DB"'
-docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env exec -T postgres \
-  sh -ec 'pg_restore --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --clean --if-exists' \
-  < /home/ubuntu/urmotiv-codex/backups/已确认的备份文件.dump
+docker compose --env-file /secure/path/urmotiv.env config
 ```
 
-恢复完成后先切回与备份兼容的代码版本，再运行 `docker compose ... up -d`。恢复命令会替换数据库内容，必须由具备恢复权限的管理员在确认备份文件后执行。
+不要把 `config` 的完整输出粘贴到工单或聊天，因为渲染结果可能包含环境值。
 
-## 日常检查与备份
+## 本地回环 HTTP（必须显式选择）
+
+默认 Web 端口只绑定到服务器回环地址：`127.0.0.1:${URMOTIV_HTTP_PORT:-8080}`。用 SSH 转发访问时，私有环境文件必须明确写：
+
+```dotenv
+URMOTIV_WEB_ORIGIN=http://127.0.0.1:8080
+URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES=true
+URMOTIV_HTTP_PORT=8080
+```
+
+`URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES=true` 只允许精确的 localhost/127.0.0.1/[::1] HTTP 来源使用非 Secure Cookie。它不是公网开关；公网、共享网络或没有 SSH 隔离的环境必须保持 `false` 并使用 HTTPS。
+
+启动本地栈：
 
 ```bash
-docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env ps
-docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env logs --tail=100 api
-bash scripts/deploy/backup.sh \
-  /home/ubuntu/urmotiv-codex/private/urmotiv.env \
-  /home/ubuntu/urmotiv-codex/backups
+docker compose --env-file /secure/path/urmotiv.env up -d --build
+docker compose --env-file /secure/path/urmotiv.env ps
 ```
 
-备份目录也会保存敏感业务数据，应使用受控的异地备份方式保存，且不要传入 Git、聊天记录或公开文件服务。MinIO 中的文件需按对象存储的官方方式另外备份；恢复数据库时应使用同一时点的对象存储备份，避免文件记录和实际文件不一致。
-
-## 健康检查语义
-
-系统区分存活（进程能响应 HTTP）与就绪（依赖可用、可以接收流量）两种状态，两个层级的判定互不影响。
-
-### API
-
-- `GET /api/v1/health`：存活检查。进程可响应 HTTP 即返回 `200 {"status":"ok"}`，不探测依赖。
-- `GET /api/v1/health/ready`：就绪检查。持久化后端（数据库）可达时返回 `200 {"status":"ready"}`，否则返回
-  `503 {"status":"unavailable"}`。检查只执行一次最廉价的查询，响应只包含固定字段，不暴露依赖地址或内部细节。
-
-### worker（后台任务进程）
-
-worker 自带健康服务，默认只监听 `127.0.0.1:3010`：
-
-- `GET /live`：存活检查。进程存在即返回 `200 {"status":"ok"}`。
-- `GET /ready`：就绪检查。最近一次队列进展（空闲轮询或任务租约续期）未超过 `URMOTIV_WORKER_HEALTH_STALE_MS`
-  （默认 60 秒）时返回 200，否则返回 503。这样可以把“进程还活着但已经卡住”的 worker 标记为不健康。
-
-Compose 里 worker 的健康检查每 10 秒访问一次 `/ready`，3 次失败即把容器标记为不健康（`docker compose ps` 可见）。
-worker 连续多次不通过就绪检查时会主动以非零码退出，交由 `restart: unless-stopped` 重新拉起；
-`URMOTIV_WORKER_HEALTH_EXIT_AFTER_UNREADY` 设为 0 可关闭主动退出，只保留健康检查的标记能力。
-
-## 配置边界
-
-- 正式环境必须使用 PostgreSQL、Redis 和私有 S3 桶；应用不接受正式环境退回到本地文件数据库或单进程任务队列。
-- 正式环境必须配置 `URMOTIV_PLUGIN_SECRET_KEY`。如果数据库已经保存插件令牌而这个值缺失，API 会在监听端口前停止启动，避免插件改用无认证请求。
-- `URMOTIV_TRUSTED_PROXY_CIDRS` 默认留空。只有明确掌握每一层代理地址并确认其正确处理转发头时才可配置；应用不会自动信任回环地址、私网、容器网络或固定跳数。
-- `URMOTIV_EMAIL_REGISTRATION_ENABLED` 默认为 `false`。在完成真实邮件验证和投递配置前，不要开启它。
-- USTC OAuth2 的客户端编号、客户端密钥、授权/令牌/资料端点、公开来源、回调和状态密钥只由服务器管理员写入私有环境文件，只注入 API 容器。客户端密钥不进入数据库、管理接口、日志、审计、迁移、后台任务或网站容器。经典 CAS 的地址、字段和独立状态密钥仅用于显式兼容模式。
-
-## 邮箱注册与验证
-
-邮箱注册默认关闭。打开后，系统会为新账号保存未验证的邮箱和经过 Argon2id 处理的密码；用户必须点击验证邮件中的一次性链接后，才能用邮箱和密码登录。数据库只保存链接令牌的 SHA-256 摘要，链接有效期为 30 分钟，使用或过期后不能再次使用。
-
-仓库没有内置的真实邮件发送服务，也不会把验证链接写进日志。自动化测试可在 `NODE_ENV=test` 下使用 `URMOTIV_EMAIL_DELIVERY_MODE=test` 和 `URMOTIV_EMAIL_VERIFICATION_WEB_URL` 注入内存投递箱。生产环境若尝试只靠环境变量开启 `URMOTIV_EMAIL_REGISTRATION_ENABLED=true`，API 会拒绝启动；接入真实邮件服务前，必须先实现并审查服务端投递器，再开启注册。
-- Docker 卷 `postgres-data`、`redis-data`、`minio-data` 是运行数据，不能随意执行 `docker compose down -v`。这会删除数据卷。
-- 日志、任务报告和故障信息不得包含题面全文、题解、测试数据、密码、令牌或密钥。
-
-## 启用 Anklang（原题检索服务）
-
-Anklang 是独立的原题检索服务，默认不随主应用启动，也不连接 Urmotiv 的 PostgreSQL、Redis 或
-MinIO。启用步骤：
-
-1. 把 Anklang 仓库与本仓库同级检出（`compose.yaml` 的 `build: ../Anklang` 依赖这个相对位置），
-   或改用已经核对过的发布镜像。
-2. 在 Anklang 仓库内准备被 Git 忽略的私有环境文件；真实服务令牌、上游地址和可选模型密钥都只放
-   在这里，不要写进 `urmotiv.env`：
-
-   ```bash
-   install -d -m 700 /home/ubuntu/urmotiv-codex/Anklang/private
-   cp /home/ubuntu/urmotiv-codex/Anklang/.env.example \
-     /home/ubuntu/urmotiv-codex/Anklang/private/anklang.env
-   chmod 600 /home/ubuntu/urmotiv-codex/Anklang/private/anklang.env
-   ```
-
-   至少填写一个长度不小于 16 的 `ANKLANG_SERVICE_TOKEN`。不要用 shell 的 `source` 或 `.` 加载
-   这个文件；Compose 会通过 `env_file` 直接注入。容器内的监听地址、正式端口、强制令牌和停止宽限
-   由 Compose 固定为安全值，私有文件不能把它们改成对外开放或无鉴权模式。
-3. 启动可选 profile：
-
-   ```bash
-   cd /home/ubuntu/urmotiv-codex/repo
-   docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env \
-     --profile anklang up -d anklang
-   ```
-
-   容器以非 root 用户运行，使用只读根文件系统并移除全部额外 Linux 权限。宿主只监听
-   `127.0.0.1:8730`；健康检查访问容器内的 `/api/v1/live`，不会触发外部检索。
-4. 在管理后台启用“原题相似度检查”插件，把 `baseUrl` 设为 `http://anklang:8730`，并填写与
-   `ANKLANG_SERVICE_TOKEN` 相同的服务令牌。插件使用 v2 接口；`partial` 或 `unavailable` 不能当成
-   “没有原题”。
-
-不带 `--profile anklang` 的普通 `docker compose up` 不会创建 Anklang 容器。不要同时运行独立
-Anklang Compose 和这个 profile 占用同一个宿主端口或数据卷。
-
-## 启用 Fermata（AI 审题服务）
-
-Fermata 是独立的 AI 审题进程，默认不随主应用启动。启用步骤：
-
-1. 把 Fermata 仓库与本仓库同级检出（`compose.yaml` 的 `build: ../Fermata` 依赖这个相对位置），
-   或改用已发布镜像。
-2. 在 Fermata 仓库内被 Git 整体忽略的私有目录准备环境文件（例如
-   `/home/ubuntu/urmotiv-codex/Fermata/private/fermata.env`），
-   字段见 Fermata 仓库的 `.env.example`。加载环境变量时不要用 shell 的 `source`——值里出现
-   `#`、`)` 等字符会导致报错并把密钥回显到终端；Fermata 自带 `scripts/run-with-env.mjs`
-   专门解决这个问题（Docker 部署下由 compose 的 `env_file` 注入，天然没有这个风险）。
-3. 在 Urmotiv 管理后台创建机器人账号并签发 API 令牌，填入 `URMOTIV_ROBOT_TOKEN`。
-4. 用 profile 启动：`docker compose --env-file /home/ubuntu/urmotiv-codex/private/urmotiv.env
-   --profile fermata up -d fermata`，或在主环境文件里设置 `COMPOSE_PROFILES=fermata` 后照常
-   `docker compose up -d`。
-5. 在管理后台启用 `Fermata 审核服务管理` 插件，把 `baseUrl` 指向
-   `http://fermata:8720`（compose 内部网络）并配置管理令牌，即可在插件页看到健康状态、
-   修改轮询间隔等公开设置。
-
-Fermata 的难度评定与等级标定实验（结果与当前校准状态）见其仓库 `experiments/results/` 与 README。
-
-## 首次接入 USTC 统一身份认证（OAuth2 授权码）
-
-用户已经手工验证 USTC CAS 的 OAuth2 授权码流程。正式接入仍必须使用身份服务管理员提供的配置，
-不能从浏览器响应、日志或聊天内容猜测或复制真实客户端密钥、授权码、访问令牌和个人资料。
-
-1. 把 `deploy/env.production.example` 复制到 Git 之外、权限为 `600` 的私有环境文件，设置
-   `URMOTIV_USTC_OAUTH_ENABLED=true`，再填写授权、令牌、资料端点、客户端编号和客户端密钥。
-   这些值只有服务器管理员能写；应用没有读取或导出客户端密钥的 HTTP 接口。
-2. `URMOTIV_USTC_OAUTH_REDIRECT_URI` 必须精确等于 `URMOTIV_WEB_ORIGIN` 加
-   `/api/v1/auth/ustc/callback`。正式环境的公开来源、端点和回调都必须使用 HTTPS，不能带账号密码；
-   回调不能改到其他来源、其他路径，也不能附加查询参数或片段。
-3. 为 OAuth2 单独生成恰好 32 字节的无填充 Base64URL 状态密钥，不能与客户端密钥、插件密钥或经典 CAS
-   状态密钥复用。运行 `scripts/deploy/validate-env.sh`；失败只输出固定配置错误码，不打印任何配置值。
-4. 资料端点的稳定身份优先取 `attributes.gid`，缺失时取顶层 `id`；`attributes.zjhm` 写入用户名和学工号标识，
-   `attributes.name` 写入真实姓名，`attributes.email` 写入已验证主邮箱。上述建档字段缺失或与现有学工号、
-   邮箱、同一稳定身份的用户名冲突时，登录固定失败，不自动创建、合并或改绑账号。
-5. 回调使用签名 `state`、一次性随机值、浏览器绑定 Cookie 和本站返回路径白名单。重放、绑定错误、换码或取资料失败
-   都返回相同未登录响应；禁止在日志、错误、审计和调试输出中记录客户端密钥、授权码、访问令牌或资料原文。
-6. 经典 CAS 票据流程仍可通过独立的 `URMOTIV_CAS_*` 配置显式开启以兼容旧部署；它与 OAuth2 使用不同的
-   状态格式、Cookie 前缀和密钥，不能替代 OAuth2 或解除上述约束。
-
-真实浏览器和真实 USTC 账号联调只能由获授权的本人在受控实例中完成。仓库测试只使用合成资料和本地替身，
-不向 USTC 或其他外部服务发请求。
-
-## 历史题目迁移
-
-协会已有题目在 `hist_problem/` 与 `USTC题目列表.xlsx`（均为私有资料，不进 Git）。迁移是一次性工作，
-用 `scripts/migrate-hist/` 的工具把格式各异的历史题目规范化成原生题目包，再走导入导出页导入。完整
-步骤见 `scripts/migrate-hist/README.md`，要点：
-
-1. 用 `scp` 把 `hist_problem/` 与 `.xlsx` 传到服务器的**非 Git 私有目录**（如
-   `/home/ubuntu/urmotiv-codex/private/hist`），传输后确认目标仍在 `.gitignore` 覆盖范围外的私有区。
-2. `parse-metadata.py` 解析表格为 `metadata.json`，自动剔除 QQ 号、审核意见和投题者自填难度；难度不进入
-   模型提示或候选题，必须另行独立评定。
-3. 人工核对每个已经分组的文本文件与表格题号，写入第一份确认文件。确认文件同时记录整份私有元数据文件
-   和每个源文本的 SHA-256 内容摘要；作者归属、元数据或源文本变化后旧确认自动失效。系统不再根据文件名
-   开头的数字猜题号，也不允许同一文件或元数据被重复分配。
-4. `prepare` 阶段用模型整理候选，只产出预览和不含题名、学号、原文件名或正文的审核清单，不生成题目包。
-   人逐题阅读后，在第二份确认文件中批准“候选安全编号 + 内容摘要”；候选变化后旧批准自动失效。
-5. `package` 阶段再次读取源文本并核对摘要，只为批准项生成原生题目包。作者学号绝不进入题目包清单或
-   扩展字段，只写到 `--author-map-out` 指定的单独私有文件。映射同时带候选、题目包和整批摘要，供管理员
-   导入后核对批次并处理归属。
-6. 如果批量为出题人建账号麻烦、或担心他们首次 CAS 登录出问题，可以**先建一个共享的“历史导入”账号**
-   （用有 `problem.import` 权限的账号）统一导入；日后再依据单独私有作者映射逐题转移。详细命令与两份
-   确认文件格式见 `scripts/migrate-hist/README.md`。当前实现覆盖 Markdown、纯文本和经过完整安全检查的
-   两层历史 ZIP 路径链；PDF、图片、表格、旧编码 ZIP 和无法明确划分的混合资料仍须人工处理。
-
-## 把测试实例部署到 ustc 并迁移数据库
-
-真实使用测试可以直接部署在 `ssh ustc`。数据库迁移就是标准的 PostgreSQL 备份/恢复：
+在服务器外的浏览器通过 SSH 转发：
 
 ```bash
-# 在旧实例导出（backup.sh 也会做同样的事，产物在备份目录）
-bash scripts/deploy/backup.sh /home/ubuntu/urmotiv-codex/private/urmotiv.env /home/ubuntu/urmotiv-codex/backups
-
-# 在新实例恢复（见上面“升级与恢复”里的 pg_restore 示例），再切到对应代码版本 up -d
+ssh -N -L 8080:127.0.0.1:8080 your-user@your-server
 ```
 
-对象存储（MinIO）里的题目文件要按同一时点单独备份并一起迁移，避免数据库里的文件记录和实际文件对不上。
-迁移完成后按上面的 OAuth2 联调步骤确认统一身份登录；若保留经典 CAS 兼容模式，也要单独验证，再放开对外访问。
+然后打开 `http://127.0.0.1:8080/login`。首次启动后要在真实服务器 TTY 执行 `bootstrap-admin`，见[管理员指南](admin-guide.md)。
+
+## 生产 HTTPS
+
+生产入口应由现有反向代理或负载均衡器终止 HTTPS，再把流量转给 Compose 的 Web 服务。设置：
+
+```dotenv
+URMOTIV_WEB_ORIGIN=https://urmotiv.example.org
+URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES=false
+URMOTIV_TRUSTED_PROXY_CIDRS=精确的反向代理IPv4或IPv6 CIDR
+```
+
+`URMOTIV_WEB_ORIGIN` 必须是浏览器实际访问的协议、主机和可选端口，不能带路径。反向代理需要：
+
+- `/` 转发到 Web 容器；Web 再把 `/api/` 转发到 API 容器。
+- 保留 `Host`、`X-Forwarded-For` 和 `X-Forwarded-Proto`，并只在代理地址确实属于 `URMOTIV_TRUSTED_PROXY_CIDRS` 时填写该变量。
+- 对上传设置足够的请求体上限。内置 nginx 示例为 `128m`；API 的单文件路由上限为 `512 MiB`，若业务需要更大文件，必须在每一层代理明确调整并重新评估风险。
+- 不要把 API、PostgreSQL、Redis、MinIO 或可选 Anklang/Fermata 端口直接暴露到公网；Compose 默认只发布 Web、Anklang 和 Fermata 的回环端口。
+
+生产 HTTPS 下 OAuth/CAS 回调和 Cookie 都使用安全来源。不要通过设置回环例外来“修复”证书、代理头或来源配置问题。
+
+## 端口和可选服务
+
+| 服务 | Compose 内部地址/默认发布 | 作用 |
+| --- | --- | --- |
+| Web | `127.0.0.1:8080` → 容器 `80` | 浏览器入口和 `/api/` 代理 |
+| API | `api:3000`（不发布到主机） | `/api/v1` 接口 |
+| Worker | `worker:3010`（不发布到主机） | 异步任务健康服务 `/ready` |
+| PostgreSQL | `postgres:5432`（不发布到主机） | 业务数据库 |
+| Redis | `redis:6379`（不发布到主机） | 任务队列 |
+| MinIO | Compose 网络内 `minio:9000` | S3 兼容对象存储 |
+| Anklang | `127.0.0.1:8730`，profile `anklang` | 原题相似性检索；独立数据库和令牌 |
+| Fermata | `127.0.0.1:8720`，profile `fermata` | 独立审核服务；不共享 Urmotiv 数据库 |
+
+启用可选服务前，确认对应独立仓库与其被 Git 忽略的私有环境文件已经准备好；Compose 会按相对构建上下文和私有 `env_file` 检查它们，缺任一文件时显式选择该 profile 的 `config`/`up` 命令会失败。主 Urmotiv 环境文件只保留插件所需的服务地址和加密密钥设置。准备好外部前置条件后分别启动：
+
+```bash
+docker compose --env-file /secure/path/urmotiv.env --profile anklang up -d --build
+docker compose --env-file /secure/path/urmotiv.env --profile fermata up -d --build
+```
+
+也可以设置 `COMPOSE_PROFILES=anklang,fermata` 后执行普通 `up`；不要为验证方便把外部私有 `env_file` 复制到 Urmotiv 仓库。
+
+Urmotiv 中的 Anklang 插件设置 `baseUrl`、接口版本、超时和失败行为；Fermata 管理插件设置 `baseUrl` 和超时。Anklang 只返回原题相似性查询结果，可支持实时添加后查询；题目的查重/检查属性由 Urmotiv 保存，插件可以写入，Fermata 可以读取。两项独立服务都不决定 Urmotiv 的权限、状态或最终审核。
+
+## 健康检查
+
+API 提供两个无需登录的检查：
+
+```bash
+curl --fail http://127.0.0.1:8080/api/v1/health
+curl --fail http://127.0.0.1:8080/api/v1/health/ready
+```
+
+`/health` 返回 `{"status":"ok","service":"urmotiv-api"}`；`/health/ready` 在数据库可连接时返回 `200` 和 `{"status":"ready",...}`，数据库不可用时返回 `503` 和 `status: unavailable`。Compose API 健康检查使用容器内的 `/api/v1/health`，Worker 使用 `http://127.0.0.1:3010/ready`，Web 使用其代理后的 `/api/v1/health`。
+
+健康检查通过不代表管理员 bootstrap 已完成，也不代表 OAuth、邮件投递、Anklang 或 Fermata 已配置。登录问题要结合 bootstrap 状态和应用日志摘要判断。
+
+## 首次启动顺序
+
+Compose 会先等待 PostgreSQL、Redis 和 MinIO 初始化，再运行迁移任务；API 依赖迁移成功。全新数据库随后需要真实 TTY：
+
+```bash
+docker compose --env-file /secure/path/urmotiv.env run --rm --no-deps api pnpm --filter @urmotiv/api bootstrap-admin
+docker compose --env-file /secure/path/urmotiv.env up -d api web worker
+```
+
+初始化前的 API 业务访问被阻塞是预期安全状态。管理员恢复、角色和备份见[管理员指南](admin-guide.md)。
+
+## 升级
+
+升级脚本参数固定为“私有环境文件、备份目录”，并按以下顺序执行：验证环境、构建镜像、停止 API/Worker/Web、备份 PostgreSQL、运行迁移、重新启动、轮询 Web 健康检查：
+
+```bash
+bash scripts/deploy/upgrade.sh /secure/path/urmotiv.env /secure/path/backups
+```
+
+脚本成功会打印“升级完成，健康检查通过。”；失败时保留服务和备份，使用下面的命令查看摘要：
+
+```bash
+docker compose --env-file /secure/path/urmotiv.env ps
+docker compose --env-file /secure/path/urmotiv.env logs --tail=100 api worker web migrate
+```
+
+不要用 `docker compose down -v` 作为升级或排障手段；它会删除数据库/对象存储卷，且不是回滚。升级前要确保备份目录已加密并可读取；对象存储附件不包含在 PostgreSQL dump 中，需要另行快照或备份。
+
+## 故障排查
+
+### Web 打不开或返回 502
+
+检查 `web` 和 `api` 的容器状态、`api` 健康检查以及反向代理上游地址。外部代理应访问 Web 的 `/api/v1/health`，不要绕过来源/安全 Cookie 配置直连 API。
+
+### API 一直不健康
+
+按顺序确认 PostgreSQL/Redis/MinIO 健康、`migrate` 已成功、私有环境必填项完整，再查看 `/api/v1/health/ready` 和 API 日志摘要。`URMOTIV_WEB_ORIGIN` 若带路径、OAuth 回调来源不一致或密钥格式不合规，API 会拒绝启动。
+
+### 能看到登录页但不能登录
+
+先确认管理员 bootstrap 已成功并重启 `api web worker`。邮箱登录由 `URMOTIV_EMAIL_LOGIN_ENABLED` 控制，默认开启；邮箱注册由 `URMOTIV_EMAIL_REGISTRATION_ENABLED` 控制，默认关闭。注册若开启，还需要正式的邮件投递实现，不能在生产使用测试投递模式。
+
+### OAuth 回调失败
+
+确认提供商登记的回调精确等于 `URMOTIV_WEB_ORIGIN` 加 `/api/v1/auth/ustc/callback`，且生产使用 HTTPS；检查所有 OAuth 变量只出现一次，并让 `URMOTIV_USTC_OAUTH_STATE_SECRET` 与其他密钥不同。具体字段映射见[USTC OAuth 指南](ustc-oauth.md)。
+
+### 导入上传被拒绝
+
+内置 nginx 的请求体上限为 `128m`，题目包接口还检查归档大小和路径安全。确认上传格式已注册、预览没有错误，并检查 `/transfer` 任务的固定失败编号。不要关闭压缩包安全检查，也不要把原始题面或失败响应贴到日志。
+
+### 插件调用超时或提交被阻止
+
+管理员在 `/admin` 检查插件状态、设置版本和密钥遮罩。提交前检查的超时/失败行为由插件设置决定；阻止行为不能靠客户端重试绕过。Anklang 和 Fermata 的服务日志、令牌和原始响应应分别在各自受控环境中排查。

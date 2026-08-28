@@ -6,8 +6,7 @@
 
 ## 支持的 FPS 内容
 
-按上游 [`fps.current.dtd`](https://github.com/zhblue/freeproblemset/blob/7782b3815fd40f5bba95b5d7b90e3fbefafae656/fps.current.dtd)
-（固定提交 `7782b3815fd40f5bba95b5d7b90e3fbefafae656`，2026-05-20）定义的最小交集：
+按上游 [`fps.current.dtd`](https://github.com/zhblue/freeproblemset/blob/master/fps.current.dtd) 和公开元素约定定义的最小交集：
 
 - `fps` 根元素下的恰好一个 `item`；`generator*` 只作名目信息，不会导入；
 - `title`、`url?`、`time_limit+`、`memory_limit+`、`description`、`input?`、`output?`、`hint?`；
@@ -57,11 +56,12 @@
 
 ## 格式依据与许可证
 
-格式依据是上游 [`zhblue/freeproblemset`](https://github.com/zhblue/freeproblemset) 的
-`fps.current.dtd`，固定提交 `7782b3815fd40f5bba95b5d7b90e3fbefafae656`（2026-05-20）。
-上游仓库标为 LGPL-3.0；README 对准确兼容和衍生格式另有说明。本插件是独立实现，不复制上游代码、
-题目、数据或程序。测试只使用本仓库人工构造的最小合成夹具；其中题目、题面、数据点和程序文本
-不来自任何 OJ 或协会资料，不能称为 FPS 真实导出样例或外部互操作证据。
+格式依据是上游 [`zhblue/freeproblemset`](https://github.com/zhblue/freeproblemset) 的公开
+`fps.current.dtd` 和元素约定。上游仓库标为 LGPL-3.0；本插件是独立实现，不复制上游代码、题目、数据或程序。
+如另行复制、修改或分发上游实现，应遵守其许可证。
+
+测试只使用本仓库人工构造的最小合成夹具；其中题目、题面、数据点和程序文本不来自任何 OJ 或协会资料，
+不能称为 FPS 真实导出样例或外部互操作证据。
 
 解析时使用禁用 DTD/实体声明的安全配置（对 `DOCTYPE`/`ENTITY` 直接拒绝），不解析外部实体，
 不访问外部网络或本地文件。「支持」只表示格式转换能力，不表示有权复制、公开或再分发包内题面、

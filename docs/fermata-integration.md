@@ -12,17 +12,15 @@ HTTP 接口调用 Fermata 的管理端口，不直接执行模型推理。
 
 ## 配置步骤
 
-### 1. 启用 Fermata 控制插件
+### 1. 配置并启用 Fermata 控制插件
 
-在 Urmotiv 管理后台的插件管理页面找到 `fermata-control` 插件，点击修改：
+在 Urmotiv 管理后台的插件管理页面找到 `org.ustc.urmotiv.fermata-control`，先提交设置，再单独启用插件：
 
-- **服务地址**（`baseUrl`）：Fermata 的 HTTP 根地址，例如 `http://fermata.internal:4100`。
-  只接受不含账号密码的 `http://` 或 `https://` 地址。
-- **超时毫秒数**（`timeoutMs`）：等待 Fermata 响应的最大时间，默认 5000。
-- **管理令牌**（`fermataManagementToken`）：Fermata 管理员提供的管理令牌，以加密字段保存，
-  保存后不在任何响应、日志或审计中回显明文。
+- **服务地址**（`baseUrl`）：Fermata 的 HTTP 根地址，例如 `http://fermata.internal:4100`。只接受不含账号密码的 `http://` 或 `https://` 地址。
+- **超时毫秒数**（`timeoutMs`）：等待 Fermata 响应的最大时间，当前范围由插件设置模式校验。
+- **管理令牌**（`fermataManagementToken`）：Fermata 管理员提供的管理令牌，以加密字段保存，保存后不在任何响应、日志或审计中回显明文。
 
-保存后插件即启用。修改配置不需要重启 Urmotiv；每次调用时重新读取最新设置和令牌。
+提交设置时带当前 `settingsRevision`；设置冲突返回 `409`。配置保存不会自动改变插件状态：确认服务可达后，在同一插件卡片执行启用；修改设置和令牌不需要重启，每次调用都会重新读取最新值。
 
 ### 2. 验证连通性
 

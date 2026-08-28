@@ -54,12 +54,8 @@ Hydro 不能直接表达的本站难度会报告为警告，不会擅自换算�
 
 ## 格式依据与许可证
 
-格式依据是 Hydro 官方仓库 [`hydro-dev/Hydro`](https://github.com/hydro-dev/Hydro)，校对提交为 `591dbd31c00ac54aa0381a85eed375c25f6bd829`（2026-07-25）。重点核对了：
+格式依据是 Hydro 官方仓库的公开题目导入/导出目录约定，重点核对题目模型、网页下载布局和题目配置字段。实现只依赖公开格式行为，不复制 Hydro 源代码、题目、测试数据或资源文件。
 
-- `packages/hydrooj/src/model/problem.ts` 的题目导入、导出目录和文件名逻辑；
-- `packages/ui-default/components/zipDownloader/index.ts` 的网页下载文件布局；
-- `packages/common/types.ts` 的 `ProblemConfigFile` 字段。
+Hydro 代码仓库标注 **AGPL-3.0-only**；如另行复制、修改或分发 Hydro 本身的代码，应遵守其许可证。本插件的许可证与内容授权边界见 [`LICENSE-NOTICE.md`](LICENSE-NOTICE.md)。
 
-在上述固定提交中，根 [`LICENSE`](https://github.com/hydro-dev/Hydro/blob/591dbd31c00ac54aa0381a85eed375c25f6bd829/LICENSE) 和 [`package.json`](https://github.com/hydro-dev/Hydro/blob/591dbd31c00ac54aa0381a85eed375c25f6bd829/package.json) 均把 Hydro 代码标为 **AGPL-3.0-only**。本插件没有复制 Hydro 的源代码、题目、测试数据或资源文件；这里只根据公开格式行为编写独立实现。使用者如计划复制、修改或分发 Hydro 本身的代码，应自行遵守 Hydro 的许可证。许可证与内容授权边界另见 [`LICENSE-NOTICE.md`](LICENSE-NOTICE.md)。
-
-当前自动化测试证据只有 `test/fixtures.ts` 中人工构造的最小公开合成夹具；其中题目、题面、数据点和程序文本不来自任何 OJ 或协会资料，不能称为 Hydro 真实导出样例或外部互操作证据。
+自动化测试只使用 `test/fixtures.ts` 中人工构造的最小公开合成夹具，其中的题目、题面、数据点和程序文本不来自任何 OJ 或协会资料，不能称为 Hydro 真实导出样例或外部互操作证据。
