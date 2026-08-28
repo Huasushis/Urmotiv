@@ -20,6 +20,13 @@ const trustedProxyConfigurationError =
 const casConfigurationError = "URMOTIV_CAS_CONFIGURATION_INVALID";
 const casStateSecretPattern = /^[A-Za-z0-9_-]{43}$/;
 const ustcOAuthConfigurationError = "URMOTIV_USTC_OAUTH_CONFIGURATION_INVALID";
+const loopbackCookieConfigurationError =
+  "URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES_CONFIGURATION_INVALID";
+const loopbackHosts: Record<string, true> = {
+  localhost: true,
+  "127.0.0.1": true,
+  "[::1]": true
+};
 
 export interface ServerEnvironment {
   readonly [name: string]: string | undefined;
@@ -54,6 +61,7 @@ export interface ServerEnvironment {
   URMOTIV_PGLITE_PATH?: string;
   URMOTIV_TRUSTED_PROXY_CIDRS?: string;
   URMOTIV_WEB_ORIGIN?: string;
+  URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES?: string;
   STORAGE_LOCAL_ROOT?: string;
   STORAGE_MAX_FILE_BYTES?: string;
   S3_ENDPOINT?: string;
@@ -112,16 +120,81 @@ export function readServerOptions(environment: ServerEnvironment): ApiAppOptions
   if (production && allowedOrigins.length === 0) {
     throw new Error("生产环境必须配置 URMOTIV_WEB_ORIGIN。");
   }
+  const parsedOrigins = parseWebOrigins(allowedOrigins);
+  const allowLoopbackInsecureCookies = readLoopbackCookieOptIn(
+    environment.URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES
+  );
+  if (
+    parsedOrigins.some(
+      (origin) => origin.protocol === "http:" && loopbackHosts[origin.hostname] !== true
+    )
+  ) {
+    throw new Error(loopbackCookieConfigurationError);
+  }
+  if (
+    allowLoopbackInsecureCookies
+    && (
+      parsedOrigins.length === 0
+      || parsedOrigins.some((origin) => loopbackHosts[origin.hostname] !== true)
+    )
+  ) {
+    throw new Error(loopbackCookieConfigurationError);
+  }
+  const insecureLoopbackCookies =
+    allowLoopbackInsecureCookies
+    && parsedOrigins.length > 0
+    && parsedOrigins.every(
+      (origin) => origin.protocol === "http:" && loopbackHosts[origin.hostname] === true
+    );
   const trustedProxyCidrs = readTrustedProxyCidrs(environment.URMOTIV_TRUSTED_PROXY_CIDRS);
 
   return {
-    secureCookies: production,
+    secureCookies: production && !insecureLoopbackCookies,
     demoAuthEnabled,
     emailLoginEnabled: environment.URMOTIV_EMAIL_LOGIN_ENABLED !== "false",
     emailRegistrationEnabled: environment.URMOTIV_EMAIL_REGISTRATION_ENABLED === "true",
     ...(allowedOrigins.length === 0 ? {} : { allowedOrigins }),
     ...(trustedProxyCidrs.length === 0 ? {} : { trustedProxyCidrs })
   };
+}
+
+interface ParsedWebOrigin {
+  readonly protocol: "http:" | "https:";
+  readonly hostname: string;
+}
+
+function parseWebOrigins(origins: readonly string[]): ParsedWebOrigin[] {
+  const parsedOrigins: ParsedWebOrigin[] = [];
+  for (const origin of origins) {
+    let parsed: URL;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      throw new Error(loopbackCookieConfigurationError);
+    }
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+      || parsed.username.length > 0
+      || parsed.password.length > 0
+      || (parsed.pathname !== "" && parsed.pathname !== "/")
+      || parsed.search.length > 0
+      || parsed.hash.length > 0
+    ) {
+      throw new Error(loopbackCookieConfigurationError);
+    }
+    parsedOrigins.push({ protocol: parsed.protocol, hostname: parsed.hostname });
+  }
+  return parsedOrigins;
+}
+
+function readLoopbackCookieOptIn(value: string | undefined): boolean {
+  if (value === undefined || value === "" || value === "false") {
+    return false;
+  }
+  if (value === "true") {
+    return true;
+  }
+  throw new Error(loopbackCookieConfigurationError);
 }
 
 export function readTrustedProxyCidrs(value: string | undefined): string[] {

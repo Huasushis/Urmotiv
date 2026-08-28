@@ -86,6 +86,7 @@ async function makeHarness(
   const app = await createApp({
     ustcOAuthClient: client,
     allowedOrigins: [localOrigin],
+    secureCookies: true,
     ...(options.appFetch === undefined ? {} : { fetchImpl: options.appFetch }),
   });
   openApps.push(app);

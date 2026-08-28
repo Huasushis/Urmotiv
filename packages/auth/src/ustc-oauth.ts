@@ -121,9 +121,9 @@ export class UstcOAuthError extends Error {
   }
 }
 
-export function ustcOAuthBrowserBindingCookieName(state: string): string {
+export function ustcOAuthBrowserBindingCookieName(state: string, secure = true): string {
   const stateDigest = createHash("sha256").update(state, "utf8").digest("base64url");
-  return `__Host-urmotiv_ustc_binding_${stateDigest}`;
+  return `${secure ? "__Host-" : ""}urmotiv_ustc_binding_${stateDigest}`;
 }
 
 /**
@@ -189,7 +189,7 @@ export class UstcOAuthClient {
       state,
       returnTo: safeReturnTo,
       browserBindingCookie: {
-        name: ustcOAuthBrowserBindingCookieName(state),
+        name: ustcOAuthBrowserBindingCookieName(state, true),
         value: browserBinding,
         maxAgeSeconds: stateLifetimeSeconds
       }

@@ -70,6 +70,7 @@ async function makeHarness(
     profileStatus?: number;
     networkFailure?: boolean;
     redirectUri?: string;
+    secureCookies?: boolean;
   } = {},
 ) {
   const states = new TrackingStates();
@@ -101,7 +102,10 @@ async function makeHarness(
     states,
     fetch: fetch as unknown as typeof globalThis.fetch,
   });
-  const app = await createApp({ ustcOAuthClient: client });
+  const app = await createApp({
+    ustcOAuthClient: client,
+    secureCookies: options.secureCookies ?? true
+  });
   openApps.push(app);
   return {
     app,

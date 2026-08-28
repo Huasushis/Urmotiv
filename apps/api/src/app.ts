@@ -144,7 +144,6 @@ const sessionLifetimeSeconds = 60 * 60 * 12;
 const emailVerificationLifetimeSeconds = 30 * 60;
 const casBrowserBindingCookieOptions = {
   httpOnly: true,
-  secure: true,
   sameSite: "lax" as const,
   path: "/"
 };
@@ -1179,11 +1178,16 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
         }
         throw error;
       }
+      const browserBindingCookieName = ustcOAuthBrowserBindingCookieName(
+        start.state,
+        dependencies.secureCookies
+      );
       reply.setCookie(
-        start.browserBindingCookie.name,
+        browserBindingCookieName,
         start.browserBindingCookie.value,
         {
           ...casBrowserBindingCookieOptions,
+          secure: dependencies.secureCookies,
           maxAge: start.browserBindingCookie.maxAgeSeconds
         }
       );
@@ -1202,7 +1206,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
           throw unauthorized();
         }
         const input = parsedInput.data;
-        const browserBindingCookieName = ustcOAuthBrowserBindingCookieName(input.state);
+        const browserBindingCookieName = ustcOAuthBrowserBindingCookieName(
+          input.state,
+          dependencies.secureCookies
+        );
         const completed = await dependencies.ustcOAuthClient!.finishLogin({
           ...input,
           browserBinding: readUnambiguousCookie(request, browserBindingCookieName)
@@ -1248,7 +1255,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
           ...(studentIds.length === 0 ? {} : { studentIds })
         });
         await beginSession(user, reply);
-        reply.clearCookie(browserBindingCookieName, casBrowserBindingCookieOptions);
+        reply.clearCookie(browserBindingCookieName, {
+          ...casBrowserBindingCookieOptions,
+          secure: dependencies.secureCookies
+        });
         return reply.redirect(completed.returnTo);
       } catch {
         throw unauthorized();
@@ -1273,11 +1283,16 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
         }
         throw error;
       }
+      const browserBindingCookieName = casBrowserBindingCookieName(
+        start.state,
+        dependencies.secureCookies
+      );
       reply.setCookie(
-        start.browserBindingCookie.name,
+        browserBindingCookieName,
         start.browserBindingCookie.value,
         {
           ...casBrowserBindingCookieOptions,
+          secure: dependencies.secureCookies,
           maxAge: start.browserBindingCookie.maxAgeSeconds
         }
       );
@@ -1293,7 +1308,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
           throw unauthorized();
         }
         const input = parsedInput.data;
-        const browserBindingCookieName = casBrowserBindingCookieName(input.state);
+        const browserBindingCookieName = casBrowserBindingCookieName(
+          input.state,
+          dependencies.secureCookies
+        );
         const completed = await dependencies.casClient!.finishLogin({
           ...input,
           browserBinding: readUnambiguousCookie(request, browserBindingCookieName)
@@ -1330,7 +1348,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
           ...(studentIds.length === 0 ? {} : { studentIds })
         });
         await beginSession(user, reply);
-        reply.clearCookie(browserBindingCookieName, casBrowserBindingCookieOptions);
+        reply.clearCookie(browserBindingCookieName, {
+          ...casBrowserBindingCookieOptions,
+          secure: dependencies.secureCookies
+        });
         return reply.redirect(completed.returnTo);
       } catch {
         throw unauthorized();
@@ -1374,14 +1395,24 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     if (sessionId !== undefined) {
       await dependencies.store.deleteSession(sessionId);
     }
-    reply.clearCookie(sessionCookieName, { path: "/" });
+    reply.clearCookie(sessionCookieName, {
+      httpOnly: true,
+      secure: dependencies.secureCookies,
+      sameSite: "lax",
+      path: "/"
+    });
     return { ok: true };
   });
 
   app.post("/api/v1/auth/logout-all", async (request, reply) => {
     const user = await requireUser(request);
     await dependencies.store.revokeUserSessions(user.id);
-    reply.clearCookie(sessionCookieName, { path: "/" });
+    reply.clearCookie(sessionCookieName, {
+      httpOnly: true,
+      secure: dependencies.secureCookies,
+      sameSite: "lax",
+      path: "/"
+    });
     return { ok: true };
   });
 

@@ -43,6 +43,51 @@ describe("服务启动配置", () => {
     );
   });
 
+  it("keeps production cookies secure by default and enables HTTP only for exact loopback origins", () => {
+    expect(readServerOptions({
+      NODE_ENV: "production",
+      URMOTIV_WEB_ORIGIN: "http://127.0.0.1:8080"
+    }).secureCookies).toBe(true);
+    expect(readServerOptions({
+      NODE_ENV: "production",
+      URMOTIV_WEB_ORIGIN: "http://127.0.0.1:8080",
+      URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES: "true"
+    }).secureCookies).toBe(false);
+    expect(readServerOptions({
+      NODE_ENV: "production",
+      URMOTIV_WEB_ORIGIN: "http://[::1]:8080",
+      URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES: "true"
+    }).secureCookies).toBe(false);
+  });
+
+  it("rejects non-loopback HTTP origins and opt-in outside exact loopback hosts", () => {
+    const invalidEnvironments = [
+      {
+        NODE_ENV: "production",
+        URMOTIV_WEB_ORIGIN: "http://example.test"
+      },
+      {
+        NODE_ENV: "production",
+        URMOTIV_WEB_ORIGIN: "http://127.0.0.1.evil:8080"
+      },
+      {
+        NODE_ENV: "production",
+        URMOTIV_WEB_ORIGIN: "https://example.test",
+        URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES: "true"
+      },
+      {
+        NODE_ENV: "production",
+        URMOTIV_WEB_ORIGIN: "http://localhost:8080",
+        URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES: "yes"
+      }
+    ];
+    for (const environment of invalidEnvironments) {
+      expect(() => readServerOptions(environment)).toThrow(
+        "URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES_CONFIGURATION_INVALID"
+      );
+    }
+  });
+
   it("未配置可信代理时不启用代理信任", () => {
     expect(readTrustedProxyCidrs(undefined)).toEqual([]);
     expect(readTrustedProxyCidrs("   ")).toEqual([]);

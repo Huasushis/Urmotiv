@@ -136,7 +136,7 @@ export class CasClient {
       serviceUrl,
       expiresAt,
       browserBindingCookie: {
-        name: casBrowserBindingCookieName(state),
+        name: casBrowserBindingCookieName(state, true),
         value: browserBinding,
         maxAgeSeconds: stateLifetimeSeconds
       }
@@ -207,9 +207,9 @@ export class CasClient {
   }
 }
 
-export function casBrowserBindingCookieName(state: string): string {
+export function casBrowserBindingCookieName(state: string, secure = true): string {
   const stateDigest = createHash("sha256").update(state, "utf8").digest("base64url");
-  return `__Host-urmotiv_cas_binding_${stateDigest}`;
+  return `${secure ? "__Host-" : ""}urmotiv_cas_binding_${stateDigest}`;
 }
 
 export function parseCasIdentity(xml: string, configuration: CasConfiguration): CasIdentity {

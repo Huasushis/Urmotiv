@@ -43,7 +43,9 @@ afterEach(async () => {
   await Promise.all(openApps.splice(0).map((app) => app.close()));
 });
 
-async function makeHarness(options: { validationStatus?: number; fetchFailure?: boolean } = {}) {
+async function makeHarness(
+  options: { validationStatus?: number; fetchFailure?: boolean; secureCookies?: boolean } = {}
+) {
   const states = new TrackingStates();
   const fetch = vi.fn(async () => {
     if (options.fetchFailure === true) {
@@ -66,7 +68,10 @@ async function makeHarness(options: { validationStatus?: number; fetchFailure?: 
     states,
     fetch,
   });
-  const app = await createApp({ casClient });
+  const app = await createApp({
+    casClient,
+    secureCookies: options.secureCookies ?? true
+  });
   openApps.push(app);
   return { app, fetch, states };
 }
@@ -76,7 +81,11 @@ function cookieLines(header: string | string[] | undefined): string[] {
   return Array.isArray(header) ? header : [header];
 }
 
-async function startFlow(app: FastifyInstance, returnPath = "/problems"): Promise<StartedFlow> {
+async function startFlow(
+  app: FastifyInstance,
+  returnPath = "/problems",
+  secure = true
+): Promise<StartedFlow> {
   const response = await app.inject({
     method: "GET",
     url: `/api/v1/auth/cas/start?returnPath=${encodeURIComponent(returnPath)}`,
@@ -88,7 +97,7 @@ async function startFlow(app: FastifyInstance, returnPath = "/problems"): Promis
   const loginLocation = new URL(response.headers.location!);
   const serviceUrl = new URL(loginLocation.searchParams.get("service")!);
   const state = serviceUrl.searchParams.get("state")!;
-  const expectedCookieName = casBrowserBindingCookieName(state);
+  const expectedCookieName = casBrowserBindingCookieName(state, secure);
   const line = cookieLines(response.headers["set-cookie"]).find((candidate) =>
     candidate.startsWith(`${expectedCookieName}=`),
   );
@@ -118,15 +127,41 @@ function publicFailure(response: { statusCode: number; json(): unknown }) {
   };
 }
 
-function expectBindingCookieAttributes(line: string): void {
+function expectBindingCookieAttributes(line: string, secure = true): void {
   expect(line).toContain("Path=/");
   expect(line).toContain("HttpOnly");
-  expect(line).toContain("Secure");
+  if (secure) {
+    expect(line).toContain("Secure");
+  } else {
+    expect(line).not.toContain("Secure");
+  }
   expect(line).toContain("SameSite=Lax");
   expect(line.toLowerCase()).not.toContain("domain=");
 }
 
 describe("CAS 浏览器绑定", () => {
+  it("uses the same secure flag for the loopback opt-in and preserves binding attributes", async () => {
+    const { app } = await makeHarness({ secureCookies: false });
+    const flow = await startFlow(app, "/problems", false);
+    expectBindingCookieAttributes(flow.cookieLine, false);
+
+    const callback = await app.inject({
+      method: "GET",
+      url: callbackRequest(flow.state, "ST-loopback-cookie"),
+      headers: { cookie: flow.cookiePair }
+    });
+    expect(callback.statusCode).toBe(302);
+    const cleared = cookieLines(callback.headers["set-cookie"]).find((line) =>
+      line.startsWith(`${flow.cookieName}=`)
+    );
+    expect(cleared).toBeDefined();
+    expectBindingCookieAttributes(cleared!, false);
+    const session = cookieLines(callback.headers["set-cookie"]).find((line) =>
+      line.startsWith("urmotiv_session=")
+    );
+    expect(session).toBeDefined();
+    expectBindingCookieAttributes(session!, false);
+  });
   it("用严格的 __Host- Cookie 启动登录，并把所有前置失败固定为不消耗的 401", async () => {
     const { app, fetch, states } = await makeHarness();
     const flow = await startFlow(app);
