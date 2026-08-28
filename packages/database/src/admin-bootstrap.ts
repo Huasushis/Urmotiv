@@ -6,6 +6,8 @@ import { hasExactDefaultCoreSeed } from "./seed";
 
 const migrationLockKeyOne = 1_431_453_001;
 const migrationLockKeyTwo = 1_651_666_804;
+const adminCredentialsRecoveryLockKeyOne = 1_431_453_002;
+const adminCredentialsRecoveryLockKeyTwo = 1_651_666_805;
 const expectedMigrationCount = 18;
 
 const seededPublicTables = new Set([
@@ -56,12 +58,23 @@ export interface AdminBootstrapAdministratorInput {
   readonly passwordHash: string;
 }
 
+export interface AdminCredentialsRecoveryInput {
+  /** Only an Argon2id encoded digest may cross this boundary. */
+  readonly passwordHash: string;
+}
+
+export type AdminCredentialsRecoveryResult =
+  | { readonly status: "completed"; readonly userId: string }
+  | "input_invalid"
+  | "not_completed"
+  | "busy"
+  | "candidate_invalid";
+
 export type AdminBootstrapCompletionResult =
   | "completed"
   | "not_open"
   | "baseline_mismatch"
   | "role_invalid";
-
 export async function tryAcquireAdminBootstrapMigrationLease(
   handle: DatabaseHandle
 ): Promise<AdminBootstrapMigrationLease | undefined> {
@@ -415,6 +428,120 @@ export async function completeAdminBootstrap(
     return "completed";
   });
 }
+/**
+ * Replaces the password of the one eligible administrator after bootstrap.
+ *
+ * The caller hashes the generated password before entering this transaction.
+ * A non-blocking advisory transaction lock makes overlapping recovery attempts
+ * fail closed instead of waiting for a second password reset.
+ */
+export async function recoverAdminCredentials(
+  handle: DatabaseHandle,
+  input: AdminCredentialsRecoveryInput
+): Promise<AdminCredentialsRecoveryResult> {
+  if (!isArgon2idPasswordHash(input.passwordHash)) {
+    return "input_invalid";
+  }
+
+  const requestId = randomUUID();
+  return handle.transaction(async (transaction) => {
+    const lockRows = await transaction.query<{ acquired: boolean }>(sql`
+      SELECT pg_try_advisory_xact_lock(
+        ${adminCredentialsRecoveryLockKeyOne}::integer,
+        ${adminCredentialsRecoveryLockKeyTwo}::integer
+      ) AS acquired
+    `);
+    if (lockRows.length !== 1 || lockRows[0]?.acquired !== true) {
+      return "busy";
+    }
+
+    const state = parseStateRows(await transaction.query<StateRow>(sql`
+      SELECT status::text AS status, opened_at, completed_at
+      FROM admin_bootstrap_state
+      WHERE singleton = true
+      FOR UPDATE
+    `));
+    if (state.status !== "completed") {
+      return "not_completed";
+    }
+
+    // User deletion is hard-delete in this schema; disabled_at is the retained inactive state.
+    const candidates = await transaction.query<{ user_id: string }>(sql`
+      SELECT user_record.id::text AS user_id
+      FROM users user_record
+      JOIN role_memberships membership
+        ON membership.user_id = user_record.id
+      JOIN roles administrator_role
+        ON administrator_role.id = membership.role_id
+      WHERE user_record.id <> 0
+        AND user_record.account_type = 'human'
+        AND user_record.password_hash IS NOT NULL
+        AND user_record.disabled_at IS NULL
+        AND membership.revoked_at IS NULL
+        AND (membership.expires_at IS NULL OR membership.expires_at > transaction_timestamp())
+        AND administrator_role.key = 'system_administrator'
+        AND administrator_role.is_built_in = true
+      ORDER BY user_record.id
+      FOR UPDATE OF user_record, membership, administrator_role
+    `);
+    if (candidates.length !== 1) {
+      return "candidate_invalid";
+    }
+    const candidate = candidates[0];
+    if (candidate === undefined || !/^[1-9][0-9]*$/u.test(candidate.user_id)) {
+      return "candidate_invalid";
+    }
+
+    const updated = await transaction.query<{ user_id: string }>(sql`
+      UPDATE users
+      SET
+        password_hash = ${input.passwordHash},
+        password_changed_at = transaction_timestamp(),
+        auth_revision = auth_revision + 1,
+        updated_at = transaction_timestamp()
+      WHERE id = ${candidate.user_id}::bigint
+        AND id <> 0
+        AND account_type = 'human'
+        AND password_hash IS NOT NULL
+        AND disabled_at IS NULL
+      RETURNING id::text AS user_id
+    `);
+    if (updated.length !== 1 || updated[0]?.user_id !== candidate.user_id) {
+      return "candidate_invalid";
+    }
+
+    await transaction.execute(sql`
+      UPDATE sessions
+      SET revoked_at = COALESCE(revoked_at, transaction_timestamp())
+      WHERE user_id = ${candidate.user_id}::bigint
+    `);
+
+    await transaction.execute(sql`
+      INSERT INTO audit_events (
+        actor_user_id,
+        subject_user_id,
+        request_id,
+        action,
+        object_type,
+        object_id,
+        result,
+        metadata
+      ) VALUES (
+        NULL,
+        ${candidate.user_id}::bigint,
+        ${requestId}::uuid,
+        'admin.credentials.recover',
+        'user',
+        ${candidate.user_id},
+        'success',
+        '{"channel":"server_tty","credential":"local_password"}'::jsonb
+      )
+    `);
+
+    return { status: "completed", userId: candidate.user_id };
+  });
+}
+
 
 interface StateRow extends Record<string, unknown> {
   readonly status: string;
@@ -705,16 +832,20 @@ function sameRows(actual: unknown, expected: unknown): boolean {
   return JSON.stringify(actual) === JSON.stringify(expected);
 }
 
+function isArgon2idPasswordHash(value: string): boolean {
+  return value.length <= 2_048
+    && /^\$argon2id\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/_-]+={0,2}\$[A-Za-z0-9+/_-]+={0,2}$/u.test(
+      value
+    );
+}
+
 function validateAdministratorInput(input: AdminBootstrapAdministratorInput): void {
   if (
     input.normalizedEmail.length === 0
     || input.normalizedEmail.length > 320
     || input.normalizedEmail !== input.normalizedEmail.trim().toLocaleLowerCase("en-US")
     || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(input.normalizedEmail)
-    || input.passwordHash.length > 2_048
-    || !/^\$argon2id\$v=\d+\$m=\d+,t=\d+,p=\d+\$[A-Za-z0-9+/_-]+={0,2}\$[A-Za-z0-9+/_-]+={0,2}$/u.test(
-      input.passwordHash
-    )
+    || !isArgon2idPasswordHash(input.passwordHash)
   ) {
     throw new Error("URMOTIV_ADMIN_BOOTSTRAP_INPUT_INVALID");
   }

@@ -9,8 +9,14 @@ import {
   adminBootstrapCliResults,
   collectAdminBootstrapCredentials,
   readHiddenTtyLine,
-  runAdminBootstrapCli,
+  runAdminBootstrapCli
 } from "../src/bootstrap-admin";
+import {
+  adminCredentialsRecoveryCliExitCodes,
+  adminCredentialsRecoveryCliResults,
+  generateAdminCredentialsRecoveryPassword,
+  runAdminCredentialsRecoveryCli
+} from "../src/recover-admin-credentials";
 
 const syntheticPassword = "synthetic-long-password";
 const syntheticHash = "$argon2id$v=19$m=19456,t=2,p=1$c3ludGhldGljc2FsdA$c3ludGhldGljaGFzaA";
@@ -295,6 +301,181 @@ describe("bootstrap administrator CLI", () => {
     ).resolves.toBe(adminBootstrapCliExitCodes.unavailable);
     expect(output.text).toBe(`${adminBootstrapCliResults.unavailable}\n`);
     expect(database.close).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("administrator credential recovery CLI", () => {
+  it("requires two confirmations, hashes a generated password, and writes credentials only to the secret TTY", async () => {
+    const database = createFakeDatabase();
+    const output = new FakeTtyOutput();
+    const password = "synthetic-recovery-password";
+    const secretWriter = {
+      calls: [] as Array<{ userId: string; password: string }>,
+      writeCredentials(userId: string, value: string): void {
+        this.calls.push({ userId, password: value });
+      },
+      close: vi.fn()
+    };
+    const hash = vi.fn(async (value: string) => {
+      expect(value).toBe(password);
+      return syntheticHash;
+    });
+    const recover = vi.fn(async () => ({ status: "completed", userId: "42" }) as const);
+
+    await expect(
+      runAdminCredentialsRecoveryCli({
+        args: [],
+        environment: {
+          DATABASE_URL: "postgres://synthetic.invalid/urmotiv",
+          RECOVERY_PASSWORD: "must-not-be-read"
+        },
+        input: new FakeTtyInput(true, ["确认", "确认"]),
+        output,
+        dependencies: {
+          createDatabase: () => database.handle,
+          readState: async () => ({
+            status: "completed",
+            openedAt: new Date(0).toISOString(),
+            completedAt: new Date(1).toISOString()
+          }),
+          generatePassword: () => password,
+          hash,
+          recover,
+          openSecretWriter: () => secretWriter
+        }
+      })
+    ).resolves.toBe(adminCredentialsRecoveryCliExitCodes.success);
+
+    expect(hash).toHaveBeenCalledWith(password);
+    expect(recover).toHaveBeenCalledWith(database.handle, { passwordHash: syntheticHash });
+    expect(secretWriter.calls).toEqual([{ userId: "42", password }]);
+    expect(secretWriter.close).toHaveBeenCalledTimes(1);
+    expect(output.text).toBe(
+      `此操作将撤销管理员现有会话并重置密码。请输入“确认”继续：\n请再次输入“确认”以执行一次性恢复：\n${adminCredentialsRecoveryCliResults.success}\n`
+    );
+    expect(output.text).not.toContain(password);
+    expect(output.text).not.toContain("42");
+    expect(output.text).not.toContain(syntheticHash);
+  });
+
+  it("rejects arguments, non-TTY calls, incomplete bootstrap, and a missing confirmation before hashing", async () => {
+    const cases = [
+      {
+        args: ["--email", "must-not-be-read@example.invalid"],
+        input: new FakeTtyInput(),
+        state: "completed" as const,
+        result: adminCredentialsRecoveryCliResults.usageError,
+        exitCode: adminCredentialsRecoveryCliExitCodes.usageError
+      },
+      {
+        args: [],
+        input: new FakeTtyInput(false),
+        state: "completed" as const,
+        result: adminCredentialsRecoveryCliResults.ttyRequired,
+        exitCode: adminCredentialsRecoveryCliExitCodes.ttyRequired
+      },
+      {
+        args: [],
+        input: new FakeTtyInput(),
+        state: "blocked" as const,
+        result: adminCredentialsRecoveryCliResults.unavailable,
+        exitCode: adminCredentialsRecoveryCliExitCodes.unavailable
+      }
+    ];
+    for (const item of cases) {
+      const output = new FakeTtyOutput();
+      const createDatabase = vi.fn(() => createFakeDatabase().handle);
+      const hash = vi.fn(async () => syntheticHash);
+      await expect(
+        runAdminCredentialsRecoveryCli({
+          args: item.args,
+          environment: { DATABASE_URL: "postgres://synthetic.invalid/urmotiv" },
+          input: item.input,
+          output,
+          dependencies: {
+            createDatabase,
+            readState: async () => ({
+              status: item.state,
+              openedAt: null,
+              completedAt: null
+            }),
+            hash
+          }
+        })
+      ).resolves.toBe(item.exitCode);
+      expect(output.text).toBe(`${item.result}\n`);
+      expect(hash).not.toHaveBeenCalled();
+      if (item.args.length !== 0 || item.input.isTTY !== true) {
+        expect(createDatabase).not.toHaveBeenCalled();
+      }
+    }
+
+    const database = createFakeDatabase();
+    const output = new FakeTtyOutput();
+    const hash = vi.fn(async () => syntheticHash);
+    const recover = vi.fn(async () => ({ status: "completed", userId: "42" }) as const);
+    await expect(
+      runAdminCredentialsRecoveryCli({
+        args: [],
+        environment: { DATABASE_URL: "postgres://synthetic.invalid/urmotiv" },
+        input: new FakeTtyInput(true, ["否"]),
+        output,
+        dependencies: {
+          createDatabase: () => database.handle,
+          readState: async () => ({
+            status: "completed",
+            openedAt: new Date(0).toISOString(),
+            completedAt: new Date(1).toISOString()
+          }),
+          hash,
+          recover
+        }
+      })
+    ).resolves.toBe(adminCredentialsRecoveryCliExitCodes.inputMismatch);
+    expect(hash).not.toHaveBeenCalled();
+    expect(recover).not.toHaveBeenCalled();
+    expect(output.text).toContain(adminCredentialsRecoveryCliResults.inputMismatch);
+  });
+
+  it("generates 256-bit base64url passwords and never exposes a writer failure", async () => {
+    const first = generateAdminCredentialsRecoveryPassword();
+    const second = generateAdminCredentialsRecoveryPassword();
+    expect(Buffer.from(first, "base64url")).toHaveLength(32);
+    expect(Buffer.from(second, "base64url")).toHaveLength(32);
+    expect(first).not.toBe(second);
+
+    const database = createFakeDatabase();
+    const output = new FakeTtyOutput();
+    const secret = "synthetic-secret-not-output";
+    await expect(
+      runAdminCredentialsRecoveryCli({
+        args: [],
+        environment: { DATABASE_URL: "postgres://synthetic.invalid/urmotiv" },
+        input: new FakeTtyInput(true, ["确认", "确认"]),
+        output,
+        dependencies: {
+          createDatabase: () => database.handle,
+          readState: async () => ({
+            status: "completed",
+            openedAt: new Date(0).toISOString(),
+            completedAt: new Date(1).toISOString()
+          }),
+          generatePassword: () => secret,
+          hash: async () => syntheticHash,
+          recover: async () => ({ status: "completed", userId: "42" }) as const,
+          openSecretWriter: () => ({
+            writeCredentials: () => {
+              throw new Error("synthetic private writer detail");
+            },
+            close: vi.fn()
+          })
+        }
+      })
+    ).resolves.toBe(adminCredentialsRecoveryCliExitCodes.outcomeUnknown);
+    expect(output.text).toBe(
+      `此操作将撤销管理员现有会话并重置密码。请输入“确认”继续：\n请再次输入“确认”以执行一次性恢复：\n${adminCredentialsRecoveryCliResults.outcomeUnknown}\n`
+    );
+    expect(output.text).not.toContain(secret);
   });
 });
 
