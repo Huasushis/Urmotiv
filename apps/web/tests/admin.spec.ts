@@ -90,8 +90,7 @@ const plugin = {
       name: "serviceToken",
       label: "访问令牌",
       description: "用于确认题库系统的请求。",
-      configured: true,
-      maskedSuffix: "a9Qx"
+      configured: true
     }
   ],
   requiresRestart: false
@@ -238,7 +237,7 @@ test("系统管理员保存插件设置后密钥输入框恢复为空", async ({
         ...plugin,
         settings: { ...plugin.settings, timeoutMs: 45000 },
         settingsRevision: 5,
-        secrets: [{ ...plugin.secrets[0], maskedSuffix: "tKey" }]
+        secrets: [{ ...plugin.secrets[0] }]
       }
     });
   });
@@ -254,7 +253,8 @@ test("系统管理员保存插件设置后密钥输入框恢复为空", async ({
 
   await expect(page.getByText("插件设置已保存")).toBeVisible();
   await expect(secret).toHaveValue("");
-  await expect(page.getByText(/末尾四个字符为 tKey/)).toBeVisible();
+  await expect(page.getByText("已配置")).toBeVisible();
+  await expect(page.getByText(/末尾四个字符/)).toHaveCount(0);
   expect(submittedBody).toEqual({
     expectedRevision: 4,
     settings: { ...plugin.settings, timeoutMs: 45000 },

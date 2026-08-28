@@ -85,9 +85,13 @@ describe("会话中的管理能力", () => {
     const reviewManager = createUser("review-manager", "human", [
       grant("problem.status.change")
     ]);
-    const pluginManager = createUser("plugin-manager", "human", [grant("plugin.manage")]);
+    const pluginManager = createUser("plugin-manager", "human", [
+      grant("plugin.manage"),
+      grant("system.manage")
+    ]);
+    const pluginOnly = createUser("plugin-only", "human", [grant("plugin.manage")]);
     const tagManager = createUser("tag-manager", "human", [grant("tag.manage")]);
-    const app = await makeApp([reviewManager, pluginManager, tagManager]);
+    const app = await makeApp([reviewManager, pluginManager, pluginOnly, tagManager]);
 
     await expect(readSession(app, reviewManager.id)).resolves.toMatchObject({
       canManageReviewPolicy: true,
@@ -97,6 +101,11 @@ describe("会话中的管理能力", () => {
     await expect(readSession(app, pluginManager.id)).resolves.toMatchObject({
       canManageReviewPolicy: false,
       canManagePlugins: true,
+      canManageTags: false
+    });
+    await expect(readSession(app, pluginOnly.id)).resolves.toMatchObject({
+      canManageReviewPolicy: false,
+      canManagePlugins: false,
       canManageTags: false
     });
     await expect(readSession(app, tagManager.id)).resolves.toMatchObject({

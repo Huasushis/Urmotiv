@@ -612,8 +612,6 @@ export const pluginSecrets = pgTable(
     name: varchar("name", { length: 120 }).notNull(),
     encryptedValue: text("encrypted_value").notNull(),
     keyVersion: integer("key_version").notNull(),
-    maskedSuffix: varchar("masked_suffix", { length: 16 }).notNull().default(""),
-    valueLength: integer("value_length"),
     updatedByUserId: bigint("updated_by_user_id", { mode: "bigint" })
       .notNull()
       .references(() => users.id, { onDelete: "restrict" }),
@@ -621,11 +619,7 @@ export const pluginSecrets = pgTable(
   },
   (table) => [
     primaryKey({ columns: [table.pluginId, table.name], name: "plugin_secrets_pk" }),
-    check("plugin_secrets_key_version_ck", sql`${table.keyVersion} > 0`),
-    check(
-      "plugin_secrets_value_length_ck",
-      sql`${table.valueLength} IS NULL OR ${table.valueLength} > 0`
-    )
+    check("plugin_secrets_key_version_ck", sql`${table.keyVersion} > 0`)
   ]
 );
 

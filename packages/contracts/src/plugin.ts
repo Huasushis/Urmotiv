@@ -296,26 +296,9 @@ export const pluginSecretStatusSchema = z
     name: pluginSecretNameSchema,
     label: z.string().trim().min(1).max(120),
     description: z.string().trim().min(1).max(500),
-    configured: z.boolean(),
-    maskedSuffix: z.string().max(4)
+    configured: z.boolean()
   })
-  .strict()
-  .superRefine((value, context) => {
-    if (!value.configured && value.maskedSuffix !== "") {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["maskedSuffix"],
-        message: "未配置的密钥不能显示末尾字符。"
-      });
-    }
-    if (value.configured && value.maskedSuffix.length !== 4) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["maskedSuffix"],
-        message: "已配置的密钥只能显示四个末尾字符。"
-      });
-    }
-  });
+  .strict();
 
 export const adminPluginSchema = z
   .object({

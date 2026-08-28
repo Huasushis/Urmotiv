@@ -169,8 +169,8 @@ Accept: application/json
 | `PUT /api/v1/me/avatar`、`DELETE /api/v1/me/avatar` | 会话 | 上传或删除自己的头像；上传为二进制，最大 512 KiB |
 | `GET /api/v1/users/:userId/avatar` | 目标可见 | 受权限检查的头像下载，无头像返回 404 |
 | `POST /api/v1/admin/accounts/batch` | `user.create` | Tab 分隔的批量账号文本，每批最多 100 行 |
-| `GET /api/v1/admin/plugins` | `plugin.manage` | 查看受信任内置插件状态和密钥遮罩 |
-| `PATCH /api/v1/admin/plugins/:pluginId` | `plugin.manage` | 带 `expectedRevision` 更新状态、设置或清除已声明密钥 |
+| `GET /api/v1/admin/plugins` | `plugin.manage` + `system.manage` | 查看受信任内置插件状态和声明密钥是否已配置 |
+| `PATCH /api/v1/admin/plugins/:pluginId` | `plugin.manage` + `system.manage` | 带 `expectedRevision` 更新状态、设置或清除已声明密钥 |
 | `GET /api/v1/tag-catalog` | 已登录 | 读取公开知识点目录 |
 | `GET /api/v1/admin/tag-catalog` | `tag.manage` | 查看知识点目录和版本 |
 | `POST /api/v1/admin/tag-catalog/items` | `tag.manage` | 新增知识点 |

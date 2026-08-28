@@ -776,9 +776,7 @@ function PluginEditor({
                     />
                     <small id={`secret-${secret.name}-description`}>{secret.description}</small>
                     <small className="admin-secret-status">
-                      {secret.configured
-                        ? `已配置，末尾四个字符为 ${secret.maskedSuffix}`
-                        : "尚未配置"}
+                      {secret.configured ? "已配置" : "尚未配置"}
                     </small>
                   </label>
                   <label className="admin-clear-secret">

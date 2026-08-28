@@ -181,11 +181,9 @@ describe("插件宿主", () => {
       retries: 1,
       failureBehavior: "block"
     });
-    expect(result?.secrets).toEqual([{
-      ...accessTokenDefinition,
-      configured: true,
-      maskedSuffix: "oken"
-    }]);
+    expect(result?.secrets).toEqual([
+      { ...accessTokenDefinition, configured: true }
+    ]);
     expect(JSON.stringify(result)).not.toContain("very-secret-token");
     expect((await store.get(manifest.id))?.secrets[0]?.encryptedValue).not.toContain("very-secret-token");
     expect(JSON.stringify(store.auditEvents)).not.toContain("very-secret-token");
@@ -271,7 +269,6 @@ describe("插件宿主", () => {
       for (const forbidden of [
         secretValue,
         accessTokenDefinition.name,
-        storedSecret?.maskedSuffix,
         storedSecret?.encryptedValue
       ]) {
         if (forbidden !== undefined) {
@@ -298,7 +295,7 @@ describe("插件宿主", () => {
       secrets: { accessToken: "abcd" }
     }, "9", "00000000-0000-4000-8000-000000000012");
     expect(saved?.secrets).toEqual([
-      { ...accessTokenDefinition, configured: true, maskedSuffix: "****" }
+      { ...accessTokenDefinition, configured: true }
     ]);
     expect(JSON.stringify(saved)).not.toContain("abcd");
 
@@ -314,7 +311,7 @@ describe("插件宿主", () => {
     }, "9", "00000000-0000-4000-8000-000000000014");
     expect(cleared).toEqual(expect.objectContaining({
       settingsRevision: 3,
-      secrets: [{ ...accessTokenDefinition, configured: false, maskedSuffix: "" }]
+      secrets: [{ ...accessTokenDefinition, configured: false }]
     }));
     await expect(host.readSecretForPlugin(manifest.id, "accessToken")).resolves.toBeUndefined();
     expect(JSON.stringify(store.auditEvents)).not.toContain("abcd");
@@ -450,7 +447,8 @@ describe("插件宿主", () => {
       roles: [], isRoot: false,
       grants: [
         { permission: "auth.login", effect: "allow" as const, scope: "global" as const },
-        { permission: "plugin.manage", effect: "allow" as const, scope: "global" as const }
+        { permission: "plugin.manage", effect: "allow" as const, scope: "global" as const },
+        { permission: "system.manage", effect: "allow" as const, scope: "global" as const }
       ]
     };
     const denied = {

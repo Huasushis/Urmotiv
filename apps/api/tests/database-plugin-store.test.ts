@@ -70,10 +70,9 @@ describe("数据库插件设置", () => {
     const encryptedMarker = "stored-ciphertext-must-not-appear";
     await database.execute(sql`
       INSERT INTO plugin_secrets (
-        plugin_id, name, encrypted_value, key_version, masked_suffix, value_length,
-        updated_by_user_id
+        plugin_id, name, encrypted_value, key_version, updated_by_user_id
       ) VALUES (
-        ${pluginId}, 'serviceToken', ${encryptedMarker}, 1, 'tail', 20, 0
+        ${pluginId}, 'serviceToken', ${encryptedMarker}, 1, 0
       )
     `);
     expect(await store.hasStoredSecrets()).toBe(true);
@@ -87,7 +86,6 @@ describe("数据库插件设置", () => {
     );
     expect(String(error)).not.toContain(encryptedMarker);
     expect(String(error)).not.toContain("serviceToken");
-    expect(String(error)).not.toContain("tail");
   });
 
   it("同时保存设置和成功审计，并拒绝过期版本覆盖", async () => {
@@ -208,27 +206,25 @@ describe("数据库插件设置", () => {
     expect(serialized).not.toContain(secretMarker);
   });
 
-  it("旧密钥没有长度记录时不显示已保存的字符", async () => {
+  it("旧密钥记录只显示已配置，不暴露任何字符", async () => {
     const { database, store, host } = await createHost();
     await database.execute(sql`
       INSERT INTO plugin_secrets (
-        plugin_id, name, encrypted_value, key_version, masked_suffix, value_length,
-        updated_by_user_id
+        plugin_id, name, encrypted_value, key_version, updated_by_user_id
       ) VALUES (
-        ${pluginId}, 'serviceToken', 'legacy-encrypted-value', 1, 'abc', NULL, 0
+        ${pluginId}, 'serviceToken', 'legacy-encrypted-value', 1, 0
       )
     `);
 
     expect(await store.get(pluginId)).toEqual(expect.objectContaining({
       secrets: [expect.objectContaining({
         name: "serviceToken",
-        maskedSuffix: "abc",
-        valueLength: null
+        encryptedValue: "legacy-encrypted-value"
       })]
     }));
     const plugins = await host.list();
     expect(plugins.find((plugin) => plugin.id === pluginId)?.secrets).toEqual([
-      expect.objectContaining({ name: "serviceToken", configured: true, maskedSuffix: "****" })
+      expect.objectContaining({ name: "serviceToken", configured: true })
     ]);
   });
 

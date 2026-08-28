@@ -100,13 +100,28 @@ describe("插件管理 HTTP 接口", () => {
     const timeoutDefinition = settingsSchema.properties?.timeoutMs;
     expect(timeoutDefinition).toMatchObject({
       default: 120_000,
+      minimum: 1_000,
       maximum: 120_000
     });
-    expect(timeoutDefinition?.maximum).toBeLessThanOrEqual(125_000);
+    const indexTimeoutDefinition = settingsSchema.properties?.indexTimeoutMs;
+    expect(indexTimeoutDefinition).toMatchObject({
+      default: 10_000,
+      minimum: 1_000,
+      maximum: 30_000
+    });
+    const retryAttemptsDefinition = settingsSchema.properties?.retryAttempts;
+    expect(retryAttemptsDefinition).toMatchObject({
+      default: 2,
+      minimum: 1,
+      maximum: 3
+    });
   });
 
   it("列表与单项修改响应均禁止缓存", async () => {
-    const manager = createUser("plugin-manager", "human", [grant("plugin.manage")]);
+    const manager = createUser("plugin-manager", "human", [
+      grant("plugin.manage"),
+      grant("system.manage")
+    ]);
     const app = await createApp({
       store: new InMemoryDataStore([manager], demoTags),
       demoAuthEnabled: true,
@@ -178,17 +193,34 @@ describe("插件管理 HTTP 接口", () => {
     });
     expect(saved.statusCode).toBe(200);
     expect(saved.body).not.toContain(managementToken);
+    expect(saved.body).not.toContain("maskedSuffix");
     expect(saved.json()).toMatchObject({
       item: {
         id: fermataPluginId,
         secrets: [{
           name: fermataManagementTokenSecretName,
           label: "管理令牌",
-          configured: true,
-          maskedSuffix: "1234"
+          configured: true
         }]
       }
     });
+
+    const followUp = await app.inject({
+      method: "GET",
+      url: "/api/v1/admin/plugins",
+      headers: { cookie }
+    });
+    expect(followUp.statusCode).toBe(200);
+    const listed = followUp.json() as { items: Array<{
+      id: string;
+      secrets: Array<{ name: string; configured: boolean }>;
+    }> };
+    const listedSecret = listed.items
+      .find((item) => item.id === fermataPluginId)
+      ?.secrets.find((secret) => secret.name === fermataManagementTokenSecretName);
+    expect(listedSecret).toMatchObject({ configured: true });
+    expect(followUp.body).not.toContain(managementToken);
+    expect(followUp.body).not.toContain("maskedSuffix");
 
     const cleared = await app.inject({
       method: "PATCH",
@@ -205,8 +237,7 @@ describe("插件管理 HTTP 接口", () => {
         id: fermataPluginId,
         secrets: [{
           name: fermataManagementTokenSecretName,
-          configured: false,
-          maskedSuffix: ""
+          configured: false
         }]
       }
     });
@@ -218,6 +249,7 @@ describe("插件管理 HTTP 接口", () => {
         grant("plugin.manage"),
         grant("plugin.manage", "deny")
       ]),
+      createUser("plugin-only", "human", [grant("plugin.manage")]),
       createUser("system-only", "human", [grant("system.manage")]),
       createUser("robot-with-both", "robot", [
         grant("plugin.manage"),
@@ -429,6 +461,7 @@ describe("插件管理权限安全契约", () => {
       grant("plugin.manage"),
       grant("plugin.manage", "deny")
     ]),
+    createUser("security-plugin-only", "human", [grant("plugin.manage")]),
     createUser("security-no-perm", "human", [grant("tag.manage")]),
     createUser("security-robot", "robot", [
       grant("plugin.manage"),

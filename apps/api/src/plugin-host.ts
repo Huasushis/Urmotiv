@@ -25,8 +25,6 @@ const stateSchema = z.enum(["enabled", "disabled", "failed"]);
 export interface PluginSecretRecord {
   readonly name: string;
   readonly encryptedValue: string;
-  readonly maskedSuffix: string;
-  readonly valueLength: number | null;
 }
 
 export class PluginRevisionConflictError extends Error {
@@ -380,9 +378,7 @@ export class TrustedPluginHost {
       }
       encryptedSecrets = Object.entries(input.secrets).map(([name, value]) => ({
         name,
-        encryptedValue: this.secretBox!.encrypt(value),
-        maskedSuffix: maskedSecretSuffix(value),
-        valueLength: value.length
+        encryptedValue: this.secretBox!.encrypt(value)
       }));
     }
     const update = {
@@ -651,10 +647,6 @@ function manifestDigest(manifest: PluginManifest): string {
   return createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
 }
 
-function maskedSecretSuffix(value: string): string {
-  return value.length <= 4 ? "****" : value.slice(-4);
-}
-
 function toAdminPlugin(
   stored: StoredPlugin | undefined,
   registered: RegisteredPlugin,
@@ -674,21 +666,10 @@ function toAdminPlugin(
     settingsSchema: registered.settingsSchema ?? null,
     reviewRuleIds: [...reviewRuleIds],
     settingsRevision: stored?.settingsRevision ?? 1,
-    secrets: registered.secretDefinitions.map((definition) => {
-      const secret = storedSecrets.get(definition.name);
-      return secret === undefined
-        ? { ...definition, configured: false, maskedSuffix: "" }
-        : {
-            ...definition,
-            configured: true,
-            maskedSuffix:
-              secret.valueLength !== null &&
-              secret.valueLength > 4 &&
-              secret.maskedSuffix.length === 4
-                ? secret.maskedSuffix
-                : "****"
-          };
-    }),
+    secrets: registered.secretDefinitions.map((definition) => ({
+      ...definition,
+      configured: storedSecrets.has(definition.name)
+    })),
     requiresRestart: registered.requiresRestart
   };
 }

@@ -162,34 +162,15 @@ describe("pluginSettingsFormSchema", () => {
 });
 
 describe("plugin administration contracts", () => {
-  it("requires a safe display description and an exact secret suffix", () => {
+  it("密钥状态只允许声明元信息和已配置标记，不接受任何字符字段", () => {
     expect(
       pluginSecretStatusSchema.parse({
         name: "serviceToken",
         label: "服务认证令牌",
         description: "用于确认请求来自 Urmotiv。",
-        configured: false,
-        maskedSuffix: ""
+        configured: false
       })
-    ).toMatchObject({ configured: false, maskedSuffix: "" });
-    expect(
-      pluginSecretStatusSchema.safeParse({
-        name: "serviceToken",
-        label: "服务认证令牌",
-        description: "用于确认请求来自 Urmotiv。",
-        configured: false,
-        maskedSuffix: "oken"
-      }).success
-    ).toBe(false);
-    expect(
-      pluginSecretStatusSchema.safeParse({
-        name: "serviceToken",
-        label: "服务认证令牌",
-        description: "用于确认请求来自 Urmotiv。",
-        configured: true,
-        maskedSuffix: "abc"
-      }).success
-    ).toBe(false);
+    ).toMatchObject({ configured: false });
     expect(
       pluginSecretStatusSchema.safeParse({
         name: "serviceToken",
@@ -198,7 +179,7 @@ describe("plugin administration contracts", () => {
         configured: true,
         maskedSuffix: "****"
       }).success
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("wraps plugin list and single-plugin responses consistently", () => {

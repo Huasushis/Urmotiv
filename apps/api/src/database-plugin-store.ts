@@ -29,8 +29,6 @@ interface SecretRow extends Record<string, unknown> {
   plugin_id: string;
   name: string;
   encrypted_value: string;
-  masked_suffix: string;
-  value_length: number | string | null;
 }
 
 function databaseId(value: string): bigint {
@@ -62,9 +60,7 @@ function toPlugin(row: PluginRow, secrets: readonly SecretRow[]): StoredPlugin {
     settingsRevision: Number(row.settings_revision ?? 1),
     secrets: secrets.map((secret) => ({
       name: secret.name,
-      encryptedValue: secret.encrypted_value,
-      maskedSuffix: secret.masked_suffix,
-      valueLength: secret.value_length === null ? null : Number(secret.value_length)
+      encryptedValue: secret.encrypted_value
     }))
   };
 }
@@ -81,7 +77,7 @@ export class DatabasePluginStore implements PluginStore {
       ORDER BY p.id
     `);
     const secrets = await this.database.query<SecretRow>(sql`
-      SELECT plugin_id, name, encrypted_value, masked_suffix, value_length
+      SELECT plugin_id, name, encrypted_value
       FROM plugin_secrets ORDER BY plugin_id, name
     `);
     return rows.map((row) => toPlugin(row, secrets.filter((secret) => secret.plugin_id === row.id)));
@@ -99,7 +95,7 @@ export class DatabasePluginStore implements PluginStore {
     const row = rows[0];
     if (row === undefined) return undefined;
     const secrets = await executor.query<SecretRow>(sql`
-      SELECT plugin_id, name, encrypted_value, masked_suffix, value_length
+      SELECT plugin_id, name, encrypted_value
       FROM plugin_secrets WHERE plugin_id = ${pluginId}
     `);
     return toPlugin(row, secrets);
@@ -200,15 +196,12 @@ export class DatabasePluginStore implements PluginStore {
     for (const secret of input.encryptedSecrets ?? []) {
       await transaction.execute(sql`
         INSERT INTO plugin_secrets (
-          plugin_id, name, encrypted_value, key_version, masked_suffix, value_length,
-          updated_by_user_id
+          plugin_id, name, encrypted_value, key_version, updated_by_user_id
         ) VALUES (
-          ${pluginId}, ${secret.name}, ${secret.encryptedValue}, 1, ${secret.maskedSuffix},
-          ${secret.valueLength}, ${actorId}
+          ${pluginId}, ${secret.name}, ${secret.encryptedValue}, 1, ${actorId}
         )
         ON CONFLICT (plugin_id, name) DO UPDATE SET
-          encrypted_value = EXCLUDED.encrypted_value, masked_suffix = EXCLUDED.masked_suffix,
-          value_length = EXCLUDED.value_length,
+          encrypted_value = EXCLUDED.encrypted_value,
           updated_by_user_id = EXCLUDED.updated_by_user_id, updated_at = now()
       `);
     }

@@ -447,8 +447,12 @@ export async function getDemoSession(): Promise<SessionResponse> {
       roles: user.roles,
       isRoot: false,
       permissions,
-      canManageReviewPolicy: user.accountType === "human" && permissions.includes("problem.status.change"),
-      canManagePlugins: user.accountType === "human" && permissions.includes("plugin.manage"),
+      canManageReviewPolicy:
+        user.accountType === "human" && permissions.includes("problem.status.change"),
+      canManagePlugins:
+        user.accountType === "human" &&
+        permissions.includes("plugin.manage") &&
+        permissions.includes("system.manage"),
       canManageTags: user.accountType === "human" && permissions.includes("tag.manage")
     },
     auth: {

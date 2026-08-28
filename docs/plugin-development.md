@@ -111,7 +111,7 @@ plugins/example-title-guard/
 
 ### 在管理员界面启用
 
-重部署并初始化插件记录后，具有 `plugin.manage` 的管理员打开 `/admin`，确认插件的 ID、版本和 `requiresRestart`，再使用启用操作。HTTP 等价请求是：
+重部署并初始化插件记录后，同时具有 `plugin.manage` 和 `system.manage` 的管理员打开 `/admin`，确认插件的 ID、版本和 `requiresRestart`，再使用启用操作。HTTP 等价请求是：
 
 ```http
 PATCH /api/v1/admin/plugins/org.example.title-guard
@@ -124,7 +124,7 @@ Content-Type: application/json
 
 ### 设置和密钥
 
-如果插件声明 `settingsSchema`，管理员在 `/admin` 的插件卡片填写设置；宿主先用受限表单模式解析，再由插件运行时 Zod 模式复核并填默认值。`settings` 必须是 JSON 对象，值只能是 JSON 值。需要外部服务令牌时在内置定义中声明 `secretDefinitions`（名称只能匹配 `[A-Za-z][A-Za-z0-9_.-]*`），管理员只提交密钥原文一次；宿主用 `URMOTIV_PLUGIN_SECRET_KEY` 加密保存，页面只显示已配置和最多四个末尾字符。
+如果插件声明 `settingsSchema`，管理员在 `/admin` 的插件卡片填写设置；宿主先用受限表单模式解析，再由插件运行时 Zod 模式复核并填默认值。`settings` 必须是 JSON 对象，值只能是 JSON 值。需要外部服务令牌时在内置定义中声明 `secretDefinitions`（名称只能匹配 `[A-Za-z][A-Za-z0-9_.-]*`），管理员只提交密钥原文一次；宿主用 `URMOTIV_PLUGIN_SECRET_KEY` 加密保存，页面只显示“已配置”标记，不回显任何字符。
 
 插件只能读取**自己声明的、自己命名空间的一个密钥**，没有列出其他密钥的 API，也不能读取数据库、会话 Cookie、密码或其他插件的设置。密钥存储不可用时插件启动/调用失败，不应回退到日志或硬编码值。
 
@@ -255,7 +255,7 @@ Anklang 设置必须使用本地/私有无路径地址，显式确认 `privateCo
 
 ### 资源不存在与权限掩码
 
-`TrustedPluginHost` 找不到插件、插件未启用或版本/清单摘要与数据库记录不一致时，插件不可调用。`GET /api/v1/admin/plugins` 和 `PATCH /api/v1/admin/plugins/:pluginId` 对没有 `plugin.manage` 的用户统一返回 `404`，不泄露插件存在性；导入导出任务、题目和文件同样把无权访问按 `404` 处理。插件错误消息不能通过标题、文件名、计数、耗时或外部原文泄露被掩码资源。
+`TrustedPluginHost` 找不到插件、插件未启用或版本/清单摘要与数据库记录不一致时，插件不可调用。`GET /api/v1/admin/plugins` 和 `PATCH /api/v1/admin/plugins/:pluginId` 对缺少 `plugin.manage` 或 `system.manage` 之一的用户统一返回 `404`，不泄露插件存在性；导入导出任务、题目和文件同样把无权访问按 `404` 处理。插件错误消息不能通过标题、文件名、计数、耗时或外部原文泄露被掩码资源。
 
 ## 6. 可运行的最小插件和测试
 

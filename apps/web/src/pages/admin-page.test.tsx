@@ -75,8 +75,7 @@ const plugin: AdminPlugin = {
       name: "managementToken",
       label: "管理令牌",
       description: "用于确认请求来自题库系统。",
-      configured: true,
-      maskedSuffix: "7xQp"
+      configured: true
     }
   ],
   requiresRestart: false
@@ -221,8 +220,9 @@ describe("管理页面", () => {
     expect(api.listAdminPlugins).toHaveBeenCalledTimes(1);
     expect(api.getReviewPolicy).not.toHaveBeenCalled();
     expect(secretInput?.value).toBe("");
-    expect(view.textContent).toContain("末尾四个字符为 7xQp");
+    expect(view.textContent).toContain("已配置");
     expect(view.textContent).not.toContain("完整密钥内容");
+    expect(view.textContent).not.toContain("末尾四个字符");
     expect(view.textContent).not.toContain(plugin.apiVersion);
     expect(view.textContent).not.toContain(plugin.source);
   });

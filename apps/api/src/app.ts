@@ -747,7 +747,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   async function requirePluginManager(request: FastifyRequest): Promise<StoredUser> {
     const user = await requireUser(request);
     const now = dependencies.now();
-    if (!hasPermission(user, "plugin.manage", {}, now)) {
+    if (
+      !hasPermission(user, "plugin.manage", {}, now) ||
+      !hasPermission(user, "system.manage", {}, now)
+    ) {
       // 无权访问插件管理与无权访问私有资源一致，统一按"不存在"返回 404，
       // 不泄露插件端点存在性或权限差异。
       throw notFound();
@@ -964,7 +967,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     );
     const auditPluginId = pluginId.success ? pluginId.data : null;
     const now = dependencies.now();
-    if (!hasPermission(user, "plugin.manage", {}, now)) {
+    if (
+      !hasPermission(user, "plugin.manage", {}, now) ||
+      !hasPermission(user, "system.manage", {}, now)
+    ) {
       await recordPluginUpdateAttemptSafely({
         actorUserId: user.id,
         requestId: request.id,

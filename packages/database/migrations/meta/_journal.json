@@ -134,6 +134,13 @@
       "when": 1787356800000,
       "tag": "0018_anklang_search_only_settings",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1787443200000,
+      "tag": "0019_drop_plugin_secret_masking",
+      "breakpoints": true
     }
   ]
 }

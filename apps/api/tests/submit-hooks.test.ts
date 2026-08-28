@@ -699,8 +699,6 @@ describe("提交前查重链路", () => {
       UPDATE plugin_secrets
       SET encrypted_value = ${encryptedMarker},
           key_version = 1,
-          masked_suffix = 'tail',
-          value_length = 20,
           updated_by_user_id = 0
       WHERE plugin_id = ${anklangPluginId}
         AND name = ${anklangServiceTokenSecretName}

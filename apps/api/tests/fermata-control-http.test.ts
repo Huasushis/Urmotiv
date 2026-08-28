@@ -122,7 +122,10 @@ async function setupFermataPlugin(
 
 describe("Fermata 管理 HTTP 接口", () => {
   it("有权限的管理员能读取 Fermata 健康状态", async () => {
-    const manager = createUser("fermata-manager", "human", [grant("plugin.manage")]);
+    const manager = createUser("fermata-manager", "human", [
+  grant("plugin.manage"),
+  grant("system.manage")
+]);
     const fetch = vi.fn<FermataFetch>(async () =>
       new Response(JSON.stringify(fakeHealth()), { status: 200 })
     );
@@ -158,7 +161,10 @@ describe("Fermata 管理 HTTP 接口", () => {
   });
 
   it("有权限的管理员能读取 Fermata 公开设置", async () => {
-    const manager = createUser("fermata-manager", "human", [grant("plugin.manage")]);
+    const manager = createUser("fermata-manager", "human", [
+  grant("plugin.manage"),
+  grant("system.manage")
+]);
     const fetch = vi.fn<FermataFetch>(async () =>
       new Response(JSON.stringify(fakeSettings()), { status: 200 })
     );
@@ -182,7 +188,10 @@ describe("Fermata 管理 HTTP 接口", () => {
   });
 
   it("有权限的管理员能更新 Fermata 公开设置", async () => {
-    const manager = createUser("fermata-manager", "human", [grant("plugin.manage")]);
+    const manager = createUser("fermata-manager", "human", [
+  grant("plugin.manage"),
+  grant("system.manage")
+]);
     const updatedSnapshot = { ...fakeSettings(), revision: 5 };
     const fetch = vi.fn<FermataFetch>(async (_url, init) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -210,7 +219,10 @@ describe("Fermata 管理 HTTP 接口", () => {
   });
 
   it("有权限的管理员能触发 Fermata 立即检查", async () => {
-    const manager = createUser("fermata-manager", "human", [grant("plugin.manage")]);
+    const manager = createUser("fermata-manager", "human", [
+  grant("plugin.manage"),
+  grant("system.manage")
+]);
     const fetch = vi.fn<FermataFetch>(async () =>
       new Response(JSON.stringify({ ok: true }), { status: 200 })
     );
@@ -235,35 +247,41 @@ describe("Fermata 管理 HTTP 接口", () => {
     expect(String(calledUrl)).toContain("/api/v1/actions/wake");
   });
 
-  it("缺少 plugin.manage 权限的请求统一返回 404", async () => {
-    const regular = createUser("regular-user", "human", []);
+  it("缺少 plugin.manage 或 system.manage 的请求统一返回 404", async () => {
+    const blockedUsers = [
+      createUser("regular-user", "human", []),
+      createUser("plugin-only", "human", [grant("plugin.manage")]),
+      createUser("system-only", "human", [grant("system.manage")])
+    ];
     const fetch = vi.fn<FermataFetch>();
     const app = await createApp({
-      store: new InMemoryDataStore([regular], demoTags),
+      store: new InMemoryDataStore(blockedUsers, demoTags),
       demoAuthEnabled: true,
-      demoUserIds: [regular.id],
+      demoUserIds: blockedUsers.map((user) => user.id),
       pluginHost: makeConfiguredHost(),
       fermataFetch: fetch
     });
     openApps.push(app);
-    const cookie = await login(app, regular.id);
 
-    for (const [method, url] of [
-      ["GET", "/api/v1/admin/fermata/health"],
-      ["GET", "/api/v1/admin/fermata/settings"],
-      ["PUT", "/api/v1/admin/fermata/settings"],
-      ["POST", "/api/v1/admin/fermata/wake"]
-    ] as const) {
-      const response = await app.inject({
-        method,
-        url,
-        headers: { cookie, ...(method === "PUT" || method === "POST" ? { origin } : {}) },
-        ...(method === "PUT"
-          ? { payload: { expectedRevision: 1, settings: fakeSettings().settings } }
-          : {})
-      });
-      expect(response.statusCode).toBe(404);
-      expect(fetch).not.toHaveBeenCalled();
+    for (const user of blockedUsers) {
+      const cookie = await login(app, user.id);
+      for (const [method, url] of [
+        ["GET", "/api/v1/admin/fermata/health"],
+        ["GET", "/api/v1/admin/fermata/settings"],
+        ["PUT", "/api/v1/admin/fermata/settings"],
+        ["POST", "/api/v1/admin/fermata/wake"]
+      ] as const) {
+        const response = await app.inject({
+          method,
+          url,
+          headers: { cookie, ...(method === "PUT" || method === "POST" ? { origin } : {}) },
+          ...(method === "PUT"
+            ? { payload: { expectedRevision: 1, settings: fakeSettings().settings } }
+            : {})
+        });
+        expect(response.statusCode, `${user.id} ${method}`).toBe(404);
+        expect(fetch).not.toHaveBeenCalled();
+      }
     }
   });
 
@@ -286,7 +304,10 @@ describe("Fermata 管理 HTTP 接口", () => {
   });
 
   it("Fermata 插件未启用时返回 503 FERMATA_NOT_CONFIGURED", async () => {
-    const manager = createUser("fermata-manager", "human", [grant("plugin.manage")]);
+    const manager = createUser("fermata-manager", "human", [
+  grant("plugin.manage"),
+  grant("system.manage")
+]);
     const fetch = vi.fn<FermataFetch>();
     const app = await createApp({
       store: new InMemoryDataStore([manager], demoTags),
@@ -312,7 +333,10 @@ describe("Fermata 管理 HTTP 接口", () => {
   });
 
   it("Fermata 插件已启用但缺少管理令牌时返回 503", async () => {
-    const manager = createUser("fermata-manager", "human", [grant("plugin.manage")]);
+    const manager = createUser("fermata-manager", "human", [
+  grant("plugin.manage"),
+  grant("system.manage")
+]);
     const fetch = vi.fn<FermataFetch>();
     const app = await createApp({
       store: new InMemoryDataStore([manager], demoTags),
@@ -349,7 +373,10 @@ describe("Fermata 管理 HTTP 接口", () => {
   });
 
   it("Fermata 返回非 2xx 时返回 502 且不泄露原始错误体", async () => {
-    const manager = createUser("fermata-manager", "human", [grant("plugin.manage")]);
+    const manager = createUser("fermata-manager", "human", [
+  grant("plugin.manage"),
+  grant("system.manage")
+]);
     const fetch = vi.fn<FermataFetch>(async () =>
       new Response(JSON.stringify({ internal: "secret-details" }), { status: 500 })
     );
@@ -375,7 +402,10 @@ describe("Fermata 管理 HTTP 接口", () => {
   });
 
   it("Fermata 返回不符合契约的内容时返回 502", async () => {
-    const manager = createUser("fermata-manager", "human", [grant("plugin.manage")]);
+    const manager = createUser("fermata-manager", "human", [
+  grant("plugin.manage"),
+  grant("system.manage")
+]);
     const fetch = vi.fn<FermataFetch>(async () =>
       new Response(JSON.stringify({ unexpected: "shape" }), { status: 200 })
     );
@@ -401,7 +431,10 @@ describe("Fermata 管理 HTTP 接口", () => {
   });
 
   it("Fermata 不可达时返回 503 且不泄露网络错误细节", async () => {
-    const manager = createUser("fermata-manager", "human", [grant("plugin.manage")]);
+    const manager = createUser("fermata-manager", "human", [
+  grant("plugin.manage"),
+  grant("system.manage")
+]);
     const fetch = vi.fn<FermataFetch>(async () => {
       throw new TypeError("fetch failed: ECONNREFUSED 127.0.0.1:4100");
     });
@@ -428,7 +461,10 @@ describe("Fermata 管理 HTTP 接口", () => {
   });
 
   it("PUT 设置时提交无效输入返回 422", async () => {
-    const manager = createUser("fermata-manager", "human", [grant("plugin.manage")]);
+    const manager = createUser("fermata-manager", "human", [
+  grant("plugin.manage"),
+  grant("system.manage")
+]);
     const fetch = vi.fn<FermataFetch>();
     const app = await createApp({
       store: new InMemoryDataStore([manager], demoTags),
@@ -475,7 +511,10 @@ describe("Fermata 管理 HTTP 接口", () => {
   });
 
   it("响应中不包含管理令牌", async () => {
-    const manager = createUser("fermata-manager", "human", [grant("plugin.manage")]);
+    const manager = createUser("fermata-manager", "human", [
+  grant("plugin.manage"),
+  grant("system.manage")
+]);
     const fetch = vi.fn<FermataFetch>(async () =>
       new Response(JSON.stringify(fakeHealth()), { status: 200 })
     );

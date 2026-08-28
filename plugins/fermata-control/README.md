@@ -19,7 +19,7 @@ Fermata 作为独立服务运行，并用机器人账号主动领取 Urmotiv 的
 
 内置插件已经能保存服务地址、等待时间和加密后的管理令牌。用于发出上述 HTTP 请求的
 `FermataControlClient` 类已有独立测试，
-Urmotiv API 通过 `FermataControlService` 把它接到了管理员 HTTP 路由，有 `plugin.manage` 权限的管理员
+Urmotiv API 通过 `FermataControlService` 把它接到了管理员 HTTP 路由，同时有 `plugin.manage` 和 `system.manage` 权限的管理员
 可以查看状态、读取/修改非密钥设置和触发立即检查。所有路由的权限检查与插件管理一致：无权访问统一返回 404，
 不泄露端点存在性；插件未启用、未配置地址或缺少管理令牌时返回 503；Fermata 不可达、超时或返回不符合
 契约时返回 503/502，响应中不包含令牌或 Fermata 原始错误体。操作员文档见 `docs/fermata-integration.md`。

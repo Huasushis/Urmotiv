@@ -7,7 +7,7 @@ HTTP 接口调用 Fermata 的管理端口，不直接执行模型推理。
 ## 前提
 
 - Fermata 服务已部署并能通过 HTTP 访问。
-- 你在 Urmotiv 中拥有 `plugin.manage` 权限。
+- 你在 Urmotiv 中同时拥有 `plugin.manage` 和 `system.manage` 权限。
 - Fermata 管理员已生成管理令牌并安全交付给你。
 
 ## 配置步骤
@@ -54,8 +54,8 @@ GET /api/v1/admin/fermata/health
 | PUT | `/api/v1/admin/fermata/settings` | 更新 Fermata 公开设置 |
 | POST | `/api/v1/admin/fermata/wake` | 通知 Fermata 立即检查一次新任务 |
 
-所有接口要求 `plugin.manage` 权限。无权访问的请求返回 404，不泄露端点存在性。
-机器人账号即使被错误分配 `plugin.manage` 也不能访问，因为机器人固定禁止该权限。
+所有接口要求同时具备 `plugin.manage` 和 `system.manage` 权限。无权访问的请求返回 404，不泄露端点存在性。
+机器人账号即使同时被错误分配 `plugin.manage` 和 `system.manage` 也不能访问，因为机器人固定禁止 `plugin.manage`。
 
 所有响应头包含 `cache-control: private, no-store`，防止管理内容被缓存。
 

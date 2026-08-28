@@ -4,7 +4,7 @@
 
 ## 管理员配置与隐私闸门
 
-插件管理端点需要核心 `plugin.manage` 权限。先在 `/api/v1/admin/plugins` 读取当前 `revision`，再用带 `expectedRevision` 的 PATCH 保存设置。令牌只从环境变量通过声明的插件密钥 `serviceToken` 提交；建议使用权限为 `0600` 的 curl cookie-jar（保存登录 Cookie 的文件）：
+插件管理端点需要核心 `plugin.manage` 和 `system.manage` 权限。先在 `/api/v1/admin/plugins` 读取当前 `revision`，再用带 `expectedRevision` 的 PATCH 保存设置。令牌只从环境变量通过声明的插件密钥 `serviceToken` 提交；建议使用权限为 `0600` 的 curl cookie-jar（保存登录 Cookie 的文件）：
 
 ```bash
 export URMOTIV_COOKIE_JAR=/secure/path/urmotiv.cookies
@@ -33,7 +33,7 @@ jq -n '{
   --data-binary @-
 ```
 
-`URMOTIV_COOKIE_JAR` 应指向一个权限为 `0600` 的保存登录 Cookie 的文件；不要把令牌写进 JSON 字面量、shell 历史或日志。管理响应只显示 `configured` 和遮罩后缀，绝不返回原文。
+`URMOTIV_COOKIE_JAR` 应指向一个权限为 `0600` 的保存登录 Cookie 的文件；不要把令牌写进 JSON 字面量、shell 历史或日志。管理响应只显示 `configured` 标记，绝不返回原文或任何字符。
 
 `baseUrl` 只允许语法上的本地/私有地址：`localhost`、`host.docker.internal`、回环/RFC1918/链路本地/IPv6 ULA 字面量，或不含点的单标签容器服务名。不得带账号密码、路径、查询参数或片段；公网主机名/IP 会在设置校验阶段拒绝。`privateContentAuthorized` 默认为 `false`，管理员只有在确认 Anklang 的数据库、对象存储和嵌入链路全部留在批准边界内后才能改为 `true`。未授权、缺少非空 `serviceToken`、插件停用或设置无效时，插件在发出任何请求前拒绝继续。
 
