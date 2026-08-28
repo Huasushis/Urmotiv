@@ -140,7 +140,7 @@ export async function runAdminCredentialsRecoveryCli(
       const passwordHash = await dependencies.hash(password);
       const completion = await dependencies.recover(database, { passwordHash });
       if (typeof completion === "object" && completion.status === "completed") {
-        secretWriter.writeCredentials(completion.userId, password);
+        secretWriter.writeCredentials(completion.accountIdentifier, password);
         result = {
           code: adminCredentialsRecoveryCliResults.success,
           exitCode: adminCredentialsRecoveryCliExitCodes.success
@@ -211,11 +211,11 @@ function openAdminCredentialsRecoveryTty(): AdminCredentialsRecoverySecretWriter
   const descriptor = openSync("/dev/tty", constants.O_WRONLY | constants.O_NOCTTY);
   let closed = false;
   return {
-    writeCredentials(userId, password) {
+    writeCredentials(accountIdentifier, password) {
       if (closed) {
         throw new Error("RECOVER_ADMIN_CREDENTIALS_TTY_CLOSED");
       }
-      const message = `管理员账号编号：${userId}\n新密码：${password}\n`;
+      const message = `管理员账号标识：${accountIdentifier}\n新密码：${password}\n`;
       writeSync(descriptor, message, undefined, "utf8");
     },
     close() {

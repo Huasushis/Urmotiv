@@ -310,9 +310,9 @@ describe("administrator credential recovery CLI", () => {
     const output = new FakeTtyOutput();
     const password = "synthetic-recovery-password";
     const secretWriter = {
-      calls: [] as Array<{ userId: string; password: string }>,
-      writeCredentials(userId: string, value: string): void {
-        this.calls.push({ userId, password: value });
+      calls: [] as Array<{ accountIdentifier: string; password: string }>,
+      writeCredentials(accountIdentifier: string, value: string): void {
+        this.calls.push({ accountIdentifier, password: value });
       },
       close: vi.fn()
     };
@@ -320,7 +320,11 @@ describe("administrator credential recovery CLI", () => {
       expect(value).toBe(password);
       return syntheticHash;
     });
-    const recover = vi.fn(async () => ({ status: "completed", userId: "42" }) as const);
+    const recover = vi.fn(async () => ({
+      status: "completed",
+      userId: "42",
+      accountIdentifier: "administrator@example.test"
+    }) as const);
 
     await expect(
       runAdminCredentialsRecoveryCli({
@@ -348,13 +352,16 @@ describe("administrator credential recovery CLI", () => {
 
     expect(hash).toHaveBeenCalledWith(password);
     expect(recover).toHaveBeenCalledWith(database.handle, { passwordHash: syntheticHash });
-    expect(secretWriter.calls).toEqual([{ userId: "42", password }]);
+    expect(secretWriter.calls).toEqual([
+      { accountIdentifier: "administrator@example.test", password }
+    ]);
     expect(secretWriter.close).toHaveBeenCalledTimes(1);
     expect(output.text).toBe(
       `此操作将撤销管理员现有会话并重置密码。请输入“确认”继续：\n请再次输入“确认”以执行一次性恢复：\n${adminCredentialsRecoveryCliResults.success}\n`
     );
     expect(output.text).not.toContain(password);
     expect(output.text).not.toContain("42");
+    expect(output.text).not.toContain("administrator@example.test");
     expect(output.text).not.toContain(syntheticHash);
   });
 
@@ -413,7 +420,11 @@ describe("administrator credential recovery CLI", () => {
     const database = createFakeDatabase();
     const output = new FakeTtyOutput();
     const hash = vi.fn(async () => syntheticHash);
-    const recover = vi.fn(async () => ({ status: "completed", userId: "42" }) as const);
+    const recover = vi.fn(async () => ({
+      status: "completed",
+      userId: "42",
+      accountIdentifier: "administrator@example.test"
+    }) as const);
     await expect(
       runAdminCredentialsRecoveryCli({
         args: [],
@@ -462,7 +473,11 @@ describe("administrator credential recovery CLI", () => {
           }),
           generatePassword: () => secret,
           hash: async () => syntheticHash,
-          recover: async () => ({ status: "completed", userId: "42" }) as const,
+          recover: async () => ({
+            status: "completed",
+            userId: "42",
+            accountIdentifier: "administrator@example.test"
+          }) as const,
           openSecretWriter: () => ({
             writeCredentials: () => {
               throw new Error("synthetic private writer detail");

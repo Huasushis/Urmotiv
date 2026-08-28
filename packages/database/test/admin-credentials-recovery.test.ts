@@ -43,7 +43,8 @@ describe("administrator credential recovery", () => {
 
     await expect(recoverAdminCredentials(database, { passwordHash: replacementHash })).resolves.toEqual({
       status: "completed",
-      userId
+      userId,
+      accountIdentifier: "administrator@example.test"
     });
 
     const stored = await database.query<{

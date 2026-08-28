@@ -64,7 +64,11 @@ export interface AdminCredentialsRecoveryInput {
 }
 
 export type AdminCredentialsRecoveryResult =
-  | { readonly status: "completed"; readonly userId: string }
+  | {
+      readonly status: "completed";
+      readonly userId: string;
+      readonly accountIdentifier: string;
+    }
   | "input_invalid"
   | "not_completed"
   | "busy"
@@ -466,8 +470,23 @@ export async function recoverAdminCredentials(
     }
 
     // User deletion is hard-delete in this schema; disabled_at is the retained inactive state.
-    const candidates = await transaction.query<{ user_id: string }>(sql`
-      SELECT user_record.id::text AS user_id
+    const candidates = await transaction.query<{
+      user_id: string;
+      account_identifier: string;
+    }>(sql`
+      SELECT
+        user_record.id::text AS user_id,
+        COALESCE(
+          (
+            SELECT email.normalized_address
+            FROM user_emails email
+            WHERE email.user_id = user_record.id
+              AND email.verified_at IS NOT NULL
+            ORDER BY email.is_primary DESC, email.created_at, email.id
+            LIMIT 1
+          ),
+          user_record.id::text
+        ) AS account_identifier
       FROM users user_record
       JOIN role_memberships membership
         ON membership.user_id = user_record.id
@@ -538,7 +557,11 @@ export async function recoverAdminCredentials(
       )
     `);
 
-    return { status: "completed", userId: candidate.user_id };
+    return {
+      status: "completed",
+      userId: candidate.user_id,
+      accountIdentifier: candidate.account_identifier
+    };
   });
 }
 
