@@ -15,6 +15,7 @@ COPY packages/storage/package.json packages/storage/package.json
 COPY plugins/anklang/package.json plugins/anklang/package.json
 COPY plugins/fermata-control/package.json plugins/fermata-control/package.json
 COPY plugins/hydro-format/package.json plugins/hydro-format/package.json
+COPY plugins/fps-format/package.json plugins/fps-format/package.json
 COPY plugins/review-default/package.json plugins/review-default/package.json
 RUN pnpm install --frozen-lockfile
 
