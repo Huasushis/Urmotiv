@@ -1,5 +1,6 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const reuseExistingServer = process.env.PLAYWRIGHT_REUSE_EXISTING_SERVER === "1";
 export default defineConfig({
   testDir: "./tests",
   outputDir: "./test-results",
@@ -9,7 +10,7 @@ export default defineConfig({
       command: "sh ../api/dev-e2e.sh",
       cwd: "../api",
       url: "http://127.0.0.1:3000/api/v1/health",
-      reuseExistingServer: false,
+      reuseExistingServer,
       timeout: 120_000,
       stdout: "pipe",
       stderr: "pipe"
@@ -17,7 +18,7 @@ export default defineConfig({
     {
       command: "pnpm dev",
       url: "http://127.0.0.1:5173",
-      reuseExistingServer: false,
+      reuseExistingServer,
       timeout: 120_000,
       stdout: "pipe",
       stderr: "pipe"
