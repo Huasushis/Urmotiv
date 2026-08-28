@@ -69,3 +69,19 @@ codex
 3. 不得从旧副本提交或推送；它们可能没有完整 Git 历史，也可能含私有文件。
 4. 不得清理 `previous-server-work/`，除非先证明相应数据已经迁移、实验可复现，并得到用户明确同意。
 5. 服务器进程只能按进程号、父进程、完整命令和工作目录确认归属后结束，不能按名称批量结束 Node.js 或 Python。
+
+## Urmotiv 管理员凭据恢复
+
+管理员初始化完成后，只有现场真实 TTY 可以执行恢复。命令不接受参数；它会要求两次输入 `确认`，在一个事务中锁定唯一符合条件的内置 `system_administrator` 人类本地密码账号，递增认证版本、撤销全部现有会话并写入不含秘密的审计记录。零个或多个候选、停用账号、根账号、机器人/服务账号、非管理员账号以及失效成员关系都会安全失败。
+
+恢复命令只在事务成功提交后，通过 `/dev/tty` 写出账号编号和新密码各一次；标准输出只会收到固定结果码，密码不会进入参数、环境变量、日志、错误或审计。操作者应立即使用新密码登录，并在安全位置按部署流程保存或轮换它。
+
+仅 SSH 本机回环 HTTP 测试可将 `URMOTIV_WEB_ORIGIN` 精确设为 `http://127.0.0.1:8080`（也接受 `localhost` 或 `[::1]` 的回环主机）并显式设置 `URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES=true`。生产默认仍使用 Secure Cookie；非回环 HTTP origin 或非回环 opt-in 会阻止 API 启动。
+
+在已构建并已迁移的 Compose API 镜像中，使用以下命令执行恢复。不要把密码写入 shell 历史或重定向；命令必须在真实 TTY 中直接运行：
+
+```bash
+docker compose --project-name urmotiv-final-20260828 --env-file /home/ubuntu/codex-urmotiv/Urmotiv/private/urmotiv.env -f /home/ubuntu/codex-urmotiv/.tools/worktrees/urmotiv-final-integration-20260828/compose.yaml run --rm --no-deps api pnpm --filter @urmotiv/api recover-admin-credentials
+```
+
+用户本人而不是 OMP 必须运行该命令；新账号标识和密码只会在 `/dev/tty` 显示一次，然后登录 `http://127.0.0.1:8080/login`。

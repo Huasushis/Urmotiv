@@ -53,6 +53,7 @@ Urmotiv 为 USTC 算法竞赛协会命题组提供一套私有题库系统。第
 - 一个账号可绑定多个邮箱，一个标准化后的邮箱只能属于一个账号。
 - 普通账号至少保留一个邮箱。OAuth2 首次登录必须取得合法邮箱；经典 CAS 兼容模式仍允许身份源未返回邮箱的账号暂时没有邮箱。
 - 密码使用 Argon2id 保存。修改密码、邮箱或权限后可撤销现有会话。
+- 生产环境默认所有会话和认证浏览器绑定 Cookie 使用 `Secure`。仅当 `URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES=true` 且 `URMOTIV_WEB_ORIGIN` 的所有配置 origin 都是 HTTP 的 `localhost`、`127.0.0.1` 或 `[::1]` 时，才允许 SSH 本机回环测试使用非 `Secure` Cookie；非回环 HTTP origin 或非回环 opt-in 会阻止服务启动。
 
 ### 3.3 USTC 统一身份认证
 
@@ -65,7 +66,7 @@ Urmotiv 为 USTC 算法竞赛协会命题组提供一套私有题库系统。第
 - 后续登录只复用相同来源和稳定编号对应的账号，不覆盖用户昵称；服务端更新来源权威的真实姓名。
   学工号、主邮箱或同一稳定编号的用户名与现有绑定冲突时固定拒绝，不自动创建、合并或改绑账号。
 - OAuth2 `state` 使用独立 HMAC 密钥签名，包含期限、一次性随机值、安全返回路径和发起浏览器的绑定摘要。
-  原始浏览器绑定值只放入 `HttpOnly`、`Secure`、`SameSite=Lax`、`Path=/` 且不设置 `Domain` 的 `__Host-` Cookie。
+  原始浏览器绑定值只放入 `HttpOnly`、`Secure`、`SameSite=Lax`、`Path=/` 且不设置 `Domain` 的 `__Host-` Cookie；回环 HTTP opt-in 时仍保留这些属性（`Secure` 除外），并使用不带 `__Host-` 前缀的同源 Cookie 名称。
   回调先校验签名、期限、返回路径和浏览器绑定，再一次性消费状态，最后换码取资料；重放、缺 Cookie、错误 Cookie、
   非法授权码、上游失败或资料缺项统一返回未登录响应，不泄露原因，也不把授权码、令牌或资料写入日志。
 - 开始和回调响应禁止缓存并使用 `Referrer-Policy: no-referrer`；成功后只清除当前流程的绑定 Cookie，
