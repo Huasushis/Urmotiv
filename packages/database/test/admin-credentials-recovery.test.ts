@@ -1,8 +1,9 @@
 import { sql } from "drizzle-orm";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   completeAdminBootstrap,
   createLocalDatabase,
+  type DatabaseHandle,
   type LocalDatabaseHandle,
   migrateDatabase,
   openAdminBootstrapForFreshSeed,
@@ -10,7 +11,6 @@ import {
   seedCoreDatabase,
   tryAcquireAdminBootstrapMigrationLease
 } from "../src";
-
 const replacementHash =
   "$argon2id$v=19$m=19456,t=2,p=1$c3ludGhldGljc2FsdA$c3ludGhldGljaGFzaA";
 const openDatabases: LocalDatabaseHandle[] = [];
@@ -190,6 +190,26 @@ describe("administrator credential recovery", () => {
     await expect(recoverAdminCredentials(database, { passwordHash: replacementHash })).resolves.toBe(
       "candidate_invalid"
     );
+  });
+
+  it("fails closed when a concurrent recovery already holds the advisory lock", async () => {
+    type SyntheticTransaction = {
+      query: (query: unknown) => Promise<unknown[]>;
+      execute: (query: unknown) => Promise<unknown>;
+    };
+    const query = vi.fn(async (_query: unknown) => [{ acquired: false }]);
+    const execute = vi.fn(async (_query: unknown) => undefined);
+    const transaction: SyntheticTransaction = { query, execute };
+    const database = {
+      transaction: async (callback: (value: SyntheticTransaction) => Promise<unknown>) =>
+        callback(transaction)
+    } as unknown as DatabaseHandle;
+
+    await expect(recoverAdminCredentials(database, { passwordHash: replacementHash })).resolves.toBe(
+      "busy"
+    );
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it("rolls back the password, revision, sessions, and audit when audit insertion fails", async () => {
