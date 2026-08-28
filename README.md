@@ -91,8 +91,6 @@ Urmotiv 是面向竞赛组织者的题库与命题协作系统：把题目草稿
 - Urmotiv 不运行参赛者程序，不提供编译器、沙箱或评测机。
 - 插件宿主只加载编译进服务端的受信任内置代码；当前没有管理员上传任意插件包并即时执行的能力。
 - Anklang、Fermata 是独立服务；服务不可用时的提交行为由各插件设置决定，不能把上游结果当作 Urmotiv 的最终审核决定。
-- 在当前起始提交中，`apps/api/package.json` 已声明 `@urmotiv/plugin-fps-format`，但 API/Worker Dockerfile 的依赖复制白名单遗漏 `plugins/fps-format/package.json`；干净 Docker 构建可能在安装阶段失败，需维护者先同步该白名单。本次文档分支不改构建配置。
-- 当前迁移把 PostgreSQL `plugin_state` 枚举写成 `unavailable`，而运行时宿主使用 `failed`；插件状态持久化可能因此失败，需维护者先完成枚举迁移。本次文档分支不改数据库或服务行为。
 - 首次管理员初始化与遗失管理员密码恢复都要求真实服务器 TTY；恢复会撤销该管理员现有会话，并把新密码只写到服务器控制台。
 
 ## 许可证与上游来源

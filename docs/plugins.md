@@ -31,7 +31,7 @@ Urmotiv 插件是编译进服务端的受信任代码单元。当前宿主只从
 
 服务启动时依次解析清单、注册回调、校验设置/审核规则，最后锁定注册表；锁定后请求处理期间不能替换回调。管理员在 `/admin` 查看当前内置插件的来源、版本、状态、设置修订号和密钥遮罩，并通过 `PATCH /api/v1/admin/plugins/:pluginId` 提交 `expectedRevision` 与 `state`/`settings`/`secrets`/`clearSecrets` 之一。没有 `plugin.manage` 的用户访问这些端点按 `404` 处理。
 
-`enabled`/`disabled`/`failed` 是当前宿主使用的状态；`failed` 表示启动或运行校验失败，宿主不会调用该插件。`requiresRestart` 为真时，保存设置后必须重启服务；密钥原文只在写入时提交，之后页面只显示已配置和最多四个末尾字符。默认启用状态由内置定义决定（默认审核人数规则启用，外部服务和格式插件按部署配置决定）。数据库迁移中若仍显示 `unavailable`，应先由维护者完成状态枚举迁移，不能在文档或客户端层自行改名。
+`enabled`/`disabled`/`failed` 是当前宿主使用的状态；`failed` 表示启动或运行校验失败，宿主不会调用该插件。`requiresRestart` 为真时，保存设置后必须重启服务；密钥原文只在写入时提交，之后页面只显示已配置和最多四个末尾字符。默认启用状态由内置定义决定（默认审核人数规则启用，外部服务和格式插件按部署配置决定）。
 
 设置表单是受限 JSON Schema（不是任意脚本）：只允许 object、array、string、number、integer、boolean；属性名不能是 `__proto__`、`prototype` 或 `constructor`；对象最多 100 个属性、表单深度最多 12 层。每个插件自己校验运行时设置并填充默认值。
 

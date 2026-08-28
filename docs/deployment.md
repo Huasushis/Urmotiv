@@ -2,7 +2,6 @@
 
 本指南描述当前仓库的 Docker Compose 部署。Compose（用一个 YAML 文件编排多个容器的工具）包含 PostgreSQL、Redis、MinIO、迁移任务、API、异步 Worker 和 Web；Anklang、Fermata 作为显式 profile（可选服务组）启动。所有密码、令牌、外部服务地址和题目资料都放在 Git 之外。
 
-> **当前构建/迁移阻塞项**：起始提交的 `apps/api/package.json` 声明了 `@urmotiv/plugin-fps-format`，但 `Dockerfile.api` 与 `Dockerfile.worker` 的依赖复制白名单没有复制 `plugins/fps-format/package.json`。因此干净 Docker 构建可能在 `pnpm install --frozen-lockfile` 阶段失败；维护者必须先同步白名单。另，数据库迁移的 `plugin_state` 枚举使用 `unavailable`，运行时宿主使用 `failed`，插件状态持久化可能失败，需维护者先完成枚举迁移。本次文档分支不改构建配置或数据库行为。
 
 ## 环境文件
 
