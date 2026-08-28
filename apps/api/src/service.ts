@@ -22,10 +22,18 @@ import {
   type SimilarityCheckResponse,
   type UpdateProblemInput
 } from "@urmotiv/contracts";
+import {
+  anklangReviewItemType,
+  anklangSearchResultSchema,
+  rebuildAnklangReviewItem,
+  type AnklangIndexAdapter,
+  type AnklangSearchResult
+} from "@urmotiv/plugin-anklang";
 import type { DatabaseExecutor } from "@urmotiv/database";
 import type {
   BeforeSubmitInput,
   ReviewDecision,
+  ReviewItemInput,
   ReviewItem,
   ReviewOpinion,
   ReviewRoundSnapshot
@@ -84,6 +92,8 @@ export interface ProblemServiceOptions {
   reviewItems?: ReviewItemStore;
   /** Evaluates the immutable rule saved for each review round. */
   reviewDecisions?: ReviewDecisionRunner;
+  /** 提交成功后把可搜索的题面同步到已配置的 Anklang 索引；只接收窄适配器。 */
+  anklangIndex?: AnklangIndexAdapter;
   /**
    * Runs inside the transaction after a new revision and its copied file relations exist.
    * Production uses this to validate judge-program references and remove superseded programs.
@@ -307,6 +317,7 @@ export class ProblemService {
   private readonly reviewItems: ReviewItemStore | undefined;
   private readonly reviewDecisions: ReviewDecisionRunner;
   private readonly judgeConfigRevisionAction: ProblemServiceOptions["judgeConfigRevisionAction"];
+  private readonly anklangIndex: AnklangIndexAdapter | undefined;
 
   public constructor(
     private readonly store: DataStore,
@@ -316,6 +327,7 @@ export class ProblemService {
     this.submitChecks = options.submitChecks;
     this.reviewItems = options.reviewItems;
     this.reviewDecisions = options.reviewDecisions ?? new DefaultReviewDecisionRunner();
+    this.anklangIndex = options.anklangIndex;
     this.judgeConfigRevisionAction = options.judgeConfigRevisionAction;
   }
 
@@ -463,6 +475,9 @@ export class ProblemService {
       revision: current.revision + 1,
       updatedAt: asIso(this.now())
     };
+    const shouldSyncAnklang =
+      (current.status === "pending_review" || current.status === "approved") &&
+      next.title !== current.title;
     assertJudgeConfigMatchesType(next.type, next.judgeConfig);
     const combinedRevisionAction = this.judgeConfigRevisionAction === undefined
       ? revisionAction
@@ -484,7 +499,9 @@ export class ProblemService {
     if (!updated) {
       throw conflict("题目已被其他操作修改，请刷新后重试。");
     }
-
+    if (shouldSyncAnklang) {
+      await this.syncAnklang(next);
+    }
     return this.toProblem(next, user);
   }
 
@@ -499,6 +516,7 @@ export class ProblemService {
     input: ForceFrozenFieldEditInput,
     requestId?: string
   ): Promise<Problem> {
+    let shouldSyncAnklang = false;
     const updated = await this.store.runProblemTransaction(problemId, async (transaction) => {
       const problem = transaction.getProblem();
       if (problem === undefined || problem.id !== problemId) {
@@ -541,6 +559,9 @@ export class ProblemService {
         revision: problem.revision + 1,
         updatedAt: asIso(this.now())
       };
+      shouldSyncAnklang =
+        input.content.basicStatement !== undefined &&
+        input.content.basicStatement !== problem.content.basicStatement;
       if (!transaction.replaceProblem(next, problem.revision, refreshedActor.id)) {
         throw conflict("题目已被其他操作修改，请刷新后重试。");
       }
@@ -559,6 +580,9 @@ export class ProblemService {
       });
       return next;
     });
+    if (shouldSyncAnklang) {
+      await this.syncAnklang(updated);
+    }
     return this.toProblem(updated, user);
   }
 
@@ -650,7 +674,7 @@ export class ProblemService {
       }
     };
 
-    const checkItems = await this.runSubmitChecks(next);
+    const checkItems = await this.runSubmitChecks(next, user);
     let updated: boolean;
     if (
       checkItems.length > 0 &&
@@ -676,10 +700,13 @@ export class ProblemService {
       throw conflict("题目已被其他操作修改，请刷新后重试。");
     }
 
+    await this.syncAnklang(next);
     return this.toProblem(next, user);
   }
-
-  private async runSubmitChecks(next: StoredProblem): Promise<readonly StoredReviewItemInput[]> {
+  private async runSubmitChecks(
+    next: StoredProblem,
+    user: StoredUser
+  ): Promise<readonly StoredReviewItemInput[]> {
     if (this.submitChecks === undefined) {
       return [];
     }
@@ -689,7 +716,84 @@ export class ProblemService {
         submitCheck: [outcome.blocked.code]
       });
     }
-    return outcome.reviewItems;
+    return this.filterAnklangReviewItems(user, next.id, outcome.reviewItems);
+  }
+
+  private async syncAnklang(problem: StoredProblem): Promise<void> {
+    if (this.anklangIndex === undefined) {
+      return;
+    }
+    try {
+      await this.anklangIndex.upsert({
+        externalId: problem.id,
+        title: problem.title,
+        basicStatement: problem.content.basicStatement,
+        updatedAt: problem.updatedAt
+      });
+    } catch {
+      // The local mutation is authoritative; a bounded best-effort sync never rolls it back.
+    }
+  }
+
+  private async filterAnklangReviewItems(
+    user: StoredUser,
+    problemId: string,
+    items: readonly StoredReviewItemInput[]
+  ): Promise<readonly StoredReviewItemInput[]> {
+    const filtered: StoredReviewItemInput[] = [];
+    for (const item of items) {
+      if (item.type !== anklangReviewItemType) {
+        filtered.push(item);
+        continue;
+      }
+      const parsed = anklangSearchResultSchema.safeParse(item.data);
+      if (!parsed.success) {
+        throw new Error("原题检索返回了不可保存的结果。");
+      }
+      const candidates: AnklangSearchResult["candidates"] = [];
+      for (const candidate of parsed.data.candidates) {
+        if (
+          candidate.source === "urmotiv" &&
+          candidate.externalId === problemId
+        ) {
+          continue;
+        }
+        if (candidate.source !== "urmotiv") {
+          candidates.push(candidate);
+          continue;
+        }
+        const visible = await this.store.findVisibleProblem(
+          candidate.externalId,
+          createProblemVisibility(user, this.now())
+        );
+        if (visible === undefined) {
+          continue;
+        }
+        candidates.push({
+          source: "urmotiv",
+          externalId: candidate.externalId,
+          title: visible.title,
+          similarity: candidate.similarity
+        });
+      }
+      const reviewItemInput: ReviewItemInput = {
+        type: item.type,
+        visibility: item.visibility === "administrator" ? "admin" : item.visibility,
+        summary: item.summary,
+        data: parsed.data,
+        contentHash: item.contentHash,
+        ...(item.expiresAt === undefined || item.expiresAt === null
+          ? {}
+          : { expiresAt: item.expiresAt })
+      };
+      const rebuilt = rebuildAnklangReviewItem(reviewItemInput, candidates);
+      filtered.push({
+        ...item,
+        summary: rebuilt.summary,
+        data: rebuilt.data
+      });
+    }
+    return filtered;
   }
 
   /**
@@ -703,12 +807,30 @@ export class ProblemService {
       return { round: current.reviewRound, items: [] };
     }
     const stored = await this.reviewItems.list(current.id, current.reviewRound, levels);
-    return { round: current.reviewRound, items: stored.map(storedItemToView) };
+    const filtered = await Promise.all(
+      stored.map(async (item) => {
+        const [filteredItem] = await this.filterAnklangReviewItems(user, current.id, [{
+          type: item.type,
+          source: item.source,
+          ...(item.sourceUserId === null ? {} : { sourceUserId: item.sourceUserId }),
+          ...(item.sourcePluginId === null ? {} : { sourcePluginId: item.sourcePluginId }),
+          visibility: item.visibility,
+          summary: item.summary,
+          data: item.data,
+          contentHash: item.contentHash,
+          ...(item.expiresAt === null ? {} : { expiresAt: item.expiresAt })
+        }]);
+        return filteredItem === undefined
+          ? item
+          : { ...item, summary: filteredItem.summary, data: filteredItem.data };
+      })
+    );
+    return { round: current.reviewRound, items: filtered.map(storedItemToView) };
   }
 
   /**
-   * 手动运行一次原题检索等提交前检查。结果直接返回给页面；题目已进入审核轮次时同时
-   * 保存为审核条目。这里的“建议不要提交”只是提示，不改变题目状态。
+   * 手动运行一次原题检索。结果直接返回给页面；题目已进入审核轮次时同时
+   * 保存为审核条目。检索候选只是参考数据，不改变题目状态。
    */
   public async runManualSimilarityCheck(
     user: StoredUser,
@@ -772,28 +894,28 @@ export class ProblemService {
       if (outcome.checksRun === 0 || outcome.similarityStatus === undefined) {
         return { status: "unavailable", blockedAdvice: null, items: [] };
       }
+      const filteredItems = await this.filterAnklangReviewItems(
+        refreshedUser,
+        refreshed.id,
+        outcome.reviewItems
+      );
       if (
         refreshed.status === "pending_review" &&
         refreshed.reviewRound >= 1 &&
         this.reviewItems !== undefined &&
-        outcome.reviewItems.length > 0
+        filteredItems.length > 0
       ) {
         await this.reviewItems.replacePluginItems(
           refreshed.id,
           refreshed.reviewRound,
-          outcome.reviewItems,
+          filteredItems,
           transaction.executor
         );
       }
-      const blockedAdvice =
-        outcome.blocked?.code === "anklang_similar_problem" ||
-        outcome.blocked?.code === "anklang_partial_same_problem"
-          ? outcome.blocked
-          : null;
       return {
         status: outcome.similarityStatus === "complete" ? "completed" : outcome.similarityStatus,
-        blockedAdvice,
-        items: outcome.reviewItems.map((item) => inputItemToView(item, asIso(checkedAt)))
+        blockedAdvice: null,
+        items: filteredItems.map((item) => inputItemToView(item, asIso(checkedAt)))
       };
     });
   }

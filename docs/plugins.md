@@ -49,12 +49,18 @@ Urmotiv 插件是编译进服务端的受信任代码单元。当前宿主只从
 ## 失败、超时和权限边界
 
 - 清单、设置或注册回调不符合契约会使插件启动失败，不会以“忽略错误”的方式上线。
-- 每个提交前检查的 `timeoutMs` 必须为 1–300,000 毫秒。超时会中止 `AbortSignal`；`failureBehavior: "block"` 返回 `plugin_check_timeout` 并阻止提交，`"continue"` 则跳过该检查继续执行。宿主按管理员顺序运行一次，不会自动重试；插件若调用外部服务，必须自己尊重信号并采用有界重试。
+- 每个提交前检查的 `timeoutMs` 必须为 1–300,000 毫秒。超时会中止 `AbortSignal`；`failureBehavior: "block"` 返回 `plugin_check_timeout` 并阻止提交，`"continue"` 则跳过该检查继续执行。宿主按管理员顺序运行一次；外部服务插件若需要重试，必须采用有界次数并尊重信号。
 - 检查返回 `block` 时立即停止，之前的 `continue` 结果不能抵消明确拒绝；超时/失败的阻止策略也不能由客户端重试绕过。
-- 插件权限只能是插件命名空间权限，不能获得 `problem.*`、`user.*`、`system.manage` 或其他核心权限。核心授权仍由服务端统一执行，明确拒绝永远优先于允许。
+- 插件权限只能是插件命名空间权限，不能获得 `problem.*`、`user.*`、`system.manage` 或其他核心权限。核心授权仍由服务端统一执行，明确拒绝永远优先。
 - 私密题面、题解、内部附件、令牌、密码和对象存储地址不能写入日志、审核条目或外部请求。审核条目只能保存必要的结构化结果，并绑定当前题目内容摘要和可见性。
-- 管理员无权访问插件，或请求不存在的插件，统一是 `404`；不能用状态、响应时间或错误信息探测插件存在性。
+- 管理员无权访问插件，或请求不存在的插件，统一是 `404`；不能用状态、响应时间或错误差异探测插件存在性。
 
 ## Urmotiv、Anklang 与 Fermata 的边界
 
-Anklang 只做原题相似性检索，支持实时添加后查询，并返回查询结果。题目的查重/检查信息是 Urmotiv 的问题属性：插件可以添加，Fermata 可以读取。Anklang 不拥有 Urmotiv 的流程、审核状态、权限或最终裁决；Fermata 的建议也不替代人工审核或 Urmotiv 的状态规则。
+Anklang 只做原题相似性检索和受控索引写入。`org.ustc.urmotiv.anklang` 的查询响应经过严格的仅检索结果投影：候选和完成/复用状态可以作为审核条目参考，`recommendation`、`sameProblemSuggestion`、`explanation` 永远不会进入保存结果，也不会阻止提交。`failureBehavior` 只处理无法取得配置检查的情形。
+
+管理员必须把 `baseUrl` 配置为本地/私有地址并显式确认 `privateContentAuthorized: true`；令牌只放在 `serviceToken` 插件密钥中。查询最多 1–3 次（默认 2），可重试的只有网络/超时/408/429/502/503/504；401、409 和契约错误不重试。同步使用 1–30 秒（默认 10 秒）的独立上限，失败不回滚 Urmotiv 已提交的本地修订。
+
+成功 submit、`pending_review`/`approved` 题目的标题变化，以及冻结 `basicStatement` 变化才通过窄 `AnklangIndexAdapter` 调用 `PUT /api/v1/index/problems`。draft/rejected、solution-only、无变化和删除不会同步；未启用、未授权或缺少密钥时不会发 HTTP 请求。Urmotiv 先按请求用户权限查找 Urmotiv 来源候选：当前题目自身、未知、隐藏、明确拒绝都静默移除，授权候选用当前 Urmotiv 标题替换并移除远端 URL、`metadata`（附加信息）；外部来源仅保留非判断参考数据。过滤失败时拒绝返回/保存，不会伪造空结果。
+
+Fermata 只能读取 Urmotiv 自己保存的检查属性；Anklang 不拥有 Urmotiv 的流程、审核状态、权限或最终审核决定。插件宿主没有通用事件总线，索引适配器只注入 `ProblemService` 的上述本地修改边界。

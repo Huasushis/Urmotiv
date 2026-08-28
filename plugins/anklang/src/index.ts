@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 import {
   type BeforeSubmitCheck,
   type BeforeSubmitInput,
@@ -14,18 +15,76 @@ export const anklangCheckId = `${anklangPluginId}.before-submit`;
 export const anklangReviewItemType = `${anklangPluginId}.similarity`;
 const responseByteLimit = 2_000_000;
 const maximumReuseMs = 7 * 24 * 60 * 60_000;
+const defaultRetryAttempts = 2;
+const defaultIndexTimeoutMs = 10_000;
+function isRetryableAnklangStatus(statusCode: number | undefined): boolean {
+  return (
+    statusCode === undefined ||
+    statusCode === 408 ||
+    statusCode === 429 ||
+    statusCode === 502 ||
+    statusCode === 503 ||
+    statusCode === 504
+  );
+}
 
 const serviceUrlSchema = z
   .string()
   .url()
   .refine((value) => {
+    if (
+      value !== value.trim() ||
+      /[\u0000-\u001f\u007f]/u.test(value) ||
+      /[?#]/u.test(value)
+    ) {
+      return false;
+    }
     const url = new URL(value);
+    const host = url.hostname.replace(/^\[|\]$/gu, "").toLowerCase();
     return (
       (url.protocol === "http:" || url.protocol === "https:") &&
       url.username.length === 0 &&
-      url.password.length === 0
+      url.password.length === 0 &&
+      (url.pathname === "/" || url.pathname === "") &&
+      url.search.length === 0 &&
+      url.hash.length === 0 &&
+      isPrivateServiceHost(host)
     );
-  }, "Anklang 服务地址必须是不含账号密码的 HTTP 或 HTTPS 地址。");
+  }, "Anklang 服务地址必须是没有账号密码、路径、查询参数或片段的本地/私有 HTTP 或 HTTPS 地址。");
+
+function isPrivateServiceHost(host: string): boolean {
+  if (host === "localhost" || host === "host.docker.internal") {
+    return true;
+  }
+  const ipVersion = isIP(host);
+  if (ipVersion === 4) {
+    const octets = host.split(".").map((value) => Number.parseInt(value, 10));
+    const [first, second] = octets;
+    return (
+      octets.length === 4 &&
+      octets.every((octet) => Number.isInteger(octet) && octet >= 0 && octet <= 255) &&
+      (first === 10 ||
+        (first === 172 && second !== undefined && second >= 16 && second <= 31) ||
+        (first === 192 && second === 168) ||
+        (first === 127 && second !== undefined) ||
+        (first === 169 && second === 254))
+    );
+  }
+  if (ipVersion === 6) {
+    const firstHextet = Number.parseInt(host.split(":", 1)[0] ?? "", 16);
+    return (
+      host === "::1" ||
+      (Number.isInteger(firstHextet) &&
+        ((firstHextet >= 0xfc00 && firstHextet <= 0xfdff) ||
+          (firstHextet >= 0xfe80 && firstHextet <= 0xfebf)))
+    );
+  }
+  return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/u.test(host);
+}
+
+export function isPrivateAnklangBaseUrl(value: string): boolean {
+  return serviceUrlSchema.safeParse(value).success;
+}
 
 const apiVersionSchema = z.enum(["2", "1"]);
 
@@ -34,8 +93,10 @@ export const anklangSettingsSchema = z
     baseUrl: serviceUrlSchema,
     apiVersion: apiVersionSchema.default("2"),
     timeoutMs: z.number().int().min(1_000).max(120_000).default(120_000),
+    indexTimeoutMs: z.number().int().min(1_000).max(30_000).default(defaultIndexTimeoutMs),
+    retryAttempts: z.number().int().min(1).max(3).default(defaultRetryAttempts),
+    privateContentAuthorized: z.boolean().default(false),
     failureBehavior: z.enum(["block", "continue"]).default("block"),
-    blockWhenRecommended: z.boolean().default(true),
     minimumSimilarityToShow: z.number().min(0).max(1).default(0.3),
     cacheMinutes: z.number().int().min(1).max(10_080).default(1_440)
   })
@@ -311,11 +372,104 @@ export const anklangResultSchema = z.union([anklangV2ResultSchema, anklangV1Resu
 export type AnklangV1Result = z.infer<typeof anklangV1ResultSchema>;
 export type AnklangV2Result = z.infer<typeof anklangV2ResultSchema>;
 export type AnklangResult = z.infer<typeof anklangResultSchema>;
+export const anklangSearchCandidateSchema = anklangCandidateSchema
+  .omit({ sameProblemSuggestion: true, explanation: true })
+  .strict();
+
+export const anklangV2SearchCandidateSchema = anklangSearchCandidateSchema
+  .extend({ metadata: anklangCandidateMetadataSchema.optional() })
+  .strict()
+  .transform((candidate) => {
+    if (candidate.metadata !== undefined && Object.keys(candidate.metadata).length !== 0) {
+      return candidate;
+    }
+    const { metadata: _omitted, ...rest } = candidate;
+    return rest;
+  });
+
+const searchV2ResultCommon = {
+  apiVersion: z.literal("2"),
+  contentHash: contentHashSchema,
+  checkedAt: utcDateTimeSchema,
+  candidates: z.array(anklangV2SearchCandidateSchema).max(50)
+} as const;
+
+const completeSearchV2ResultSchema = z
+  .object({
+    ...searchV2ResultCommon,
+    completion: completeCompletionSchema,
+    reuse: z.union([allowedReuseSchema, noStoreReuseSchema]).optional()
+  })
+  .strict()
+  .superRefine((result, context) => {
+    if (result.reuse?.policy !== "allowed") {
+      return;
+    }
+    const checkedAtMs = Date.parse(result.checkedAt);
+    const expiresAtMs = Date.parse(result.reuse.expiresAt);
+    if (expiresAtMs <= checkedAtMs || expiresAtMs - checkedAtMs > maximumReuseMs) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["reuse", "expiresAt"],
+        message: "复用到期时间必须晚于检查时间且相差不超过七天。"
+      });
+    }
+  });
+
+const partialSearchV2ResultSchema = z
+  .object({
+    ...searchV2ResultCommon,
+    completion: noncompleteCompletionSchema("partial"),
+    reuse: noStoreReuseSchema.optional()
+  })
+  .strict();
+
+const unavailableSearchV2ResultSchema = z
+  .object({
+    ...searchV2ResultCommon,
+    completion: noncompleteCompletionSchema("unavailable"),
+    candidates: z.array(anklangV2SearchCandidateSchema).length(0),
+    reuse: noStoreReuseSchema.optional()
+  })
+  .strict();
+
+export const anklangSearchResultSchema = z.union([
+  completeSearchV2ResultSchema,
+  partialSearchV2ResultSchema,
+  unavailableSearchV2ResultSchema,
+  z
+    .object({
+      apiVersion: z.literal("1"),
+      contentHash: contentHashSchema,
+      checkedAt: utcDateTimeSchema,
+      candidates: z.array(anklangSearchCandidateSchema).max(50)
+    })
+    .strict()
+]);
+
+export type AnklangSearchResult = z.infer<typeof anklangSearchResultSchema>;
+
+export function projectAnklangSearchResult(result: AnklangResult): AnklangSearchResult {
+  const candidates = result.candidates.map((candidate) => {
+    const { sameProblemSuggestion: _suggestion, explanation: _explanation, ...searchCandidate } =
+      candidate;
+    return searchCandidate;
+  });
+  if (result.apiVersion === "1") {
+    return anklangSearchResultSchema.parse({
+      apiVersion: result.apiVersion,
+      contentHash: result.contentHash,
+      checkedAt: result.checkedAt,
+      candidates
+    });
+  }
+  const { recommendation: _recommendation, candidates: _candidates, ...searchResult } = result;
+  return anklangSearchResultSchema.parse({ ...searchResult, candidates });
+}
+
 export type AnklangCompletionStatus = "complete" | "partial" | "unavailable";
 export type AnklangNoncompleteReasonCode = z.infer<typeof noncompleteReasonCodeSchema>;
 
-class AnklangUnavailableError extends Error {}
-class AnklangInvalidResponseError extends Error {}
 
 const anklangProblemRequestSchema = z
   .object({
@@ -348,9 +502,71 @@ export const anklangRequestSchema = z.union([anklangV2RequestSchema, anklangV1Re
 
 export type AnklangRequest = z.infer<typeof anklangRequestSchema>;
 
+const anklangIndexProblemSchema = z
+  .object({
+    title: boundedCanonicalText(200),
+    basicStatement: z.string().min(1).max(500_000)
+  })
+  .strict();
+
+export const anklangIndexUpsertRequestSchema = z
+  .object({
+    apiVersion: z.literal("1"),
+    requestId: z.string().uuid(),
+    externalId: boundedCanonicalText(200),
+    updatedAt: utcDateTimeSchema,
+    problem: anklangIndexProblemSchema
+  })
+  .strict();
+
+export const anklangIndexUpsertResponseSchema = z
+  .object({
+    apiVersion: z.literal("1"),
+    requestId: z.string().uuid(),
+    source: z.literal("urmotiv"),
+    externalId: boundedCanonicalText(200),
+    contentHash: contentHashSchema,
+    outcome: z.enum(["inserted", "updated", "unchanged"])
+  })
+  .strict();
+
+export type AnklangIndexUpsertRequest = z.infer<typeof anklangIndexUpsertRequestSchema>;
+export type AnklangIndexUpsertResponse = z.infer<typeof anklangIndexUpsertResponseSchema>;
+
+export class AnklangUnavailableError extends Error {
+  public readonly statusCode: number | undefined;
+
+  public constructor(message = "Anklang 服务暂时不可用。", statusCode?: number) {
+    super(message);
+    this.name = "AnklangUnavailableError";
+    this.statusCode = statusCode;
+  }
+}
+
+export class AnklangInvalidResponseError extends Error {
+  public constructor(message = "Anklang 返回的内容格式不正确。") {
+    super(message);
+    this.name = "AnklangInvalidResponseError";
+  }
+}
+
+export class AnklangConfigurationError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "AnklangConfigurationError";
+  }
+}
+
+export class AnklangStaleUpdateError extends Error {
+  public constructor() {
+    super("Anklang 索引中的题目更新时间较新。");
+    this.name = "AnklangStaleUpdateError";
+  }
+}
+
 export interface AnklangCache {
   get(cacheKey: string): Promise<unknown | undefined>;
-  set(cacheKey: string, result: AnklangResult, expiresAt: string): Promise<void>;
+  set(cacheKey: string, result: AnklangSearchResult, expiresAt: string): Promise<void>;
 }
 
 export type AnklangFetch = (
@@ -362,23 +578,56 @@ export interface AnklangClientOptions {
   readonly baseUrl: string;
   readonly apiVersion?: AnklangApiVersion;
   readonly token?: string;
+  readonly privateContentAuthorized?: boolean;
+  readonly retryAttempts?: number;
+  readonly timeoutMs?: number;
+  readonly indexTimeoutMs?: number;
   readonly fetch?: AnklangFetch;
 }
+
+type JsonResponseKind = "check" | "index";
 
 export class AnklangClient {
   readonly #apiVersion: AnklangApiVersion;
   readonly #endpoint: URL;
-  readonly #token: string | undefined;
+  readonly #indexEndpoint: URL;
+  readonly #token: string;
+  readonly #retryAttempts: number;
+  readonly #timeoutMs: number;
+  readonly #indexTimeoutMs: number;
   readonly #fetch: AnklangFetch;
 
   public constructor(options: AnklangClientOptions) {
-    const baseUrl = serviceUrlSchema.parse(options.baseUrl);
+    const parsedBaseUrl = serviceUrlSchema.safeParse(options.baseUrl);
+    if (!parsedBaseUrl.success) {
+      throw new AnklangConfigurationError("Anklang 服务地址不在批准的私有边界内。");
+    }
+    const baseUrl = parsedBaseUrl.data;
+    if (options.privateContentAuthorized !== true) {
+      throw new AnklangConfigurationError(
+        "管理员必须先确认 Anklang 存储与嵌入链路处于批准的私有边界内。"
+      );
+    }
+    const token = options.token?.trim();
+    if (token === undefined || token.length === 0) {
+      throw new AnklangConfigurationError("Anklang 服务认证令牌未配置。");
+    }
     this.#apiVersion = apiVersionSchema.parse(options.apiVersion ?? "2");
     this.#endpoint = new URL(
       `/api/v${this.#apiVersion}/checks/similarity`,
       ensureTrailingSlash(baseUrl)
     );
-    this.#token = options.token?.trim() || undefined;
+    this.#indexEndpoint = new URL("/api/v1/index/problems", ensureTrailingSlash(baseUrl));
+    this.#token = token;
+    this.#retryAttempts = z.number().int().min(1).max(3).parse(
+      options.retryAttempts ?? defaultRetryAttempts
+    );
+    this.#timeoutMs = z.number().int().min(1_000).max(120_000).parse(
+      options.timeoutMs ?? 120_000
+    );
+    this.#indexTimeoutMs = z.number().int().min(1_000).max(30_000).parse(
+      options.indexTimeoutMs ?? defaultIndexTimeoutMs
+    );
     this.#fetch = options.fetch ?? globalThis.fetch;
   }
 
@@ -389,57 +638,205 @@ export class AnklangClient {
       throw new AnklangInvalidResponseError("Anklang 请求不符合已配置的接口版本。");
     }
     const body = parsedRequest.data;
-    let response: Response;
-    try {
-      response = await this.#fetch(this.#endpoint, {
-        method: "POST",
-        redirect: "error",
-        signal,
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "X-Urmotiv-API-Version": this.#apiVersion,
-          ...(this.#token === undefined ? {} : { Authorization: `Bearer ${this.#token}` })
-        },
-        body: JSON.stringify(body)
-      });
-    } catch (error) {
-      if (signal.aborted) {
-        throw error;
+    const result = await this.#requestJson(
+      this.#endpoint,
+      body,
+      signal,
+      this.#timeoutMs,
+      "check",
+      (raw) => {
+        const resultSchema = this.#apiVersion === "2" ? anklangV2ResultSchema : anklangV1ResultSchema;
+        const parsedResult = resultSchema.safeParse(raw);
+        if (!parsedResult.success) {
+          throw new AnklangInvalidResponseError();
+        }
+        if (parsedResult.data.contentHash !== body.contentHash) {
+          throw new AnklangInvalidResponseError("Anklang 返回结果对应的题目内容已经变化。");
+        }
+        return parsedResult.data;
       }
-      throw new AnklangUnavailableError("Anklang 服务暂时不可用。");
-    }
-
-    if (!response.ok) {
-      throw new AnklangUnavailableError("Anklang 服务未能完成检查。");
-    }
-    const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
-    if (contentType !== "application/json") {
-      throw new AnklangInvalidResponseError("Anklang 返回的内容格式不正确。");
-    }
-
-    let text: string;
-    try {
-      text = await readLimitedText(response, responseByteLimit);
-    } catch {
-      throw new AnklangInvalidResponseError("Anklang 返回的内容格式不正确。");
-    }
-    let raw: unknown;
-    try {
-      raw = JSON.parse(text) as unknown;
-    } catch {
-      throw new AnklangInvalidResponseError("Anklang 返回的内容格式不正确。");
-    }
-    const resultSchema = this.#apiVersion === "2" ? anklangV2ResultSchema : anklangV1ResultSchema;
-    const parsedResult = resultSchema.safeParse(raw);
-    if (!parsedResult.success) {
-      throw new AnklangInvalidResponseError("Anklang 返回的内容格式不正确。");
-    }
-    const result = parsedResult.data;
-    if (result.contentHash !== body.contentHash) {
-      throw new AnklangInvalidResponseError("Anklang 返回结果对应的题目内容已经变化。");
-    }
+    );
     return result;
+  }
+
+  public async upsert(
+    request: AnklangIndexUpsertRequest,
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<AnklangIndexUpsertResponse> {
+    const parsedRequest = anklangIndexUpsertRequestSchema.safeParse(request);
+    if (!parsedRequest.success) {
+      throw new AnklangInvalidResponseError("Anklang 索引请求不符合已配置的接口版本。");
+    }
+    const body = parsedRequest.data;
+    return this.#requestJson(
+      this.#indexEndpoint,
+      body,
+      signal,
+      this.#indexTimeoutMs,
+      "index",
+      (raw) => {
+        const parsed = anklangIndexUpsertResponseSchema.safeParse(raw);
+        if (!parsed.success) {
+          throw new AnklangInvalidResponseError();
+        }
+        if (
+          parsed.data.requestId !== body.requestId ||
+          parsed.data.externalId !== body.externalId
+        ) {
+          throw new AnklangInvalidResponseError("Anklang 索引返回结果与请求不一致。");
+        }
+        return parsed.data;
+      }
+    );
+  }
+
+  async #requestJson<T>(
+    endpoint: URL,
+    body: object,
+    parentSignal: AbortSignal,
+    timeoutMs: number,
+    kind: JsonResponseKind,
+    parse: (raw: unknown) => T
+  ): Promise<T> {
+    const deadline = Date.now() + timeoutMs;
+    let rejectParentAbort = (_reason?: unknown): void => {};
+    const parentAbort = new Promise<never>((_resolve, reject) => {
+      rejectParentAbort = reject;
+    });
+    const abortParent = (): void => {
+      rejectParentAbort(new DOMException("The operation was aborted", "AbortError"));
+    };
+    if (parentSignal.aborted) {
+      abortParent();
+    } else {
+      parentSignal.addEventListener("abort", abortParent, { once: true });
+    }
+    const request = async (): Promise<T> => {
+      for (let attempt = 0; attempt < this.#retryAttempts; attempt += 1) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          throw new AnklangUnavailableError("Anklang 请求超时。");
+        }
+        const attemptsLeft = this.#retryAttempts - attempt;
+        const attemptTimeoutMs = Math.max(1, Math.min(remainingMs, Math.ceil(remainingMs / attemptsLeft)));
+        const attemptController = new AbortController();
+        const abortAttempt = (): void => attemptController.abort();
+        if (parentSignal.aborted) {
+          abortAttempt();
+        } else {
+          parentSignal.addEventListener("abort", abortAttempt, { once: true });
+        }
+        let attemptTimedOut = false;
+        let rejectAttemptTimeout = (_reason?: unknown): void => {};
+        const attemptTimeout = new Promise<never>((_resolve, reject) => {
+          rejectAttemptTimeout = reject;
+        });
+        const timer = setTimeout(() => {
+          attemptTimedOut = true;
+          attemptController.abort();
+          rejectAttemptTimeout(new AnklangUnavailableError("Anklang 请求超时。"));
+        }, attemptTimeoutMs);
+        try {
+          let response: Response;
+          try {
+            response = await Promise.race([
+              this.#fetch(endpoint, {
+                method: kind === "index" ? "PUT" : "POST",
+                redirect: "error",
+                signal: attemptController.signal,
+                headers: {
+                  Accept: "application/json",
+                  "Cache-Control": "no-store",
+                  "Content-Type": "application/json",
+                  "X-Urmotiv-API-Version": kind === "index" ? "1" : this.#apiVersion,
+                  Authorization: `Bearer ${this.#token}`
+                },
+                body: JSON.stringify(body)
+              }),
+              attemptTimeout
+            ]);
+          } catch (error) {
+            if (parentSignal.aborted) {
+              throw error;
+            }
+            if (error instanceof AnklangUnavailableError) {
+              throw error;
+            }
+            throw new AnklangUnavailableError();
+          }
+
+          if (response.status === 401) {
+            throw new AnklangUnavailableError("Anklang 认证失败。", response.status);
+          }
+          if (kind === "index" && response.status === 409) {
+            throw new AnklangStaleUpdateError();
+          }
+          if (isRetryableAnklangStatus(response.status)) {
+            throw new AnklangUnavailableError("Anklang 服务未能完成请求。", response.status);
+          }
+          if (!response.ok) {
+            throw new AnklangUnavailableError("Anklang 服务未能完成请求。", response.status);
+          }
+          const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+          if (contentType !== "application/json") {
+            throw new AnklangInvalidResponseError();
+          }
+          let text: string;
+          try {
+            text = await Promise.race([
+              readLimitedText(response, responseByteLimit),
+              attemptTimeout
+            ]);
+          } catch (error) {
+            if (attemptTimedOut || error instanceof AnklangUnavailableError || parentSignal.aborted) {
+              throw error;
+            }
+            throw new AnklangInvalidResponseError();
+          }
+          let raw: unknown;
+          try {
+            raw = JSON.parse(text) as unknown;
+          } catch {
+            throw new AnklangInvalidResponseError();
+          }
+          return parse(raw);
+        } catch (error) {
+          if (parentSignal.aborted) {
+            throw error;
+          }
+          if (error instanceof AnklangInvalidResponseError ||
+            error instanceof AnklangStaleUpdateError ||
+            error instanceof AnklangConfigurationError) {
+            throw error;
+          }
+          if (error instanceof AnklangUnavailableError) {
+            if (
+              isRetryableAnklangStatus(error.statusCode) &&
+              attempt + 1 < this.#retryAttempts &&
+              Date.now() < deadline
+            ) {
+              continue;
+            }
+            throw error;
+          }
+          if (attempt + 1 < this.#retryAttempts && Date.now() < deadline) {
+            continue;
+          }
+          throw new AnklangUnavailableError();
+        } finally {
+          clearTimeout(timer);
+          parentSignal.removeEventListener("abort", abortAttempt);
+          attemptController.abort();
+        }
+      }
+      throw new AnklangUnavailableError();
+    };
+    try {
+      return await Promise.race([request(), parentAbort]);
+    } finally {
+      parentSignal.removeEventListener("abort", abortParent);
+      rejectParentAbort(new AnklangUnavailableError());
+    }
   }
 }
 
@@ -458,24 +855,23 @@ export function createAnklangCheck(options: CreateAnklangCheckOptions): BeforeSu
     baseUrl: settings.baseUrl,
     apiVersion: settings.apiVersion,
     ...(options.token === undefined ? {} : { token: options.token }),
+    privateContentAuthorized: settings.privateContentAuthorized,
+    retryAttempts: settings.retryAttempts,
+    timeoutMs: settings.timeoutMs,
+    indexTimeoutMs: settings.indexTimeoutMs,
     ...(options.fetch === undefined ? {} : { fetch: options.fetch })
   });
-
   return {
     id: anklangCheckId,
     displayName: "原题相似度检查",
     timeoutMs: settings.timeoutMs,
     failureBehavior: settings.failureBehavior,
     async run(input, context): Promise<BeforeSubmitResult> {
-      let result: AnklangResult;
+      let result: AnklangSearchResult;
       try {
         result = await readOrCheck(input, context.signal, client, settings, options.cache, now);
       } catch (error) {
-        if (
-          context.signal.aborted ||
-          settings.failureBehavior === "block" ||
-          settings.apiVersion === "1"
-        ) {
+        if (context.signal.aborted || settings.failureBehavior === "block") {
           throw error;
         }
         return {
@@ -491,44 +887,18 @@ export function createAnklangCheck(options: CreateAnklangCheckOptions): BeforeSu
           ]
         };
       }
-      const highestCandidate = result.candidates.reduce<(typeof result.candidates)[number] | undefined>(
-        (highest, candidate) =>
-          highest === undefined || candidate.similarity > highest.similarity ? candidate : highest,
-        undefined
-      );
-      const visibleCandidates = result.candidates
-        .filter(
-          (candidate) =>
-            candidate.similarity >= settings.minimumSimilarityToShow ||
-            (result.recommendation?.blockSubmission === true &&
-              candidate === highestCandidate) ||
-            (result.apiVersion === "2" &&
-              result.completion.status === "partial" &&
-              candidate.sameProblemSuggestion === true)
-        )
-        .sort((left, right) => right.similarity - left.similarity);
-
-      if (
-        result.apiVersion === "2" &&
-        result.completion.status === "partial" &&
-        settings.blockWhenRecommended &&
-        result.recommendation?.blockSubmission === true
-      ) {
-        return blockedResult(result, visibleCandidates, "anklang_partial_same_problem");
-      }
 
       if (
         result.apiVersion === "2" &&
         result.completion.status !== "complete" &&
         settings.failureBehavior === "block"
       ) {
-        throw new Error("Anklang 检查没有完整完成。");
+        throw new AnklangUnavailableError("Anklang 检查没有完整完成。");
       }
 
-      if (settings.blockWhenRecommended && result.recommendation?.blockSubmission === true) {
-        return blockedResult(result, visibleCandidates, "anklang_similar_problem");
-      }
-
+      const visibleCandidates = result.candidates
+        .filter((candidate) => candidate.similarity >= settings.minimumSimilarityToShow)
+        .sort((left, right) => right.similarity - left.similarity);
       return {
         decision: "continue",
         reviewItems: [toReviewItem(result, visibleCandidates)]
@@ -541,21 +911,87 @@ export function registerAnklangPlugin(
   registry: PluginRegistry,
   options: CreateAnklangCheckOptions
 ): void {
-  const itemType: ReviewItemType<AnklangResult> = {
+  const itemType: ReviewItemType<AnklangSearchResult> = {
     type: anklangReviewItemType,
     displayName: "原题相似度结果",
-    dataSchema: anklangResultSchema
+    dataSchema: anklangSearchResultSchema
   };
   registry.registerReviewItemType(itemType);
   registry.registerBeforeSubmitCheck(createAnklangCheck(options));
 }
 
 export function anklangCompletionStatus(value: unknown): AnklangCompletionStatus | undefined {
-  const parsed = anklangResultSchema.safeParse(value);
+  const parsed = anklangSearchResultSchema.safeParse(value);
   if (!parsed.success) {
     return undefined;
   }
   return parsed.data.apiVersion === "1" ? "complete" : parsed.data.completion.status;
+}
+
+
+
+export interface AnklangIndexProblem {
+  readonly externalId: string;
+  readonly title: string;
+  readonly basicStatement: string;
+  readonly updatedAt: string;
+}
+
+export interface AnklangIndexAdapter {
+  upsert(problem: AnklangIndexProblem): Promise<AnklangIndexUpsertResponse | void>;
+}
+
+export interface AnklangIndexRuntime {
+  readSettings(): Promise<unknown | undefined>;
+  readToken(): Promise<string | undefined>;
+  readonly fetch?: AnklangFetch;
+}
+
+/**
+ * Creates the narrow built-in index bridge. It deliberately performs no
+ * network request when the plugin is disabled, malformed, unauthorized, or
+ * missing its secret; sync errors are best effort and never escape here.
+ */
+export function createAnklangIndexAdapter(runtime: AnklangIndexRuntime): AnklangIndexAdapter {
+  return {
+    async upsert(problem) {
+      try {
+        const rawSettings = await runtime.readSettings();
+        const parsedSettings = anklangSettingsSchema.safeParse(rawSettings);
+        if (!parsedSettings.success || !parsedSettings.data.privateContentAuthorized) {
+          return undefined;
+        }
+        const token = await runtime.readToken();
+        const normalizedToken = token?.trim();
+        if (normalizedToken === undefined || normalizedToken.length === 0) {
+          return undefined;
+        }
+        const settings = parsedSettings.data;
+        const client = new AnklangClient({
+          baseUrl: settings.baseUrl,
+          apiVersion: settings.apiVersion,
+          token: normalizedToken,
+          privateContentAuthorized: settings.privateContentAuthorized,
+          retryAttempts: settings.retryAttempts,
+          timeoutMs: settings.timeoutMs,
+          indexTimeoutMs: settings.indexTimeoutMs,
+          ...(runtime.fetch === undefined ? {} : { fetch: runtime.fetch })
+        });
+        return await client.upsert({
+          apiVersion: "1",
+          requestId: randomUUID(),
+          externalId: problem.externalId,
+          updatedAt: problem.updatedAt,
+          problem: {
+            title: problem.title,
+            basicStatement: problem.basicStatement
+          }
+        });
+      } catch {
+        return undefined;
+      }
+    }
+  };
 }
 
 /** 把本地可安全公开的失败状态写成审核条目，不复制异常或上游响应正文。 */
@@ -564,17 +1000,19 @@ export function createAnklangUnavailableReviewItem(
   reasonCode: AnklangNoncompleteReasonCode,
   now: () => Date = () => new Date()
 ): ReviewItemInput {
-  const result = anklangV2ResultSchema.parse({
-    apiVersion: "2",
-    contentHash: input.contentHash,
-    checkedAt: now().toISOString(),
-    completion: {
-      status: "unavailable",
-      reasonCode,
-      retryable: reasonCode !== "service_invalid_response"
-    },
-    candidates: []
-  });
+  const result = projectAnklangSearchResult(
+    anklangV2ResultSchema.parse({
+      apiVersion: "2",
+      contentHash: input.contentHash,
+      checkedAt: now().toISOString(),
+      completion: {
+        status: "unavailable",
+        reasonCode,
+        retryable: reasonCode !== "service_invalid_response"
+      },
+      candidates: []
+    })
+  );
   return toReviewItem(result, []);
 }
 
@@ -585,7 +1023,7 @@ async function readOrCheck(
   settings: AnklangSettings,
   cache: AnklangCache | undefined,
   now: () => Date
-): Promise<AnklangResult> {
+): Promise<AnklangSearchResult> {
   const cacheKey = `${settings.apiVersion}:${new URL(settings.baseUrl).href}:${settings.cacheMinutes}:${input.contentHash}`;
   let cached: unknown | undefined;
   try {
@@ -595,7 +1033,7 @@ async function readOrCheck(
   }
   const reusable = reusableCachedResult(cached, settings.apiVersion, input.contentHash, now());
   if (reusable !== undefined) {
-    return reusable;
+    return projectAnklangSearchResult(reusable);
   }
 
   const request = {
@@ -609,7 +1047,7 @@ async function readOrCheck(
       basicStatement: input.problem.basicStatement
     }
   } as AnklangRequest;
-  const result = await client.check(request, signal);
+  const result = projectAnklangSearchResult(await client.check(request, signal));
 
   if (result.apiVersion === "1") {
     const expiresAt = new Date(now().getTime() + settings.cacheMinutes * 60_000).toISOString();
@@ -633,7 +1071,7 @@ async function readOrCheck(
 async function safeCacheSet(
   cache: AnklangCache | undefined,
   cacheKey: string,
-  result: AnklangResult,
+  result: AnklangSearchResult,
   expiresAt: string
 ): Promise<void> {
   try {
@@ -668,26 +1106,10 @@ function reusableCachedResult(
   return parsed.data;
 }
 
-function blockedResult(
-  result: AnklangResult,
-  candidates: AnklangResult["candidates"],
-  code: "anklang_similar_problem" | "anklang_partial_same_problem"
-): BeforeSubmitResult {
-  return {
-    decision: "block",
-    code,
-    message: result.recommendation?.message ?? "",
-    details: {
-      candidateCount: candidates.length,
-      maximumSimilarity: candidates[0]?.similarity ?? 0,
-      contentHash: result.contentHash
-    }
-  };
-}
 
 function toReviewItem(
-  result: AnklangResult,
-  candidates: AnklangResult["candidates"]
+  result: AnklangSearchResult,
+  candidates: AnklangSearchResult["candidates"]
 ): ReviewItemInput {
   const highest = candidates[0]?.similarity;
   const status = result.apiVersion === "1" ? "complete" : result.completion.status;
@@ -719,6 +1141,21 @@ function toReviewItem(
     data: { ...result, candidates },
     contentHash: result.contentHash,
     ...(expiresAt === undefined ? {} : { expiresAt })
+  };
+}
+
+export function rebuildAnklangReviewItem(
+  item: ReviewItemInput,
+  candidates: AnklangSearchResult["candidates"]
+): ReviewItemInput {
+  const result = anklangSearchResultSchema.parse(item.data);
+  const rebuilt = toReviewItem(result, candidates);
+  const { expiresAt: _oldExpiresAt, ...withoutExpiresAt } = item;
+  return {
+    ...withoutExpiresAt,
+    summary: rebuilt.summary,
+    data: rebuilt.data,
+    ...(rebuilt.expiresAt === undefined ? {} : { expiresAt: rebuilt.expiresAt })
   };
 }
 

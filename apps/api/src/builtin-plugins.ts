@@ -1,12 +1,14 @@
 import {
   anklangCheckId,
-  anklangResultSchema,
+  anklangSearchResultSchema,
   anklangReviewItemType,
   anklangSettingsSchema,
+  createAnklangIndexAdapter,
   createAnklangUnavailableReviewItem,
   createAnklangCheck,
   type AnklangCache,
-  type AnklangFetch
+  type AnklangFetch,
+  type AnklangIndexAdapter
 } from "@urmotiv/plugin-anklang";
 import {
   defaultReviewRuleId,
@@ -21,7 +23,7 @@ import {
   registerFpsFormatPlugin
 } from "@urmotiv/plugin-fps-format";
 
-import type { PluginRegistry } from "@urmotiv/plugin-sdk";
+import type { BeforeSubmitCheck, PluginRegistry } from "@urmotiv/plugin-sdk";
 import type { TrustedPluginDefinition } from "./plugin-host";
 
 /**
@@ -42,6 +44,12 @@ export interface AnklangHookRuntime {
 
 export interface BuiltinPluginRuntime {
   readonly anklang?: AnklangHookRuntime;
+}
+
+export function createAnklangIndexAdapterForRuntime(
+  runtime: AnklangHookRuntime
+): AnklangIndexAdapter {
+  return createAnklangIndexAdapter(runtime);
 }
 
 export const anklangPluginId = "org.ustc.urmotiv.anklang";
@@ -90,7 +98,7 @@ export function createBuiltinPluginDefinitions(
     {
       source: "builtin:anklang",
       manifest: {
-        id: anklangPluginId, name: "原题相似度检查", version: "0.2.0", apiVersion: "1",
+        id: anklangPluginId, name: "原题相似度检查", version: "0.3.0", apiVersion: "1",
         serverEntry: "dist/index.js", permissions: ["org.ustc.urmotiv.anklang.configure", "org.ustc.urmotiv.anklang.results.read"], settingsSchema: "settings.schema.json"
       },
       secretDefinitions: [{
@@ -103,7 +111,7 @@ export function createBuiltinPluginDefinitions(
         properties: {
           baseUrl: {
             type: "string", format: "uri", title: "Anklang 服务地址",
-            description: "Urmotiv 调用原题检索服务的 HTTP 或 HTTPS 地址。认证令牌单独保存。"
+            description: "Urmotiv 调用原题检索服务的本地或私有 HTTP/HTTPS 地址；认证令牌单独保存。"
           },
           apiVersion: {
             type: "string",
@@ -117,7 +125,20 @@ export function createBuiltinPluginDefinitions(
           },
           timeoutMs: {
             type: "integer", minimum: 1000, maximum: 120000, default: 120000,
-            title: "最长等待时间（毫秒）"
+            title: "检索最长等待时间（毫秒）"
+          },
+          indexTimeoutMs: {
+            type: "integer", minimum: 1000, maximum: 30000, default: 10000,
+            title: "索引同步最长等待时间（毫秒）"
+          },
+          retryAttempts: {
+            type: "integer", minimum: 1, maximum: 3, default: 2,
+            title: "最多请求次数",
+            description: "网络失败、超时、408、429、502、503、504 最多执行此次数；认证、冲突和契约错误不重试。"
+          },
+          privateContentAuthorized: {
+            type: "boolean", default: false, title: "允许发送私密题面",
+            description: "仅在确认 Anklang 的存储和嵌入链路全程留在批准的私有边界后启用。"
           },
           failureBehavior: {
             type: "string",
@@ -127,10 +148,7 @@ export function createBuiltinPluginDefinitions(
             ],
             default: "block",
             title: "服务不可用时",
-            description: "阻止提交表示必须完成查重；继续提交表示服务暂时不可用时仍可进入审核。"
-          },
-          blockWhenRecommended: {
-            type: "boolean", default: true, title: "服务建议拦截时阻止提交"
+            description: "只控制无法取得配置检查时的提交；相似候选本身不会阻止提交。"
           },
           minimumSimilarityToShow: {
             type: "number", minimum: 0, maximum: 1, default: 0.3,
@@ -139,7 +157,7 @@ export function createBuiltinPluginDefinitions(
           cacheMinutes: {
             type: "integer", minimum: 1, maximum: 10080, default: 1440,
             title: "本地最长复用时间（分钟）",
-            description: "v2 取服务绝对到期时间与这个本地上限中较早的时间；v1 只使用这个上限。"
+            description: "只复用服务明确允许的完整检索结果，且不超过这个本地上限。"
           }
         }
       },
@@ -201,7 +219,7 @@ function createAnklangHookRegistrar(runtime: AnklangHookRuntime): (registry: Plu
     registry.registerReviewItemType({
       type: anklangReviewItemType,
       displayName: "原题相似度结果",
-      dataSchema: anklangResultSchema
+      dataSchema: anklangSearchResultSchema
     });
     registry.registerBeforeSubmitCheck({
       id: anklangCheckId,
@@ -211,17 +229,36 @@ function createAnklangHookRegistrar(runtime: AnklangHookRuntime): (registry: Plu
       run: async (input, context) => {
         const rawSettings = await runtime.readSettings();
         if (rawSettings === undefined) {
-          return { decision: "continue" };
+          return {
+            decision: "continue",
+            reviewItems: [createAnklangUnavailableReviewItem(input, "service_unavailable")]
+          };
         }
-        const settings = anklangSettingsSchema.parse(rawSettings);
-        const token = await runtime.readToken();
-        const check = createAnklangCheck({
-          settings,
-          ...(token === undefined ? {} : { token }),
-          cache: runtime.cache,
-          ...(runtime.fetch === undefined ? {} : { fetch: runtime.fetch })
-        });
-
+        const parsedSettings = anklangSettingsSchema.safeParse(rawSettings);
+        if (!parsedSettings.success) {
+          throw new Error("Anklang 服务配置不可用。");
+        }
+        const settings = parsedSettings.data;
+        let check: BeforeSubmitCheck;
+        try {
+          const token = await runtime.readToken();
+          check = createAnklangCheck({
+            settings,
+            ...(token === undefined ? {} : { token }),
+            cache: runtime.cache,
+            ...(runtime.fetch === undefined ? {} : { fetch: runtime.fetch })
+          });
+        } catch {
+          if (settings.failureBehavior === "continue") {
+            return {
+              decision: "continue",
+              reviewItems: [
+                createAnklangUnavailableReviewItem(input, "service_unavailable")
+              ]
+            };
+          }
+          throw new Error("Anklang 服务配置不可用。");
+        }
         const controller = new AbortController();
         const cancel = (): void => controller.abort();
         context.signal.addEventListener("abort", cancel, { once: true });
@@ -240,17 +277,15 @@ function createAnklangHookRegistrar(runtime: AnklangHookRuntime): (registry: Plu
             throw error;
           }
           if (settings.failureBehavior === "continue") {
-            return settings.apiVersion === "2"
-              ? {
-                  decision: "continue",
-                  reviewItems: [
-                    createAnklangUnavailableReviewItem(
-                      input,
-                      timedOut ? "search_timeout" : "service_unavailable"
-                    )
-                  ]
-                }
-              : { decision: "continue" };
+            return {
+              decision: "continue",
+              reviewItems: [
+                createAnklangUnavailableReviewItem(
+                  input,
+                  timedOut ? "search_timeout" : "service_unavailable"
+                )
+              ]
+            };
           }
           throw error;
         } finally {

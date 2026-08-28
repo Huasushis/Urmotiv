@@ -12,6 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
 import {
   anklangPluginId,
+  anklangServiceTokenSecretName,
   createBuiltinPluginDefinitions,
   type AnklangHookRuntime
 } from "../src/builtin-plugins";
@@ -19,7 +20,7 @@ import { DatabaseContestStore } from "../src/database-contest-store";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo";
 import { DatabaseDataStore } from "../src/database-store";
 import { DatabasePluginStore } from "../src/database-plugin-store";
-import { TrustedPluginHost } from "../src/plugin-host";
+import { AesGcmPluginSecretBox, TrustedPluginHost } from "../src/plugin-host";
 import { DatabaseReviewItemStore } from "../src/review-item-store";
 // 不再需要 registerOwnedDatabase——隔离集群方案中数据库在一次性容器内创建。
 
@@ -193,11 +194,13 @@ describePostgres("手动原题检索的真实 PostgreSQL 撤权竞态", () => {
         }
       }), { status: 200, headers: { "content-type": "application/json" } });
     };
-
     let hostReference: TrustedPluginHost | undefined;
     const runtime: AnklangHookRuntime = {
       readSettings: async () => hostReference?.readEnabledPluginSettings(anklangPluginId),
-      readToken: async () => undefined,
+      readToken: async () => hostReference?.readSecretForPlugin(
+        anklangPluginId,
+        anklangServiceTokenSecretName
+      ),
       cache: {
         get: async () => undefined,
         set: async () => undefined
@@ -206,7 +209,8 @@ describePostgres("手动原题检索的真实 PostgreSQL 撤权竞态", () => {
     };
     const host = new TrustedPluginHost(
       createBuiltinPluginDefinitions({ anklang: runtime }),
-      new DatabasePluginStore(database)
+      new DatabasePluginStore(database),
+      new AesGcmPluginSecretBox(Buffer.alloc(32, 6))
     );
     hostReference = host;
     app = await createApp({
@@ -216,9 +220,9 @@ describePostgres("手动原题检索的真实 PostgreSQL 撤权竞态", () => {
       demoUserIds: Object.values(databaseDemoUserIds),
       demoLoginUserIds: databaseDemoUserIds,
       pluginHost: host,
-      reviewItems: new DatabaseReviewItemStore(database)
+      reviewItems: new DatabaseReviewItemStore(database),
+      ...(runtime.fetch === undefined ? {} : { anklangFetch: runtime.fetch })
     });
-
     const cookie = await login(app);
     const problemId = await createPendingProblem(app, cookie);
     const enabled = await host.update(
@@ -227,7 +231,8 @@ describePostgres("手动原题检索的真实 PostgreSQL 撤权竞态", () => {
         expectedRevision: 1,
         clearSecrets: [],
         state: "enabled",
-        settings: { baseUrl: "http://anklang.test" }
+        settings: { baseUrl: "http://127.0.0.1:8730", privateContentAuthorized: true },
+        secrets: { [anklangServiceTokenSecretName]: "test-service-token" }
       },
       "0",
       randomUUID()

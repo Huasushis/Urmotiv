@@ -1,4 +1,5 @@
 import type { PermissionGrant, ProblemTag } from "@urmotiv/contracts";
+import type { AnklangIndexAdapter } from "@urmotiv/plugin-anklang";
 import type { FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
@@ -86,12 +87,16 @@ function robotWithFrozenEdit(): StoredUser {
   return { ...demoUser("robot"), grants: [...demoUser("robot").grants, allow("problem.frozen.edit")] };
 }
 
-async function makeApp(users: StoredUser[]): Promise<{ app: FastifyInstance; store: FrozenEditAuditStore }> {
+async function makeApp(
+  users: StoredUser[],
+  anklangIndexAdapter?: AnklangIndexAdapter
+): Promise<{ app: FastifyInstance; store: FrozenEditAuditStore }> {
   const store = new FrozenEditAuditStore(users, demoTags);
   const app = await createApp({
     demoAuthEnabled: true,
     store,
-    demoUserIds: users.map((user) => user.id)
+    demoUserIds: users.map((user) => user.id),
+    ...(anklangIndexAdapter === undefined ? {} : { anklangIndexAdapter })
   });
   openApps.push(app);
   return { app, store };
@@ -423,5 +428,81 @@ describe("冻结字段管理员覆盖", () => {
     expect(result.revision).toBe(draft.revision + 1);
     expect(result.content.basicStatement).toBe("修订后的题面");
     expect(result.content.basicSolution).toBe("修订后的题解");
+  });
+
+  it("索引同步只覆盖 submit、可搜索标题和冻结基础题面", async () => {
+    const syncs: Array<{
+      externalId: string;
+      title: string;
+      basicStatement: string;
+      updatedAt: string;
+    }> = [];
+    const anklangIndexAdapter: AnklangIndexAdapter = {
+      upsert: async (problem) => {
+        syncs.push(problem);
+      }
+    };
+    const users = [
+      ...createDemoUsers().filter((user) => user.id !== "member"),
+      adminWithFrozenEdit
+    ];
+    const { app } = await makeApp(users, anklangIndexAdapter);
+    const authorCookie = await login(app, "author");
+    const memberCookie = await login(app, "member");
+    const pending = await createSubmittedProblem(app, authorCookie);
+    expect(syncs).toHaveLength(1);
+    expect(syncs[0]).toMatchObject({
+      externalId: pending.id,
+      title: pending.title,
+      basicStatement: pending.content.basicStatement
+    });
+
+    const renamed = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/problems/${pending.id}`,
+      headers: { cookie: memberCookie, origin },
+      payload: { expectedRevision: pending.revision, title: "可搜索的新标题" }
+    });
+    expect(renamed.statusCode).toBe(200);
+    expect(syncs).toHaveLength(2);
+    expect(syncs[1]).toMatchObject({ externalId: pending.id, title: "可搜索的新标题" });
+
+    const approved = await approveProblem(
+      app,
+      await login(app, "reviewer"),
+      memberCookie,
+      renamed.json() as ProblemResult,
+      authorCookie
+    );
+    const frozen = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${approved.id}/frozen-fields`,
+      headers: { cookie: memberCookie, origin },
+      payload: {
+        expectedRevision: approved.revision,
+        reason: "修正冻结题面",
+        content: { basicStatement: "修正后的可搜索基础题面" }
+      }
+    });
+    expect(frozen.statusCode).toBe(200);
+    expect(syncs).toHaveLength(3);
+    expect(syncs[2]).toMatchObject({
+      externalId: approved.id,
+      title: "可搜索的新标题",
+      basicStatement: "修正后的可搜索基础题面"
+    });
+
+    const solutionOnly = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${approved.id}/frozen-fields`,
+      headers: { cookie: memberCookie, origin },
+      payload: {
+        expectedRevision: (frozen.json() as ProblemResult).revision,
+        reason: "只修正冻结题解",
+        content: { basicSolution: "修正后的冻结题解" }
+      }
+    });
+    expect(solutionOnly.statusCode).toBe(200);
+    expect(syncs).toHaveLength(3);
   });
 });

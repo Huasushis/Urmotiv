@@ -119,13 +119,20 @@ function request(version: "1" | "2") {
 }
 
 describe("Anklang 设置、清单与 HTTP 边界", () => {
-  it("新配置默认使用 v2，并保留显式 v1 迁移选项", () => {
+  it("新配置默认使用 v2，私密内容授权默认关闭，并保留显式 v1 迁移选项", () => {
     expect(
-      anklangSettingsSchema.parse({ baseUrl: "https://anklang.example.test" })
-    ).toMatchObject({ apiVersion: "2", timeoutMs: 120_000 });
+      anklangSettingsSchema.parse({ baseUrl: "http://127.0.0.1:8730" })
+    ).toMatchObject({
+      apiVersion: "2",
+      timeoutMs: 120_000,
+      indexTimeoutMs: 10_000,
+      retryAttempts: 2,
+      privateContentAuthorized: false
+    });
     expect(
       anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
         apiVersion: "1"
       }).apiVersion
     ).toBe("1");
@@ -148,7 +155,8 @@ describe("Anklang 设置、清单与 HTTP 边界", () => {
     });
     expect(() =>
       anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
         timeoutMs: 120_001
       })
     ).toThrow();
@@ -156,7 +164,7 @@ describe("Anklang 设置、清单与 HTTP 边界", () => {
     const manifest = pluginManifestSchema.parse(
       JSON.parse(readFileSync(new URL("../urmotiv-plugin.json", import.meta.url), "utf8"))
     );
-    expect(manifest).toMatchObject({ version: "0.2.0", apiVersion: "1" });
+    expect(manifest).toMatchObject({ version: "0.3.0", apiVersion: "1" });
   });
 
   it("拒绝服务地址中夹带账号密码", () => {
@@ -167,7 +175,7 @@ describe("Anklang 设置、清单与 HTTP 边界", () => {
 
   it("v2 只发送查重所需字段，固定路径和版本且禁止重定向", async () => {
     const fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-      expect(String(url)).toBe("https://anklang.example.test/api/v2/checks/similarity");
+      expect(String(url)).toBe("http://127.0.0.1:8730/api/v2/checks/similarity");
       expect(init?.redirect).toBe("error");
       expect(init?.headers).toEqual(
         expect.objectContaining({
@@ -181,7 +189,8 @@ describe("Anklang 设置、清单与 HTTP 边界", () => {
       return jsonResponse(v2Result());
     });
     const client = new AnklangClient({
-      baseUrl: "https://anklang.example.test",
+      baseUrl: "http://127.0.0.1:8730",
+      privateContentAuthorized: true,
       token: "hidden-token",
       fetch
     });
@@ -192,7 +201,7 @@ describe("Anklang 设置、清单与 HTTP 边界", () => {
 
   it("只有显式配置才调用 v1 路径并要求 v1 正文", async () => {
     const fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-      expect(String(url)).toBe("https://anklang.example.test/api/v1/checks/similarity");
+      expect(String(url)).toBe("http://127.0.0.1:8730/api/v1/checks/similarity");
       expect(init?.headers).toEqual(
         expect.objectContaining({ "X-Urmotiv-API-Version": "1" })
       );
@@ -200,8 +209,10 @@ describe("Anklang 设置、清单与 HTTP 边界", () => {
       return jsonResponse(v1Result());
     });
     const client = new AnklangClient({
-      baseUrl: "https://anklang.example.test",
+      baseUrl: "http://127.0.0.1:8730",
       apiVersion: "1",
+      privateContentAuthorized: true,
+      token: "hidden-token",
       fetch
     });
     await expect(client.check(request("1"), new AbortController().signal)).resolves.toEqual(
@@ -221,7 +232,7 @@ describe("Anklang 设置、清单与 HTTP 边界", () => {
       async () => new Response(marker, { status: 503, headers: { "Content-Type": "text/plain" } })
     ];
     for (const fetch of cases) {
-      const client = new AnklangClient({ baseUrl: "https://anklang.example.test", fetch });
+      const client = new AnklangClient({ baseUrl: "http://127.0.0.1:8730", privateContentAuthorized: true, token: "hidden-token", fetch });
       const rejection = client.check(request("2"), new AbortController().signal);
       await expect(rejection).rejects.toThrow();
       await rejection.catch((error: unknown) => {
@@ -245,7 +256,7 @@ describe("Anklang 设置、清单与 HTTP 边界", () => {
         })
     ];
     for (const fetch of cases) {
-      const client = new AnklangClient({ baseUrl: "https://anklang.example.test", fetch });
+      const client = new AnklangClient({ baseUrl: "http://127.0.0.1:8730", privateContentAuthorized: true, token: "hidden-token", fetch });
       await expect(
         client.check(request("2"), new AbortController().signal)
       ).rejects.toThrow("格式不正确");
@@ -349,7 +360,8 @@ describe("提交前相似度检查与缓存", () => {
     };
     const fetch = vi.fn(async () => jsonResponse(v2Result()));
     const check = createAnklangCheck({
-      settings: anklangSettingsSchema.parse({ baseUrl: "https://anklang.example.test" }),
+      token: "hidden-token",
+      settings: anklangSettingsSchema.parse({ baseUrl: "http://127.0.0.1:8730", privateContentAuthorized: true }),
       cache,
       fetch,
       now: () => current
@@ -358,7 +370,7 @@ describe("提交前相似度检查与缓存", () => {
     await check.run(input, { signal: new AbortController().signal });
     expect(cache.set).toHaveBeenCalledTimes(1);
     expect(stored?.expiresAt).toBe(expiresAt);
-    expect(stored?.key).toContain(`2:https://anklang.example.test/:1440:${contentHash}`);
+    expect(stored?.key).toContain(`2:http://127.0.0.1:8730/:1440:${contentHash}`);
     await check.run(input, { signal: new AbortController().signal });
     expect(fetch).toHaveBeenCalledTimes(1);
 
@@ -373,7 +385,8 @@ describe("提交前相似度检查与缓存", () => {
       set: vi.fn(async () => undefined)
     };
     const check = createAnklangCheck({
-      settings: anklangSettingsSchema.parse({ baseUrl: "https://anklang.example.test" }),
+      token: "hidden-token",
+      settings: anklangSettingsSchema.parse({ baseUrl: "http://127.0.0.1:8730", privateContentAuthorized: true }),
       cache,
       fetch: async () => jsonResponse(v2Result()),
       now: () => new Date("2026-08-01T02:00:00.000Z")
@@ -401,8 +414,10 @@ describe("提交前相似度检查与缓存", () => {
       )
     );
     const check = createAnklangCheck({
+      token: "hidden-token",
       settings: anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
         cacheMinutes: 60
       }),
       cache,
@@ -430,6 +445,7 @@ describe("提交前相似度检查与缓存", () => {
     };
     const fetch = vi.fn(async () => jsonResponse(v2Result()));
     const common = {
+      token: "hidden-token",
       cache,
       fetch,
       now: () => new Date(checkedAt)
@@ -438,14 +454,16 @@ describe("提交前相似度检查与缓存", () => {
     const longCacheCheck = createAnklangCheck({
       ...common,
       settings: anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
         cacheMinutes: 1_440
       })
     });
     const shortCacheCheck = createAnklangCheck({
       ...common,
       settings: anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
         cacheMinutes: 1
       })
     });
@@ -468,8 +486,10 @@ describe("提交前相似度检查与缓存", () => {
         set: vi.fn(async () => undefined)
       };
       const check = createAnklangCheck({
+        token: "hidden-token",
         settings: anklangSettingsSchema.parse({
-          baseUrl: "https://anklang.example.test",
+          baseUrl: "http://127.0.0.1:8730",
+          privateContentAuthorized: true,
           failureBehavior: "continue"
         }),
         cache,
@@ -486,34 +506,12 @@ describe("提交前相似度检查与缓存", () => {
     }
   });
 
-  it("partial 只有可信同题复核可拦截，并保留低于显示阈值的拦截依据", async () => {
-    const trusted = v2Result({
-      status: "partial",
-      candidates: [{ ...candidate, similarity: 0.1, sameProblemSuggestion: true }],
-      blockSubmission: true
-    });
-    const check = createAnklangCheck({
-      settings: anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
-        minimumSimilarityToShow: 0.9
-      }),
-      fetch: async () => jsonResponse(trusted)
-    });
-    const output = await check.run(input, { signal: new AbortController().signal });
-    expect(output).toEqual({
-      decision: "block",
-      code: "anklang_partial_same_problem",
-      message: "请继续人工核对。",
-      details: { candidateCount: 1, maximumSimilarity: 0.1, contentHash }
-    });
-    expect(JSON.stringify(output)).not.toContain("sample-1");
-    expect(JSON.stringify(output)).not.toContain(input.problem.basicStatement);
-  });
 
   it("未完整结果按 failureBehavior 阻止或明确降级，不会伪装成完整空候选", async () => {
     const partial = v2Result({ status: "partial", candidates: [] });
     const blocking = createAnklangCheck({
-      settings: anklangSettingsSchema.parse({ baseUrl: "https://anklang.example.test" }),
+      token: "hidden-token",
+      settings: anklangSettingsSchema.parse({ baseUrl: "http://127.0.0.1:8730", privateContentAuthorized: true }),
       fetch: async () => jsonResponse(partial)
     });
     await expect(
@@ -521,8 +519,10 @@ describe("提交前相似度检查与缓存", () => {
     ).rejects.toThrow("没有完整完成");
 
     const continuing = createAnklangCheck({
+      token: "hidden-token",
       settings: anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
         failureBehavior: "continue"
       }),
       fetch: async () => jsonResponse(partial)
@@ -543,8 +543,10 @@ describe("提交前相似度检查与缓存", () => {
       async () => jsonResponse({ ...v2Result(), extra: marker })
     ]) {
       const check = createAnklangCheck({
+        token: "hidden-token",
         settings: anklangSettingsSchema.parse({
-          baseUrl: "https://anklang.example.test",
+          baseUrl: "http://127.0.0.1:8730",
+          privateContentAuthorized: true,
           failureBehavior: "continue"
         }),
         fetch
@@ -594,7 +596,8 @@ describe("candidate.metadata 镜像契约", () => {
 
   function throughReviewItem(metadata: unknown) {
     const ck = createAnklangCheck({
-      settings: anklangSettingsSchema.parse({ baseUrl: "https://anklang.example.test" }),
+      token: "hidden-token",
+      settings: anklangSettingsSchema.parse({ baseUrl: "http://127.0.0.1:8730", privateContentAuthorized: true }),
       fetch: async () => jsonResponse(withCandidateMetadata(metadata))
     });
     return ck.run(input, { signal: new AbortController().signal });
@@ -624,8 +627,10 @@ describe("candidate.metadata 镜像契约", () => {
     // v1 候选 schema 未声明 metadata：strict 拒绝携带 metadata 的 v1 候选。
     const v1 = { ...v1Result(), candidates: [{ ...candidate, metadata: { a: "b" } }] };
     const client = new AnklangClient({
-      baseUrl: "https://anklang.example.test",
+      baseUrl: "http://127.0.0.1:8730",
       apiVersion: "1",
+      privateContentAuthorized: true,
+      token: "hidden-token",
       fetch: async () => jsonResponse(v1)
     });
     await expect(client.check(request("1"), new AbortController().signal)).rejects.toThrow(
@@ -713,7 +718,7 @@ describe("candidate.metadata 镜像契约", () => {
     const withoutData = continueReviewItems(withoutMetadata)[0]?.data as AnklangV2Result;
     expect(withData.contentHash).toBe(withoutData.contentHash);
     expect(withData.candidates[0]?.similarity).toBe(withoutData.candidates[0]?.similarity);
-    expect(withData.recommendation).toEqual(withoutData.recommendation);
+    expect(withData.recommendation).toBeUndefined();
   });
 });
 
@@ -748,10 +753,11 @@ describe("搜索型只读结果：recommendation 与 reuse 可选", () => {
     });
 
     const check = createAnklangCheck({
+      token: "hidden-token",
       settings: anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
         failureBehavior: "continue",
-        blockWhenRecommended: true
       }),
       fetch: async () => jsonResponse(value)
     });
@@ -772,39 +778,13 @@ describe("搜索型只读结果：recommendation 与 reuse 可选", () => {
     });
   });
 
-  it("显式旧版决策字段仍参与本地 blockWhenRecommended 拦截", async () => {
-    const legacy = v2Result({ blockSubmission: true });
-    const check = createAnklangCheck({
-      settings: anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
-        blockWhenRecommended: true
-      }),
-      fetch: async () => jsonResponse(legacy)
-    });
-    const output = await check.run(input, { signal: new AbortController().signal });
-    expect(output).toMatchObject({
-      decision: "block",
-      code: "anklang_similar_problem",
-      message: "请继续人工核对。"
-    });
-
-    // blockWhenRecommended=false 时显式推荐不会拦截。
-    const permissive = createAnklangCheck({
-      settings: anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
-        blockWhenRecommended: false
-      }),
-      fetch: async () => jsonResponse(legacy)
-    });
-    await expect(
-      permissive.run(input, { signal: new AbortController().signal })
-    ).resolves.toMatchObject({ decision: "continue" });
-  });
 
   it("缺失决策字段时非法 metadata 仍 fail closed 且不生成合成字段", async () => {
     const check = createAnklangCheck({
+      token: "hidden-token",
       settings: anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
         failureBehavior: "continue"
       }),
       fetch: async () =>
@@ -832,8 +812,10 @@ describe("搜索型只读结果：recommendation 与 reuse 可选", () => {
     const set = vi.fn(async () => undefined);
     const cache: AnklangCache = { get: vi.fn(async () => undefined), set };
     const check = createAnklangCheck({
+      token: "hidden-token",
       settings: anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
         failureBehavior: "continue",
         cacheMinutes: 60
       }),
@@ -862,8 +844,10 @@ describe("搜索型只读结果：recommendation 与 reuse 可选", () => {
   it("partial/unavailable 失败语义不变：block 模式仍抛错，continue 模式明确降级", async () => {
     const partial = v2Result({ status: "partial", candidates: [] });
     const blocking = createAnklangCheck({
+      token: "hidden-token",
       settings: anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
         failureBehavior: "block"
       }),
       fetch: async () => jsonResponse(partial)
@@ -873,8 +857,10 @@ describe("搜索型只读结果：recommendation 与 reuse 可选", () => {
     ).rejects.toThrow("没有完整完成");
 
     const continuing = createAnklangCheck({
+      token: "hidden-token",
       settings: anklangSettingsSchema.parse({
-        baseUrl: "https://anklang.example.test",
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
         failureBehavior: "continue"
       }),
       fetch: async () => jsonResponse(partial)

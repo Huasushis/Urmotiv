@@ -20,6 +20,19 @@ Urmotiv 是面向竞赛组织者的题库与命题协作系统：把题目草稿
 - **受信任插件**：提交前检查、审核条目、审核规则和题目包格式在服务端注册；插件不能授予核心权限。
 - **独立服务边界**：Anklang 只做原题相似性检索，支持实时添加后查询并返回查询结果。题目的查重/检查信息属于 Urmotiv 的题目属性，插件可以写入，Fermata 可以读取；Anklang 不是流程、审核状态或权限的权威。
 
+### Anklang 原题检索插件
+
+内置 `org.ustc.urmotiv.anklang` 只生成仅检索结果候选参考，不执行模型审核、推荐工作流或最终裁决。管理员必须使用本地/私有 `baseUrl`（例如 `http://127.0.0.1:8730`），显式确认 `privateContentAuthorized: true`，并把非空认证令牌单独保存为 `serviceToken` 插件密钥；默认未授权、停用、缺密钥或设置错误时不会发出请求。
+
+索引同步通过 `ProblemService` 的窄适配器，在成功 submit、`pending_review`/`approved` 标题变化或冻结 `basicStatement` 变化后调用 `PUT /api/v1/index/problems`。draft/rejected、solution-only、无变化和删除不同步。网络/超时/408/429/502/503/504 按 `retryAttempts`（1–3 次，默认 2）有限重试；401/409/契约错误不重试；`indexTimeoutMs`（1–30 秒，默认 10 秒）到期或失败不会回滚本地提交。候选返回前按请求用户权限过滤 Urmotiv 来源，未知/隐藏/明确拒绝与当前题目自身候选静默移除，授权候选用当前标题替换。
+
+本地 Node 24 合成 E2E（端口占用即失败，不停止现有服务）：
+
+```bash
+ANKLANG_SOURCE_DIR=/path/to/anklang \
+  pnpm --filter @urmotiv/plugin-anklang e2e:synthetic
+```
+
 ## 当前界面入口
 
 本地 Compose 默认把 Web 发布到 `http://127.0.0.1:8080`。打开 `/login` 登录；登录后使用左侧导航：

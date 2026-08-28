@@ -352,6 +352,9 @@ importers:
       '@types/node':
         specifier: latest
         version: 26.1.1
+      tsx:
+        specifier: 4.23.1
+        version: 4.23.1
       typescript:
         specifier: latest
         version: 7.0.2

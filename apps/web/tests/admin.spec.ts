@@ -52,16 +52,16 @@ const reviewPolicy = {
 const plugin = {
   id: "org.ustc.urmotiv.anklang",
   name: "原题检索",
-  version: "0.1.0",
-  apiVersion: "v1-private-detail",
+  version: "0.3.0",
+  apiVersion: "1",
   source: "server-only-source",
   state: "disabled",
   failureCode: null,
   settings: {
-    baseUrl: "https://search.internal",
+    baseUrl: "http://127.0.0.1:8730",
     timeoutMs: 30000,
+    privateContentAuthorized: false,
     failureBehavior: "block",
-    blockWhenRecommended: true,
     minimumSimilarityToShow: 0.3,
     cacheMinutes: 1440
   },

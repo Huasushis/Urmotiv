@@ -94,7 +94,7 @@ describe("插件管理 HTTP 接口", () => {
       (candidate) => pluginManifestSchema.parse(candidate.manifest).id === anklangPluginId
     );
     expect(definition).toBeDefined();
-    expect(pluginManifestSchema.parse(definition?.manifest).version).toBe("0.2.0");
+    expect(pluginManifestSchema.parse(definition?.manifest).version).toBe("0.3.0");
     const settingsSchema = pluginSettingsFormSchema.parse(definition?.settingsSchema);
     expect(settingsSchema.properties?.apiVersion?.default).toBe("2");
     const timeoutDefinition = settingsSchema.properties?.timeoutMs;

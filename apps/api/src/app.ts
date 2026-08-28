@@ -102,12 +102,15 @@ import {
   anklangCheckId,
   anklangCompletionStatus,
   type AnklangCache,
-  type AnklangCompletionStatus
+  type AnklangCompletionStatus,
+  type AnklangFetch,
+  type AnklangIndexAdapter
 } from "@urmotiv/plugin-anklang";
 import type { FermataFetch } from "@urmotiv/plugin-fermata-control";
 import {
   anklangPluginId,
   anklangServiceTokenSecretName,
+  createAnklangIndexAdapterForRuntime,
   createBuiltinPluginDefinitions,
   type AnklangHookRuntime
 } from "./builtin-plugins";
@@ -187,6 +190,10 @@ export interface ApiAppOptions {
   demoLoginUserIds?: Readonly<Record<string, string>>;
   pluginHost?: TrustedPluginHost;
   fermataFetch?: FermataFetch;
+  /** 仅测试或本地合成环境替换 Anklang HTTP 客户端。 */
+  anklangFetch?: AnklangFetch;
+  /** 可选的窄索引适配器；未提供时由内置 Anklang 运行时创建。 */
+  anklangIndexAdapter?: AnklangIndexAdapter;
   problemFiles?: ProblemFilePartsOptions;
   transfer?: TransferService;
   reviewItems?: ReviewItemStore;
@@ -407,12 +414,7 @@ function createSubmitCheckRunner(host: TrustedPluginHost): SubmitCheckRunner {
           checksRun: checkIds.length,
           ...(checkId === anklangCheckId
             ? {
-                similarityStatus:
-                  result.code === "anklang_partial_same_problem"
-                    ? ("partial" as const)
-                    : result.code === "anklang_similar_problem"
-                      ? ("complete" as const)
-                      : ("unavailable" as const)
+                similarityStatus: "unavailable" as const
               }
             : similarityStatus === undefined
               ? {}
@@ -515,13 +517,16 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
         anklangServiceTokenSecretName
       );
     },
-    cache: createInMemoryAnklangCache(now)
+    cache: createInMemoryAnklangCache(now),
+    ...(options.anklangFetch === undefined ? {} : { fetch: options.anklangFetch })
   };
   const pluginHost = options.pluginHost ?? new TrustedPluginHost(
     createBuiltinPluginDefinitions({ anklang: anklangRuntime }),
     new InMemoryPluginStore()
   );
   pluginHostReference = pluginHost;
+  const anklangIndexAdapter =
+    options.anklangIndexAdapter ?? createAnklangIndexAdapterForRuntime(anklangRuntime);
   const fermataControl = new FermataControlService({
     pluginHost,
     ...(options.fermataFetch === undefined ? {} : { fetch: options.fermataFetch })
@@ -540,6 +545,7 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     submitChecks,
     reviewItems,
     reviewDecisions,
+    anklangIndex: anklangIndexAdapter,
     ...(options.problemFiles === undefined
       ? {}
       : {

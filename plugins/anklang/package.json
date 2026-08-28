@@ -1,6 +1,6 @@
 {
   "name": "@urmotiv/plugin-anklang",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "exports": {
@@ -12,7 +12,8 @@
   "scripts": {
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "e2e:synthetic": "tsx scripts/synthetic-e2e.ts"
   },
   "dependencies": {
     "@urmotiv/plugin-sdk": "workspace:*",
@@ -20,6 +21,7 @@
   },
   "devDependencies": {
     "@types/node": "latest",
+    "tsx": "4.23.1",
     "typescript": "latest",
     "vitest": "latest"
   }

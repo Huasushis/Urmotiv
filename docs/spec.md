@@ -29,7 +29,7 @@ Urmotiv 管理竞赛题目的协作生命周期：草稿、题面和题解编辑
 
 插件宿主只加载编译进服务端的受信任内置代码，插件不能动态增加核心权限、读取数据库或跨插件密钥。支持提交前检查、审核条目、审核决策规则和题目包格式适配器；检查超时和失败行为按插件设置处理，明确阻止不可由客户端重试抵消。
 
-Anklang 只做原题相似性检索，支持实时添加后查询并返回查询结果；它不是 Urmotiv 的流程、审核状态、权限或最终裁决权威。题目的查重/检查信息属于 Urmotiv 问题属性，插件可以添加，Fermata 可以读取。Fermata 的建议不替代人工终审。
+Anklang 只做私有边界内的仅检索结果原题相似性检索和受控索引同步，支持实时添加后查询并返回候选参考；它不是 Urmotiv 的流程、审核状态、权限或最终裁决权威。题目的查重/检查信息属于 Urmotiv 问题属性，插件可以添加，Fermata 可以读取。查询会丢弃 `recommendation`、`sameProblemSuggestion`、`explanation` 等判断字段，候选不会阻止提交；`failureBehavior` 只处理无法取得配置检查。同步仅注入 `ProblemService`，成功 submit、`pending_review`/`approved` 标题变化和冻结 `basicStatement` 变化调用冻结 `PUT /api/v1/index/problems`，失败不回滚本地修改。
 
 ## 约束和当前上限
 

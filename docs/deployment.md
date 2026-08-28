@@ -104,7 +104,18 @@ docker compose --env-file /secure/path/urmotiv.env --profile fermata up -d --bui
 
 也可以设置 `COMPOSE_PROFILES=anklang,fermata` 后执行普通 `up`；不要为验证方便把外部私有 `env_file` 复制到 Urmotiv 仓库。
 
-Urmotiv 中的 Anklang 插件设置 `baseUrl`、接口版本、超时和失败行为；Fermata 管理插件设置 `baseUrl` 和超时。Anklang 只返回原题相似性查询结果，可支持实时添加后查询；题目的查重/检查属性由 Urmotiv 保存，插件可以写入，Fermata 可以读取。两项独立服务都不决定 Urmotiv 的权限、状态或最终审核。
+Urmotiv 中的 Anklang 插件只接受 `http://127.0.0.1:8730`、`localhost`、`host.docker.internal`、RFC1918/链路本地/ULA 字面量或单标签容器服务名；不得填写公网地址、账号密码、路径、查询或片段。管理员必须在确认 Anklang 自己的数据库、对象存储和 DashScope/OpenAI-compatible embedding 链路全程留在批准私有边界后，才把 `privateContentAuthorized` 从默认 `false` 改为 `true`。`serviceToken` 使用插件密钥保存，不会出现在 `/api/v1/admin/plugins` 响应。一个完整的设置请求示例见 `plugins/anklang/README.md`。
+
+Anklang 查询只生成仅检索结果候选参考，绝不执行 Urmotiv 的模型审核、推荐工作流或最终裁决。提交同步通过 `ProblemService` 的窄索引适配器调用冻结的 `PUT /api/v1/index/problems`：成功 submit、`pending_review`/`approved` 标题变更、冻结 `basicStatement` 变更才同步；solution-only、draft/rejected、无变化和删除不发请求。`retryAttempts` 为 1–3 次（默认 2），仅网络/超时/408/429/502/503/504 重试；401、409、数据结构约束错误不重试。`indexTimeoutMs` 为 1–30 秒（默认 10 秒），同步失败不回滚已经提交的 Urmotiv 修订，也不伪装成“没有相似题”。
+
+每个返回/保存的候选先移除当前题目自身候选，再按请求用户权限查找 Urmotiv 候选；未知、隐藏和明确拒绝完全等价并静默丢弃，授权的 Urmotiv 候选使用当前标题且丢弃 Anklang URL、`metadata`（附加信息）/判断字段。过滤失败时拒绝返回/保存。Fermata 仅读取 Urmotiv 自有检查属性。
+
+Node 24 合成 E2E 只在没有生产 Anklang 监听器时运行；它使用临时数据库和回环模拟模型服务，不调用外部服务。端口占用会立即失败且不会停止现有进程：
+
+```bash
+ANKLANG_SOURCE_DIR=/path/to/anklang \
+  pnpm --filter @urmotiv/plugin-anklang e2e:synthetic
+```
 
 ## 健康检查
 

@@ -22,7 +22,11 @@ import {
 import { DatabaseContestStore } from "../src/database-contest-store";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "../src/database-demo";
 import { DatabaseDataStore } from "../src/database-store";
-import { TrustedPluginHost, type TrustedPluginDefinition } from "../src/plugin-host";
+import {
+  AesGcmPluginSecretBox,
+  TrustedPluginHost,
+  type TrustedPluginDefinition
+} from "../src/plugin-host";
 import { DatabasePluginStore } from "../src/database-plugin-store";
 import { DatabaseReviewItemStore } from "../src/review-item-store";
 
@@ -46,15 +50,31 @@ afterEach(async () => {
 
 interface FakeAnklang {
   calls: number;
+  indexCalls?: number;
   blockSubmission: boolean;
   completionStatus?: "complete" | "partial" | "unavailable";
+  candidateIds?: string[];
   failWith?: Error;
   beforeResponse?: () => Promise<void>;
   includeBlockingOtherCheck?: boolean;
 }
-
 function fakeAnklangFetch(state: FakeAnklang): AnklangFetch {
-  return async (_input, init) => {
+  return async (input, init) => {
+    if (String(input).endsWith("/api/v1/index/problems")) {
+      state.indexCalls = (state.indexCalls ?? 0) + 1;
+      const request = JSON.parse(String(init?.body ?? "{}")) as {
+        requestId: string;
+        externalId: string;
+      };
+      return new Response(JSON.stringify({
+        apiVersion: "1",
+        requestId: request.requestId,
+        source: "urmotiv",
+        externalId: request.externalId,
+        contentHash: "a".repeat(64),
+        outcome: "inserted"
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
     state.calls += 1;
     if (state.failWith !== undefined) {
       throw state.failWith;
@@ -83,17 +103,15 @@ function fakeAnklangFetch(state: FakeAnklang): AnklangFetch {
       candidates:
         completionStatus === "unavailable"
           ? []
-          : [
-              {
-                source: "yuantiji",
-                externalId: "cf-1234A",
-                title: "非常相似的公开题目",
-                url: "https://example.test/problem/1234A",
-                similarity: 0.92,
-                sameProblemSuggestion: state.blockSubmission,
-                explanation: "题面结构与数据范围几乎一致。"
-              }
-            ],
+          : (state.candidateIds ?? ["cf-1234A"]).map((externalId) => ({
+              source: state.candidateIds === undefined ? "yuantiji" : "urmotiv",
+              externalId,
+              title: "上游题目标题",
+              url: "https://example.test/problem/1234A",
+              similarity: 0.92,
+              sameProblemSuggestion: state.blockSubmission,
+              explanation: "题面结构与数据范围几乎一致。"
+            })),
       recommendation: {
         blockSubmission: completionStatus === "unavailable" ? false : state.blockSubmission,
         message: state.blockSubmission
@@ -179,7 +197,11 @@ async function makeHookedApp(state: FakeAnklang): Promise<{
       }
     });
   }
-  const host = new TrustedPluginHost(definitions, new DatabasePluginStore(database));
+  const host = new TrustedPluginHost(
+    definitions,
+    new DatabasePluginStore(database),
+    new AesGcmPluginSecretBox(Buffer.alloc(32, 6))
+  );
   hostReference = host;
 
   const store = new DatabaseDataStore(database);
@@ -190,7 +212,8 @@ async function makeHookedApp(state: FakeAnklang): Promise<{
     demoUserIds: Object.values(databaseDemoUserIds),
     demoLoginUserIds: databaseDemoUserIds,
     pluginHost: host,
-    reviewItems: new DatabaseReviewItemStore(database)
+    reviewItems: new DatabaseReviewItemStore(database),
+    ...(runtime.fetch === undefined ? {} : { anklangFetch: runtime.fetch })
   });
   openApps.push(app);
   return { app, database, host };
@@ -242,7 +265,8 @@ async function enableAnklang(host: TrustedPluginHost, settings: Record<string, u
       expectedRevision: 1,
       clearSecrets: [],
       state: "enabled",
-      settings: { baseUrl: "http://anklang.test", ...settings }
+      settings: { baseUrl: "http://127.0.0.1:8730", privateContentAuthorized: true, ...settings },
+      secrets: { [anklangServiceTokenSecretName]: "test-service-token" }
     },
     "0",
     randomUUID()
@@ -269,6 +293,7 @@ describe("提交前查重链路", () => {
     expect(submitted.statusCode).toBe(200);
     expect((submitted.json() as { status: string }).status).toBe("pending_review");
     expect(state.calls).toBe(1);
+    expect(state.indexCalls).toBe(1);
 
     for (const cookie of [author, reviewer]) {
       const items = await app.inject({
@@ -301,7 +326,7 @@ describe("提交前查重链路", () => {
     expect(deniedItems.body).not.toContain("相似");
   });
 
-  it("查重建议拦截时提交被阻止，题目保持草稿", async () => {
+  it("Anklang 建议字段不会拦截提交，题目进入审核", async () => {
     const state: FakeAnklang = { calls: 0, blockSubmission: true };
     const { app, host } = await makeHookedApp(state);
     await enableAnklang(host);
@@ -314,16 +339,16 @@ describe("提交前查重链路", () => {
       headers: { cookie: author, origin: localOrigin },
       payload: { expectedRevision: draft.revision }
     });
-    expect(submitted.statusCode).toBe(409);
-    expect(submitted.body).toContain("建议不要提交");
+    expect(submitted.statusCode).toBe(200);
+    expect(submitted.body).not.toContain("建议不要提交");
 
     const reloaded = await app.inject({
       method: "GET",
       url: `/api/v1/problems/${draft.id}`,
       headers: { cookie: author }
     });
-    expect((reloaded.json() as { status: string; revision: number }).status).toBe("draft");
-    expect((reloaded.json() as { revision: number }).revision).toBe(draft.revision);
+    expect((reloaded.json() as { status: string; revision: number }).status).toBe("pending_review");
+    expect((reloaded.json() as { revision: number }).revision).toBe(draft.revision + 1);
   });
 
   it("活动审核轮次的重复手动检查替换同源结果而不重复追加", async () => {
@@ -407,9 +432,31 @@ describe("提交前查重链路", () => {
       payload: {}
     });
     expect(deniedCheck.statusCode).toBe(404);
+    expect(state.calls).toBe(1);
+
+    const unknownCheck = await app.inject({
+      method: "POST",
+      url: "/api/v1/problems/999999999999/similarity-check",
+      headers: { cookie: author, origin: localOrigin },
+      payload: {}
+    });
+    expect(unknownCheck.statusCode).toBe(deniedCheck.statusCode);
+    const deniedJson = deniedCheck.json() as {
+      error: { code: string; message: string; requestId?: string };
+    };
+    const unknownJson = unknownCheck.json() as {
+      error: { code: string; message: string; requestId?: string };
+    };
+    expect(deniedJson.error.code).toBe("NOT_FOUND");
+    expect(unknownJson.error.code).toBe("NOT_FOUND");
+    expect(unknownJson.error.message).toBe(deniedJson.error.message);
+    expect(deniedJson.error.requestId).toBeDefined();
+    expect(unknownJson.error.requestId).toBeDefined();
+    expect(unknownJson.error.requestId).not.toBe(deniedJson.error.requestId);
+    expect(state.calls).toBe(1);
   });
 
-  it("手动完整检索建议拦截时返回建议且不会伪造空候选阴性条目", async () => {
+  it("手动完整检索忽略 Anklang 建议字段并返回候选", async () => {
     const state: FakeAnklang = { calls: 0, blockSubmission: true };
     const { app, host } = await makeHookedApp(state);
     await enableAnklang(host);
@@ -424,14 +471,15 @@ describe("提交前查重链路", () => {
     });
 
     expect(checked.statusCode).toBe(200);
-    expect(checked.json()).toEqual({
-      status: "completed",
-      blockedAdvice: {
-        code: "anklang_similar_problem",
-        message: "发现高度相似的公开题目，建议不要提交。"
-      },
-      items: []
-    });
+    const body = checked.json() as {
+      status: string;
+      blockedAdvice: unknown;
+      items: Array<{ data: Record<string, unknown> }>;
+    };
+    expect(body.status).toBe("completed");
+    expect(body.blockedAdvice).toBeNull();
+    expect(body.items).toHaveLength(1);
+    expect(body.items[0]?.data).not.toHaveProperty("recommendation");
   });
 
   it("手动查重只运行 Anklang，不受其他提交前检查冒充或阻止", async () => {
@@ -639,7 +687,7 @@ describe("提交前查重链路", () => {
       payload: { expectedRevision: secondDraft.revision }
     });
     expect(secondSubmit.statusCode).toBe(200);
-    expect(state.calls).toBe(1);
+    expect(state.calls).toBe(2);
   });
 
   it("已有令牌但无法解密时不发送无认证请求", async () => {
@@ -648,13 +696,14 @@ describe("提交前查重链路", () => {
     await enableAnklang(host);
     const encryptedMarker = "anklang-ciphertext-must-not-appear";
     await database.execute(sql`
-      INSERT INTO plugin_secrets (
-        plugin_id, name, encrypted_value, key_version, masked_suffix, value_length,
-        updated_by_user_id
-      ) VALUES (
-        ${anklangPluginId}, ${anklangServiceTokenSecretName}, ${encryptedMarker}, 1,
-        'tail', 20, 0
-      )
+      UPDATE plugin_secrets
+      SET encrypted_value = ${encryptedMarker},
+          key_version = 1,
+          masked_suffix = 'tail',
+          value_length = 20,
+          updated_by_user_id = 0
+      WHERE plugin_id = ${anklangPluginId}
+        AND name = ${anklangServiceTokenSecretName}
     `);
     const author = await login(app, databaseDemoUserIds.author);
     const draft = await createDraft(app, author);
@@ -672,5 +721,34 @@ describe("提交前查重链路", () => {
     expect(submitted.body).not.toContain(encryptedMarker);
     expect(submitted.body).not.toContain(anklangServiceTokenSecretName);
     expect(state.calls).toBe(0);
+  });
+  it("submit 过滤 self/unknown Urmotiv 候选并用权限过滤后的当前标题重建摘要", async () => {
+    const state: FakeAnklang = { calls: 0, blockSubmission: false };
+    const { app, host } = await makeHookedApp(state);
+    await enableAnklang(host);
+    const author = await login(app, databaseDemoUserIds.author);
+    const visible = await createDraft(app, author);
+    const target = await createDraft(app, author);
+    state.candidateIds = [target.id, visible.id, "999999999999"];
+
+    const submitted = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${target.id}/submit`,
+      headers: { cookie: author, origin: localOrigin },
+      payload: { expectedRevision: target.revision }
+    });
+    expect(submitted.statusCode).toBe(200);
+    const items = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${target.id}/review-items`,
+      headers: { cookie: author }
+    });
+    const body = items.json() as {
+      items: Array<{ summary: string; data: { candidates: Array<Record<string, unknown>> } }>;
+    };
+    expect(body.items[0]?.data.candidates).toEqual([
+      expect.objectContaining({ source: "urmotiv", externalId: visible.id, title: "查重链路演示题" })
+    ]);
+    expect(body.items[0]?.summary).toContain("1 道候选");
   });
 });

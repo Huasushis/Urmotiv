@@ -191,6 +191,56 @@ Accept: application/json
 
 机器人硬拒绝和权限优先级见[权限参考](permissions.md)与[管理员指南](admin-guide.md)。
 
+## Anklang 内置适配器 API
+
+Anklang 查询和索引是插件到独立服务的内部 API，不是公开的 Urmotiv `/api/v1` 路由。插件只接受语法上的本地/私有 `baseUrl`（无凭据、路径、查询或片段），并要求管理员显式设置 `privateContentAuthorized: true`；默认 `false`，且运行时必须有非空 `serviceToken` 插件密钥。密钥永远不会出现在管理设置响应、审核条目或日志中。
+
+查询使用现有 Anklang `POST /api/v2/checks/similarity`（仅显式 v1 迁移配置使用 `/api/v1/checks/similarity`），只发送标题、题型、标签、基础题面和内容摘要。响应必须是严格 JSON，最多 2 MB、禁止重定向并按 `Cache-Control: no-store` 处理。插件投影为仅检索结果：候选与完成/复用状态可保存，`recommendation`、`sameProblemSuggestion`、`explanation` 等判断字段会被删除；相似候选不会产生 Urmotiv 裁决或阻止提交。`failureBehavior` 只处理无法取得配置检查的情况。`retryAttempts` 范围 1–3（默认 2），只对网络/超时/408/429/502/503/504 重试；401、409 和数据结构约束错误不重试，最终都保持 unavailable 语义而不是空成功。
+成功 submit、`pending_review`/`approved` 题目的标题变更、冻结 `basicStatement` 变更，才通过注入 `ProblemService` 的窄适配器执行 `PUT /api/v1/index/problems`。索引超时 `indexTimeoutMs` 范围 1–30 秒（默认 10 秒），请求严格为：
+
+```http
+PUT /api/v1/index/problems
+Authorization: Bearer <serviceToken>
+Content-Type: application/json
+Cache-Control: no-store
+```
+
+```json
+{
+  "apiVersion": "1",
+  "requestId": "00000000-0000-4000-8000-000000000001",
+  "externalId": "42",
+  "updatedAt": "2026-08-28T00:00:00.000Z",
+  "problem": { "title": "题目标题", "basicStatement": "基础题面" }
+}
+```
+
+成功响应示例（`outcome` 也可以是 `updated` 或 `unchanged`）：
+
+```json
+{
+  "apiVersion": "1",
+  "requestId": "00000000-0000-4000-8000-000000000001",
+  "source": "urmotiv",
+  "externalId": "42",
+  "contentHash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "outcome": "inserted"
+}
+```
+
+409 `STALE_UPDATE` 和 503 `INDEX_UNAVAILABLE` 不会回滚 Urmotiv 已提交的本地修改。draft/rejected、solution-only、无变化和删除均无同步；插件停用、设置错误、授权为 false 或缺少密钥时不会发 HTTP 请求。
+
+返回或保存审核条目前，Urmotiv 会移除当前题目自身候选；其他 Urmotiv 来源候选必须按当前请求用户权限查找。未知、隐藏和明确拒绝统一静默丢弃，授权候选使用当前 Urmotiv 标题并去掉 Anklang URL、`metadata`（附加信息）和判断字段；外部来源候选保留为非判断参考。过滤失败时拒绝返回/保存，不转成完整空结果。
+
+合成 Node 24 E2E（仅本地模拟向量服务、临时 DB，端口被占用即失败且不会停止现有服务）：
+
+```bash
+ANKLANG_SOURCE_DIR=/path/to/anklang \
+  pnpm --filter @urmotiv/plugin-anklang e2e:synthetic
+```
+
+详见 [Anklang 插件说明](../plugins/anklang/README.md)。
+
 ## 兼容性和升级规则
 
 - `/api/v1` 是当前稳定路由前缀；不要依赖未列出的内部路径。删除或变更字段时应发布新的 API 版本，而不是静默改变 v1 的含义。

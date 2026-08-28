@@ -55,7 +55,7 @@
 | 插件 ID | 版本 | 能力 |
 | --- | --- | --- |
 | `org.ustc.urmotiv.review-default` | `1.0.0` | 默认审核人数决策规则 |
-| `org.ustc.urmotiv.anklang` | `0.2.0` | 原题相似性检索提交前检查 |
+| `org.ustc.urmotiv.anklang` | `0.3.0` | 私有边界内的仅检索结果原题检索与受控索引同步 |
 | `org.ustc.urmotiv.fermata-control` | `0.1.0` | Fermata 管理健康/设置/唤醒接口 |
 | `org.ustc.urmotiv.hydro-format` | `0.1.0` | Hydro ZIP 题目包适配器 |
 | `org.ustc.urmotiv.fps-format` | `0.1.0` | FPS XML 单文件适配器 |
@@ -232,6 +232,10 @@ registry.registerReviewDecisionRule(exampleRule);
 - 外部 HTTP 只发送完成任务所需的最小、已获授权字段；设置超时，使用 `AbortSignal`，限制响应大小，不把原始响应写入错误消息。
 - 公开附件、内部附件、测试数据、标准程序和评测程序按题目文件权限处理；题面 Markdown 只引用受权限检查的站内文件地址。
 - Anklang 只做原题相似性检索，支持实时添加后查询并返回查询结果。题目的查重/检查信息属于 Urmotiv 问题属性，插件可以添加，Fermata 可以读取；Anklang 不是流程、审核状态、权限或最终裁决的权威。
+
+Anklang 内置适配器是 `ProblemService` 的窄注入，不是插件事件总线。它使用 `PUT /api/v1/index/problems` 同步 `pending_review`/`approved` 题目的成功 submit、允许的标题变更和冻结 `basicStatement` 变更；没有删除同步，solution-only 或 draft/rejected 不发请求。`indexTimeoutMs` 为 1–30 秒（默认 10 秒），`retryAttempts` 为 1–3 次（默认 2），仅网络/超时/408/429/502/503/504 重试，失败不回滚本地提交。
+
+Anklang 设置必须使用本地/私有无路径地址，显式确认 `privateContentAuthorized`，并把 `serviceToken` 放在插件密钥中。查询响应在进入审核条目之前投影为仅检索结果，删除推荐/同题/解释判断字段；按请求用户权限查找 Urmotiv 当前题目自身、未知、隐藏和明确拒绝候选，并把授权候选标题替换为 Urmotiv 当前值。设置未授权、密钥为空或过滤失败都在失败时拒绝返回/保存。
 
 ## 5. 错误、超时、重试和“不存在”
 

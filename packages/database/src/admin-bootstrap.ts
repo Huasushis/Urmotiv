@@ -8,7 +8,7 @@ const migrationLockKeyOne = 1_431_453_001;
 const migrationLockKeyTwo = 1_651_666_804;
 const adminCredentialsRecoveryLockKeyOne = 1_431_453_002;
 const adminCredentialsRecoveryLockKeyTwo = 1_651_666_805;
-const expectedMigrationCount = 18;
+const expectedMigrationCount = 19;
 
 const seededPublicTables = new Set([
   "admin_bootstrap_state",
@@ -27,7 +27,7 @@ const formalPublicTableNames = Object.values(databaseSchema)
   .sort(compareText);
 
 const expectedSequenceStates = [
-  { schema: "drizzle", name: "__drizzle_migrations_id_seq", last_value: "18", is_called: true },
+  { schema: "drizzle", name: "__drizzle_migrations_id_seq", last_value: "19", is_called: true },
   { schema: "public", name: "audit_events_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "contests_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "problems_id_seq", last_value: "1", is_called: false },
