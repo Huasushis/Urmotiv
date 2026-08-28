@@ -10,6 +10,33 @@
       "title": "Anklang 服务地址",
       "description": "只能填写本地或私有 HTTP/HTTPS 地址，不含账号密码、路径、查询参数或片段。认证令牌单独保存在插件密钥中。"
     },
+    "embeddingProvider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseUrl", "model", "dimension"],
+      "title": "Anklang 嵌入提供方",
+      "description": "Anklang 生成嵌入所用的模型提供方；API 密钥以 embeddingApiKey 插件密钥单独加密保存，不会在此显示。",
+      "properties": {
+        "baseUrl": {
+          "type": "string",
+          "format": "uri",
+          "title": "嵌入提供方地址",
+          "description": "允许任一主机名的 HTTPS 地址，或仅供隔离测试的本地/私有 HTTP 地址；不得含账号密码、查询参数或片段。"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "title": "嵌入模型名称"
+        },
+        "dimension": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096,
+          "title": "嵌入向量维度"
+        }
+      }
+    },
     "apiVersion": {
       "type": "string",
       "enum": ["2", "1"],

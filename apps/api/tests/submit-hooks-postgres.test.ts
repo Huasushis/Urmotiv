@@ -11,6 +11,7 @@ import type { FastifyInstance } from "fastify";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
 import {
+  anklangEmbeddingApiKeySecretName,
   anklangPluginId,
   anklangServiceTokenSecretName,
   createBuiltinPluginDefinitions,
@@ -200,6 +201,10 @@ describePostgres("手动原题检索的真实 PostgreSQL 撤权竞态", () => {
       readToken: async () => hostReference?.readSecretForPlugin(
         anklangPluginId,
         anklangServiceTokenSecretName
+      ),
+      readEmbeddingApiKey: async () => hostReference?.readSecretForPlugin(
+        anklangPluginId,
+        anklangEmbeddingApiKeySecretName
       ),
       cache: {
         get: async () => undefined,

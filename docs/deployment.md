@@ -104,7 +104,7 @@ docker compose --env-file /secure/path/urmotiv.env --profile fermata up -d --bui
 
 也可以设置 `COMPOSE_PROFILES=anklang,fermata` 后执行普通 `up`；不要为验证方便把外部私有 `env_file` 复制到 Urmotiv 仓库。
 
-Urmotiv 中的 Anklang 插件只接受 `http://127.0.0.1:8730`、`localhost`、`host.docker.internal`、RFC1918/链路本地/ULA 字面量或单标签容器服务名；不得填写公网地址、账号密码、路径、查询或片段。管理员必须在确认 Anklang 自己的数据库、对象存储和 DashScope/OpenAI-compatible embedding 链路全程留在批准私有边界后，才把 `privateContentAuthorized` 从默认 `false` 改为 `true`。`serviceToken` 使用插件密钥保存，不会出现在 `/api/v1/admin/plugins` 响应。一个完整的设置请求示例见 `plugins/anklang/README.md`。
+Urmotiv 中的 Anklang 插件只接受 `http://127.0.0.1:8730`、`localhost`、`host.docker.internal`、RFC1918/链路本地/ULA 字面量或单标签容器服务名；不得填写公网地址、账号密码、路径、查询或片段。管理员必须在确认 Anklang 自己的数据库、对象存储和 embedding 链路全程留在批准私有边界后，才把 `privateContentAuthorized` 从默认 `false` 改为 `true`。两个插件密钥分开保存：`serviceToken` 认证 Urmotiv→Anklang 服务请求，`embeddingApiKey` 是嵌入提供方写密钥；`embeddingProvider`（`baseUrl`/`model`/`dimension`）是普通设置，地址只允许 HTTPS 或仅供隔离测试的本地/私有 HTTP。查询与索引同步前插件都会先认证地 PUT `/api/v1/admin/embedding-provider` 供给提供方；未配置时查询不可用、索引跳过，绝不伪装成“没有相似题”。`serviceToken` 使用插件密钥保存，不会出现在 `/api/v1/admin/plugins` 响应。一个完整的设置请求示例见 `plugins/anklang/README.md`。
 
 Anklang 查询只生成仅检索结果候选参考，绝不执行 Urmotiv 的模型审核、推荐工作流或最终裁决。提交同步通过 `ProblemService` 的窄索引适配器调用冻结的 `PUT /api/v1/index/problems`：成功 submit、`pending_review`/`approved` 标题变更、冻结 `basicStatement` 变更才同步；solution-only、draft/rejected、无变化和删除不发请求。`retryAttempts` 为 1–3 次（默认 2），仅网络/超时/408/429/502/503/504 重试；401、409、数据结构约束错误不重试。`indexTimeoutMs` 为 1–30 秒（默认 10 秒），同步失败不回滚已经提交的 Urmotiv 修订，也不伪装成“没有相似题”。
 

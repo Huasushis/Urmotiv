@@ -86,6 +86,102 @@ export function isPrivateAnklangBaseUrl(value: string): boolean {
   return serviceUrlSchema.safeParse(value).success;
 }
 
+const embeddingProviderMaxDimension = 4_096;
+
+/**
+ * 嵌入提供方地址：任何主机名的 HTTPS 都接受；HTTP 只允许本地/私有主机
+ * （仅供隔离的合成测试使用）。一律拒绝账号密码、查询参数和片段。
+ */
+const embeddingProviderUrlSchema = z
+  .string()
+  .url()
+  .refine((value) => {
+    if (
+      value !== value.trim() ||
+      /[\u0000-\u001f\u007f]/u.test(value) ||
+      /[?#]/u.test(value)
+    ) {
+      return false;
+    }
+    const url = new URL(value);
+    const host = url.hostname.replace(/^\[|\]$/gu, "").toLowerCase();
+    return (
+      (url.protocol === "http:" || url.protocol === "https:") &&
+      url.username.length === 0 &&
+      url.password.length === 0 &&
+      url.search.length === 0 &&
+      url.hash.length === 0 &&
+      (url.protocol === "https:" || isPrivateServiceHost(host))
+    );
+  }, "嵌入提供方地址必须是不含账号密码、查询参数或片段的 HTTPS 地址；仅隔离测试可用本地/私有 HTTP 地址。");
+
+export function isValidEmbeddingProviderBaseUrl(value: string): boolean {
+  return embeddingProviderUrlSchema.safeParse(value).success;
+}
+
+const embeddingProviderSettingsSchema = z
+  .object({
+    baseUrl: embeddingProviderUrlSchema,
+    model: z
+      .string()
+      .min(1)
+      .max(200)
+      .refine(
+        (value) => value === value.trim() && !/[\u0000-\u001f\u007f]/u.test(value),
+        "模型名称不能为空、带首尾空白或包含控制字符。"
+      ),
+    dimension: z.number().int().min(1).max(embeddingProviderMaxDimension)
+  })
+  .strict();
+
+/** 提交给 Anklang 的嵌入提供方配置（含一次性写密钥）。 */
+export const embeddingProviderProvisionSchema = z
+  .object({
+    baseUrl: embeddingProviderUrlSchema,
+    apiKey: z.string().min(1).max(4_096),
+    model: z.string().min(1).max(200),
+    dimension: z.number().int().min(1).max(embeddingProviderMaxDimension)
+  })
+  .strict();
+
+/** Anklang 只会返回 configured 与非密钥设置；永不回显 apiKey。 */
+export const embeddingProviderStatusSchema = z
+  .object({
+    configured: z.boolean(),
+    baseUrl: embeddingProviderUrlSchema.optional(),
+    model: z.string().min(1).max(200).optional(),
+    dimension: z.number().int().min(1).max(embeddingProviderMaxDimension).optional()
+  })
+  .strict()
+  .refine(
+    (value) =>
+      !(
+        value.configured &&
+        (value.baseUrl === undefined || value.model === undefined || value.dimension === undefined)
+      ),
+    "配置有效时必须返回非密钥的设置字段。"
+  )
+  .refine(
+    (value) =>
+      !(
+        !value.configured &&
+        (value.baseUrl !== undefined || value.model !== undefined || value.dimension !== undefined)
+      ),
+    "未配置时不得返回任何设置字段。"
+  );
+
+export interface EmbeddingProviderConfig {
+  readonly baseUrl: string;
+  readonly model: string;
+  readonly dimension: number;
+}
+
+export interface EmbeddingProviderProvisionInput extends EmbeddingProviderConfig {
+  readonly apiKey: string;
+}
+
+export type EmbeddingProviderStatus = z.infer<typeof embeddingProviderStatusSchema>;
+
 const apiVersionSchema = z.enum(["2", "1"]);
 
 export const anklangSettingsSchema = z
@@ -98,9 +194,11 @@ export const anklangSettingsSchema = z
     privateContentAuthorized: z.boolean().default(false),
     failureBehavior: z.enum(["block", "continue"]).default("block"),
     minimumSimilarityToShow: z.number().min(0).max(1).default(0.3),
-    cacheMinutes: z.number().int().min(1).max(10_080).default(1_440)
+    cacheMinutes: z.number().int().min(1).max(10_080).default(1_440),
+    embeddingProvider: embeddingProviderSettingsSchema.optional()
   })
   .strict();
+
 
 export type AnklangSettings = z.infer<typeof anklangSettingsSchema>;
 export type AnklangApiVersion = z.infer<typeof apiVersionSchema>;
@@ -585,12 +683,19 @@ export interface AnklangClientOptions {
   readonly fetch?: AnklangFetch;
 }
 
-type JsonResponseKind = "check" | "index";
+interface JsonRequestStyle {
+  readonly method: "GET" | "POST" | "PUT" | "DELETE";
+  /** 需要 X-Urmotiv-API-Version 请求头时提供（check/index 版本化接口）。 */
+  readonly apiVersionHeader?: string;
+  /** 409 冲突按“索引已较新”处理（仅 upsert）。 */
+  readonly staleConflict?: boolean;
+}
 
 export class AnklangClient {
   readonly #apiVersion: AnklangApiVersion;
   readonly #endpoint: URL;
   readonly #indexEndpoint: URL;
+  readonly #providerEndpoint: URL;
   readonly #token: string;
   readonly #retryAttempts: number;
   readonly #timeoutMs: number;
@@ -618,6 +723,10 @@ export class AnklangClient {
       ensureTrailingSlash(baseUrl)
     );
     this.#indexEndpoint = new URL("/api/v1/index/problems", ensureTrailingSlash(baseUrl));
+    this.#providerEndpoint = new URL(
+      "/api/v1/admin/embedding-provider",
+      ensureTrailingSlash(baseUrl)
+    );
     this.#token = token;
     this.#retryAttempts = z.number().int().min(1).max(3).parse(
       options.retryAttempts ?? defaultRetryAttempts
@@ -640,10 +749,10 @@ export class AnklangClient {
     const body = parsedRequest.data;
     const result = await this.#requestJson(
       this.#endpoint,
+      { method: "POST", apiVersionHeader: this.#apiVersion },
       body,
       signal,
       this.#timeoutMs,
-      "check",
       (raw) => {
         const resultSchema = this.#apiVersion === "2" ? anklangV2ResultSchema : anklangV1ResultSchema;
         const parsedResult = resultSchema.safeParse(raw);
@@ -670,10 +779,10 @@ export class AnklangClient {
     const body = parsedRequest.data;
     return this.#requestJson(
       this.#indexEndpoint,
+      { method: "PUT", apiVersionHeader: "1", staleConflict: true },
       body,
       signal,
       this.#indexTimeoutMs,
-      "index",
       (raw) => {
         const parsed = anklangIndexUpsertResponseSchema.safeParse(raw);
         if (!parsed.success) {
@@ -690,12 +799,62 @@ export class AnklangClient {
     );
   }
 
+  /**
+   * 读取 Anklang 当前嵌入提供方配置。响应只含 configured 与非密钥设置；
+   * 上游若回显 apiKey 或形状不符，按契约错误处理，绝不透传。
+   */
+  public async getEmbeddingProvider(
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<EmbeddingProviderStatus> {
+    return this.#requestJson(
+      this.#providerEndpoint,
+      { method: "GET" },
+      undefined,
+      signal,
+      this.#timeoutMs,
+      parseEmbeddingProviderStatus
+    );
+  }
+
+  /** 用一次性写密钥向 Anklang 配置嵌入提供方；幂等 PUT。 */
+  public async putEmbeddingProvider(
+    input: EmbeddingProviderProvisionInput,
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<EmbeddingProviderStatus> {
+    const parsedInput = embeddingProviderProvisionSchema.safeParse(input);
+    if (!parsedInput.success) {
+      throw new AnklangInvalidResponseError("Anklang 嵌入提供方配置不符合契约。");
+    }
+    return this.#requestJson(
+      this.#providerEndpoint,
+      { method: "PUT" },
+      parsedInput.data,
+      signal,
+      this.#timeoutMs,
+      parseEmbeddingProviderStatus
+    );
+  }
+
+  /** 清除 Anklang 上的嵌入提供方配置；幂等 DELETE。 */
+  public async deleteEmbeddingProvider(
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<EmbeddingProviderStatus> {
+    return this.#requestJson(
+      this.#providerEndpoint,
+      { method: "DELETE" },
+      undefined,
+      signal,
+      this.#timeoutMs,
+      parseEmbeddingProviderStatus
+    );
+  }
+
   async #requestJson<T>(
     endpoint: URL,
-    body: object,
+    style: JsonRequestStyle,
+    body: object | undefined,
     parentSignal: AbortSignal,
     timeoutMs: number,
-    kind: JsonResponseKind,
     parse: (raw: unknown) => T
   ): Promise<T> {
     const deadline = Date.now() + timeoutMs;
@@ -741,17 +900,19 @@ export class AnklangClient {
           try {
             response = await Promise.race([
               this.#fetch(endpoint, {
-                method: kind === "index" ? "PUT" : "POST",
+                method: style.method,
                 redirect: "error",
                 signal: attemptController.signal,
                 headers: {
                   Accept: "application/json",
                   "Cache-Control": "no-store",
-                  "Content-Type": "application/json",
-                  "X-Urmotiv-API-Version": kind === "index" ? "1" : this.#apiVersion,
-                  Authorization: `Bearer ${this.#token}`
+                  ...(style.apiVersionHeader === undefined
+                    ? {}
+                    : { "X-Urmotiv-API-Version": style.apiVersionHeader }),
+                  Authorization: `Bearer ${this.#token}`,
+                  ...(body === undefined ? {} : { "Content-Type": "application/json" })
                 },
-                body: JSON.stringify(body)
+                ...(body === undefined ? {} : { body: JSON.stringify(body) })
               }),
               attemptTimeout
             ]);
@@ -768,7 +929,7 @@ export class AnklangClient {
           if (response.status === 401) {
             throw new AnklangUnavailableError("Anklang 认证失败。", response.status);
           }
-          if (kind === "index" && response.status === 409) {
+          if (style.staleConflict === true && response.status === 409) {
             throw new AnklangStaleUpdateError();
           }
           if (isRetryableAnklangStatus(response.status)) {
@@ -840,6 +1001,46 @@ export class AnklangClient {
   }
 }
 
+function parseEmbeddingProviderStatus(raw: unknown): EmbeddingProviderStatus {
+  const parsed = embeddingProviderStatusSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new AnklangInvalidResponseError();
+  }
+  return parsed.data;
+}
+
+/**
+ * 在每次查询/写入前从插件设置与密钥配置 Anklang 的嵌入提供方。设置或密钥
+ * 缺失/清空/残缺时按“服务不可用”处理，绝不伪装成空候选；apiKey 只出现在
+ * 一次写请求体中，不会进入返回、日志或错误消息。
+ */
+async function provisionEmbeddingProvider(
+  client: AnklangClient,
+  settings: AnklangSettings,
+  apiKey: string | undefined,
+  signal: AbortSignal = new AbortController().signal
+): Promise<void> {
+  const provider = settings.embeddingProvider;
+  const normalizedApiKey = apiKey?.trim();
+  if (
+    provider === undefined ||
+    normalizedApiKey === undefined ||
+    normalizedApiKey.length === 0
+  ) {
+    throw new AnklangUnavailableError("Anklang 嵌入提供方未配置。");
+  }
+  await client.putEmbeddingProvider({ ...provider, apiKey: normalizedApiKey }, signal);
+}
+
+export interface CreateAnklangCheckOptions {
+  readonly settings: AnklangSettings;
+  readonly token?: string;
+  readonly embeddingApiKey?: string;
+  readonly cache?: AnklangCache;
+  readonly fetch?: AnklangFetch;
+  readonly now?: () => Date;
+}
+
 export interface CreateAnklangCheckOptions {
   readonly settings: AnklangSettings;
   readonly token?: string;
@@ -869,6 +1070,9 @@ export function createAnklangCheck(options: CreateAnklangCheckOptions): BeforeSu
     async run(input, context): Promise<BeforeSubmitResult> {
       let result: AnklangSearchResult;
       try {
+        if (settings.embeddingProvider !== undefined) {
+          await provisionEmbeddingProvider(client, settings, options.embeddingApiKey, context.signal);
+        }
         result = await readOrCheck(input, context.signal, client, settings, options.cache, now);
       } catch (error) {
         if (context.signal.aborted || settings.failureBehavior === "block") {
@@ -944,13 +1148,15 @@ export interface AnklangIndexAdapter {
 export interface AnklangIndexRuntime {
   readSettings(): Promise<unknown | undefined>;
   readToken(): Promise<string | undefined>;
+  /** 读取名为 embeddingApiKey 的插件密钥；未配置返回 undefined。 */
+  readEmbeddingApiKey(): Promise<string | undefined>;
   readonly fetch?: AnklangFetch;
 }
 
 /**
  * Creates the narrow built-in index bridge. It deliberately performs no
  * network request when the plugin is disabled, malformed, unauthorized, or
- * missing its secret; sync errors are best effort and never escape here.
+ * missing its secret; 嵌入提供方设置或密钥缺失时同样 zero-call no-op。
  */
 export function createAnklangIndexAdapter(runtime: AnklangIndexRuntime): AnklangIndexAdapter {
   return {
@@ -967,6 +1173,15 @@ export function createAnklangIndexAdapter(runtime: AnklangIndexRuntime): Anklang
           return undefined;
         }
         const settings = parsedSettings.data;
+        const apiKey = await runtime.readEmbeddingApiKey();
+        const normalizedApiKey = apiKey?.trim();
+        if (
+          settings.embeddingProvider === undefined ||
+          normalizedApiKey === undefined ||
+          normalizedApiKey.length === 0
+        ) {
+          return undefined;
+        }
         const client = new AnklangClient({
           baseUrl: settings.baseUrl,
           apiVersion: settings.apiVersion,
@@ -977,6 +1192,7 @@ export function createAnklangIndexAdapter(runtime: AnklangIndexRuntime): Anklang
           indexTimeoutMs: settings.indexTimeoutMs,
           ...(runtime.fetch === undefined ? {} : { fetch: runtime.fetch })
         });
+        await provisionEmbeddingProvider(client, settings, normalizedApiKey);
         return await client.upsert({
           apiVersion: "1",
           requestId: randomUUID(),

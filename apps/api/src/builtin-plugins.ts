@@ -37,6 +37,8 @@ export interface AnklangHookRuntime {
   readSettings(): Promise<unknown | undefined>;
   /** 读取名为 serviceToken 的插件密钥；未配置返回 undefined。 */
   readToken(): Promise<string | undefined>;
+  /** 读取名为 embeddingApiKey 的嵌入提供方密钥；未配置返回 undefined。 */
+  readEmbeddingApiKey(): Promise<string | undefined>;
   readonly cache: AnklangCache;
   /** 仅测试使用：替换 HTTP 客户端。 */
   readonly fetch?: AnklangFetch;
@@ -54,6 +56,7 @@ export function createAnklangIndexAdapterForRuntime(
 
 export const anklangPluginId = "org.ustc.urmotiv.anklang";
 export const anklangServiceTokenSecretName = "serviceToken";
+export const anklangEmbeddingApiKeySecretName = "embeddingApiKey";
 export const fermataPluginId = "org.ustc.urmotiv.fermata-control";
 export const fermataManagementTokenSecretName = "managementToken";
 export const hydroFormatPluginId = "org.ustc.urmotiv.hydro-format";
@@ -98,13 +101,17 @@ export function createBuiltinPluginDefinitions(
     {
       source: "builtin:anklang",
       manifest: {
-        id: anklangPluginId, name: "原题相似度检查", version: "0.3.0", apiVersion: "1",
+        id: anklangPluginId, name: "原题相似度检查", version: "0.4.0", apiVersion: "1",
         serverEntry: "dist/index.js", permissions: ["org.ustc.urmotiv.anklang.configure", "org.ustc.urmotiv.anklang.results.read"], settingsSchema: "settings.schema.json"
       },
       secretDefinitions: [{
         name: anklangServiceTokenSecretName,
         label: "服务认证令牌",
         description: "Anklang 用它确认请求来自 Urmotiv；完整内容只会加密保存，不会在页面重新显示。"
+      }, {
+        name: anklangEmbeddingApiKeySecretName,
+        label: "嵌入提供方 API 密钥",
+        description: "Anklang 用它调用嵌入模型提供方（与 serviceToken 用途不同）；完整内容只会加密保存，不会在页面重新显示。"
       }],
       settingsSchema: {
         type: "object", additionalProperties: false, required: ["baseUrl"],
@@ -112,6 +119,23 @@ export function createBuiltinPluginDefinitions(
           baseUrl: {
             type: "string", format: "uri", title: "Anklang 服务地址",
             description: "Urmotiv 调用原题检索服务的本地或私有 HTTP/HTTPS 地址；认证令牌单独保存。"
+          },
+          embeddingProvider: {
+            type: "object", additionalProperties: false, required: ["baseUrl", "model", "dimension"],
+            title: "嵌入提供方",
+            description: "Anklang 生成嵌入所用的模型提供方；API 密钥以 embeddingApiKey 插件密钥单独加密保存，不会在此显示。",
+            properties: {
+              baseUrl: {
+                type: "string", format: "uri", title: "嵌入提供方地址",
+                description: "允许任一主机名的 HTTPS 地址，或仅供隔离测试的本地/私有 HTTP 地址；不得含账号密码、查询参数或片段。"
+              },
+              model: {
+                type: "string", minLength: 1, maxLength: 200, title: "嵌入模型名称"
+              },
+              dimension: {
+                type: "integer", minimum: 1, maximum: 4096, title: "嵌入向量维度"
+              }
+            }
           },
           apiVersion: {
             type: "string",
@@ -239,12 +263,36 @@ function createAnklangHookRegistrar(runtime: AnklangHookRuntime): (registry: Plu
           throw new Error("Anklang 服务配置不可用。");
         }
         const settings = parsedSettings.data;
+        if (settings.embeddingProvider === undefined) {
+          if (settings.failureBehavior === "continue") {
+            return {
+              decision: "continue",
+              reviewItems: [
+                createAnklangUnavailableReviewItem(input, "service_unavailable")
+              ]
+            };
+          }
+          throw new Error("Anklang 嵌入提供方未配置。");
+        }
+        const embeddingApiKey = (await runtime.readEmbeddingApiKey())?.trim();
+        if (embeddingApiKey === undefined || embeddingApiKey.length === 0) {
+          if (settings.failureBehavior === "continue") {
+            return {
+              decision: "continue",
+              reviewItems: [
+                createAnklangUnavailableReviewItem(input, "service_unavailable")
+              ]
+            };
+          }
+          throw new Error("Anklang 嵌入提供方未配置。");
+        }
         let check: BeforeSubmitCheck;
         try {
           const token = await runtime.readToken();
           check = createAnklangCheck({
             settings,
             ...(token === undefined ? {} : { token }),
+            embeddingApiKey,
             cache: runtime.cache,
             ...(runtime.fetch === undefined ? {} : { fetch: runtime.fetch })
           });

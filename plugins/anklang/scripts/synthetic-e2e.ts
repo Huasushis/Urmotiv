@@ -166,10 +166,6 @@ try {
       ANKLANG_LOCAL_DB_PATH: join(tempDir, "anklang.sqlite"),
       ANKLANG_REQUIRE_SERVICE_TOKEN: "true",
       ANKLANG_SERVICE_TOKEN: token,
-      DASHSCOPE_BASE_URL: embeddingBaseUrl,
-      DASHSCOPE_API_KEY: "synthetic-dashscope-key",
-      DASHSCOPE_EMBEDDING_MODEL: "synthetic-embedding",
-      DASHSCOPE_EMBEDDING_DIM: "3",
       HTTP_PROXY: "",
       HTTPS_PROXY: "",
       ALL_PROXY: "",
@@ -191,6 +187,28 @@ try {
     timeoutMs: 10_000,
     indexTimeoutMs: 10_000
   });
+
+  // 提供方只在进程内存中：启动后未配置，环境变量不会激活向量能力。
+  const initialStatus = await client.getEmbeddingProvider();
+  assert(initialStatus.configured === false, "provider_initial_should_be_clear");
+  steps.providerInitial = "clear";
+
+  const providerConfig = {
+    baseUrl: embeddingBaseUrl,
+    apiKey: "synthetic-dashscope-key",
+    model: "synthetic-embedding",
+    dimension: 3
+  };
+  const provisioned = await client.putEmbeddingProvider(providerConfig);
+  assert(provisioned.configured === true, "provider_put_failed");
+  assert(
+    provisioned.baseUrl === embeddingBaseUrl &&
+      provisioned.model === "synthetic-embedding" &&
+      provisioned.dimension === 3,
+    "provider_put_mismatch"
+  );
+  steps.providerPut = "configured";
+
   const firstRequest = {
     apiVersion: "1" as const,
     requestId: randomUUID(),
@@ -226,6 +244,43 @@ try {
   }, new AbortController().signal);
   assert(result.candidates.some((candidate) => candidate.externalId === externalId), "query_hit_missing");
   steps.query = "hit";
+
+  // 再次 PUT 视为更新：同一模型/维度可幂等重配置，返回非密钥状态。
+  const updatedProvider = await client.putEmbeddingProvider({
+    ...providerConfig,
+    apiKey: "synthetic-dashscope-key-rotated"
+  });
+  assert(
+    updatedProvider.configured === true && updatedProvider.baseUrl === embeddingBaseUrl,
+    "provider_update_failed"
+  );
+  steps.providerUpdate = "configured";
+
+  // 清除后提供方消失，查询明确不可用：绝不伪装成“没有相似题”。
+  const cleared = await client.deleteEmbeddingProvider();
+  assert(cleared.configured === false, "provider_clear_failed");
+  steps.providerClear = "clear";
+  const afterClear = await client.getEmbeddingProvider();
+  assert(afterClear.configured === false, "provider_status_after_clear");
+
+  const unavailable = await client.check({
+    apiVersion: "2",
+    requestId: randomUUID(),
+    contentHash,
+    problem: {
+      title: "Synthetic renamed original",
+      type: "traditional",
+      tagIds: ["synthetic"],
+      basicStatement
+    }
+  }, new AbortController().signal);
+  assert(
+    unavailable.apiVersion === "2" &&
+      (unavailable as { completion?: { status?: string } }).completion?.status === "unavailable" &&
+      unavailable.candidates.length === 0,
+    "provider_clear_not_unavailable"
+  );
+  steps.providerClearUnavailable = "unavailable";
   console.log(JSON.stringify({ status: "passed", steps }));
 } catch (error) {
   const known: Record<string, true> = {
@@ -234,10 +289,17 @@ try {
     anklang_source_exited: true,
     anklang_source_not_ready: true,
     embedding_not_ready: true,
+    provider_initial_should_be_clear: true,
+    provider_put_failed: true,
+    provider_put_mismatch: true,
     upsert_insert_failed: true,
     upsert_replay_failed: true,
     upsert_title_update_failed: true,
-    query_hit_missing: true
+    query_hit_missing: true,
+    provider_update_failed: true,
+    provider_clear_failed: true,
+    provider_status_after_clear: true,
+    provider_clear_not_unavailable: true
   };
   const reason =
     error instanceof Error && known[error.message] === true

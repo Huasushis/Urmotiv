@@ -35,6 +35,7 @@ import { ProblemFileStore } from "./problem-file-store";
 import { ProblemService } from "./service";
 import { TransferService } from "./transfer-service";
 import {
+  anklangEmbeddingApiKeySecretName,
   anklangPluginId,
   anklangServiceTokenSecretName,
   createBuiltinPluginDefinitions,
@@ -87,6 +88,15 @@ try {
       return pluginHostReference.readSecretForPlugin(
         anklangPluginId,
         anklangServiceTokenSecretName
+      );
+    },
+    readEmbeddingApiKey: async () => {
+      if (pluginHostReference === undefined) {
+        return undefined;
+      }
+      return pluginHostReference.readSecretForPlugin(
+        anklangPluginId,
+        anklangEmbeddingApiKeySecretName
       );
     },
     cache: createProcessAnklangCache()

@@ -260,7 +260,7 @@ describe("机器人审题接口", () => {
         id, display_name, version, api_version, source, manifest_digest,
         state, installed_by_user_id
       ) VALUES (
-        'org.ustc.urmotiv.anklang', '原题相似度检查', '0.3.0', '1',
+        'org.ustc.urmotiv.anklang', '原题相似度检查', '0.4.0', '1',
         'builtin', ${"a".repeat(64)}, 'enabled', 0
       )
     `);

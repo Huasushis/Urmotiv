@@ -109,6 +109,7 @@ import {
 import type { FermataFetch } from "@urmotiv/plugin-fermata-control";
 import {
   anklangPluginId,
+  anklangEmbeddingApiKeySecretName,
   anklangServiceTokenSecretName,
   createAnklangIndexAdapterForRuntime,
   createBuiltinPluginDefinitions,
@@ -515,6 +516,15 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
       return pluginHostReference.readSecretForPlugin(
         anklangPluginId,
         anklangServiceTokenSecretName
+      );
+    },
+    readEmbeddingApiKey: async () => {
+      if (pluginHostReference === undefined) {
+        return undefined;
+      }
+      return pluginHostReference.readSecretForPlugin(
+        anklangPluginId,
+        anklangEmbeddingApiKeySecretName
       );
     },
     cache: createInMemoryAnklangCache(now),

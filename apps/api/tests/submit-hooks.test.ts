@@ -14,6 +14,7 @@ import type { FastifyInstance } from "fastify";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
 import {
+  anklangEmbeddingApiKeySecretName,
   anklangPluginId,
   anklangServiceTokenSecretName,
   createBuiltinPluginDefinitions,
@@ -60,6 +61,26 @@ interface FakeAnklang {
 }
 function fakeAnklangFetch(state: FakeAnklang): AnklangFetch {
   return async (input, init) => {
+    if (String(input).endsWith("/api/v1/admin/embedding-provider")) {
+      const method = init?.method ?? "GET";
+      if (method === "DELETE") {
+        return new Response(JSON.stringify({ configured: false }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      const provision = JSON.parse(String(init?.body ?? "{}")) as {
+        baseUrl?: string;
+        model?: string;
+        dimension?: number;
+      };
+      return new Response(JSON.stringify({
+        configured: true,
+        baseUrl: provision.baseUrl ?? "https://emb.example.com/v1",
+        model: provision.model ?? "bge-m3",
+        dimension: provision.dimension ?? 1024
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
     if (String(input).endsWith("/api/v1/index/problems")) {
       state.indexCalls = (state.indexCalls ?? 0) + 1;
       const request = JSON.parse(String(init?.body ?? "{}")) as {
@@ -153,6 +174,10 @@ async function makeHookedApp(state: FakeAnklang): Promise<{
     readToken: async () => hostReference?.readSecretForPlugin(
       anklangPluginId,
       anklangServiceTokenSecretName
+    ),
+    readEmbeddingApiKey: async () => hostReference?.readSecretForPlugin(
+      anklangPluginId,
+      anklangEmbeddingApiKeySecretName
     ),
     cache: {
       async get(contentHash) {
@@ -265,8 +290,16 @@ async function enableAnklang(host: TrustedPluginHost, settings: Record<string, u
       expectedRevision: 1,
       clearSecrets: [],
       state: "enabled",
-      settings: { baseUrl: "http://127.0.0.1:8730", privateContentAuthorized: true, ...settings },
-      secrets: { [anklangServiceTokenSecretName]: "test-service-token" }
+      settings: {
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
+        embeddingProvider: { baseUrl: "https://emb.example.com/v1", model: "bge-m3", dimension: 1024 },
+        ...settings
+      },
+      secrets: {
+        [anklangServiceTokenSecretName]: "test-service-token",
+        [anklangEmbeddingApiKeySecretName]: "test-embedding-key"
+      }
     },
     "0",
     randomUUID()

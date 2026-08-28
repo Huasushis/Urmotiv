@@ -1,16 +1,18 @@
 # Anklang 接入插件
 
-`org.ustc.urmotiv.anklang`（插件版本 `0.3.0`）是 Urmotiv 的受信任内置插件。它调用独立 Anklang 服务做原题相似性检索，并把候选与完成状态作为 Urmotiv 的审核条目参考数据；它不是流程、权限、审核状态或最终裁决的权威。
+`org.ustc.urmotiv.anklang`（插件版本 `0.4.0`）是 Urmotiv 的受信任内置插件。它调用独立 Anklang 服务做原题相似性检索，并把候选与完成状态作为 Urmotiv 的审核条目参考数据；它不是流程、权限、审核状态或最终裁决的权威。
 
 ## 管理员配置与隐私闸门
 
-插件管理端点需要核心 `plugin.manage` 和 `system.manage` 权限。先在 `/api/v1/admin/plugins` 读取当前 `revision`，再用带 `expectedRevision` 的 PATCH 保存设置。令牌只从环境变量通过声明的插件密钥 `serviceToken` 提交；建议使用权限为 `0600` 的 curl cookie-jar（保存登录 Cookie 的文件）：
+插件管理端点需要核心 `plugin.manage` 和 `system.manage` 权限。先在 `/api/v1/admin/plugins` 读取当前 `revision`，再用带 `expectedRevision` 的 PATCH 保存设置。两个密钥只从环境变量通过声明的插件密钥 `serviceToken`（Anklang 服务认证）与 `embeddingApiKey`（嵌入提供方认证）提交；建议使用权限为 `0600` 的 curl cookie-jar（保存登录 Cookie 的文件）：
 
 ```bash
 export URMOTIV_COOKIE_JAR=/secure/path/urmotiv.cookies
 read -rsp 'Anklang service token: ' ANKLANG_SERVICE_TOKEN
 printf '\n'
-export ANKLANG_SERVICE_TOKEN
+read -rsp 'Embedding provider api key: ' ANKLANG_EMBEDDING_API_KEY
+printf '\n'
+export ANKLANG_SERVICE_TOKEN ANKLANG_EMBEDDING_API_KEY
 jq -n '{
   expectedRevision: 1,
   state: "enabled",
@@ -23,9 +25,17 @@ jq -n '{
     retryAttempts: 2,
     failureBehavior: "continue",
     minimumSimilarityToShow: 0.3,
-    cacheMinutes: 1440
+    cacheMinutes: 1440,
+    embeddingProvider: {
+      baseUrl: "https://emb.example.com/v1",
+      model: "bge-m3",
+      dimension: 1024
+    }
   },
-  secrets: { serviceToken: env.ANKLANG_SERVICE_TOKEN },
+  secrets: {
+    serviceToken: env.ANKLANG_SERVICE_TOKEN,
+    embeddingApiKey: env.ANKLANG_EMBEDDING_API_KEY
+  },
   clearSecrets: []
 }' | curl -X PATCH "$URMOTIV_URL/api/v1/admin/plugins/org.ustc.urmotiv.anklang" \
   --cookie "$URMOTIV_COOKIE_JAR" \
@@ -33,7 +43,9 @@ jq -n '{
   --data-binary @-
 ```
 
-`URMOTIV_COOKIE_JAR` 应指向一个权限为 `0600` 的保存登录 Cookie 的文件；不要把令牌写进 JSON 字面量、shell 历史或日志。管理响应只显示 `configured` 标记，绝不返回原文或任何字符。
+`URMOTIV_COOKIE_JAR` 应指向一个权限为 `0600` 的保存登录 Cookie 的文件；不要把令牌写进 JSON 字面量、shell 历史或日志。管理响应只显示 `configured` 标记，绝不返回原文、掩码后缀、长度或哈希。
+
+两个插件密钥用途不同，必须分开保存：`serviceToken` 是 Urmotiv 调用 Anklang 服务和提供方管理接口时认证自己的身份；`embeddingApiKey` 是 Anklang 调用嵌入模型提供方时使用的写密钥，只在进程内存中短暂存在，永不回显。`embeddingProvider` 设置（`baseUrl`、`model`、`dimension`）是普通设置，其中 `baseUrl` 允许任一主机名的 HTTPS 地址，或仅供隔离测试的本地/私有 HTTP 地址；不得含账号密码、查询参数或片段。每次启用后的查询或索引同步前，插件都先用 `serviceToken` 认证地 PUT `/api/v1/admin/embedding-provider` 把当前提供方配置（含 `embeddingApiKey`）供给 Anklang；提供方设置或密钥缺失/被清除/非法时，查询按 `failureBehavior` 作为不可用处理（绝不伪装成“没有相似题”），索引同步零请求跳过。没有通用或 Fermata 回退，也不从环境变量读取任何嵌入配置。
 
 `baseUrl` 只允许语法上的本地/私有地址：`localhost`、`host.docker.internal`、回环/RFC1918/链路本地/IPv6 ULA 字面量，或不含点的单标签容器服务名。不得带账号密码、路径、查询参数或片段；公网主机名/IP 会在设置校验阶段拒绝。`privateContentAuthorized` 默认为 `false`，管理员只有在确认 Anklang 的数据库、对象存储和嵌入链路全部留在批准边界内后才能改为 `true`。未授权、缺少非空 `serviceToken`、插件停用或设置无效时，插件在发出任何请求前拒绝继续。
 
@@ -54,7 +66,7 @@ Anklang 的 `recommendation`、`sameProblemSuggestion`、`explanation` 等判断
 
 ## 索引同步边界
 
-成功的 Urmotiv 本地提交之后，内置窄适配器才会尽力调用 Anklang 冻结接口 `PUT /api/v1/index/problems`。请求严格是：
+每次索引同步前先认证地配置嵌入提供方（见上），提供方可用后，成功的 Urmotiv 本地提交才会尽力调用 Anklang 冻结接口 `PUT /api/v1/index/problems`。请求严格是：
 
 ```json
 {
@@ -94,4 +106,4 @@ ANKLANG_SOURCE_DIR=/path/to/anklang \
 pnpm --filter @urmotiv/plugin-anklang e2e:synthetic -- --source-dir /path/to/anklang
 ```
 
-工具使用真实插件客户端完成首次写入、相同请求重放、更新标题和查询命中，最后总是终止自己创建的子进程、关闭模拟模型服务、删除临时目录。输出仅包含步骤状态，不包含题面、响应正文或令牌。
+工具使用真实插件客户端完成：初始提供方状态读取、认证配置提供方、首次写入、相同请求重放、更新标题、更新提供方、清除提供方、清除后查询不可用。最后总是终止自己创建的子进程、关闭模拟模型服务、删除临时目录。输出仅包含步骤状态，不包含题面、响应正文或令牌。

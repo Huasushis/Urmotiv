@@ -94,7 +94,7 @@ describe("插件管理 HTTP 接口", () => {
       (candidate) => pluginManifestSchema.parse(candidate.manifest).id === anklangPluginId
     );
     expect(definition).toBeDefined();
-    expect(pluginManifestSchema.parse(definition?.manifest).version).toBe("0.3.0");
+    expect(pluginManifestSchema.parse(definition?.manifest).version).toBe("0.4.0");
     const settingsSchema = pluginSettingsFormSchema.parse(definition?.settingsSchema);
     expect(settingsSchema.properties?.apiVersion?.default).toBe("2");
     const timeoutDefinition = settingsSchema.properties?.timeoutMs;
@@ -241,6 +241,184 @@ describe("插件管理 HTTP 接口", () => {
         }]
       }
     });
+  });
+
+  it("Anklang 嵌入提供方密钥与 serviceToken 分开保存/更新/清除，配置标记之外永不回显", async () => {
+    const manager = createUser("anklang-manager", "human", [
+      grant("plugin.manage"),
+      grant("system.manage")
+    ]);
+    const pluginHost = new TrustedPluginHost(
+      createBuiltinPluginDefinitions(),
+      new InMemoryPluginStore(),
+      new AesGcmPluginSecretBox(Buffer.alloc(32, 7))
+    );
+    const app = await createApp({
+      store: new InMemoryDataStore([manager], demoTags),
+      demoAuthEnabled: true,
+      demoUserIds: [manager.id],
+      pluginHost
+    });
+    openApps.push(app);
+    const cookie = await login(app, manager.id);
+    const serviceToken = "anklang-service-token-test";
+    const embeddingApiKey = "anklang-embedding-key-test";
+
+    const saved = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/admin/plugins/${anklangPluginId}`,
+      headers: { cookie, origin },
+      payload: {
+        expectedRevision: 1,
+        state: "enabled",
+        settings: {
+          baseUrl: "http://127.0.0.1:8730",
+          privateContentAuthorized: true,
+          embeddingProvider: { baseUrl: "https://emb.example.com/v1", model: "bge-m3", dimension: 1024 }
+        },
+        secrets: { serviceToken, embeddingApiKey }
+      }
+    });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.body).not.toContain(serviceToken);
+    expect(saved.body).not.toContain(embeddingApiKey);
+    expect(saved.body).not.toContain("maskedSuffix");
+    const savedSecrets = (saved.json() as { item: { secrets: Array<{ name: string; configured: boolean }> } })
+      .item.secrets;
+    expect(savedSecrets.map((secret) => secret.name)).toEqual(
+      expect.arrayContaining(["serviceToken", "embeddingApiKey"])
+    );
+    expect(
+      savedSecrets.find((secret) => secret.name === "embeddingApiKey")
+    ).toMatchObject({ configured: true, label: "嵌入提供方 API 密钥" });
+    expect(saved.json()).toMatchObject({
+      item: {
+        id: anklangPluginId,
+        settings: {
+          embeddingProvider: { baseUrl: "https://emb.example.com/v1", model: "bge-m3", dimension: 1024 }
+        }
+      }
+    });
+
+    const list = await app.inject({
+      method: "GET",
+      url: "/api/v1/admin/plugins",
+      headers: { cookie }
+    });
+    expect(list.statusCode).toBe(200);
+    const listedItem = (list.json() as { items: Array<{
+      id: string;
+      secrets: Array<{ name: string; configured: boolean }>;
+    }> }).items.find((item) => item.id === anklangPluginId);
+    const listedSecrets = new Map(listedItem?.secrets.map((secret) => [secret.name, secret]));
+    expect(listedSecrets.get("serviceToken")).toMatchObject({ configured: true });
+    expect(listedSecrets.get("embeddingApiKey")).toMatchObject({ configured: true });
+    expect(list.body).not.toContain(serviceToken);
+    expect(list.body).not.toContain(embeddingApiKey);
+    expect(list.body).not.toContain("maskedSuffix");
+
+    const rotated = "anklang-embedding-key-rotated";
+    const updated = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/admin/plugins/${anklangPluginId}`,
+      headers: { cookie, origin },
+      payload: { expectedRevision: 2, secrets: { embeddingApiKey: rotated } }
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.body).not.toContain(rotated);
+    expect(
+      (updated.json() as { item: { secrets: Array<{ name: string; configured: boolean }> } })
+        .item.secrets.find((secret) => secret.name === "embeddingApiKey")
+    ).toMatchObject({ configured: true });
+
+    const cleared = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/admin/plugins/${anklangPluginId}`,
+      headers: { cookie, origin },
+      payload: { expectedRevision: 3, clearSecrets: ["embeddingApiKey"] }
+    });
+    expect(cleared.statusCode).toBe(200);
+    const clearedSecrets = new Map(
+      (cleared.json() as { item: { secrets: Array<{ name: string; configured: boolean }> } })
+        .item.secrets.map((secret) => [secret.name, secret])
+    );
+    expect(clearedSecrets.get("embeddingApiKey")).toMatchObject({ configured: false });
+    expect(clearedSecrets.get("serviceToken")).toMatchObject({ configured: true });
+    expect(cleared.body).not.toContain(rotated);
+  });
+
+  it("带嵌入密钥的修改同样受双权限、机器人、404 遮罩与审计不含值约束", async () => {
+    const manager = createUser("anklang-security-manager", "human", [
+      grant("plugin.manage"),
+      grant("system.manage")
+    ]);
+    const pluginStore = new InMemoryPluginStore();
+    const pluginHost = new TrustedPluginHost(
+      createBuiltinPluginDefinitions(),
+      pluginStore,
+      new AesGcmPluginSecretBox(Buffer.alloc(32, 8))
+    );
+    const secretMarker = "embedding-key-must-not-leak";
+    const payload = {
+      expectedRevision: 1,
+      state: "enabled",
+      settings: {
+        baseUrl: "http://127.0.0.1:8730",
+        privateContentAuthorized: true,
+        embeddingProvider: { baseUrl: "https://emb.example.com/v1", model: "bge-m3", dimension: 1024 }
+      },
+      secrets: { embeddingApiKey: secretMarker }
+    };
+    const blockedUsers = [
+      createUser("embedding-plugin-only", "human", [grant("plugin.manage")]),
+      createUser("embedding-system-only", "human", [grant("system.manage")]),
+      createUser("embedding-explicit-deny", "human", [
+        grant("plugin.manage"),
+        grant("plugin.manage", "deny")
+      ]),
+      createUser("embedding-robot", "robot", [
+        grant("plugin.manage"),
+        grant("system.manage")
+      ])
+    ];
+    const app = await createApp({
+      store: new InMemoryDataStore([...blockedUsers, manager], demoTags),
+      demoAuthEnabled: true,
+      demoUserIds: [...blockedUsers.map((user) => user.id), manager.id],
+      pluginHost
+    });
+    openApps.push(app);
+    for (const user of blockedUsers) {
+      const blockedCookie = await login(app, user.id);
+      const response = await app.inject({
+        method: "PATCH",
+        url: `/api/v1/admin/plugins/${anklangPluginId}`,
+        headers: { cookie: blockedCookie, origin },
+        payload
+      });
+      expect(response.statusCode).toBe(404);
+      expect(response.body).not.toContain(secretMarker);
+    }
+    const unauthenticated = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/admin/plugins/${anklangPluginId}`,
+      headers: { origin },
+      payload
+    });
+    expect(unauthenticated.statusCode).toBe(401);
+    // 审计只记录固定的拒绝原因，不记录提交的密钥值、长度或哈希。
+    const auditText = JSON.stringify(pluginStore.auditEvents);
+    expect(auditText).not.toContain(secretMarker);
+    expect(auditText).not.toContain("maskedSuffix");
+    expect(pluginStore.auditEvents).toEqual(blockedUsers.map((user) => ({
+      actorUserId: user.id,
+      requestId: expect.any(String),
+      action: "plugin.update",
+      pluginId: anklangPluginId,
+      result: "denied",
+      reasonCode: "permission_denied",
+      metadata: {}
+    })));
   });
 
   it("缺少插件管理权限、明确拒绝和机器人固定限制都不能读取或修改插件", async () => {

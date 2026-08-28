@@ -59,7 +59,7 @@ Urmotiv 插件是编译进服务端的受信任代码单元。当前宿主只从
 
 Anklang 只做原题相似性检索和受控索引写入。`org.ustc.urmotiv.anklang` 的查询响应经过严格的仅检索结果投影：候选和完成/复用状态可以作为审核条目参考，`recommendation`、`sameProblemSuggestion`、`explanation` 永远不会进入保存结果，也不会阻止提交。`failureBehavior` 只处理无法取得配置检查的情形。
 
-管理员必须把 `baseUrl` 配置为本地/私有地址并显式确认 `privateContentAuthorized: true`；令牌只放在 `serviceToken` 插件密钥中。查询最多 1–3 次（默认 2），可重试的只有网络/超时/408/429/502/503/504；401、409 和契约错误不重试。同步使用 1–30 秒（默认 10 秒）的独立上限，失败不回滚 Urmotiv 已提交的本地修订。
+管理员必须把 `baseUrl` 配置为本地/私有地址并显式确认 `privateContentAuthorized: true`；两个插件密钥用途不同：`serviceToken` 认证 Urmotiv→Anklang 服务请求，`embeddingApiKey` 是嵌入提供方写密钥（只加密保存、永不回显）。`embeddingProvider` 设置（`baseUrl`/`model`/`dimension`）只允许 HTTPS 或仅供隔离测试的本地/私有 HTTP，拒绝账号密码/查询/片段；没有通用或 Fermata 回退，也不读取环境变量。每次启用后的查询与索引同步前，插件都用 `serviceToken` 认证地 PUT `/api/v1/admin/embedding-provider` 供给当前提供方；设置或密钥缺失时查询按 `failureBehavior` 不可用、索引同步零请求跳过。查询最多 1–3 次（默认 2），可重试的只有网络/超时/408/429/502/503/504；401、409 和契约错误不重试。同步使用 1–30 秒（默认 10 秒）的独立上限，失败不回滚 Urmotiv 已提交的本地修订。
 
 成功 submit、`pending_review`/`approved` 题目的标题变化，以及冻结 `basicStatement` 变化才通过窄 `AnklangIndexAdapter` 调用 `PUT /api/v1/index/problems`。draft/rejected、solution-only、无变化和删除不会同步；未启用、未授权或缺少密钥时不会发 HTTP 请求。Urmotiv 先按请求用户权限查找 Urmotiv 来源候选：当前题目自身、未知、隐藏、明确拒绝都静默移除，授权候选用当前 Urmotiv 标题替换并移除远端 URL、`metadata`（附加信息）；外部来源仅保留非判断参考数据。过滤失败时拒绝返回/保存，不会伪造空结果。
 

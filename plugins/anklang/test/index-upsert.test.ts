@@ -236,8 +236,15 @@ describe("Anklang v1 index mutation", () => {
       recommendation: { blockSubmission: true, message: "discard" }
     });
     const check = createAnklangCheck({
-      settings: settings({ failureBehavior: "continue" }), token: "service-secret",
-      fetch: async () => json(raw)
+      settings: settings({
+        failureBehavior: "continue",
+        embeddingProvider: { baseUrl: "https://emb.example.com/v1", model: "bge-m3", dimension: 1024 }
+      }),
+      token: "service-secret", embeddingApiKey: "emb-secret",
+      fetch: async (url: string | URL | Request, init?: RequestInit) =>
+        String(url).endsWith("/api/v1/admin/embedding-provider")
+          ? json({ configured: true, baseUrl: "https://emb.example.com/v1", model: "bge-m3", dimension: 1024 })
+          : json(raw)
     });
     const result = await check.run(input, { signal: new AbortController().signal });
     expect(result.decision).toBe("continue");
@@ -258,12 +265,19 @@ describe("disabled/misconfigured index bridge", () => {
   it("performs zero fetches until enabled, authorized, and secret-backed", async () => {
     const fetch = vi.fn(async () => json(upsertResponse("inserted")));
     const problem = { externalId: "42", title: "题目标题", basicStatement: "题面", updatedAt: upsertRequest.updatedAt };
-    const disabled = createAnklangIndexAdapter({ readSettings: async () => undefined, readToken: async () => "secret", fetch });
+    const disabled = createAnklangIndexAdapter({ readSettings: async () => undefined, readToken: async () => "secret", readEmbeddingApiKey: async () => "emb-secret", fetch });
     await disabled.upsert(problem);
-    const unauthorized = createAnklangIndexAdapter({ readSettings: async () => settings({ privateContentAuthorized: false }), readToken: async () => "secret", fetch });
+    const unauthorized = createAnklangIndexAdapter({ readSettings: async () => settings({ privateContentAuthorized: false }), readToken: async () => "secret", readEmbeddingApiKey: async () => "emb-secret", fetch });
     await unauthorized.upsert(problem);
-    const missingSecret = createAnklangIndexAdapter({ readSettings: async () => settings(), readToken: async () => "", fetch });
+    const missingSecret = createAnklangIndexAdapter({ readSettings: async () => settings(), readToken: async () => "", readEmbeddingApiKey: async () => "emb-secret", fetch });
     await missingSecret.upsert(problem);
+    const missingProvider = createAnklangIndexAdapter({ readSettings: async () => settings(), readToken: async () => "secret", readEmbeddingApiKey: async () => "emb-secret", fetch });
+    await missingProvider.upsert(problem);
+    const missingApiKey = createAnklangIndexAdapter({
+      readSettings: async () => settings({ embeddingProvider: { baseUrl: "https://emb.example.com/v1", model: "bge-m3", dimension: 1024 } }),
+      readToken: async () => "secret", readEmbeddingApiKey: async () => undefined, fetch
+    });
+    await missingApiKey.upsert(problem);
     expect(fetch).not.toHaveBeenCalled();
   });
 });

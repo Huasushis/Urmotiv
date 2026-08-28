@@ -164,7 +164,7 @@ describe("Anklang 设置、清单与 HTTP 边界", () => {
     const manifest = pluginManifestSchema.parse(
       JSON.parse(readFileSync(new URL("../urmotiv-plugin.json", import.meta.url), "utf8"))
     );
-    expect(manifest).toMatchObject({ version: "0.3.0", apiVersion: "1" });
+    expect(manifest).toMatchObject({ version: "0.4.0", apiVersion: "1" });
   });
 
   it("拒绝服务地址中夹带账号密码", () => {
