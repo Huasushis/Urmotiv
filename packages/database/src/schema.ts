@@ -380,6 +380,23 @@ export const roles = pgTable(
     check("roles_key_ck", sql`${table.key} ~ '^[a-z0-9]+([_-][a-z0-9]+)*$'`)
   ]
 );
+export const roleDefaults = pgTable(
+  "role_defaults",
+  {
+    id: varchar("id", { length: 32 }).primaryKey(),
+    humanRoleKey: varchar("human_role_key", { length: 80 }).notNull(),
+    robotRoleKey: varchar("robot_role_key", { length: 80 }).notNull(),
+    revision: integer("revision").notNull().default(1),
+    updatedByUserId: bigint("updated_by_user_id", { mode: "bigint" }).references(
+      () => users.id,
+      { onDelete: "set null" }
+    ),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    check("role_defaults_revision_ck", sql`${table.revision} > 0`)
+  ]
+);
 
 export const roleMemberships = pgTable(
   "role_memberships",

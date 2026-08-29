@@ -7,11 +7,15 @@ import {
   importHistoryQuerySchema,
   createAdminRoleInputSchema,
   updateAdminRoleInputSchema,
+  updateAdminRoleDefaultsInputSchema,
+  updateAdminUserPermissionDeltaInputSchema,
   updateUstcOAuthSettingsInputSchema,
   updateAdminGeneralSettingsInputSchema,
-  applyReviewSuggestionsInputSchema,
-  casCallbackQuerySchema,
+  loginInputSchema,
+  rootLoginInputSchema,
+  emailRegistrationInputSchema,
   casStartQuerySchema,
+  casCallbackQuerySchema,
   ustcOAuthCallbackQuerySchema,
   ustcOAuthStartQuerySchema,
   confirmTagDeactivationInputSchema,
@@ -28,10 +32,8 @@ import {
   createProblemInputSchema,
   demoLoginInputSchema,
   deleteTagAliasInputSchema,
-  emailRegistrationInputSchema,
   emailVerificationInputSchema,
   forceFrozenFieldEditInputSchema,
-  loginInputSchema,
   manualReviewDecisionInputSchema,
   createExportJobRequestSchema,
   createImportJobRequestSchema,
@@ -42,6 +44,7 @@ import {
   problemListQuerySchema,
   removeProblemFileInputSchema,
   reviewInputSchema,
+  applyReviewSuggestionsInputSchema,
   resendEmailVerificationInputSchema,
   submitProblemInputSchema,
   tagDeactivationPreviewInputSchema,
@@ -50,6 +53,7 @@ import {
   updateFermataPublicSettingsInputSchema,
   updateProblemInputSchema,
   updateReviewPolicyInputSchema,
+  switchAccountInputSchema,
   updateProfileInputSchema,
   updateTagAliasInputSchema,
   updateTagCatalogItemInputSchema,
@@ -87,7 +91,7 @@ import {
   parseBatchAccountText
 } from "./batch-account";
 import type { BatchAccountAuditWriter } from "./account-audit";
-import type { StoredUser } from "./domain";
+import type { StoredSession, StoredUser } from "./domain";
 import {
   createProblemPermissionFilter,
   createProblemVisibility,
@@ -709,8 +713,8 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     const routeUrl = request.routeOptions.url;
     const writesSessionCookie =
       routeUrl === "/api/v1/auth/demo-login" ||
+      routeUrl === "/api/v1/auth/root-login" ||
       routeUrl === "/api/v1/auth/email-login" ||
-      routeUrl === "/api/v1/auth/email-register" ||
       routeUrl === "/api/v1/auth/email-verification/verify" ||
       routeUrl === "/api/v1/auth/email-verification/resend" ||
       routeUrl === "/api/v1/auth/logout" ||
@@ -766,13 +770,19 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
     const errorName = error instanceof Error ? error.name : "UnknownError";
     app.log.error({ requestId: request.id, errorName }, "Unhandled API error");
+    sendError(reply, request.id, new ApiError(500, "INTERNAL_ERROR", "服务器暂时无法处理请求。"));
+
   });
 
   app.setNotFoundHandler((request, reply) => {
     sendError(reply, request.id, notFound());
   });
 
-  async function currentUser(request: FastifyRequest): Promise<StoredUser | undefined> {
+  async function currentSession(request: FastifyRequest): Promise<{
+    session: StoredSession;
+    actor: StoredUser;
+    user: StoredUser;
+  } | undefined> {
     const sessionId = request.cookies[sessionCookieName];
     if (sessionId === undefined) {
       return undefined;
@@ -794,7 +804,28 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       await dependencies.store.deleteSession(sessionId);
       return undefined;
     }
-    return user;
+
+    let actor = user;
+    if (session.impersonatorUserId !== undefined && session.impersonatorUserId !== null) {
+      actor = (await dependencies.store.getUser(session.impersonatorUserId)) ?? user;
+      if (
+        actor.id !== "0" ||
+        !actor.isRoot ||
+        actor.accountType !== "human" ||
+        actor.id === user.id ||
+        user.accountType !== "human" ||
+        !hasPermission(actor, "auth.login", {}, dependencies.now()) ||
+        !hasPermission(actor, "user.impersonate", {}, dependencies.now())
+      ) {
+        await dependencies.store.deleteSession(sessionId);
+        return undefined;
+      }
+    }
+    return { session, actor, user };
+  }
+
+  async function currentUser(request: FastifyRequest): Promise<StoredUser | undefined> {
+    return (await currentSession(request))?.user;
   }
 
   async function requireUser(request: FastifyRequest): Promise<StoredUser> {
@@ -826,27 +857,39 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     return dependencies.tagCatalog;
   }
 
-  async function requireServiceAccountManager(request: FastifyRequest): Promise<StoredUser> {
-    const user = await requireUser(request);
+  async function requireServiceAccountManagerContext(
+    request: FastifyRequest
+  ): Promise<{ actor: StoredUser; user: StoredUser }> {
+    const current = await currentSession(request);
+    if (current === undefined) throw unauthorized();
     if (
-      user.accountType !== "human"
-      || !hasPermission(user, "service_account.manage", {}, dependencies.now())
+      current.user.accountType !== "human" ||
+      !hasPermission(current.user, "service_account.manage", {}, dependencies.now())
     ) {
       throw notFound();
     }
-    return user;
+    return current;
+  }
+
+  async function requireServiceAccountManager(request: FastifyRequest): Promise<StoredUser> {
+    return (await requireServiceAccountManagerContext(request)).user;
+  }
+
+  async function requireOAuthManagerContext(request: FastifyRequest): Promise<{ actor: StoredUser; user: StoredUser }> {
+    const current = await currentSession(request);
+    if (current === undefined) throw unauthorized();
+    if (
+      current.user.accountType !== "human" ||
+      !hasPermission(current.user, "system.manage", {}, dependencies.now()) ||
+      !hasPermission(current.user, "user.permission.manage", {}, dependencies.now())
+    ) {
+      throw notFound();
+    }
+    return current;
   }
 
   async function requireOAuthManager(request: FastifyRequest): Promise<StoredUser> {
-    const user = await requireUser(request);
-    if (
-      user.accountType !== "human" ||
-      !hasPermission(user, "system.manage", {}, dependencies.now()) ||
-      !hasPermission(user, "user.permission.manage", {}, dependencies.now())
-    ) {
-      throw notFound();
-    }
-    return user;
+    return (await requireOAuthManagerContext(request)).user;
   }
 
   async function requireAdminPermission(
@@ -861,6 +904,21 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       throw notFound();
     }
     return user;
+  }
+  async function requireAdminPermissionContext(
+    request: FastifyRequest,
+    permission: Parameters<typeof hasPermission>[1]
+  ): Promise<{ actor: StoredUser; user: StoredUser }> {
+    const current = await currentSession(request);
+    if (
+      current === undefined
+      || current.user.accountType !== "human"
+      || !hasPermission(current.user, permission, {}, dependencies.now())
+    ) {
+      if (current === undefined) throw unauthorized();
+      throw notFound();
+    }
+    return current;
   }
 
   function requireServiceAccountTokenStore(): DatabaseServiceAccountTokenStore {
@@ -923,9 +981,24 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     return client;
   }
 
-  async function authSummary(user: StoredUser | undefined) {
+  async function authSummary(user: StoredUser | undefined, session?: StoredSession) {
+    const actor =
+      user === undefined
+        ? undefined
+        : session?.impersonatorUserId === undefined || session.impersonatorUserId === null
+          ? user
+          : (await dependencies.store.getUser(session.impersonatorUserId)) ?? user;
+    const identity = user === undefined || actor === undefined
+      ? undefined
+      : {
+          actor: { id: actor.id, nickname: actor.nickname },
+          effective: { id: user.id, nickname: user.nickname },
+          switched: session?.impersonatorUserId !== undefined &&
+            session.impersonatorUserId !== null
+        };
     return {
       user: user === undefined ? null : dependencies.service.getSessionUser(user),
+      ...(identity === undefined ? {} : { identity }),
       auth: {
         emailEnabled: dependencies.emailLoginEnabled,
         emailRegistrationEnabled: await dependencies.adminService.isPublicRegistrationEnabled(),
@@ -936,14 +1009,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     };
   }
 
-  async function beginSession(user: StoredUser, reply: FastifyReply): Promise<void> {
-    if (!hasPermission(user, "auth.login", {}, dependencies.now())) {
-      throw unauthorized();
-    }
-    const expiresAt = new Date(
-      dependencies.now().getTime() + sessionLifetimeSeconds * 1000
-    ).toISOString();
-    const session = await dependencies.store.createSession(user.id, expiresAt);
+  function setSessionCookie(session: StoredSession, reply: FastifyReply): void {
     reply.setCookie(sessionCookieName, session.id, {
       httpOnly: true,
       secure: dependencies.secureCookies,
@@ -952,6 +1018,19 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       maxAge: sessionLifetimeSeconds
     });
   }
+
+  async function beginSession(user: StoredUser, reply: FastifyReply): Promise<StoredSession> {
+    if (!hasPermission(user, "auth.login", {}, dependencies.now())) {
+      throw unauthorized();
+    }
+    const expiresAt = new Date(
+      dependencies.now().getTime() + sessionLifetimeSeconds * 1000
+    ).toISOString();
+    const session = await dependencies.store.createSession(user.id, expiresAt);
+    setSessionCookie(session, reply);
+    return session;
+  }
+
 
   async function sendEmailVerification(
     target: { userId: string; normalizedEmail: string },
@@ -999,8 +1078,83 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   });
 
   app.get("/api/v1/session", async (request) => {
-    const user = await currentUser(request);
-    return authSummary(user);
+    const session = await currentSession(request);
+    return authSummary(session?.user, session?.session);
+  });
+
+  app.post("/api/v1/auth/switch-account", async (request, reply) => {
+    const current = await currentSession(request);
+    if (current === undefined) {
+      throw unauthorized();
+    }
+    if (current.session.impersonatorUserId !== undefined && current.session.impersonatorUserId !== null) {
+      throw new ApiError(409, "IMPERSONATION_NESTED", "不能在已切换的账号下再次切换账号。");
+    }
+    if (
+      current.actor.id !== "0" ||
+      !current.actor.isRoot ||
+      current.actor.accountType !== "human" ||
+      !hasPermission(current.actor, "user.impersonate", {}, dependencies.now())
+    ) {
+      throw notFound();
+    }
+    const input = switchAccountInputSchema.strict().parse(request.body);
+    const target = await dependencies.store.getUser(input.targetUserId);
+    if (
+      target === undefined ||
+      target.id === "0" ||
+      target.accountType !== "human" ||
+      target.disabled ||
+      !hasPermission(target, "auth.login", {}, dependencies.now())
+    ) {
+      throw notFound();
+    }
+    const expiresAt = new Date(
+      dependencies.now().getTime() + sessionLifetimeSeconds * 1000
+    ).toISOString();
+    const switchedSession = await dependencies.store.createSession(
+      target.id,
+      expiresAt,
+      current.actor.id
+    );
+    await dependencies.store.deleteSession(current.session.id);
+    await dependencies.adminService.recordAuditEvent({
+      actorUserId: current.actor.id,
+      requestId: request.id,
+      action: "auth.account_switch",
+      objectType: "user",
+      objectId: target.id,
+      result: "success",
+      metadata: { effectiveUserId: target.id }
+    });
+    setSessionCookie(switchedSession, reply);
+    return authSummary(target, switchedSession);
+  });
+
+  app.post("/api/v1/auth/switch-account/exit", async (request, reply) => {
+    const current = await currentSession(request);
+    if (current === undefined) {
+      throw unauthorized();
+    }
+    if (current.session.impersonatorUserId === undefined || current.session.impersonatorUserId === null) {
+      throw notFound();
+    }
+    const expiresAt = new Date(
+      dependencies.now().getTime() + sessionLifetimeSeconds * 1000
+    ).toISOString();
+    const restoredSession = await dependencies.store.createSession(current.actor.id, expiresAt);
+    await dependencies.store.deleteSession(current.session.id);
+    await dependencies.adminService.recordAuditEvent({
+      actorUserId: current.actor.id,
+      requestId: request.id,
+      action: "auth.account_switch.exit",
+      objectType: "user",
+      objectId: current.user.id,
+      result: "success",
+      metadata: { effectiveUserId: current.actor.id }
+    });
+    setSessionCookie(restoredSession, reply);
+    return authSummary(current.actor, restoredSession);
   });
 
   app.get("/api/v1/admin/settings", async (request, reply) => {
@@ -1010,13 +1164,14 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   });
   app.put("/api/v1/admin/settings", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
-    await requireAdminPermission(request, "system.manage");
+    const current = await requireAdminPermissionContext(request, "system.manage");
     const input = updateAdminGeneralSettingsInputSchema.strict().parse(request.body);
     return {
       settings: await dependencies.adminService.updateGeneralSettings(
-        await requireUser(request),
+        current.user,
         input,
-        request.id
+        request.id,
+        { auditActorUserId: current.actor.id }
       )
     };
   });
@@ -1029,27 +1184,73 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   app.post("/api/v1/admin/roles", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
-    await requireAdminPermission(request, "user.permission.manage");
+    const current = await requireAdminPermissionContext(request, "user.permission.manage");
     const input = createAdminRoleInputSchema.strict().parse(request.body);
     const result = await dependencies.adminService.createRole(
-      await requireUser(request),
+      current.user,
       input,
-      request.id
+      request.id,
+      { auditActorUserId: current.actor.id }
     );
     reply.code(201);
     return result;
   });
+  app.get("/api/v1/admin/roles/defaults", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    return dependencies.adminService.getRoleDefaults(await requireUser(request));
+  });
+
+  app.put("/api/v1/admin/roles/defaults", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const actor = await requireUser(request);
+    const input = updateAdminRoleDefaultsInputSchema.strict().parse(request.body);
+    return dependencies.adminService.updateRoleDefaults(actor, input, request.id);
+  });
+
+  app.get("/api/v1/admin/permissions/catalog", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requireAdminPermission(request, "user.permission.manage");
+    return dependencies.adminService.listPermissionCatalog();
+  });
+
+  app.get("/api/v1/admin/users", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requireAdminPermission(request, "user.permission.manage");
+    const query = z.object({ search: z.string().trim().max(160).optional() }).strict().parse(request.query);
+    return dependencies.adminService.listManagedUsers(query.search);
+  });
+  app.get("/api/v1/admin/users/:userId/permissions", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const actor = await requireAdminPermission(request, "user.permission.manage");
+    const params = z.object({ userId: z.string().trim().min(1).max(80) }).strict().parse(request.params);
+    return dependencies.adminService.getManagedUserPermissionDelta(actor, params.userId);
+  });
+
+  app.put("/api/v1/admin/users/:userId/permissions", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const current = await requireAdminPermissionContext(request, "user.permission.manage");
+    const params = z.object({ userId: z.string().trim().min(1).max(80) }).strict().parse(request.params);
+    const input = updateAdminUserPermissionDeltaInputSchema.strict().parse(request.body);
+    return dependencies.adminService.updateManagedUserPermissionDelta(
+      current.user,
+      params.userId,
+      input,
+      request.id,
+      { auditActorUserId: current.actor.id }
+    );
+  });
 
   app.put("/api/v1/admin/roles/:roleId", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
-    const actor = await requireAdminPermission(request, "user.permission.manage");
+    const current = await requireAdminPermissionContext(request, "user.permission.manage");
     const params = z.object({ roleId: z.string().uuid() }).strict().parse(request.params);
     const input = updateAdminRoleInputSchema.strict().parse(request.body);
     return dependencies.adminService.updateRole(
-      actor,
+      current.user,
       params.roleId,
       input,
-      request.id
+      request.id,
+      { auditActorUserId: current.actor.id }
     );
   });
 
@@ -1079,12 +1280,13 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   app.put("/api/v1/admin/oauth/ustc", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
-    const actor = await requireOAuthManager(request);
+    const current = await requireOAuthManagerContext(request);
     const input = updateUstcOAuthSettingsInputSchema.strict().parse(request.body);
     return dependencies.adminService.updateUstcOAuthSettings(
-      actor,
+      current.user,
       input,
-      request.id
+      request.id,
+      { auditActorUserId: current.actor.id }
     );
   });
   app.get("/api/v1/admin/service-accounts/:userId/tokens", async (request, reply) => {
@@ -1100,14 +1302,15 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   app.post("/api/v1/admin/service-accounts/:userId/tokens", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
-    const actor = await requireServiceAccountManager(request);
+    const current = await requireServiceAccountManagerContext(request);
     const userId = parseServiceAccountUserId(request);
     const input = createServiceAccountTokenInputSchema.parse(request.body);
     if (input.expiresAt !== null && Date.parse(input.expiresAt) <= dependencies.now().getTime()) {
       throw new ApiError(422, "INVALID_INPUT", "机器人令牌的到期时间必须晚于当前时间。");
     }
     const created = await requireServiceAccountTokenStore().createToken(userId, {
-      actorUserId: actor.id,
+      actorUserId: current.actor.id,
+      ...(current.actor.id === current.user.id ? {} : { effectiveUserId: current.user.id }),
       requestId: request.id,
       token: input
     });
@@ -1121,7 +1324,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     "/api/v1/admin/service-accounts/:userId/tokens/:tokenId/rotate",
     async (request, reply) => {
       reply.header("cache-control", "private, no-store");
-      const actor = await requireServiceAccountManager(request);
+      const current = await requireServiceAccountManagerContext(request);
       const userId = parseServiceAccountUserId(request);
       const tokenId = parseServiceAccountTokenId(request);
       const input = createServiceAccountTokenInputSchema.parse(request.body);
@@ -1129,7 +1332,8 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
         throw new ApiError(422, "INVALID_INPUT", "机器人令牌的到期时间必须晚于当前时间。");
       }
       const rotated = await requireServiceAccountTokenStore().rotateToken(userId, tokenId, {
-        actorUserId: actor.id,
+        actorUserId: current.actor.id,
+        ...(current.actor.id === current.user.id ? {} : { effectiveUserId: current.user.id }),
         requestId: request.id,
         token: input
       });
@@ -1144,14 +1348,15 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     "/api/v1/admin/service-accounts/:userId/tokens/:tokenId",
     async (request, reply) => {
       reply.header("cache-control", "private, no-store");
-      const actor = await requireServiceAccountManager(request);
+      const current = await requireServiceAccountManagerContext(request);
       const userId = parseServiceAccountUserId(request);
       const tokenId = parseServiceAccountTokenId(request);
       const revoked = await requireServiceAccountTokenStore().revokeToken(
         userId,
         tokenId,
-        actor.id,
-        request.id
+        current.actor.id,
+        request.id,
+        current.actor.id === current.user.id ? undefined : current.user.id
       );
       if (revoked === undefined) {
         throw notFound();
@@ -1361,6 +1566,31 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       throw new ApiError(400, "INVALID_VERIFICATION", "验证链接无效或已过期，请重新申请验证邮件。");
     }
     return { ok: true };
+  });
+
+  app.post("/api/v1/auth/root-login", async (request, reply) => {
+    const input = rootLoginInputSchema.strict().parse(request.body);
+    const limiter = dependencies.loginRateLimiter;
+    const sourceAddress = resolveClientAddress(request, dependencies.trustedProxyCidrs);
+    if (limiter !== undefined && limiter.isBlocked(sourceAddress)) {
+      throw new ApiError(429, "LOGIN_RATE_LIMITED", "登录尝试过于频繁，请稍后再试。");
+    }
+    const credential = await dependencies.store.findRootCredential();
+    const verified = await verifyEmailLoginPassword(credential?.passwordHash, input.password);
+    if (
+      credential === undefined ||
+      credential.user.id !== "0" ||
+      !credential.user.isRoot ||
+      credential.user.accountType !== "human" ||
+      !hasPermission(credential.user, "auth.login", {}, dependencies.now()) ||
+      !verified
+    ) {
+      limiter?.recordFailure(sourceAddress);
+      throw unauthorized();
+    }
+    limiter?.recordSuccess(sourceAddress);
+    const session = await beginSession(credential.user, reply);
+    return authSummary(credential.user, session);
   });
 
   app.post("/api/v1/auth/email-login", async (request, reply) => {
@@ -1658,10 +1888,17 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   }
 
   app.post("/api/v1/admin/accounts/batch", async (request) => {
-    const user = await requireUser(request);
-    if (!hasPermission(user, "user.create", {}, dependencies.now())) {
+    const current = await currentSession(request);
+    if (current === undefined) {
+      throw unauthorized();
+    }
+    if (
+      current.user.accountType !== "human"
+      || !hasPermission(current.user, "user.create", {}, dependencies.now())
+    ) {
       throw forbidden();
     }
+    const user = current.user;
     const input = batchAccountCreateInputSchema.strict().parse(request.body);
     let parsed;
     try {
@@ -1689,7 +1926,8 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     try {
       const result = await dependencies.store.createEmailUsersBatch(
         {
-          actorUserId: user.id,
+          actorUserId: current.actor.id,
+          ...(current.actor.id === current.user.id ? {} : { effectiveUserId: current.user.id }),
           requestId: request.id,
           accounts
         },

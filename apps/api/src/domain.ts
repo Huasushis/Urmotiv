@@ -84,7 +84,10 @@ export interface StoredReview extends Review {
 
 export interface StoredSession {
   id: string;
+  /** The account whose permissions are applied to this request. */
   userId: string;
+  /** Root actor preserved across a supported account switch. */
+  impersonatorUserId?: string | null;
   expiresAt: string;
 }
 

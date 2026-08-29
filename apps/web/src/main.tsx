@@ -18,6 +18,7 @@ import { TransferPage } from "./pages/transfer-page";
 import { VerifyEmailPage } from "./pages/verify-email-page";
 
 import { AdminSectionPage } from "./pages/admin-section-page";
+import { AdminPermissionsPage } from "./pages/admin-permissions-page";
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: { retry: 1, refetchOnWindowFocus: false }
@@ -84,7 +85,9 @@ function App() {
         <Route path="/profile" element={<ProfilePage />} />
         <Route path="/admin/accounts" element={<BatchAccountPage />} />
         <Route path="/admin/settings" element={<AdminSectionPage section="settings" session={sessionData.user} />} />
-        <Route path="/admin/roles" element={<AdminSectionPage section="roles" session={sessionData.user} />} />
+        <Route path="/admin/users" element={<AdminPermissionsPage section="users" session={sessionData.user} />} />
+        <Route path="/admin/roles" element={<AdminPermissionsPage section="roles" session={sessionData.user} />} />
+        <Route path="/admin/roles/defaults" element={<AdminPermissionsPage section="defaults" session={sessionData.user} />} />
         <Route path="/admin/service-accounts" element={<AdminSectionPage section="service-accounts" session={sessionData.user} />} />
         <Route path="/admin/audit" element={<AdminSectionPage section="audit" session={sessionData.user} />} />
         <Route path="/admin/fermata" element={<AdminSectionPage section="fermata" session={sessionData.user} />} />

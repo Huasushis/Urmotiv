@@ -1,30 +1,22 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  createAdminRole,
   getAdminGeneralSettings,
   getAdminUstcOAuthSettings,
   getFermataHealth,
   getFermataSettings,
   listAdminAudit,
   listAdminPlugins,
-  listAdminRoles,
   listAdminServiceAccounts,
   listImportHistory,
   listManagedTagCatalog,
   updateAdminGeneralSettings,
-  updateAdminRole,
   updateAdminUstcOAuthSettings
 } from "../lib/api";
-import type {
-  AdminManagedRole,
-  AdminRoleManagementResponse,
-  SessionUser
-} from "@urmotiv/contracts";
+import type { SessionUser } from "@urmotiv/contracts";
 
 export type AdminSection =
   | "settings"
-  | "roles"
   | "service-accounts"
   | "audit"
   | "fermata"
@@ -44,7 +36,6 @@ function LoadingState() {
 function SectionFrame({ section, children }: { section: AdminSection; children: React.ReactNode }) {
   const labels: Record<AdminSection, string> = {
     settings: "常规设置",
-    roles: "角色与权限",
     "service-accounts": "服务账号与令牌",
     audit: "审计记录",
     fermata: "Fermata 服务",
@@ -141,171 +132,6 @@ function SettingsSection() {
   );
 }
 
-type RoleDraft = {
-  id: string | null;
-  key: string;
-  displayName: string;
-  description: string;
-  expectedRevision: number;
-  isBuiltIn: boolean;
-  permissions: Array<{ name: string; effect: "allow" | "deny" }>;
-  userIds: string[];
-};
-
-function roleToDraft(role: AdminManagedRole): RoleDraft {
-  return {
-    id: role.id,
-    key: role.key,
-    displayName: role.displayName,
-    description: role.description,
-    expectedRevision: role.revision,
-    isBuiltIn: role.isBuiltIn,
-    permissions: role.permissions.map((permission) => ({ ...permission })),
-    userIds: role.members.map((member) => member.id)
-  };
-}
-
-function RolesSection() {
-  const client = useQueryClient();
-  const query = useQuery({ queryKey: ["admin-roles"], queryFn: listAdminRoles });
-  const [draft, setDraft] = useState<RoleDraft | null>(null);
-  useEffect(() => {
-    if (query.data === undefined || draft !== null) return;
-    const first = query.data.roles[0];
-    if (first !== undefined) setDraft(roleToDraft(first));
-  }, [query.data, draft]);
-  const mutation = useMutation({
-    mutationFn: (value: RoleDraft) => {
-      const payload = {
-        key: value.key,
-        displayName: value.displayName,
-        description: value.description,
-        permissions: value.permissions,
-        userIds: value.userIds
-      };
-      return value.id === null
-        ? createAdminRole(payload)
-        : updateAdminRole(value.id, { ...payload, expectedRevision: value.expectedRevision });
-    },
-    onSuccess: (result) => {
-      setDraft(roleToDraft(result.role));
-      void client.invalidateQueries({ queryKey: ["admin-roles"] });
-    }
-  });
-  if (query.isPending) return <LoadingState />;
-  if (query.isError) return <ErrorState message={query.error.message} />;
-  if (draft === null) return <LoadingState />;
-  const selectRole = (role: AdminManagedRole) => {
-    setDraft(roleToDraft(role));
-    mutation.reset();
-  };
-  const updateDraft = (patch: Partial<RoleDraft>) => {
-    setDraft((current) => current === null ? current : { ...current, ...patch });
-  };
-  const togglePermission = (name: string, checked: boolean) => {
-    const permissions = checked
-      ? [...draft.permissions, { name, effect: "allow" as const }]
-      : draft.permissions.filter((permission) => permission.name !== name);
-    updateDraft({ permissions });
-  };
-  const changePermissionEffect = (name: string, effect: "allow" | "deny") => {
-    updateDraft({
-      permissions: draft.permissions.map((permission) =>
-        permission.name === name ? { ...permission, effect } : permission
-      )
-    });
-  };
-  const toggleUser = (id: string, checked: boolean) => {
-    updateDraft({ userIds: checked ? [...draft.userIds, id] : draft.userIds.filter((value) => value !== id) });
-  };
-  return (
-    <div className="admin-two-column">
-      <div className="plain-panel">
-        <div className="section-heading">
-          <h2>角色</h2>
-          <button
-            type="button"
-            onClick={() => {
-              setDraft({
-                id: null,
-                key: "",
-                displayName: "",
-                description: "",
-                expectedRevision: 1,
-                isBuiltIn: false,
-                permissions: [],
-                userIds: []
-              });
-              mutation.reset();
-            }}
-          >
-            新建自定义角色
-          </button>
-        </div>
-        <ul>
-          {query.data.roles.map((role) => (
-            <li key={role.id}>
-              <button type="button" onClick={() => selectRole(role)}>
-                {role.displayName}{role.isBuiltIn ? "（内置）" : ""}
-              </button>
-              <small>成员 {role.members.length} 人，权限 {role.permissions.length} 项</small>
-            </li>
-          ))}
-        </ul>
-        <h2>可用权限</h2>
-        <ul>
-          {query.data.permissions.map((permission) => (
-            <li key={permission.name}>
-              <strong>{permission.displayName}</strong>（{permission.name}）：{permission.description}
-            </li>
-          ))}
-        </ul>
-      </div>
-      <form className="plain-panel admin-form" onSubmit={(event) => { event.preventDefault(); mutation.mutate(draft); }}>
-        <h2>{draft.id === null ? "新建角色" : `编辑：${draft.displayName}`}</h2>
-        {draft.isBuiltIn ? <p>内置角色的名称和权限不可修改；可以调整成员归属。</p> : null}
-        <label>角色标识<input value={draft.key} disabled={draft.isBuiltIn} required onChange={(event) => updateDraft({ key: event.target.value })} /></label>
-        <label>显示名称<input value={draft.displayName} disabled={draft.isBuiltIn} required onChange={(event) => updateDraft({ displayName: event.target.value })} /></label>
-        <label>说明<textarea value={draft.description} disabled={draft.isBuiltIn} onChange={(event) => updateDraft({ description: event.target.value })} /></label>
-        <fieldset disabled={draft.isBuiltIn}>
-          <legend>权限</legend>
-          {query.data.permissions.map((permission) => {
-            const grant = draft.permissions.find((item) => item.name === permission.name);
-            return (
-              <label key={permission.name} className="checkbox-row">
-                <input
-                  type="checkbox"
-                  checked={grant !== undefined}
-                  onChange={(event) => togglePermission(permission.name, event.target.checked)}
-                />
-                {permission.displayName}
-                {grant !== undefined ? (
-                  <select value={grant.effect} onChange={(event) => changePermissionEffect(permission.name, event.target.value as "allow" | "deny")}>
-                    <option value="allow">允许</option>
-                    <option value="deny">明确拒绝</option>
-                  </select>
-                ) : null}
-              </label>
-            );
-          })}
-        </fieldset>
-        <fieldset>
-          <legend>分配账号</legend>
-          {query.data.users.map((user) => (
-            <label key={user.id} className="checkbox-row">
-              <input type="checkbox" checked={draft.userIds.includes(user.id)} onChange={(event) => toggleUser(user.id, event.target.checked)} />
-              {user.nickname}（{user.accountType === "robot" ? "机器人" : "人类"}{user.enabled ? "" : "，已停用"}）
-            </label>
-          ))}
-          <p>机器人即使被分配角色，仍受服务端机器人硬拒绝规则约束。</p>
-        </fieldset>
-        <button type="submit" disabled={mutation.isPending}>{draft.id === null ? "创建角色" : "保存角色"}</button>
-        {mutation.isError ? <p role="alert">{mutation.error.message}</p> : null}
-        {mutation.isSuccess ? <p role="status">角色设置已保存。</p> : null}
-      </form>
-    </div>
-  );
-}
 
 function ServiceAccountsSection() {
   const query = useQuery({ queryKey: ["admin-service-accounts"], queryFn: listAdminServiceAccounts });
@@ -453,7 +279,6 @@ export function AdminSectionPage({ section, session: _session }: { section: Admi
   const content = useMemo(() => {
     switch (section) {
       case "settings": return <SettingsSection />;
-      case "roles": return <RolesSection />;
       case "service-accounts": return <ServiceAccountsSection />;
       case "audit": return <AuditSection />;
       case "fermata": return <FermataSection />;

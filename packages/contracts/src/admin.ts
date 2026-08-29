@@ -189,3 +189,74 @@ export type AdminRoleMember = z.infer<typeof adminRoleMemberSchema>;
 export type AdminManagedRole = z.infer<typeof adminManagedRoleSchema>;
 export type AdminRoleManagementResponse = z.infer<typeof adminRoleManagementResponseSchema>;
 export type AdminRoleResponse = z.infer<typeof adminRoleResponseSchema>;
+
+export const adminPermissionCatalogGroupSchema = z.object({
+  key: z.string().trim().min(1).max(40),
+  displayName: z.string().trim().min(1).max(80),
+  permissions: z.array(adminPermissionSchema).max(100)
+}).strict();
+export const adminPermissionCatalogResponseSchema = z.object({
+  groups: z.array(adminPermissionCatalogGroupSchema).max(20)
+}).strict();
+export type AdminPermissionCatalogGroup = z.infer<typeof adminPermissionCatalogGroupSchema>;
+export type AdminPermissionCatalogResponse = z.infer<typeof adminPermissionCatalogResponseSchema>;
+
+export const adminUserListItemSchema = z.object({
+  id: z.string().trim().min(1).max(80),
+  nickname: z.string().trim().min(1).max(120),
+  accountType: z.enum(["human", "robot"]),
+  enabled: z.boolean(),
+  roles: z.array(z.string()).max(100)
+}).strict();
+export const adminUsersResponseSchema = z.object({
+  items: z.array(adminUserListItemSchema).max(5_000),
+  total: z.number().int().nonnegative()
+}).strict();
+export type AdminUserListItem = z.infer<typeof adminUserListItemSchema>;
+export type AdminUsersResponse = z.infer<typeof adminUsersResponseSchema>;
+
+export const adminUserPermissionDeltaSchema = z.object({
+  userId: z.string().trim().min(1).max(80),
+  roles: z.array(z.string()).max(100),
+  allows: z.array(z.string()).max(500),
+  denies: z.array(z.string()).max(500),
+  effective: z.array(z.string()).max(500),
+  revision: z.number().int().positive()
+}).strict();
+export const updateAdminUserPermissionDeltaInputSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  allows: z.array(z.string().trim().min(1).max(160)).max(500),
+  denies: z.array(z.string().trim().min(1).max(160)).max(500)
+}).strict();
+export type UpdateAdminUserPermissionDeltaInput = z.infer<typeof updateAdminUserPermissionDeltaInputSchema>;
+export const adminPermissionEffectiveEntrySchema = z.object({
+  name: z.string().trim().min(1).max(160),
+  allowed: z.boolean(),
+  sources: z.array(z.string().trim().min(1).max(160)).max(20)
+}).strict();
+export const adminUserPermissionDeltaResponseSchema = z.object({
+  delta: adminUserPermissionDeltaSchema,
+  effective: z.object({
+    permissions: z.array(z.string()).max(500),
+    entries: z.array(adminPermissionEffectiveEntrySchema).max(500)
+  }).strict()
+}).strict();
+export type AdminPermissionEffectiveEntry = z.infer<typeof adminPermissionEffectiveEntrySchema>;
+export type AdminUserPermissionDeltaResponse = z.infer<typeof adminUserPermissionDeltaResponseSchema>;
+
+export const adminRoleDefaultsSchema = z.object({
+  humanRoleKey: z.string().trim().min(1).max(80),
+  robotRoleKey: z.string().trim().min(1).max(80),
+  revision: z.number().int().positive()
+}).strict();
+export const adminRoleDefaultsResponseSchema = z.object({
+  defaults: adminRoleDefaultsSchema
+}).strict();
+export const updateAdminRoleDefaultsInputSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  humanRoleKey: z.string().trim().min(1).max(80),
+  robotRoleKey: z.string().trim().min(1).max(80)
+}).strict();
+export type AdminRoleDefaults = z.infer<typeof adminRoleDefaultsSchema>;
+export type AdminRoleDefaultsResponse = z.infer<typeof adminRoleDefaultsResponseSchema>;
+export type UpdateAdminRoleDefaultsInput = z.infer<typeof updateAdminRoleDefaultsInputSchema>;

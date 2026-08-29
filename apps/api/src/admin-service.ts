@@ -1,7 +1,13 @@
 import {
+  corePermissions,
+  robotHardDeniedPermissions,
   adminAuditEventSchema,
   adminGeneralSettingsSchema,
   adminPermissionSchema,
+  adminPermissionCatalogResponseSchema,
+  adminRoleDefaultsResponseSchema,
+  adminUserPermissionDeltaResponseSchema,
+  adminUsersResponseSchema,
   adminRoleSchema,
   adminServiceAccountSchema,
   adminManagedRoleSchema,
@@ -9,19 +15,25 @@ import {
   type AdminAuditEvent,
   type AdminGeneralSettings,
   type AdminPermission,
+  type AdminPermissionCatalogResponse,
   type AdminRole,
   type AdminManagedRole,
+  type AdminRoleDefaults,
+  type AdminRoleDefaultsResponse,
   type AdminRoleManagementResponse,
+  type AdminServiceAccount,
+  type AdminUserPermissionDeltaResponse,
+  type AdminUsersResponse,
   type CreateAdminRoleInput,
   type UpdateAdminRoleInput,
-  type AdminServiceAccount,
+  type UpdateAdminRoleDefaultsInput,
   type UpdateAdminGeneralSettingsInput,
   type UpdateUstcOAuthSettingsInput,
   type UstcOAuthSettings
 } from "@urmotiv/contracts";
 import { isApprovedUstcOAuthEndpoint, ustcOAuthCallbackPath, ustcOAuthEndpointContract } from "@urmotiv/auth";
-import { sql, type SQL } from "drizzle-orm";
-import { corePermissionDefinitions, builtinRoleDefinitions, type DatabaseHandle } from "@urmotiv/database";
+import { corePermissionDefinitions, builtinRoleDefinitions, type DatabaseExecutor, type DatabaseHandle } from "@urmotiv/database";
+import { type SQL, sql } from "drizzle-orm";
 import type { StoredUser } from "./domain";
 import { ApiError, conflict, notFound } from "./errors";
 import { hasPermission } from "./permissions";
@@ -33,7 +45,7 @@ import {
   type AdminRoleMutationContext,
   type StoredAdminRole
 } from "./admin-role-service";
-import type { DataStore } from "./repository";
+import type { DataStore, ReplaceUserPermissionDeltaInput, UserPermissionDelta } from "./repository";
 import type { PluginSecretBox } from "./plugin-host";
 
 export interface StoredUstcOAuthSettings {
@@ -69,6 +81,7 @@ export interface StoredGeneralSettings {
 
 export interface AdminAuditEventInput {
   readonly actorUserId: string;
+  readonly subjectUserId?: string;
   readonly requestId: string;
   readonly action: string;
   readonly objectType: string;
@@ -76,6 +89,9 @@ export interface AdminAuditEventInput {
   readonly result: "success" | "failure";
   readonly reasonCode?: string;
   readonly metadata?: Record<string, unknown>;
+}
+export interface AdminMutationAuditContext {
+  readonly auditActorUserId?: string;
 }
 
 export interface AdminSettingsStore {
@@ -92,6 +108,8 @@ export interface AdminSettingsStore {
     event: AdminAuditEventInput
   ): Promise<StoredUstcOAuthSettings>;
   listAuditEvents(page: number, pageSize: number): Promise<{ items: AdminAuditEvent[]; total: number }>;
+  recordAuditEvent(event: AdminAuditEventInput): Promise<void>;
+  recordAuditEventInTransaction?(executor: DatabaseExecutor, event: AdminAuditEventInput): Promise<void>;
   encryptSecret(value: string): string;
   decryptSecret(value: string): string;
 }
@@ -193,6 +211,17 @@ export class InMemoryAdminSettingsStore implements AdminSettingsStore {
     } catch {
       throw new ApiError(503, "SECRET_STORAGE_UNAVAILABLE", "密钥读取服务暂不可用。");
     }
+  }
+
+  public async recordAuditEvent(event: AdminAuditEventInput): Promise<void> {
+    this.audits.unshift({
+      id: String(this.audits.length + 1),
+      occurredAt: new Date().toISOString(),
+      action: event.action,
+      objectType: event.objectType,
+      result: event.result,
+      reasonCode: event.reasonCode ?? null
+    });
   }
 
   public async listAuditEvents(page: number, pageSize: number): Promise<{ items: AdminAuditEvent[]; total: number }> {
@@ -358,6 +387,28 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
     });
   }
 
+  public async recordAuditEventInTransaction(
+    executor: DatabaseExecutor,
+    event: AdminAuditEventInput
+  ): Promise<void> {
+    const actorId = databaseId(event.actorUserId);
+    const subjectId = event.subjectUserId === undefined ? null : databaseId(event.subjectUserId);
+    await executor.execute(sql`
+      INSERT INTO audit_events (
+        actor_user_id, subject_user_id, request_id, action, object_type, object_id,
+        result, reason_code, metadata
+      ) VALUES (
+        ${actorId}, ${subjectId}, ${event.requestId}::uuid, ${event.action}, ${event.objectType},
+        ${event.objectId ?? "global"}, ${event.result}, ${event.reasonCode ?? null},
+        ${JSON.stringify(event.metadata ?? {})}::jsonb
+      )
+    `);
+  }
+
+  public async recordAuditEvent(event: AdminAuditEventInput): Promise<void> {
+    await this.recordAuditEventInTransaction(this.database, event);
+  }
+
   public async listAuditEvents(page: number, pageSize: number): Promise<{ items: AdminAuditEvent[]; total: number }> {
     const start = (page - 1) * pageSize;
     const [rows, totals] = await Promise.all([
@@ -474,6 +525,189 @@ export class AdminService {
       description: value.description
     }));
   }
+  public async listPermissionCatalog(): Promise<AdminPermissionCatalogResponse> {
+    const groups = new Map<string, { displayName: string; permissions: AdminPermission[] }>([
+      ["accounts", { displayName: "账号与权限", permissions: [] }],
+      ["content", { displayName: "题目与附件", permissions: [] }],
+      ["review", { displayName: "审题与状态", permissions: [] }],
+      ["contest", { displayName: "组题与比赛", permissions: [] }],
+      ["integration", { displayName: "插件与系统", permissions: [] }]
+    ]);
+    for (const permission of this.listPermissions()) {
+      const key =
+        permission.name.startsWith("problem.") || permission.name === "tag.manage"
+          ? "content"
+          : permission.name.startsWith("contest.")
+            ? "contest"
+            : permission.name.startsWith("review.")
+              ? "review"
+              : permission.name.startsWith("plugin.") ||
+                  permission.name.startsWith("service_account.") ||
+                  permission.name === "system.manage"
+                ? "integration"
+                : "accounts";
+      groups.get(key)!.permissions.push(permission);
+    }
+    return adminPermissionCatalogResponseSchema.parse({
+      groups: [...groups].map(([key, group]) => ({ key, ...group }))
+    });
+  }
+
+  public async listManagedUsers(search = ""): Promise<AdminUsersResponse> {
+    const normalizedSearch = search.trim().toLocaleLowerCase();
+    const users = (await this.options.store.listUsers()).filter((user) =>
+      normalizedSearch.length === 0 ||
+      user.id.toLocaleLowerCase().includes(normalizedSearch) ||
+      user.nickname.toLocaleLowerCase().includes(normalizedSearch)
+    );
+    return adminUsersResponseSchema.parse({
+      items: users.map((user) => ({
+        id: user.id,
+        nickname: user.nickname,
+        accountType: user.accountType,
+        enabled: !user.disabled,
+        roles: user.roles
+      })),
+      total: users.length
+    });
+  }
+
+  public async getManagedUserPermissionDelta(
+    actor: StoredUser,
+    userId: string
+  ): Promise<AdminUserPermissionDeltaResponse> {
+    const target = await this.options.store.getUser(userId);
+    this.assertPermissionDeltaManager(actor, target);
+    return this.buildUserPermissionDelta(target!);
+  }
+  public async updateManagedUserPermissionDelta(
+    actor: StoredUser,
+    userId: string,
+    input: {
+      expectedRevision: number;
+      allows: readonly string[];
+      denies: readonly string[];
+    },
+    requestId: string,
+    auditContext: AdminMutationAuditContext = {}
+  ): Promise<AdminUserPermissionDeltaResponse> {
+    const target = await this.options.store.getUser(userId);
+    this.assertPermissionDeltaManager(actor, target);
+    const known = new Set<string>(corePermissions);
+    const allows = [...new Set(input.allows)];
+    const denies = [...new Set(input.denies)];
+    if (
+      allows.some((permission) => !known.has(permission)) ||
+      denies.some((permission) => !known.has(permission))
+    ) {
+      throw new ApiError(422, "PERMISSION_UNKNOWN", "包含未知权限。");
+    }
+    if (!actor.isRoot && actor.id !== "0" && (
+      allows.includes("user.impersonate") ||
+      denies.includes("user.impersonate") ||
+      target!.isRoot
+    )) {
+      throw new ApiError(403, "ROOT_PRIVILEGE_REQUIRED", "只有 root 可以管理 root 等价权限。");
+    }
+    if (target!.isRoot) {
+      throw new ApiError(409, "ROOT_DELTA_IMMUTABLE", "root 账号的完整权限不可改为用户增量。");
+    }
+    const auditActorUserId = auditContext.auditActorUserId ?? actor.id;
+    const auditEvent: AdminAuditEventInput = {
+      actorUserId: auditActorUserId,
+      subjectUserId: userId,
+      requestId,
+      action: "admin.user_permission_delta.update",
+      objectType: "user",
+      objectId: userId,
+      result: "success",
+      metadata: {
+        allows,
+        denies,
+        effectiveUserId: actor.id
+      }
+    };
+    let delta: UserPermissionDelta;
+    try {
+      delta = await this.options.store.replaceUserPermissionDeltaAtomic({
+        userId,
+        expectedRevision: input.expectedRevision,
+        allows: allows as ReplaceUserPermissionDeltaInput["allows"],
+        denies: denies as ReplaceUserPermissionDeltaInput["denies"],
+        actorUserId: auditActorUserId,
+        authorizationUserId: actor.id,
+        requestId,
+        authorizeActor: (currentActor, currentTarget) => {
+          this.assertPermissionDeltaManager(currentActor, currentTarget);
+          if (!currentActor.isRoot && currentActor.id !== "0" && (
+            allows.includes("user.impersonate") ||
+            denies.includes("user.impersonate") ||
+            currentTarget.isRoot
+          )) {
+            throw new ApiError(403, "ROOT_PRIVILEGE_REQUIRED", "只有 root 可以管理 root 等价权限。");
+          }
+          if (currentTarget.isRoot) {
+            throw new ApiError(409, "ROOT_DELTA_IMMUTABLE", "root 账号的完整权限不可改为用户增量。");
+          }
+        },
+        writeAudit: async (executor) => {
+          try {
+            if (executor === undefined) {
+              await this.settingsStore.recordAuditEvent(auditEvent);
+              return;
+            }
+            if (this.settingsStore.recordAuditEventInTransaction === undefined) {
+              throw new Error("AUDIT_TRANSACTION_UNAVAILABLE");
+            }
+            await this.settingsStore.recordAuditEventInTransaction(executor, auditEvent);
+          } catch {
+            throw new Error("AUDIT_WRITE_FAILED");
+          }
+        }
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "PERMISSION_DELTA_CONFLICT") {
+        throw conflict("用户权限增量已被其他管理员修改，请刷新后重试。");
+      }
+      if (error instanceof Error && error.message === "USER_NOT_FOUND") {
+        throw notFound();
+      }
+      if (error instanceof Error && error.message === "AUDIT_WRITE_FAILED") {
+        throw new ApiError(503, "AUDIT_WRITE_FAILED", "审计记录暂时无法写入，权限修改未提交。");
+      }
+      throw error;
+    }
+    const updated = await this.options.store.getUser(userId);
+    return this.buildUserPermissionDelta(updated!);
+  }
+
+  public async getRoleDefaults(actor: StoredUser): Promise<AdminRoleDefaultsResponse> {
+    this.assertRootManager(actor);
+    return adminRoleDefaultsResponseSchema.parse({
+      defaults: await this.roleManagementStore.getRoleDefaults()
+    });
+  }
+  public async updateRoleDefaults(
+    actor: StoredUser,
+    input: UpdateAdminRoleDefaultsInput,
+    requestId: string,
+    auditContext: AdminMutationAuditContext = {}
+  ): Promise<AdminRoleDefaultsResponse> {
+    this.assertRootManager(actor);
+    const defaults = await this.roleManagementStore.updateRoleDefaults(
+      input,
+      this.roleMutationContext(actor, requestId, auditContext)
+    );
+    this.options.store.setDefaultRoleKeys?.(defaults);
+    await this.settingsStore.recordAuditEvent(this.auditedAdminEvent(actor, auditContext, {
+      requestId,
+      action: "admin.role_defaults.update",
+      objectType: "role_defaults",
+      objectId: "global",
+      result: "success"
+    }));
+    return adminRoleDefaultsResponseSchema.parse({ defaults });
+  }
   public async listRoleManagement(): Promise<AdminRoleManagementResponse> {
     const [storedRoles, users] = await Promise.all([
       this.roleManagementStore.listRoles(),
@@ -509,27 +743,45 @@ export class AdminService {
   public async createRole(
     user: StoredUser,
     input: CreateAdminRoleInput,
-    requestId: string
+    requestId: string,
+    auditContext: AdminMutationAuditContext = {}
   ): Promise<{ role: AdminManagedRole }> {
     this.assertRoleManager(user);
-    const context = this.roleMutationContext(user, requestId);
+    const context = this.roleMutationContext(user, requestId, auditContext);
     await this.validateRoleInput(input.permissions, input.userIds);
     assertRoleMutationSafety(input, context);
     const role = await this.roleManagementStore.createRole(input, context);
-    return { role: await this.toPublicManagedRole(role) };
+    const response = { role: await this.toPublicManagedRole(role) };
+    await this.settingsStore.recordAuditEvent(this.auditedAdminEvent(user, auditContext, {
+      requestId,
+      action: "admin.role.create",
+      objectType: "role",
+      objectId: role.id,
+      result: "success"
+    }));
+    return response;
   }
 
   public async updateRole(
     user: StoredUser,
     roleId: string,
     input: UpdateAdminRoleInput,
-    requestId: string
+    requestId: string,
+    auditContext: AdminMutationAuditContext = {}
   ): Promise<{ role: AdminManagedRole }> {
     this.assertRoleManager(user);
-    const context = this.roleMutationContext(user, requestId);
+    const context = this.roleMutationContext(user, requestId, auditContext);
     await this.validateRoleInput(input.permissions, input.userIds);
     const role = await this.roleManagementStore.updateRole(roleId, input, context);
-    return { role: await this.toPublicManagedRole(role) };
+    const response = { role: await this.toPublicManagedRole(role) };
+    await this.settingsStore.recordAuditEvent(this.auditedAdminEvent(user, auditContext, {
+      requestId,
+      action: "admin.role.update",
+      objectType: "role",
+      objectId: role.id,
+      result: "success"
+    }));
+    return response;
   }
 
   public async getGeneralSettings(): Promise<AdminGeneralSettings> {
@@ -549,7 +801,8 @@ export class AdminService {
   public async updateGeneralSettings(
     user: StoredUser,
     input: UpdateAdminGeneralSettingsInput,
-    requestId: string
+    requestId: string,
+    auditContext: AdminMutationAuditContext = {}
   ): Promise<AdminGeneralSettings> {
     this.assertSystemManager(user);
     const current = await this.settingsStore.getGeneralSettings();
@@ -568,14 +821,13 @@ export class AdminService {
       publicRegistrationEnabled: input.publicRegistrationEnabled,
       publicSiteUrl,
       revision: current.revision + 1
-    }, {
-      actorUserId: user.id,
+    }, this.auditedAdminEvent(user, auditContext, {
       requestId,
       action: "system.general_settings.update",
       objectType: "system_settings",
       objectId: "global",
       result: "success"
-    });
+    }));
     return adminGeneralSettingsSchema.parse({
       emailLoginEnabled: this.options.emailLoginEnabled,
       emailRegistrationEnabled: this.options.emailRegistrationEnabled,
@@ -653,7 +905,8 @@ export class AdminService {
   public async updateUstcOAuthSettings(
     user: StoredUser,
     input: UpdateUstcOAuthSettingsInput,
-    requestId: string
+    requestId: string,
+    auditContext: AdminMutationAuditContext = {}
   ): Promise<{ settings: UstcOAuthSettings }> {
     this.assertOAuthManager(user);
     const current = await this.settingsStore.getUstcOAuthSettings();
@@ -703,20 +956,22 @@ export class AdminService {
       overrideConfigured: true
     };
     this.validateUstcSettings(next, general.publicSiteUrl);
-    const saved = await this.settingsStore.updateUstcOAuthSettings(current.revision, next, {
-      actorUserId: user.id,
+    const saved = await this.settingsStore.updateUstcOAuthSettings(current.revision, next, this.auditedAdminEvent(user, auditContext, {
       requestId,
       action: "auth.ustc_oauth.settings.update",
       objectType: "system_oauth_settings",
       objectId: "global",
       result: "success",
       metadata: { secretChanged: input.clientSecret !== undefined || input.clearClientSecret }
-    });
+    }));
     return { settings: this.toPublicUstcSettings(saved) };
   }
 
   public async listAudit(page: number, pageSize: number): Promise<{ items: AdminAuditEvent[]; total: number }> {
     return this.settingsStore.listAuditEvents(page, pageSize);
+  }
+  public async recordAuditEvent(event: AdminAuditEventInput): Promise<void> {
+    await this.settingsStore.recordAuditEvent(event);
   }
 
   private async toPublicManagedRole(role: StoredAdminRole): Promise<AdminManagedRole> {
@@ -744,8 +999,120 @@ export class AdminService {
     });
   }
 
-  private roleMutationContext(user: StoredUser, requestId: string): AdminRoleMutationContext {
-    return createAdminRoleMutationContext(user, requestId, this.now());
+  private async rolesForUser(user: StoredUser): Promise<StoredAdminRole[]> {
+    const roles = await this.roleManagementStore.listRoles();
+    return roles.filter((role) =>
+      role.memberIds.includes(user.id) ||
+      user.roles.includes(role.key) ||
+      user.roles.includes(role.displayName) ||
+      (user.isRoot && role.key === "root")
+    );
+  }
+
+  private async buildUserPermissionDelta(user: StoredUser): Promise<AdminUserPermissionDeltaResponse> {
+    const [roles, delta] = await Promise.all([
+      this.rolesForUser(user),
+      this.options.store.getUserPermissionDelta(user.id)
+    ]);
+    const allowed = new Set<string>();
+    const denied = new Set<string>();
+    const sources = new Map<string, Set<string>>();
+    const addSource = (permission: string, source: string): void => {
+      const entries = sources.get(permission) ?? new Set<string>();
+      entries.add(source);
+      sources.set(permission, entries);
+    };
+    for (const role of roles) {
+      for (const permission of role.permissions) {
+        if (!corePermissions.includes(permission.name as typeof corePermissions[number])) continue;
+        addSource(permission.name, `role:${role.key}${permission.effect === "deny" ? ":deny" : ""}`);
+        (permission.effect === "deny" ? denied : allowed).add(permission.name);
+      }
+    }
+    if (user.isRoot && user.id === "0") {
+      for (const permission of corePermissions) {
+        allowed.add(permission);
+        addSource(permission, "root:complete");
+      }
+    }
+    for (const permission of delta.allows) {
+      allowed.add(permission);
+      addSource(permission, "user:allow");
+    }
+    for (const permission of delta.denies) {
+      denied.add(permission);
+      addSource(permission, "user:deny");
+    }
+    const hardDenied = new Set<string>(
+      user.accountType === "robot" ? robotHardDeniedPermissions : []
+    );
+    for (const permission of hardDenied) {
+      denied.add(permission);
+      addSource(permission, "robot:hard-deny");
+    }
+    const entries = corePermissions.map((name) => ({
+      name,
+      allowed: allowed.has(name) && !denied.has(name),
+      sources: [...(sources.get(name) ?? new Set(["none"]))]
+    }));
+    return adminUserPermissionDeltaResponseSchema.parse({
+      delta: {
+        userId: user.id,
+        roles: roles.map((role) => role.key),
+        allows: delta.allows,
+        denies: delta.denies,
+        effective: entries.filter((entry) => entry.allowed).map((entry) => entry.name),
+        revision: delta.revision
+      },
+      effective: {
+        permissions: entries.filter((entry) => entry.allowed).map((entry) => entry.name),
+        entries
+      }
+    });
+  }
+
+  private assertPermissionDeltaManager(actor: StoredUser, target: StoredUser | undefined): void {
+    if (
+      actor.accountType !== "human" ||
+      !hasPermission(actor, "user.permission.manage", {}, this.now()) ||
+      target === undefined ||
+      target.accountType === "robot" ||
+      (target.isRoot && !(actor.isRoot && actor.id === "0"))
+    ) {
+      throw notFound();
+    }
+  }
+
+  private assertRootManager(actor: StoredUser): void {
+    if (actor.accountType !== "human" || !actor.isRoot || actor.id !== "0") {
+      throw notFound();
+    }
+  }
+
+  private roleMutationContext(
+    user: StoredUser,
+    requestId: string,
+    auditContext: AdminMutationAuditContext = {}
+  ): AdminRoleMutationContext {
+    return createAdminRoleMutationContext(user, requestId, this.now(), auditContext.auditActorUserId);
+  }
+
+  private auditedAdminEvent(
+    user: StoredUser,
+    auditContext: AdminMutationAuditContext,
+    event: Omit<AdminAuditEventInput, "actorUserId">
+  ): AdminAuditEventInput {
+    const effectiveUserId = auditContext.auditActorUserId !== undefined && auditContext.auditActorUserId !== user.id
+      ? user.id
+      : undefined;
+    const metadata = effectiveUserId === undefined
+      ? event.metadata
+      : { ...event.metadata, effectiveUserId };
+    return {
+      actorUserId: auditContext.auditActorUserId ?? user.id,
+      ...event,
+      ...(metadata === undefined ? {} : { metadata })
+    };
   }
 
   private async validateRoleInput(

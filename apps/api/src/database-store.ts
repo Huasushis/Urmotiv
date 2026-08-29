@@ -27,7 +27,11 @@ import {
   type BatchAccountCreationResult,
   type DataStore,
   type EmailCredential,
+  type UserPermissionDeltaAtomicInput,
   type EmailRegistration,
+  type ReplaceUserPermissionDeltaInput,
+  type RootCredential,
+  type UserPermissionDelta,
   type EmailVerificationTarget,
   type EmailVerificationToken,
   type ExternalIdentity,
@@ -1311,6 +1315,51 @@ async function writeReview(
   }
 }
 
+async function readPermissionDelta(
+  executor: DatabaseExecutor,
+  userId: string
+): Promise<UserPermissionDelta> {
+  const databaseUserId = requireDatabaseId(userId, "用户编号");
+  const revisionRows = await executor.query<{ revision: string }>(sql`
+    SELECT GREATEST(1, (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint)::text AS revision
+    FROM users WHERE id = ${databaseUserId}
+  `);
+  if (revisionRows[0] === undefined) throw new Error("USER_NOT_FOUND");
+  const grantRows = await executor.query<{ permission_name: string; effect: "allow" | "deny" }>(sql`
+    SELECT permission_name, effect
+    FROM permission_grants
+    WHERE subject_user_id = ${databaseUserId}
+      AND revoked_at IS NULL
+      AND scope = 'global'
+      AND (expires_at IS NULL OR expires_at > now())
+    ORDER BY permission_name, effect
+  `);
+  const revision = Number(revisionRows[0].revision);
+  return {
+    userId,
+    allows: grantRows.filter((row) => row.effect === "allow").map((row) => row.permission_name as UserPermissionDelta["allows"][number]),
+    denies: grantRows.filter((row) => row.effect === "deny").map((row) => row.permission_name as UserPermissionDelta["denies"][number]),
+    revision: Number.isSafeInteger(revision) && revision > 0 ? revision : 1
+  };
+}
+async function defaultRoleId(
+  executor: DatabaseExecutor,
+  accountType: "human" | "robot"
+): Promise<string> {
+  const column = accountType === "human" ? "human_role_key" : "robot_role_key";
+  const rows = await executor.query<{ id: string }>(sql`
+    SELECT role.id::text AS id
+    FROM role_defaults defaults
+    JOIN roles role
+      ON role.key = ${sql.raw(`defaults.${column}`)}
+    WHERE defaults.id = 'global'
+    LIMIT 1
+  `);
+  const roleId = rows[0]?.id;
+  if (roleId === undefined) throw new Error("默认角色尚未初始化。");
+  return roleId;
+}
+
 export class DatabaseDataStore implements DataStore {
   public constructor(private readonly handle: DatabaseHandle) {}
 
@@ -1493,6 +1542,136 @@ export class DatabaseDataStore implements DataStore {
     const user = await this.getUser(row.user_id);
     return user === undefined ? undefined : { user, passwordHash: row.password_hash };
   }
+  public async findRootCredential(): Promise<RootCredential | undefined> {
+    const rows = await this.handle.query<{ password_hash: string | null }>(sql`
+      SELECT password_hash
+      FROM users
+      WHERE id = 0
+        AND account_type = 'human'
+        AND disabled_at IS NULL
+      LIMIT 1
+    `);
+    const passwordHash = rows[0]?.password_hash;
+    if (passwordHash === undefined || passwordHash === null) {
+      return undefined;
+    }
+    const user = await this.getUser("0");
+    return user === undefined || !user.isRoot ? undefined : { user, passwordHash };
+  }
+
+  public async getUserPermissionDelta(userId: string): Promise<UserPermissionDelta> {
+    return readPermissionDelta(this.handle, userId);
+  }
+
+  public async replaceUserPermissionDelta(
+    input: ReplaceUserPermissionDeltaInput
+  ): Promise<UserPermissionDelta> {
+    const databaseUserId = requireDatabaseId(input.userId, "用户编号");
+    const actorId = requireDatabaseId(input.actorUserId, "操作者编号");
+    const allows = [...new Set(input.allows)];
+    const denies = [...new Set(input.denies)];
+    return this.handle.transaction(async (transaction) => {
+      const userRows = await transaction.query<{ revision: string }>(sql`
+        SELECT GREATEST(1, (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint)::text AS revision
+        FROM users WHERE id = ${databaseUserId} FOR UPDATE
+      `);
+      if (userRows[0] === undefined) throw new Error("USER_NOT_FOUND");
+      const currentRevision = Number(userRows[0].revision);
+      if (currentRevision !== input.expectedRevision) {
+        throw new Error("PERMISSION_DELTA_CONFLICT");
+      }
+      await transaction.execute(sql`
+        UPDATE permission_grants
+        SET revoked_at = clock_timestamp(), revoked_by_user_id = ${actorId}
+        WHERE subject_user_id = ${databaseUserId}
+          AND scope = 'global'
+          AND revoked_at IS NULL
+      `);
+      for (const permission of allows) {
+        await transaction.execute(sql`
+          INSERT INTO permission_grants (
+            id, subject_user_id, permission_name, effect, scope, granted_by_user_id, reason
+          ) VALUES (
+            ${randomUUID()}::uuid, ${databaseUserId}, ${permission}, 'allow'::permission_effect,
+            'global'::permission_scope, ${actorId}, ${`用户权限增量设置（${input.requestId}）`}
+          )
+        `);
+      }
+      for (const permission of denies) {
+        await transaction.execute(sql`
+          INSERT INTO permission_grants (
+            id, subject_user_id, permission_name, effect, scope, granted_by_user_id, reason
+          ) VALUES (
+            ${randomUUID()}::uuid, ${databaseUserId}, ${permission}, 'deny'::permission_effect,
+            'global'::permission_scope, ${actorId}, ${`用户权限增量设置（${input.requestId}）`}
+          )
+        `);
+      }
+      await transaction.execute(sql`UPDATE users SET updated_at = clock_timestamp() WHERE id = ${databaseUserId}`);
+      return readPermissionDelta(transaction, input.userId);
+    });
+  }
+  public async replaceUserPermissionDeltaAtomic(
+    input: UserPermissionDeltaAtomicInput
+  ): Promise<UserPermissionDelta> {
+    const databaseUserId = requireDatabaseId(input.userId, "用户编号");
+    const actorId = requireDatabaseId(input.actorUserId, "操作者编号");
+    const authorizationId = requireDatabaseId(input.authorizationUserId, "授权操作者编号");
+    const allows = [...new Set(input.allows)];
+    const denies = [...new Set(input.denies)];
+    const orderedIds = [...new Set([actorId, authorizationId, databaseUserId])].sort((left, right) =>
+      left < right ? -1 : left > right ? 1 : 0
+    );
+    return this.handle.transaction(async (transaction) => {
+      const lockedUsers = new Map<string, StoredUser>();
+      for (const id of orderedIds) {
+        const user = await lockUserPolicyForAuthorization(transaction, id);
+        if (user === undefined) throw new Error("USER_NOT_FOUND");
+        lockedUsers.set(user.id, user);
+      }
+      const actor = lockedUsers.get(input.authorizationUserId);
+      const target = lockedUsers.get(input.userId);
+      if (actor === undefined || target === undefined) {
+        throw new Error("USER_NOT_FOUND");
+      }
+      await input.authorizeActor(actor, target);
+      const current = await readPermissionDelta(transaction, input.userId);
+      if (current.revision !== input.expectedRevision) {
+        throw new Error("PERMISSION_DELTA_CONFLICT");
+      }
+      await transaction.execute(sql`
+        UPDATE permission_grants
+        SET revoked_at = clock_timestamp(), revoked_by_user_id = ${actorId}
+        WHERE subject_user_id = ${databaseUserId}
+          AND scope = 'global'
+          AND revoked_at IS NULL
+      `);
+      for (const permission of allows) {
+        await transaction.execute(sql`
+          INSERT INTO permission_grants (
+            id, subject_user_id, permission_name, effect, scope, granted_by_user_id, reason
+          ) VALUES (
+            ${randomUUID()}::uuid, ${databaseUserId}, ${permission}, 'allow'::permission_effect,
+            'global'::permission_scope, ${actorId}, ${`用户权限增量设置（${input.requestId}）`}
+          )
+        `);
+      }
+      for (const permission of denies) {
+        await transaction.execute(sql`
+          INSERT INTO permission_grants (
+            id, subject_user_id, permission_name, effect, scope, granted_by_user_id, reason
+          ) VALUES (
+            ${randomUUID()}::uuid, ${databaseUserId}, ${permission}, 'deny'::permission_effect,
+            'global'::permission_scope, ${actorId}, ${`用户权限增量设置（${input.requestId}）`}
+          )
+        `);
+      }
+      await transaction.execute(sql`UPDATE users SET updated_at = clock_timestamp() WHERE id = ${databaseUserId}`);
+      await input.writeAudit(transaction);
+      return readPermissionDelta(transaction, input.userId);
+    });
+  }
+
 
   public async registerEmailUser(input: EmailRegistration): Promise<StoredUser | undefined> {
     try {
@@ -1519,13 +1698,7 @@ export class DatabaseDataStore implements DataStore {
             NULL
           )
         `);
-        const contributor = await transaction.query<{ id: string }>(sql`
-          SELECT id::text AS id FROM roles WHERE key = 'contributor' LIMIT 1
-        `);
-        const roleId = contributor[0]?.id;
-        if (roleId === undefined) {
-          throw new Error("投稿人角色尚未初始化。");
-        }
+        const roleId = await defaultRoleId(transaction, "human");
         await transaction.execute(sql`
           INSERT INTO role_memberships (id, user_id, role_id, granted_by_user_id, reason)
           VALUES (
@@ -1599,13 +1772,7 @@ export class DatabaseDataStore implements DataStore {
           throw new BatchAccountConflictError(conflicts);
         }
 
-        const contributor = await transaction.query<{ id: string }>(sql`
-          SELECT id::text AS id FROM roles WHERE key = 'contributor' LIMIT 1
-        `);
-        const roleId = contributor[0]?.id;
-        if (roleId === undefined) {
-          throw new Error("投稿人角色尚未初始化。");
-        }
+        const roleId = await defaultRoleId(transaction, "human");
 
         for (const account of input.accounts) {
           const inserted = await transaction.query<{ id: string }>(sql`
@@ -1645,6 +1812,7 @@ export class DatabaseDataStore implements DataStore {
         await writer.write(
           {
             actorUserId: input.actorUserId,
+            ...(input.effectiveUserId === undefined ? {} : { effectiveUserId: input.effectiveUserId }),
             requestId: input.requestId,
             accountCount: input.accounts.length
           },
@@ -1873,13 +2041,7 @@ export class DatabaseDataStore implements DataStore {
           throw new ExternalIdentityCollisionError();
         }
       }
-      const contributor = await transaction.query<{ id: string }>(sql`
-        SELECT id::text AS id FROM roles WHERE key = 'contributor' LIMIT 1
-      `);
-      const roleId = contributor[0]?.id;
-      if (roleId === undefined) {
-        throw new Error("投稿人角色尚未初始化。");
-      }
+      const roleId = await defaultRoleId(transaction, "human");
       await transaction.execute(sql`
         INSERT INTO role_memberships (id, user_id, role_id, granted_by_user_id, reason)
         VALUES (${randomUUID()}::uuid, ${databaseUserId}, ${roleId}::uuid, 0, '统一身份认证首次登录')
@@ -1925,12 +2087,21 @@ export class DatabaseDataStore implements DataStore {
         UPDATE sessions
         SET revoked_at = COALESCE(revoked_at, now())
         WHERE user_id = ${databaseUserId}
+           OR impersonator_user_id = ${databaseUserId}
       `);
     });
   }
 
-  public async createSession(userId: string, expiresAt: string): Promise<StoredSession> {
+  public async createSession(
+    userId: string,
+    expiresAt: string,
+    impersonatorUserId?: string | null
+  ): Promise<StoredSession> {
     const databaseUserId = requireDatabaseId(userId, "用户编号");
+    const impersonatorDatabaseUserId =
+      impersonatorUserId === undefined || impersonatorUserId === null
+        ? null
+        : requireDatabaseId(impersonatorUserId, "操作者编号");
     const authRows = await this.handle.query<{ auth_revision: number }>(sql`
       SELECT auth_revision
       FROM users
@@ -1943,24 +2114,35 @@ export class DatabaseDataStore implements DataStore {
 
     const token = randomBytes(32).toString("base64url");
     await this.handle.execute(sql`
-      INSERT INTO sessions (id, token_digest, user_id, auth_revision, expires_at)
+      INSERT INTO sessions (
+        id, token_digest, user_id, impersonator_user_id, auth_revision, expires_at
+      )
       VALUES (
         ${randomUUID()}::uuid,
         ${sessionDigest(token)},
         ${databaseUserId},
+        ${impersonatorDatabaseUserId},
         ${Number(authRevision)},
         ${expiresAt}::timestamptz
       )
     `);
-    return { id: token, userId, expiresAt };
+    return {
+      id: token,
+      userId,
+      expiresAt,
+      ...(impersonatorUserId === undefined ? {} : { impersonatorUserId })
+    };
   }
-
   public async getSession(sessionId: string): Promise<StoredSession | undefined> {
     const rows = await this.handle.query<{
       user_id: string;
+      impersonator_user_id: string | null;
       expires_at: Date | string;
     }>(sql`
-      SELECT session_record.user_id::text AS user_id, session_record.expires_at
+      SELECT
+        session_record.user_id::text AS user_id,
+        session_record.impersonator_user_id::text AS impersonator_user_id,
+        session_record.expires_at
       FROM sessions session_record
       JOIN users user_record ON user_record.id = session_record.user_id
       WHERE session_record.token_digest = ${sessionDigest(sessionId)}
@@ -1973,8 +2155,16 @@ export class DatabaseDataStore implements DataStore {
     if (row === undefined) {
       return undefined;
     }
-    return { id: sessionId, userId: row.user_id, expiresAt: toIso(row.expires_at) };
+    return {
+      id: sessionId,
+      userId: row.user_id,
+      expiresAt: toIso(row.expires_at),
+      ...(row.impersonator_user_id === null
+        ? {}
+        : { impersonatorUserId: row.impersonator_user_id })
+    };
   }
+
 
   public async deleteSession(sessionId: string): Promise<void> {
     await this.handle.execute(sql`

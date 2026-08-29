@@ -10,7 +10,7 @@ const api = vi.hoisted(() => ({
 }));
 
 vi.mock("../lib/api", async (importOriginal) => {
-  const original = await importOriginal<typeof import("../lib/api")>();
+  const original = await importOriginal() as Record<string, unknown>;
   return { ...original, logout: api.logout };
 });
 
@@ -31,14 +31,14 @@ const session: NonNullable<SessionResponse["user"]> = {
 let root: Root | undefined;
 let container: HTMLDivElement | undefined;
 
-function mount(client: QueryClient, children: ReactNode): HTMLDivElement {
+function mount(client: QueryClient, children: ReactNode, initialEntries = ["/"]): HTMLDivElement {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
   act(() => {
     root?.render(
       <QueryClientProvider client={client}>
-        <MemoryRouter>{children}</MemoryRouter>
+        <MemoryRouter initialEntries={initialEntries}>{children}</MemoryRouter>
       </QueryClientProvider>
     );
   });
@@ -135,6 +135,29 @@ describe("管理导航", () => {
     const management = [...view.querySelectorAll<HTMLAnchorElement>("nav a")]
       .find((link) => link.textContent === "管理");
     expect(management?.getAttribute("href")).toBe("/admin");
+  });
+  it("按清晰分组提供独立用户、角色和默认角色入口并标记当前路由", () => {
+    const client = new QueryClient();
+    const view = mount(
+      client,
+      <AppShell session={{ ...session, permissions: ["problem.review", "problem.import"], canManagePermissions: true }} demoEnabled={false}>
+        <p>题目工作区</p>
+      </AppShell>,
+      ["/admin/users"]
+    );
+    const links = [...view.querySelectorAll<HTMLAnchorElement>('nav[aria-label="主导航"] a')];
+    const hrefs = links.map((link) => link.getAttribute("href"));
+    expect(view.querySelector("details.management-menu")).toBeNull();
+    expect(hrefs.filter((href) => href === "/transfer")).toHaveLength(1);
+    expect(links.map((link) => link.textContent)).toEqual(
+      expect.arrayContaining(["用户管理", "角色与权限", "默认角色"])
+    );
+    const usersLink = links.find((link) => link.getAttribute("href") === "/admin/users");
+    const rolesLink = links.find((link) => link.getAttribute("href") === "/admin/roles");
+    expect(usersLink?.classList.contains("active")).toBe(true);
+    expect(usersLink?.getAttribute("aria-current")).toBe("page");
+    expect(rolesLink?.classList.contains("active")).toBe(false);
+    expect(new Set(hrefs).size).toBe(hrefs.length);
   });
 
   it("没有任何管理权限时不显示管理入口", () => {

@@ -199,21 +199,8 @@ const roleDefinitions = [
   {
     key: "system_administrator",
     displayName: "系统管理员",
-    description: "可以管理账号、权限、运行设置、题库入口和插件，但不自动拥有最终审题权。",
-    permissions: [
-      "auth.login",
-      "user.create",
-      "user.delete",
-      "user.permission.manage",
-      "system.manage",
-      "plugin.manage",
-      "service_account.manage",
-      "tag.manage",
-      "audit.read",
-      "review.policy.manage",
-      "problem.view.all",
-      "problem.import"
-    ]
+    description: "可以管理账号、题库、审题、组题、导入导出和插件，但不拥有 root 模拟登录特权。",
+    permissions: corePermissions.filter((permission) => permission !== "user.impersonate")
   },
   {
     key: "root",
@@ -303,6 +290,11 @@ export async function seedCoreDatabase(handle: DatabaseHandle): Promise<CoreSeed
         reason
       )
       VALUES (${rootMembershipId}::uuid, 0, ${rootRoleId}::uuid, 0, '首次初始化 root 账号')
+      ON CONFLICT (id) DO NOTHING
+    `);
+    await transaction.execute(sql`
+      INSERT INTO role_defaults (id, human_role_key, robot_role_key, revision, updated_by_user_id)
+      VALUES ('global', 'contributor', 'reviewer', 1, 0)
       ON CONFLICT (id) DO NOTHING
     `);
   });

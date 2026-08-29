@@ -4,8 +4,7 @@ import {
   ClipboardCheck,
   FilePenLine,
   ListChecks,
-  Settings,
-  UserPlus
+  Settings
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
@@ -42,6 +41,53 @@ const baseNavItems = [
   { to: "/reviews", label: "待审", icon: ClipboardCheck }
 ];
 
+const managementGroups = [
+  {
+    label: "系统",
+    items: [
+      { to: "/admin/settings", label: "常规设置" },
+      { to: "/admin/audit", label: "审计记录" }
+    ]
+  },
+  {
+    label: "账号与权限",
+    items: [
+      { to: "/admin/users", label: "用户管理" },
+      { to: "/admin/roles", label: "角色与权限" },
+      { to: "/admin/roles/defaults", label: "默认角色" },
+      { to: "/admin/service-accounts", label: "服务账号" }
+    ]
+  },
+  {
+    label: "内容与迁移",
+    items: [
+      { to: "/admin/accounts", label: "批量账号" },
+      { to: "/admin/imports", label: "导入历史" },
+      { to: "/admin/knowledge", label: "知识点目录" }
+    ]
+  },
+  {
+    label: "集成",
+    items: [
+      { to: "/admin/plugins", label: "插件配置" },
+      { to: "/admin/oauth", label: "USTC OAuth" },
+      { to: "/admin/fermata", label: "Fermata 服务" }
+    ]
+  }
+];
+
+function canManage(session: NonNullable<SessionResponse["user"]>): boolean {
+  return session.accountType === "human" && (
+    session.permissions.includes("user.create") ||
+    session.canManageReviewPolicy ||
+    session.canManagePlugins ||
+    session.canManageTags ||
+    session.canManageSystem === true ||
+    session.canManagePermissions === true ||
+    session.canManageProblemCatalog === true
+  );
+}
+
 function buildNavItems(session: NonNullable<SessionResponse["user"]>) {
   const items = [...baseNavItems];
   if (contestPermissions.some((name) => session.permissions.includes(name))) {
@@ -50,18 +96,7 @@ function buildNavItems(session: NonNullable<SessionResponse["user"]>) {
   if (transferPermissions.some((name) => session.permissions.includes(name))) {
     items.push({ to: "/transfer", label: "导入导出", icon: ArrowLeftRight });
   }
-  if (session.accountType === "human" && (
-    session.permissions.includes("user.create") ||
-    session.canManageReviewPolicy ||
-    session.canManagePlugins ||
-    session.canManageTags ||
-    session.canManageSystem === true ||
-    session.canManagePermissions === true ||
-    session.canManageProblemCatalog === true
-  )) {
-    items.push({ to: "/admin", label: "管理", icon: Settings });
-  }
-  return items;
+  return { items, showManagement: canManage(session) };
 }
 
 function HeaderAvatar({ user }: { user: NonNullable<SessionResponse["user"]> }) {
@@ -89,7 +124,7 @@ function HeaderAvatar({ user }: { user: NonNullable<SessionResponse["user"]> }) 
 }
 
 export function AppShell({ session, demoEnabled, children }: AppShellProps) {
-  const navItems = buildNavItems(session);
+  const { items: navItems, showManagement } = buildNavItems(session);
   const client = useQueryClient();
   const signOut = useMutation({
     mutationFn: logout,
@@ -119,6 +154,28 @@ export function AppShell({ session, demoEnabled, children }: AppShellProps) {
               <span>{label}</span>
             </NavLink>
           ))}
+          {showManagement ? (
+            <div className="global-nav-management">
+              <NavLink end to="/admin" className={({ isActive }) => (isActive ? "active" : "")}>
+                <Settings size={16} aria-hidden="true" />
+                <span>管理</span>
+              </NavLink>
+              <div className="management-nav-groups" aria-label="管理分组">
+                {managementGroups.map((group) => (
+                  <section key={group.label} className="management-nav-group">
+                    <span className="management-nav-group-label">{group.label}</span>
+                    <div className="management-nav-group-items">
+                      {group.items.map((item) => (
+                        <NavLink end key={item.to} to={item.to} className={({ isActive }) => (isActive ? "active" : "")}>
+                          {item.label}
+                        </NavLink>
+                      ))}
+                    </div>
+                  </section>
+                ))}
+              </div>
+            </div>
+          ) : null}
         </nav>
         <div className="user-context">
           <NavLink className="user-profile-link" to="/profile" aria-label="个人资料">

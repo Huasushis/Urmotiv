@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { AdminPlugin, ReviewPolicyView, SessionUser } from "@urmotiv/contracts";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const api = vi.hoisted(() => ({
@@ -45,6 +46,32 @@ const reviewPolicy: ReviewPolicyView = {
       }
     }
   ]
+};
+const reviewPolicyWithMobileControls: ReviewPolicyView = {
+  ...reviewPolicy,
+  settings: { minimumReviewers: 2, countRobotReviews: false },
+  availableRules: [{
+    id: reviewPolicy.selectedRuleId,
+    displayName: "默认审核人数规则",
+    pluginVersion: reviewPolicy.selectedPluginVersion,
+    settingsSchema: {
+      type: "object",
+      properties: {
+        minimumReviewers: {
+          type: "integer",
+          title: "至少需要的审核人数",
+          minimum: 1,
+          maximum: 20,
+          default: 2
+        },
+        countRobotReviews: {
+          type: "boolean",
+          title: "计算机器人意见",
+          default: false
+        }
+      }
+    }
+  }]
 };
 
 const plugin: AdminPlugin = {
@@ -100,7 +127,7 @@ function session(overrides: Partial<SessionUser> = {}): SessionUser {
   };
 }
 
-function mount(element: ReactNode): HTMLDivElement {
+function mount(element: ReactNode, initialEntries = ["/admin"]): HTMLDivElement {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -109,7 +136,7 @@ function mount(element: ReactNode): HTMLDivElement {
   });
   queryClient = client;
   act(() => {
-    root?.render(<QueryClientProvider client={client}>{element}</QueryClientProvider>);
+    root?.render(<QueryClientProvider client={client}><MemoryRouter initialEntries={initialEntries}>{element}</MemoryRouter></QueryClientProvider>);
   });
   return container;
 }
@@ -197,6 +224,23 @@ describe("管理页面", () => {
     expect(api.getReviewPolicy).toHaveBeenCalledTimes(1);
     expect(api.listAdminPlugins).not.toHaveBeenCalled();
     expect(view.textContent).not.toContain("已安装插件");
+  });
+  it("审核规则控件保留移动端精确语义钩子", async () => {
+    api.getReviewPolicy.mockResolvedValue(reviewPolicyWithMobileControls);
+    const view = mount(
+      <AdminPage session={session({ canManageReviewPolicy: true })} />
+    );
+
+    await waitFor(() => {
+      expect(view.querySelector(".admin-rule-select > select")).not.toBeNull();
+      expect(view.querySelector('label.settings-form-toggle[for="review-rule-countRobotReviews"]')).not.toBeNull();
+    });
+    const ruleSelect = view.querySelector<HTMLSelectElement>(".admin-rule-select > select");
+    expect(ruleSelect?.textContent).toContain("默认审核人数规则");
+    const robotOpinionToggle = view.querySelector<HTMLLabelElement>(
+      'label.settings-form-toggle[for="review-rule-countRobotReviews"]'
+    );
+    expect(robotOpinionToggle?.textContent).toContain("计算机器人意见");
   });
 
   it("审核规则读取失败时显示错误而不是停留在加载状态", async () => {
@@ -414,8 +458,9 @@ describe("管理页面", () => {
     }));
     expect(links).toEqual(expect.arrayContaining([
       expect.objectContaining({ href: "/admin/settings", text: expect.stringContaining("常规设置") }),
+      expect.objectContaining({ href: "/admin/users", text: expect.stringContaining("用户管理") }),
       expect.objectContaining({ href: "/admin/roles", text: expect.stringContaining("角色与权限") }),
-      expect.objectContaining({ href: "/admin/service-accounts", text: expect.stringContaining("服务账号") }),
+      expect.objectContaining({ href: "/admin/roles/defaults", text: expect.stringContaining("默认角色") }),
       expect.objectContaining({ href: "/admin/audit", text: expect.stringContaining("审计") }),
       expect.objectContaining({ href: "/admin/fermata", text: expect.stringContaining("Fermata") }),
       expect.objectContaining({ href: "/admin/oauth", text: expect.stringContaining("USTC") }),
@@ -423,6 +468,22 @@ describe("管理页面", () => {
       expect.objectContaining({ href: "/admin/knowledge", text: expect.stringContaining("知识点") }),
       expect.objectContaining({ href: "/problems", text: expect.stringContaining("题库") })
     ]));
+    const sectionLinks = [...view.querySelectorAll<HTMLAnchorElement>(".admin-section-nav a")];
+    expect(new Set(sectionLinks.map((link) => link.getAttribute("href"))).size).toBe(sectionLinks.length);
   });
 
+  it("管理页导航按当前路由标记 active 状态", () => {
+    const view = mount(
+      <AdminPage session={session({
+        permissions: ["user.permission.manage"],
+        canManagePermissions: true
+      })} />,
+      ["/admin/roles"]
+    );
+    const roleLink = view.querySelector<HTMLAnchorElement>('.admin-section-nav a[href="/admin/roles"]');
+    const usersLink = view.querySelector<HTMLAnchorElement>('.admin-section-nav a[href="/admin/users"]');
+    expect(roleLink?.classList.contains("active")).toBe(true);
+    expect(roleLink?.getAttribute("aria-current")).toBe("page");
+    expect(usersLink?.classList.contains("active")).toBe(false);
+  });
 });

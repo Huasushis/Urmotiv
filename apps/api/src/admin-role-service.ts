@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import {
   corePermissions,
+  type AdminRoleDefaults,
   type CreateAdminRoleInput,
   type PermissionGrant,
+  type UpdateAdminRoleDefaultsInput,
   type UpdateAdminRoleInput
 } from "@urmotiv/contracts";
 import { builtinRoleDefinitions, type DatabaseHandle } from "@urmotiv/database";
@@ -31,12 +33,19 @@ export interface StoredAdminRole {
 export interface AdminRoleMutationContext {
   readonly actorUserId: string;
   readonly requestId: string;
+  readonly actorIsRoot?: boolean;
+  readonly auditActorUserId?: string;
   readonly actorAllowCeiling: readonly string[];
   readonly actorDeniedPermissions: readonly string[];
 }
 
 export interface RoleManagementStore {
   listRoles(): Promise<StoredAdminRole[]>;
+  getRoleDefaults(): Promise<AdminRoleDefaults>;
+  updateRoleDefaults(
+    input: UpdateAdminRoleDefaultsInput,
+    context: AdminRoleMutationContext
+  ): Promise<AdminRoleDefaults>;
   createRole(input: CreateAdminRoleInput, context: AdminRoleMutationContext): Promise<StoredAdminRole>;
   updateRole(
     roleId: string,
@@ -58,11 +67,11 @@ function isActiveGrant(grant: PermissionGrant, now: Date): boolean {
   const expiresAt = Date.parse(grant.expiresAt);
   return Number.isFinite(expiresAt) && expiresAt > now.getTime();
 }
-
 export function createAdminRoleMutationContext(
   user: StoredUser,
   requestId: string,
-  now = new Date()
+  now = new Date(),
+  auditActorUserId?: string
 ): AdminRoleMutationContext {
   const actorAllowCeiling = corePermissions.filter((permission) =>
     hasPermission(user, permission, {}, now)
@@ -81,8 +90,10 @@ export function createAdminRoleMutationContext(
   return {
     actorUserId: user.id,
     requestId,
+    actorIsRoot: user.isRoot && user.id === "0",
     actorAllowCeiling,
-    actorDeniedPermissions
+    actorDeniedPermissions,
+    ...(auditActorUserId === undefined ? {} : { auditActorUserId })
   };
 }
 
@@ -96,6 +107,7 @@ export function assertRoleMutationSafety(
   role?: Pick<StoredAdminRole, "key" | "isBuiltIn">
 ): void {
   const memberIds = [...new Set(input.userIds)];
+  const actorIsRoot = context.actorIsRoot ?? context.actorUserId === "0";
   if (memberIds.includes("0") && role?.key !== "root") {
     throw new ApiError(403, "ROLE_ROOT_MEMBERSHIP", "bootstrap root 账号只能属于 root 角色。");
   }
@@ -105,6 +117,12 @@ export function assertRoleMutationSafety(
     memberIds[0] !== "0"
   )) {
     throw new ApiError(403, "ROLE_ROOT_MEMBERSHIP", "root 角色成员固定为 bootstrap root 账号。");
+  }
+  if (!actorIsRoot && (
+    role?.key === "root" ||
+    input.permissions.some((permission) => permission.name === "user.impersonate")
+  )) {
+    throw new ApiError(403, "ROLE_ROOT_PRIVILEGE", "只有 root 可以管理 root 等价权限。");
   }
   const allowCeiling = new Set(context.actorAllowCeiling);
   const explicitDenies = new Set(context.actorDeniedPermissions);
@@ -121,6 +139,11 @@ export function assertRoleMutationSafety(
 
 export class InMemoryRoleManagementStore implements RoleManagementStore {
   private readonly roles: StoredAdminRole[];
+  private defaults: AdminRoleDefaults = {
+    humanRoleKey: "contributor",
+    robotRoleKey: "reviewer",
+    revision: 1
+  };
 
   public constructor(memberIdsByRoleKey: Readonly<Record<string, readonly string[]>> = {}) {
     this.roles = builtinRoleDefinitions.map((role, index) => ({
@@ -138,6 +161,32 @@ export class InMemoryRoleManagementStore implements RoleManagementStore {
   public async listRoles(): Promise<StoredAdminRole[]> {
     return this.roles.map(cloneRole);
   }
+
+  public async getRoleDefaults(): Promise<AdminRoleDefaults> {
+    return { ...this.defaults };
+  }
+
+  public async updateRoleDefaults(
+    input: UpdateAdminRoleDefaultsInput,
+    context: AdminRoleMutationContext
+  ): Promise<AdminRoleDefaults> {
+    const actorIsRoot = context.actorIsRoot ?? context.actorUserId === "0";
+    if (!actorIsRoot) throw notFound();
+    if (this.defaults.revision !== input.expectedRevision) {
+      throw conflict("默认角色已被其他管理员修改，请刷新后重试。");
+    }
+    if (!this.roles.some((role) => role.key === input.humanRoleKey) ||
+        !this.roles.some((role) => role.key === input.robotRoleKey)) {
+      throw new ApiError(422, "ROLE_DEFAULT_UNKNOWN", "默认角色不存在。");
+    }
+    this.defaults = {
+      humanRoleKey: input.humanRoleKey,
+      robotRoleKey: input.robotRoleKey,
+      revision: this.defaults.revision + 1
+    };
+    return { ...this.defaults };
+  }
+
 
   public async createRole(input: CreateAdminRoleInput, context: AdminRoleMutationContext): Promise<StoredAdminRole> {
     assertRoleMutationSafety(input, context);
@@ -174,13 +223,12 @@ export class InMemoryRoleManagementStore implements RoleManagementStore {
       throw conflict("角色标识已存在，请换一个标识。");
     }
     if (current.isBuiltIn && (
+      current.key === "root" ||
       current.key !== input.key ||
       current.displayName !== input.displayName ||
-      current.description !== input.description ||
-      rolePermissionNames(current.permissions).size !== rolePermissionNames(input.permissions).size ||
-      [...rolePermissionNames(current.permissions)].some((permission) => !rolePermissionNames(input.permissions).has(permission))
+      current.description !== input.description
     )) {
-      throw new ApiError(409, "BUILTIN_ROLE_IMMUTABLE", "内置角色的名称和权限不可修改。请调整成员归属或新建自定义角色。");
+      throw new ApiError(409, "BUILTIN_ROLE_METADATA_IMMUTABLE", "内置角色标识和说明不可修改。");
     }
     const next: StoredAdminRole = {
       ...current,
@@ -304,6 +352,73 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
     ]);
     return buildRoles(roleRows, grantRows, memberRows);
   }
+  public async getRoleDefaults(): Promise<AdminRoleDefaults> {
+    const rows = await this.database.query<{
+      human_role_key: string;
+      robot_role_key: string;
+      revision: number;
+    }>(sql`
+      SELECT human_role_key, robot_role_key, revision
+      FROM role_defaults
+      WHERE id = 'global'
+    `);
+    const row = rows[0];
+    return {
+      humanRoleKey: row?.human_role_key ?? "contributor",
+      robotRoleKey: row?.robot_role_key ?? "reviewer",
+      revision: Number(row?.revision ?? 1)
+    };
+  }
+
+  public async updateRoleDefaults(
+    input: UpdateAdminRoleDefaultsInput,
+    context: AdminRoleMutationContext
+  ): Promise<AdminRoleDefaults> {
+    const actorIsRoot = context.actorIsRoot ?? context.actorUserId === "0";
+    if (!actorIsRoot) throw notFound();
+    const actorId = databaseId(context.actorUserId);
+    return this.database.transaction(async (transaction) => {
+      const currentRows = await transaction.query<{
+        human_role_key: string;
+        robot_role_key: string;
+        revision: number;
+      }>(sql`
+        SELECT human_role_key, robot_role_key, revision
+        FROM role_defaults
+        WHERE id = 'global'
+        FOR UPDATE
+      `);
+      const current = currentRows[0];
+      if (current === undefined) throw new ApiError(503, "ROLE_DEFAULTS_UNAVAILABLE", "默认角色配置不可用。");
+      if (Number(current.revision) !== input.expectedRevision) {
+        throw conflict("默认角色已被其他管理员修改，请刷新后重试。");
+      }
+      const roleRows = await transaction.query<{ key: string }>(sql`
+        SELECT key FROM roles WHERE key IN (${input.humanRoleKey}, ${input.robotRoleKey})
+      `);
+      if (roleRows.length !== new Set([input.humanRoleKey, input.robotRoleKey]).size) {
+        throw new ApiError(422, "ROLE_DEFAULT_UNKNOWN", "默认角色不存在。");
+      }
+      await transaction.execute(sql`
+        UPDATE role_defaults
+        SET human_role_key = ${input.humanRoleKey},
+            robot_role_key = ${input.robotRoleKey},
+            revision = revision + 1,
+            updated_at = clock_timestamp(),
+            updated_by_user_id = ${actorId}
+        WHERE id = 'global'
+      `);
+      const next = await transaction.query<{ revision: number }>(sql`
+        SELECT revision FROM role_defaults WHERE id = 'global'
+      `);
+      await this.writeAudit(transaction, context, "admin.role_defaults.update", "global");
+      return {
+        humanRoleKey: input.humanRoleKey,
+        robotRoleKey: input.robotRoleKey,
+        revision: Number(next[0]?.revision ?? input.expectedRevision + 1)
+      };
+    });
+  }
 
   public async createRole(input: CreateAdminRoleInput, context: AdminRoleMutationContext): Promise<StoredAdminRole> {
     const actorId = databaseId(context.actorUserId);
@@ -355,20 +470,19 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
       `);
       if (duplicate[0] !== undefined) throw conflict("角色标识已存在，请换一个标识。");
       if (current.isBuiltIn && (
+        current.key === "root" ||
         current.key !== input.key ||
         current.displayName !== input.displayName ||
-        current.description !== input.description ||
-        rolePermissionNames(current.permissions).size !== rolePermissionNames(input.permissions).size ||
-        [...rolePermissionNames(current.permissions)].some((permission) => !rolePermissionNames(input.permissions).has(permission))
+        current.description !== input.description
       )) {
-        throw new ApiError(409, "BUILTIN_ROLE_IMMUTABLE", "内置角色的名称和权限不可修改。请调整成员归属或新建自定义角色。");
+        throw new ApiError(409, "BUILTIN_ROLE_METADATA_IMMUTABLE", "内置角色标识和说明不可修改。");
       }
       await transaction.execute(sql`
         UPDATE roles SET key = ${input.key}, display_name = ${input.displayName}, description = ${input.description},
           revision = revision + 1, updated_at = now()
         WHERE id = ${roleId}::uuid
       `);
-      if (!current.isBuiltIn) {
+      if (current.key !== "root") {
         await transaction.execute(sql`
           UPDATE permission_grants SET revoked_at = now(), revoked_by_user_id = ${actorId}
           WHERE subject_role_id = ${roleId}::uuid AND revoked_at IS NULL
@@ -404,16 +518,11 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
     if (actor === undefined || actor.accountType !== "human") {
       throw notFound();
     }
-    const refreshedContext = createAdminRoleMutationContext(
-      actor,
-      context.requestId
-    );
-    if (!refreshedContext.actorAllowCeiling.includes("user.permission.manage")) {
+    if (!hasPermission(actor, "user.permission.manage", {}, new Date())) {
       throw notFound();
     }
-    return refreshedContext;
+    return createAdminRoleMutationContext(actor, context.requestId, new Date(), context.auditActorUserId);
   }
-
   private async lockRoleState(executor: RoleExecutor, roleId: string): Promise<StoredAdminRole> {
     const rows = await executor.query<{ id: string }>(sql`
       SELECT id::text AS id FROM roles WHERE id = ${roleId}::uuid FOR UPDATE
@@ -508,12 +617,16 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
   }
 
   private async writeAudit(executor: RoleExecutor, context: AdminRoleMutationContext, action: string, roleId: string): Promise<void> {
+    const actorId = context.auditActorUserId ?? context.actorUserId;
+    const metadata = context.auditActorUserId === undefined
+      ? {}
+      : { effectiveUserId: context.actorUserId };
     await executor.execute(sql`
       INSERT INTO audit_events (
         actor_user_id, request_id, action, object_type, object_id, result, reason_code, metadata
       ) VALUES (
-        ${databaseId(context.actorUserId)}, ${context.requestId}::uuid, ${action}, 'role', ${roleId},
-        'success', NULL, '{}'::jsonb
+        ${databaseId(actorId)}, ${context.requestId}::uuid, ${action}, 'role', ${roleId},
+        'success', NULL, ${JSON.stringify(metadata)}::jsonb
       )
     `);
   }

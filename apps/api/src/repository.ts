@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { DatabaseExecutor } from "@urmotiv/database";
-import type { ProblemTag, ReviewSuggestionField } from "@urmotiv/contracts";
+import { builtinRoleDefinitions, type DatabaseExecutor } from "@urmotiv/database";
+import type { CorePermission, PermissionGrant, ProblemTag, ReviewSuggestionField } from "@urmotiv/contracts";
 import type {
   ProblemListFilters,
   StoredProblem,
@@ -98,7 +98,12 @@ export interface DataStore {
     userId: string
   ): Promise<{ readonly mediaType: string; readonly content: Uint8Array; readonly updatedAt: string } | undefined>;
   clearUserAvatar(userId: string): Promise<StoredUser | undefined>;
+  findRootCredential(): Promise<RootCredential | undefined>;
   findEmailCredential(normalizedEmail: string): Promise<EmailCredential | undefined>;
+  getUserPermissionDelta(userId: string): Promise<UserPermissionDelta>;
+  replaceUserPermissionDelta(input: ReplaceUserPermissionDeltaInput): Promise<UserPermissionDelta>;
+  replaceUserPermissionDeltaAtomic(input: UserPermissionDeltaAtomicInput): Promise<UserPermissionDelta>;
+  setDefaultRoleKeys?(keys: { readonly humanRoleKey: string; readonly robotRoleKey: string }): void;
   registerEmailUser(input: EmailRegistration): Promise<StoredUser | undefined>;
   createEmailUsersBatch(
     input: BatchAccountCreationInput,
@@ -111,7 +116,11 @@ export interface DataStore {
   putLoginState(nonceDigest: string, expiresAt: string): Promise<void>;
   consumeLoginState(nonceDigest: string, now: string): Promise<boolean>;
   revokeUserSessions(userId: string): Promise<void>;
-  createSession(userId: string, expiresAt: string): Promise<StoredSession>;
+  createSession(
+    userId: string,
+    expiresAt: string,
+    impersonatorUserId?: string | null
+  ): Promise<StoredSession>;
   getSession(sessionId: string): Promise<StoredSession | undefined>;
   deleteSession(sessionId: string): Promise<void>;
   listTags(): Promise<ProblemTag[]>;
@@ -149,10 +158,32 @@ export interface DataStore {
   ping?(): Promise<void>;
 }
 
-export interface EmailCredential {
+export interface UserPermissionDelta {
+  readonly userId: string;
+  readonly allows: readonly CorePermission[];
+  readonly denies: readonly CorePermission[];
+  readonly revision: number;
+}
+
+export interface ReplaceUserPermissionDeltaInput {
+  readonly userId: string;
+  readonly expectedRevision: number;
+  readonly allows: readonly CorePermission[];
+  readonly denies: readonly CorePermission[];
+  readonly actorUserId: string;
+  readonly requestId: string;
+}
+export interface UserPermissionDeltaAtomicInput extends ReplaceUserPermissionDeltaInput {
+  readonly authorizationUserId: string;
+  readonly authorizeActor: (actor: StoredUser, target: StoredUser) => void | Promise<void>;
+  readonly writeAudit: (executor: DatabaseExecutor | undefined) => Promise<void>;
+}
+
+export interface RootCredential {
   readonly user: StoredUser;
   readonly passwordHash: string;
 }
+export type EmailCredential = RootCredential;
 
 export interface EmailRegistration {
   readonly normalizedEmail: string;
@@ -163,6 +194,7 @@ export interface EmailRegistration {
 
 export interface BatchAccountCreationInput {
   readonly actorUserId: string;
+  readonly effectiveUserId?: string;
   readonly requestId: string;
   readonly accounts: readonly HashedBatchAccount[];
 }
@@ -235,13 +267,18 @@ function sortProblems(problems: StoredProblem[], sort: ProblemListFilters["sort"
 
 export class InMemoryDataStore implements DataStore {
   private readonly users = new Map<string, StoredUser>();
+  private readonly baselineGrants = new Map<string, PermissionGrant[]>();
+  private readonly permissionDeltas = new Map<string, UserPermissionDelta>();
+  private permissionDeltaTransactionQueue: Promise<void> = Promise.resolve();
   private readonly tags = new Map<string, ProblemTag>();
   private readonly sessions = new Map<string, StoredSession>();
   private readonly problems = new Map<string, StoredProblem>();
   private readonly reviews = new Map<string, StoredReview>();
   private readonly emailCredentials = new Map<string, { userId: string; passwordHash: string; verified: boolean }>();
-  private readonly emailVerificationTokens = new Map<string, EmailVerificationToken & { consumed: boolean }>();
   private readonly externalIdentities = new Map<string, string>();
+  private readonly emailVerificationTokens = new Map<string, EmailVerificationToken & { consumed: boolean }>();
+  private defaultRoleKeys = { humanRoleKey: "contributor", robotRoleKey: "reviewer" };
+  private readonly rootPasswordHash: string | undefined;
   private readonly loginStates = new Map<string, { expiresAt: string; consumed: boolean }>();
   private readonly primaryEmails = new Map<string, { address: string; verified: boolean }>();
   public readonly batchAccountAuditEvents: BatchAccountAuditEvent[] = [];
@@ -262,9 +299,16 @@ export class InMemoryDataStore implements DataStore {
     return undefined;
   }
 
-  public constructor(users: StoredUser[], tags: ProblemTag[]) {
+  public constructor(
+    users: StoredUser[],
+    tags: ProblemTag[],
+    options: { readonly rootPasswordHash?: string } = {}
+  ) {
+    this.rootPasswordHash = options.rootPasswordHash;
     for (const user of users) {
-      this.users.set(user.id, copy(user));
+      const stored = copy(user);
+      this.users.set(user.id, stored);
+      this.baselineGrants.set(user.id, copy(stored.grants));
     }
 
     for (const tag of tags) {
@@ -277,6 +321,25 @@ export class InMemoryDataStore implements DataStore {
       updatedByUserId: null,
       updatedAt: new Date(0).toISOString()
     };
+  }
+  private defaultRoleKey(accountType: "human" | "robot"): string {
+    return accountType === "human" ? this.defaultRoleKeys.humanRoleKey : this.defaultRoleKeys.robotRoleKey;
+  }
+
+  private defaultRoleDefinition(accountType: "human" | "robot") {
+    const key = this.defaultRoleKey(accountType);
+    return builtinRoleDefinitions.find((role) => role.key === key);
+  }
+
+  private defaultRoleGrants(accountType: "human" | "robot"): StoredUser["grants"] {
+    const role = this.defaultRoleDefinition(accountType);
+    return role === undefined
+      ? contributorGrants()
+      : role.permissions.map((permission) => ({
+          permission,
+          effect: "allow" as const,
+          scope: permission.endsWith(".own") ? "own" as const : "global" as const
+        }));
   }
 
   public async getUser(userId: string): Promise<StoredUser | undefined> {
@@ -371,21 +434,132 @@ export class InMemoryDataStore implements DataStore {
     const user = this.users.get(credential.userId);
     return user === undefined ? undefined : { user: copy(user), passwordHash: credential.passwordHash };
   }
+  public async findRootCredential(): Promise<RootCredential | undefined> {
+    const user = this.users.get("0");
+    if (
+      user === undefined ||
+      !user.isRoot ||
+      user.accountType !== "human" ||
+      user.disabled ||
+      this.rootPasswordHash === undefined
+    ) {
+      return undefined;
+    }
+    return { user: copy(user), passwordHash: this.rootPasswordHash };
+  }
+
+  public async getUserPermissionDelta(userId: string): Promise<UserPermissionDelta> {
+    const delta = this.permissionDeltas.get(userId);
+    return delta === undefined
+      ? { userId, allows: [], denies: [], revision: 1 }
+      : copy(delta);
+  }
+
+  public async replaceUserPermissionDelta(
+    input: ReplaceUserPermissionDeltaInput
+  ): Promise<UserPermissionDelta> {
+    const user = this.users.get(input.userId);
+    if (user === undefined) {
+      throw new Error("USER_NOT_FOUND");
+    }
+    const current = await this.getUserPermissionDelta(input.userId);
+    if (current.revision !== input.expectedRevision) {
+      throw new Error("PERMISSION_DELTA_CONFLICT");
+    }
+    const allows = [...new Set(input.allows)];
+    const denies = [...new Set(input.denies)];
+    const next: UserPermissionDelta = {
+      userId: input.userId,
+      allows,
+      denies,
+      revision: current.revision + 1
+    };
+    this.permissionDeltas.set(input.userId, next);
+    const baseline = this.baselineGrants.get(input.userId) ?? [];
+    user.grants = [
+      ...copy(baseline),
+      ...allows.map((permission) => ({ permission, effect: "allow" as const, scope: "global" as const })),
+      ...denies.map((permission) => ({ permission, effect: "deny" as const, scope: "global" as const }))
+    ];
+    return copy(next);
+  }
+  public replaceUserPermissionDeltaAtomic(
+    input: UserPermissionDeltaAtomicInput
+  ): Promise<UserPermissionDelta> {
+    const operation = this.permissionDeltaTransactionQueue.then(async () => {
+      const orderedUserIds = [...new Set([input.actorUserId, input.authorizationUserId, input.userId])].sort();
+      const lockedUsers = orderedUserIds.map((userId) => this.users.get(userId));
+      if (lockedUsers.some((user) => user === undefined)) {
+        throw new Error("USER_NOT_FOUND");
+      }
+      const actor = this.users.get(input.authorizationUserId)!;
+      const target = this.users.get(input.userId)!;
+      await input.authorizeActor(copy(actor), copy(target));
+      const current = await this.getUserPermissionDelta(input.userId);
+      if (current.revision !== input.expectedRevision) {
+        throw new Error("PERMISSION_DELTA_CONFLICT");
+      }
+      const allows = [...new Set(input.allows)];
+      const denies = [...new Set(input.denies)];
+      const next: UserPermissionDelta = {
+        userId: input.userId,
+        allows,
+        denies,
+        revision: current.revision + 1
+      };
+      const previousDelta = this.permissionDeltas.get(input.userId);
+      const previousGrants = copy(target.grants);
+      this.permissionDeltas.set(input.userId, next);
+      const baseline = this.baselineGrants.get(input.userId) ?? [];
+      target.grants = [
+        ...copy(baseline),
+        ...allows.map((permission) => ({ permission, effect: "allow" as const, scope: "global" as const })),
+        ...denies.map((permission) => ({ permission, effect: "deny" as const, scope: "global" as const }))
+      ];
+      try {
+        await input.writeAudit(undefined);
+      } catch (error) {
+        if (previousDelta === undefined) {
+          this.permissionDeltas.delete(input.userId);
+        } else {
+          this.permissionDeltas.set(input.userId, previousDelta);
+        }
+        target.grants = previousGrants;
+        throw error;
+      }
+      return copy(next);
+    });
+    this.permissionDeltaTransactionQueue = operation.then(
+      () => undefined,
+      () => undefined
+    );
+    return operation;
+  }
+  public setDefaultRoleKeys(keys: { readonly humanRoleKey: string; readonly robotRoleKey: string }): void {
+    this.defaultRoleKeys = {
+      humanRoleKey: keys.humanRoleKey,
+      robotRoleKey: keys.robotRoleKey
+    };
+  }
+
 
   public async registerEmailUser(input: EmailRegistration): Promise<StoredUser | undefined> {
     if (this.emailCredentials.has(input.normalizedEmail)) {
       return undefined;
     }
+    const defaultRoleKey = this.defaultRoleKey("human");
+    const defaultRole = this.defaultRoleDefinition("human");
     const user: StoredUser = {
       id: String(this.nextUserId++),
       nickname: input.nickname,
       accountType: "human",
       disabled: false,
-      roles: ["投稿人"],
-      grants: contributorGrants(),
+      roles: [defaultRole?.displayName ?? defaultRoleKey],
+      grants: this.defaultRoleGrants("human"),
       isRoot: false
     };
     this.users.set(user.id, copy(user));
+    this.baselineGrants.set(user.id, copy(user.grants));
     this.emailCredentials.set(input.normalizedEmail, {
       userId: user.id,
       passwordHash: input.passwordHash,
@@ -424,21 +598,25 @@ export class InMemoryDataStore implements DataStore {
     }
 
     const nextUsers = new Map(this.users);
+    const nextBaselineGrants = new Map(this.baselineGrants);
     const nextEmailCredentials = new Map(this.emailCredentials);
     const nextPrimaryEmails = new Map(this.primaryEmails);
     let nextUserId = this.nextUserId;
+    const defaultRoleKey = this.defaultRoleKey("human");
+    const defaultRole = this.defaultRoleDefinition("human");
     for (const account of input.accounts) {
       const user: StoredUser = {
         id: String(nextUserId++),
         nickname: account.nickname,
         accountType: "human",
         disabled: false,
-        roles: ["投稿人"],
-        grants: contributorGrants(),
+        roles: [defaultRole?.displayName ?? defaultRoleKey],
+        grants: this.defaultRoleGrants("human"),
         isRoot: false,
         username: account.username
       };
       nextUsers.set(user.id, copy(user));
+      nextBaselineGrants.set(user.id, copy(user.grants));
       nextEmailCredentials.set(account.normalizedEmail, {
         userId: user.id,
         passwordHash: account.passwordHash,
@@ -446,9 +624,9 @@ export class InMemoryDataStore implements DataStore {
       });
       nextPrimaryEmails.set(user.id, { address: account.displayEmail, verified: true });
     }
-
     const event = {
       actorUserId: input.actorUserId,
+      ...(input.effectiveUserId === undefined ? {} : { effectiveUserId: input.effectiveUserId }),
       requestId: input.requestId,
       accountCount: input.accounts.length
     };
@@ -469,6 +647,10 @@ export class InMemoryDataStore implements DataStore {
     this.primaryEmails.clear();
     for (const [userId, email] of nextPrimaryEmails) {
       this.primaryEmails.set(userId, email);
+    }
+    this.baselineGrants.clear();
+    for (const [id, grants] of nextBaselineGrants) {
+      this.baselineGrants.set(id, grants);
     }
     this.nextUserId = nextUserId;
     return { createdCount: input.accounts.length, totalCount: input.accounts.length };
@@ -599,13 +781,15 @@ export class InMemoryDataStore implements DataStore {
         throw new ExternalIdentityCollisionError();
       }
     }
+    const defaultRoleKey = this.defaultRoleKey("human");
+    const defaultRole = this.defaultRoleDefinition("human");
     const user: StoredUser = {
       id: String(this.nextUserId++),
       nickname: input.nickname,
       accountType: "human",
       disabled: false,
-      roles: ["投稿人"],
-      grants: contributorGrants(),
+      roles: [defaultRole?.displayName ?? defaultRoleKey],
+      grants: this.defaultRoleGrants("human"),
       isRoot: false,
       username: input.username ?? null,
       realName: input.realName ?? null,
@@ -613,6 +797,7 @@ export class InMemoryDataStore implements DataStore {
       avatarSource: "none"
     };
     this.users.set(user.id, copy(user));
+    this.baselineGrants.set(user.id, copy(user.grants));
     this.externalIdentities.set(key, user.id);
     if (input.email !== undefined) {
       this.primaryEmails.set(user.id, { address: input.email, verified: true });
@@ -641,14 +826,23 @@ export class InMemoryDataStore implements DataStore {
 
   public async revokeUserSessions(userId: string): Promise<void> {
     for (const [sessionId, session] of this.sessions) {
-      if (session.userId === userId) {
+      if (session.userId === userId || session.impersonatorUserId === userId) {
         this.sessions.delete(sessionId);
       }
     }
   }
 
-  public async createSession(userId: string, expiresAt: string): Promise<StoredSession> {
-    const session: StoredSession = { id: randomUUID(), userId, expiresAt };
+  public async createSession(
+    userId: string,
+    expiresAt: string,
+    impersonatorUserId?: string | null
+  ): Promise<StoredSession> {
+    const session: StoredSession = {
+      id: randomUUID(),
+      userId,
+      expiresAt,
+      ...(impersonatorUserId === undefined ? {} : { impersonatorUserId })
+    };
     this.sessions.set(session.id, session);
     return copy(session);
   }

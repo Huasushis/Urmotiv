@@ -4,6 +4,7 @@ import { BatchAccountAuditWriteError } from "./batch-account";
 
 export interface BatchAccountAuditEvent {
   readonly actorUserId: string;
+  readonly effectiveUserId?: string;
   readonly requestId: string;
   readonly accountCount: number;
 }
@@ -30,7 +31,10 @@ export class DatabaseBatchAccountAuditWriter implements BatchAccountAuditWriter 
           'user_batch',
           NULL,
           'success',
-          ${JSON.stringify({ accountCount: event.accountCount })}::jsonb
+          ${JSON.stringify({
+            accountCount: event.accountCount,
+            ...(event.effectiveUserId === undefined ? {} : { effectiveUserId: event.effectiveUserId })
+          })}::jsonb
         )
       `);
     } catch {

@@ -8,7 +8,8 @@ const migrationLockKeyOne = 1_431_453_001;
 const migrationLockKeyTwo = 1_651_666_804;
 const adminCredentialsRecoveryLockKeyOne = 1_431_453_002;
 const adminCredentialsRecoveryLockKeyTwo = 1_651_666_805;
-const expectedMigrationCount = 20;
+const rootCredentialsRecoveryLockKeyOne = 1_431_453_003;
+const rootCredentialsRecoveryLockKeyTwo = 1_651_666_806;
 
 const seededPublicTables = new Set([
   "admin_bootstrap_state",
@@ -17,8 +18,10 @@ const seededPublicTables = new Set([
   "review_policy",
   "role_memberships",
   "roles",
+  "system_settings",
   "tag_catalog_state",
   "tags",
+  "role_defaults",
   "users"
 ]);
 
@@ -27,12 +30,13 @@ const formalPublicTableNames = Object.values(databaseSchema)
   .sort(compareText);
 
 const expectedSequenceStates = [
-  { schema: "drizzle", name: "__drizzle_migrations_id_seq", last_value: "20", is_called: true },
+  { schema: "drizzle", name: "__drizzle_migrations_id_seq", last_value: "24", is_called: true },
   { schema: "public", name: "audit_events_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "contests_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "problems_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "users_id_seq", last_value: "1", is_called: false }
 ] as const;
+const expectedMigrationCount = 24;
 
 export type AdminBootstrapStatus = "blocked" | "open" | "completed";
 
@@ -564,6 +568,96 @@ export async function recoverAdminCredentials(
     };
   });
 }
+/**
+ * Resets only the fixed bootstrap root account (user id 0).
+ *
+ * The password digest, session revocation, and audit row share one transaction.
+ * Plain credentials never cross this database boundary.
+ */
+export async function recoverRootCredentials(
+  handle: DatabaseHandle,
+  input: AdminCredentialsRecoveryInput
+): Promise<AdminCredentialsRecoveryResult> {
+  if (!isArgon2idPasswordHash(input.passwordHash)) {
+    return "input_invalid";
+  }
+  const requestId = randomUUID();
+  return handle.transaction(async (transaction) => {
+    const lockRows = await transaction.query<{ acquired: boolean }>(sql`
+      SELECT pg_try_advisory_xact_lock(
+        ${rootCredentialsRecoveryLockKeyOne}::integer,
+        ${rootCredentialsRecoveryLockKeyTwo}::integer
+      ) AS acquired
+    `);
+    if (lockRows.length !== 1 || lockRows[0]?.acquired !== true) return "busy";
+
+    const state = parseStateRows(await transaction.query<StateRow>(sql`
+      SELECT status::text AS status, opened_at, completed_at
+      FROM admin_bootstrap_state
+      WHERE singleton = true
+      FOR UPDATE
+    `));
+    if (state.status !== "completed") return "not_completed";
+
+    const rootRows = await transaction.query<{
+      user_id: string;
+      account_type: string;
+      disabled_at: Date | string | null;
+    }>(sql`
+      SELECT id::text AS user_id, account_type::text AS account_type, disabled_at
+      FROM users
+      WHERE id = 0
+        AND account_type = 'human'
+        AND disabled_at IS NULL
+      FOR UPDATE
+    `);
+    if (rootRows.length !== 1 || rootRows[0]?.user_id !== "0") return "candidate_invalid";
+
+    const memberships = await transaction.query<{ role_key: string; is_built_in: boolean }>(sql`
+      SELECT role_record.key AS role_key, role_record.is_built_in AS is_built_in
+      FROM role_memberships membership
+      JOIN roles role_record ON role_record.id = membership.role_id
+      WHERE membership.user_id = 0
+        AND membership.revoked_at IS NULL
+        AND (membership.expires_at IS NULL OR membership.expires_at > transaction_timestamp())
+      FOR UPDATE OF membership, role_record
+    `);
+    if (
+      memberships.length !== 1 ||
+      memberships[0]?.role_key !== "root" ||
+      memberships[0]?.is_built_in !== true
+    ) {
+      return "candidate_invalid";
+    }
+
+    await transaction.execute(sql`
+      UPDATE users
+      SET
+        password_hash = ${input.passwordHash},
+        password_changed_at = transaction_timestamp(),
+        auth_revision = auth_revision + 1,
+        updated_at = transaction_timestamp()
+      WHERE id = 0
+        AND account_type = 'human'
+        AND disabled_at IS NULL
+    `);
+
+    await transaction.execute(sql`
+      UPDATE sessions
+      SET revoked_at = COALESCE(revoked_at, transaction_timestamp())
+      WHERE user_id = 0 OR impersonator_user_id = 0
+    `);
+    await transaction.execute(sql`
+      INSERT INTO audit_events (
+        actor_user_id, subject_user_id, request_id, action, object_type, object_id, result, metadata
+      ) VALUES (
+        NULL, 0, ${requestId}::uuid, 'admin.root_credentials.recover', 'user', '0',
+        'success', '{"channel":"server_tty","credential":"local_password"}'::jsonb
+      )
+    `);
+    return { status: "completed", userId: "0", accountIdentifier: "root" };
+  });
+}
 
 
 interface StateRow extends Record<string, unknown> {
@@ -604,6 +698,67 @@ async function transactionOwnsMigrationLease(
     ) AS owned
   `);
   return rows.length === 1 && rows[0]?.owned === true;
+}
+
+async function hasExactDefaultSystemSettingsSeed(
+  executor: DatabaseExecutor
+): Promise<boolean> {
+  const rows = await executor.query<{
+    id: string;
+    enabled: boolean;
+    authorize_url: string;
+    token_url: string;
+    profile_url: string;
+    redirect_uri: string;
+    scope: string;
+    public_registration_enabled: boolean;
+    public_site_url: string;
+    client_id_encrypted: string | null;
+    client_secret_encrypted: string | null;
+    revision: number;
+    updated_by_user_id: string | null;
+    created_at_is_not_null: boolean;
+    updated_at_is_not_null: boolean;
+    timestamps_match: boolean;
+  }>(sql`
+    SELECT
+      id,
+      enabled,
+      authorize_url,
+      token_url,
+      profile_url,
+      redirect_uri,
+      scope,
+      public_registration_enabled,
+      public_site_url,
+      client_id_encrypted,
+      client_secret_encrypted,
+      revision::integer AS revision,
+      updated_by_user_id::text AS updated_by_user_id,
+      created_at IS NOT NULL AS created_at_is_not_null,
+      updated_at IS NOT NULL AS updated_at_is_not_null,
+      created_at = updated_at AS timestamps_match
+    FROM system_settings
+    ORDER BY id
+  `);
+  return sameRows(rows, [{
+    id: "global",
+    enabled: false,
+    authorize_url: "",
+    token_url: "",
+    profile_url: "",
+    redirect_uri: "/api/v1/auth/ustc/callback",
+    scope: "",
+    public_registration_enabled: false,
+    public_site_url: "",
+    client_id_encrypted: null,
+    client_secret_encrypted: null,
+    revision: 1,
+    updated_by_user_id: null,
+    created_at_is_not_null: true,
+    updated_at_is_not_null: true,
+    timestamps_match: true
+  }]);
 }
 
 async function hasExactFreshSeedBaseline(
@@ -711,6 +866,10 @@ async function hasExactFreshSeedBaseline(
   if (!await hasExactDefaultCoreSeed(executor)) {
     return false;
   }
+  if (!await hasExactDefaultSystemSettingsSeed(executor)) {
+    return false;
+  }
+
 
   const tagCatalogRows = await executor.query<{
     version: number;

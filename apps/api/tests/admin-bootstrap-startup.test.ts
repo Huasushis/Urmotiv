@@ -1,3 +1,5 @@
+import { sql } from "drizzle-orm";
+
 import { hashPassword } from "@urmotiv/auth";
 import {
   completeAdminBootstrap,
@@ -44,6 +46,23 @@ describe("API administrator bootstrap startup gate", () => {
     });
 
     await expect(assertAdminBootstrapReadyForServer(database)).resolves.toBeUndefined();
+  });
+
+  it("rejects non-seed system settings during fresh bootstrap", async () => {
+    const database = createDatabase();
+    const lease = await tryAcquireAdminBootstrapMigrationLease(database);
+    if (lease === undefined) throw new Error("测试未取得迁移锁。");
+    await migrateDatabase(database);
+    await seedCoreDatabase(database);
+    await database.execute(sql`
+      UPDATE system_settings
+      SET public_site_url = 'unexpected'
+      WHERE id = 'global'
+    `);
+
+    await expect(openAdminBootstrapForFreshSeed(database, lease)).resolves.toBe(
+      "baseline_mismatch",
+    );
   });
 
   it("maps a missing marker or unreadable database to one fixed error", async () => {

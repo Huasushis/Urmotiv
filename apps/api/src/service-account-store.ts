@@ -35,6 +35,7 @@ interface TokenPermissionRow extends Record<string, unknown> {
 
 export interface CreateServiceAccountTokenRecordInput {
   readonly actorUserId: string;
+  readonly effectiveUserId?: string;
   readonly requestId: string;
   readonly token: CreateServiceAccountTokenInput;
 }
@@ -193,7 +194,10 @@ async function insertToken(
       ${JSON.stringify({
         permissionCount: permissions.length,
         sourceCidrCount: sourceCidrs.length,
-        hasExpiry: input.expiresAt !== null
+        hasExpiry: input.expiresAt !== null,
+        ...(operation.effectiveUserId === undefined || operation.effectiveUserId === operation.actorUserId
+          ? {}
+          : { effectiveUserId: operation.effectiveUserId })
       })}::jsonb
     )
   `);
@@ -282,7 +286,8 @@ export class DatabaseServiceAccountTokenStore {
     serviceAccountUserId: string,
     tokenId: string,
     actorUserId: string,
-    requestId: string
+    requestId: string,
+    effectiveUserId?: string
   ): Promise<ServiceAccountToken | undefined> {
     const userId = parseDatabaseId(serviceAccountUserId);
     if (userId === undefined || !uuidPattern.test(tokenId)) return undefined;
@@ -304,7 +309,10 @@ export class DatabaseServiceAccountTokenStore {
           object_id, result, metadata
         ) VALUES (
           ${actorId}, ${userId}, ${requestId}::uuid,
-          'service_account.token.revoke', 'api_token', ${tokenId}, 'success', '{}'::jsonb
+          'service_account.token.revoke', 'api_token', ${tokenId}, 'success',
+          ${JSON.stringify(
+            effectiveUserId === undefined || effectiveUserId === actorUserId ? {} : { effectiveUserId }
+          )}::jsonb
         )
       `);
       const item = (await readTokens(transaction, userId, tokenId))[0];

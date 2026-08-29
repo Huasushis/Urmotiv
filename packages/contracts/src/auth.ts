@@ -18,8 +18,22 @@ export const sessionUserSchema = userSummarySchema.extend({
 
 export type SessionUser = z.infer<typeof sessionUserSchema>;
 
+export const sessionIdentityUserSchema = z.object({
+  id: z.string(),
+  nickname: z.string()
+}).strict();
+
+export const sessionIdentitySchema = z.object({
+  actor: sessionIdentityUserSchema,
+  effective: sessionIdentityUserSchema,
+  switched: z.boolean()
+}).strict();
+
+export type SessionIdentity = z.infer<typeof sessionIdentitySchema>;
+
 export const sessionResponseSchema = z.object({
   user: sessionUserSchema.nullable(),
+  identity: sessionIdentitySchema.optional(),
   auth: z.object({
     emailEnabled: z.boolean(),
     emailRegistrationEnabled: z.boolean(),
@@ -31,15 +45,22 @@ export const sessionResponseSchema = z.object({
 
 export type SessionResponse = z.infer<typeof sessionResponseSchema>;
 
+export const rootLoginInputSchema = z.object({
+  identifier: z.enum(["root", "0"]),
+  password: z.string().min(8).max(1_024)
+}).strict();
+export const loginInputSchema = z.object({
+  email: z.string().trim().email().max(320),
+  password: z.string().min(1).max(1_024)
+});
+
+export const switchAccountInputSchema = z.object({
+  targetUserId: z.string().trim().min(1).max(80)
+}).strict();
+
 export const demoLoginInputSchema = z.object({
   userId: z.string().min(1)
 });
-
-export const loginInputSchema = z.object({
-  email: z.string().trim().email().max(320),
-  password: z.string().min(8).max(1024)
-});
-
 export const emailRegistrationInputSchema = z.object({
   email: z.string().trim().email().max(320),
   password: z.string().min(12).max(1024),

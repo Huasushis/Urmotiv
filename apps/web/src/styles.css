@@ -163,9 +163,14 @@ h3 {
 
 .global-nav {
   display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-content: center;
+  align-items: center;
   justify-content: center;
   min-width: 0;
-  height: 60px;
+  min-height: 60px;
+  height: auto;
 }
 
 .global-nav a {
@@ -187,7 +192,79 @@ h3 {
   background: var(--teal-soft);
   border-bottom-color: var(--teal);
 }
+.global-nav-management {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: stretch;
+  min-width: 0;
+  max-width: 100%;
+  position: relative;
+}
 
+.global-nav-management > a {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: max-content;
+  min-height: 44px;
+  height: 60px;
+  padding: 0 12px;
+  border-bottom: 2px solid transparent;
+  color: var(--text-soft);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.global-nav-management > a:hover,
+.global-nav-management > a.active {
+  color: var(--teal);
+  background: var(--teal-soft);
+  border-bottom-color: var(--teal);
+}
+
+.management-nav-groups {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 8px;
+  min-width: 0;
+}
+
+.management-nav-group {
+  display: flex;
+  flex: 0 1 auto;
+  align-items: stretch;
+  gap: 4px;
+  min-width: max-content;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+
+.management-nav-group-label {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.management-nav-group-items {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 1px;
+  min-width: 0;
+}
+.management-nav-group-items a {
+  min-height: 44px;
+  height: 60px;
+  padding: 0 9px;
+  font-size: 13px;
+}
 .user-context {
   display: flex;
   align-items: center;
@@ -2639,6 +2716,7 @@ textarea:read-only {
 .similarity-check-heading {
   display: flex;
   align-items: center;
+
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 12px;
@@ -2651,9 +2729,72 @@ textarea:read-only {
   font-weight: 700;
 }
 
+.admin-page {
+  min-width: 0;
+}
+
 .admin-heading {
   margin-bottom: 14px;
 }
+.admin-section-nav {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.admin-section-nav-group {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 6px;
+}
+
+.admin-section-nav-group h2 {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.admin-section-nav-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.admin-section-link {
+  display: inline-flex;
+  min-width: 0;
+  min-height: 44px;
+  align-items: center;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-soft);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.admin-section-link:hover,
+.admin-section-link.active {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+  color: var(--teal);
+}
+.admin-page .permission-user-list > label input,
+.admin-page .admin-actions .primary-button {
+  min-height: 44px;
+}
+
+
 
 .admin-mode {
   margin-bottom: 18px;
@@ -3089,6 +3230,450 @@ textarea:read-only {
   font-size: 13px;
 }
 
+.admin-permissions-page {
+  display: grid;
+  gap: 20px;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: clip;
+}
+
+.admin-save-uncertain {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid #e2b5ad;
+  border-radius: 5px;
+  background: var(--red-soft);
+}
+
+.admin-save-uncertain p {
+  margin: 0;
+  color: var(--red);
+  font-size: 12px;
+}
+
+.admin-save-uncertain .secondary-button {
+  justify-self: start;
+}
+
+.permission-user-empty {
+  display: grid;
+  gap: 8px;
+  min-height: 160px;
+  align-content: center;
+  padding: 22px;
+  color: var(--text-soft);
+  text-align: center;
+}
+
+.permission-user-empty h3,
+.permission-user-empty p {
+  margin: 0;
+}
+
+.admin-permissions-roles {
+  display: grid;
+  grid-template-columns: minmax(220px, 290px) minmax(0, 1fr);
+  align-items: start;
+  gap: 18px;
+}
+
+.permission-role-list,
+.permission-role-editor,
+.permission-user-list,
+.permission-user-editor,
+.permission-defaults {
+  min-width: 0;
+}
+
+.permission-role-buttons,
+.permission-user-list > div {
+  display: grid;
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--border);
+}
+
+.permission-role-buttons > button,
+.permission-user-list > div > button {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  min-height: 58px;
+  padding: 10px 12px;
+  border: 0;
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.permission-role-buttons > button:hover,
+.permission-role-buttons > button.selected,
+.permission-user-list > div > button:hover,
+.permission-user-list > div > button.selected {
+  background: var(--teal-soft);
+  box-shadow: inset 3px 0 0 var(--teal);
+}
+
+.permission-role-buttons small,
+.permission-user-list > div > button small {
+  overflow-wrap: anywhere;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.permission-role-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 16px;
+  margin-bottom: 18px;
+}
+
+.permission-role-fields > label,
+.permission-user-list > label,
+.permission-defaults > label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.permission-role-fields input,
+.permission-role-fields textarea,
+.permission-user-list > label input,
+.permission-defaults select {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.permission-role-fields textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.wide-field {
+  grid-column: 1 / -1;
+}
+
+.permission-matrix {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+
+.permission-delta-column {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.permission-delta-column > h4 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.permission-group,
+.permission-member-list,
+.permission-delta-columns fieldset {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin: 0 0 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.permission-group > summary {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: -12px;
+  padding: 0 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.permission-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+.permission-group > summary::after {
+  content: "＋";
+  color: var(--text-faint);
+  font-size: 16px;
+}
+
+.permission-group[open] > summary::after {
+  content: "−";
+}
+
+.permission-group > summary:focus-visible {
+  outline: 3px solid rgba(13, 118, 110, 0.22);
+  outline-offset: -3px;
+}
+
+.permission-group > summary span,
+.permission-group > summary small {
+  overflow-wrap: anywhere;
+}
+
+.permission-group > summary span {
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.permission-group > summary small {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.permission-group-fields {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.permission-delta-columns .permission-group-fields {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.permission-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+  padding: 6px 0;
+  cursor: pointer;
+}
+
+.permission-row.compact {
+  padding: 4px 0;
+}
+
+.permission-row > input {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: var(--teal);
+}
+
+.permission-row-copy {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 2px;
+  min-width: 0;
+}
+
+.permission-row-copy small {
+  overflow-wrap: anywhere;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.permission-row select {
+  flex: none;
+  min-height: 30px;
+  max-width: 100px;
+  padding: 3px 5px;
+}
+
+.permission-member-list p {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.permission-user-panel,
+.permission-defaults {
+  display: grid;
+  gap: 14px;
+}
+
+.permission-user-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 290px) minmax(0, 1fr);
+  align-items: start;
+  gap: 18px;
+}
+
+.permission-user-list {
+  display: grid;
+  gap: 12px;
+}
+
+.permission-user-list > div > p {
+  margin: 0;
+  padding: 14px;
+  color: var(--text-soft);
+  font-size: 13px;
+}
+
+.permission-user-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.permission-user-heading h3,
+.permission-user-heading p {
+  margin-bottom: 0;
+}
+
+.permission-user-heading p {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.permission-delta-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.permission-effective-preview {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.permission-effective-preview h3,
+.permission-effective-preview p {
+  margin-bottom: 0;
+}
+
+.permission-effective-preview > p {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+.effective-domains {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.effective-domain {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.effective-domain > summary {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.effective-domain > summary::-webkit-details-marker {
+  display: none;
+}
+
+.effective-domain > summary::after {
+  content: "＋";
+  color: var(--text-faint);
+  font-size: 16px;
+}
+
+.effective-domain[open] > summary::after {
+  content: "−";
+}
+
+.effective-domain > summary:focus-visible {
+  outline: 3px solid rgba(13, 118, 110, 0.22);
+  outline-offset: -3px;
+}
+
+.effective-domain > summary span,
+.effective-domain > summary small {
+  overflow-wrap: anywhere;
+}
+
+.effective-domain > summary span {
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.effective-domain > summary small {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.effective-domain-entries {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding-top: 8px;
+}
+
+
+.effective-entry {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.8fr) minmax(130px, 1fr) minmax(0, 1.4fr);
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid #cfe4d5;
+  border-radius: 4px;
+  background: var(--green-soft);
+  font-size: 12px;
+}
+
+.effective-entry.denied {
+  border-color: #ecc8c4;
+  background: var(--red-soft);
+}
+
+.effective-entry code {
+  overflow-wrap: anywhere;
+  color: var(--text-soft);
+  font-size: 11px;
+}
+
+.effective-entry span {
+  overflow-wrap: anywhere;
+  color: var(--text-soft);
+}
+
+.permission-defaults {
+  width: min(100%, 760px);
+}
+
 .sr-only {
   position: absolute;
   width: 1px;
@@ -3474,6 +4059,18 @@ textarea:read-only {
   .quiet-link {
     min-height: 44px;
   }
+
+  .permission-role-fields input,
+  .permission-role-fields textarea,
+  .permission-user-list > label input,
+  .permission-defaults select,
+  .permission-row select {
+    min-height: 44px;
+  }
+
+  .permission-row {
+    min-height: 44px;
+  }
 }
 
 @media (max-width: 1080px) {
@@ -3492,6 +4089,16 @@ textarea:read-only {
     overflow-x: auto;
     border-top: 1px solid var(--border);
     scrollbar-width: thin;
+  }
+  .global-nav-management {
+    flex: 0 0 max-content;
+    max-width: none;
+    flex-wrap: nowrap;
+  }
+
+  .management-nav-groups,
+  .management-nav-group-items {
+    flex-wrap: nowrap;
   }
 
   .global-header::after {
@@ -3512,6 +4119,25 @@ textarea:read-only {
 
   .global-nav a {
     height: 48px;
+  }
+  .global-nav-management > a,
+  .management-nav-group-items a {
+    height: 48px;
+    padding: 0 9px;
+    font-size: 12px;
+  }
+
+  .management-nav-groups {
+    gap: 4px;
+  }
+
+  .management-nav-group {
+    gap: 2px;
+    padding-left: 4px;
+  }
+
+  .management-nav-group-label {
+    font-size: 10px;
   }
 
   .user-context {
@@ -3555,6 +4181,10 @@ textarea:read-only {
   .admin-plugin-layout {
     grid-template-columns: minmax(190px, 230px) minmax(0, 1fr);
   }
+  .admin-permissions-roles,
+  .permission-user-layout {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 760px) {
@@ -3565,6 +4195,24 @@ textarea:read-only {
   .main-content {
     padding: 20px 16px 52px;
   }
+  .admin-section-nav {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-section-nav-items {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .admin-section-link {
+    min-height: 44px;
+  }
+  .admin-rule-select > select,
+  .settings-form-toggle[for="review-rule-countRobotReviews"] {
+    min-block-size: 44px;
+    min-height: 44px;
+  }
+
 
   .global-header {
     position: relative;
@@ -3579,6 +4227,20 @@ textarea:read-only {
   .global-nav a {
     padding: 0 11px;
     font-size: 12px;
+  }
+  .global-nav-management > a,
+  .management-nav-group-items a {
+    padding: 0 8px;
+    font-size: 12px;
+  }
+
+  .management-nav-groups {
+    gap: 3px;
+  }
+
+  .management-nav-group {
+    gap: 1px;
+    padding-left: 3px;
   }
 
   .user-name span,
@@ -4009,6 +4671,15 @@ textarea:read-only {
     width: 100%;
   }
   .admin-two-column {
+    grid-template-columns: 1fr;
+  }
+  .permission-role-fields,
+  .permission-matrix,
+  .permission-delta-columns {
+    grid-template-columns: 1fr;
+  }
+
+  .effective-entry {
     grid-template-columns: 1fr;
   }
 

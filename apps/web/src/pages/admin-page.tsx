@@ -11,6 +11,7 @@ import {
   ShieldAlert,
   Tags
 } from "lucide-react";
+import { NavLink } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import type {
@@ -78,43 +79,52 @@ export function AdminPage({ session }: { session: SessionUser }) {
   const canReadAudit = session.accountType === "human" && session.canReadAudit === true;
   const canManageProblemCatalog = session.accountType === "human" && session.canManageProblemCatalog === true;
   const canManageOAuth = session.accountType === "human" && session.canManageOAuth === true;
-  const hasPermission = (permission: string) => session.accountType === "human" && session.permissions.includes(permission);
-  const legacyCapabilityLinks = [
-    ...(canReview ? [{ href: "/admin", label: "审核规则" }] : []),
-    ...(canManagePlugins && !hasPermission("plugin.manage") ? [{ href: "/admin/plugins", label: "插件配置" }] : []),
-    ...(canManageTags && !hasPermission("tag.manage") ? [{ href: "/admin/knowledge", label: "知识点目录" }] : [])
+  const canOpenAdmin = canReview ||
+    canManagePlugins ||
+    canManageTags ||
+    canManageSystem ||
+    canManagePermissions ||
+    canManageServiceAccounts ||
+    canReadAudit ||
+    canManageProblemCatalog ||
+    canManageOAuth;
+  const adminGroups = [
+    {
+      label: "系统",
+      items: [
+        ...(canOpenAdmin ? [{ href: "/admin", label: "管理首页" }] : []),
+        ...(canManageSystem ? [{ href: "/admin/settings", label: "常规设置" }] : []),
+        ...(canReadAudit ? [{ href: "/admin/audit", label: "审计记录" }] : [])
+      ]
+    },
+    {
+      label: "用户与权限",
+      items: [
+        ...(canManagePermissions ? [
+          { href: "/admin/users", label: "用户管理" },
+          { href: "/admin/roles", label: "角色与权限" },
+          { href: "/admin/roles/defaults", label: "默认角色" }
+        ] : []),
+        ...(canManageServiceAccounts ? [{ href: "/admin/service-accounts", label: "服务账号与令牌" }] : [])
+      ]
+    },
+    {
+      label: "审核与内容",
+      items: [
+        ...(canManageTags ? [{ href: "/admin/knowledge", label: "知识点目录" }] : []),
+        ...(canManageProblemCatalog ? [{ href: "/problems", label: "题库" }] : [])
+      ]
+    },
+    {
+      label: "集成",
+      items: [
+        ...(canManagePlugins ? [{ href: "/admin/plugins", label: "插件配置" }] : []),
+        ...(canManageOAuth ? [{ href: "/admin/oauth", label: "USTC OAuth" }] : []),
+        ...(canManagePlugins && canManageSystem ? [{ href: "/admin/fermata", label: "Fermata 服务" }] : [])
+      ]
+    }
   ];
-  const adminLinks = [
-    ...legacyCapabilityLinks,
-    ...(canManageSystem
-      ? [{ href: "/admin/settings", label: "常规设置" }]
-      : []),
-    ...(canManagePermissions
-      ? [{ href: "/admin/roles", label: "角色与权限" }]
-      : []),
-    ...(canManageServiceAccounts
-      ? [{ href: "/admin/service-accounts", label: "服务账号与令牌" }]
-      : []),
-    ...(canReadAudit ? [{ href: "/admin/audit", label: "审计记录" }] : []),
-    ...(canManagePlugins && canManageSystem
-      ? [{ href: "/admin/fermata", label: "Fermata 服务" }]
-      : []),
-    ...(canManageOAuth
-      ? [{ href: "/admin/oauth", label: "USTC OAuth" }]
-      : []),
-    ...(canManagePlugins && hasPermission("plugin.manage")
-      ? [{ href: "/admin/plugins", label: "插件配置" }]
-      : []),
-    ...(canManageTags && hasPermission("tag.manage")
-      ? [{ href: "/admin/knowledge", label: "知识点目录" }]
-      : []),
-    ...(canManageProblemCatalog
-      ? [{ href: "/problems", label: "题库" }]
-      : []),
-    ...(canManageProblemCatalog
-      ? [{ href: "/transfer?tab=history", label: "导入历史" }]
-      : [])
-  ];
+  const adminLinks = adminGroups.flatMap((group) => group.items);
   const allowedModes: AdminMode[] = [
     ...(canReview ? ["review" as const] : []),
     ...(canManagePlugins ? ["plugins" as const] : []),
@@ -166,10 +176,22 @@ export function AdminPage({ session }: { session: SessionUser }) {
         <Settings className="page-heading-icon" size={32} aria-hidden="true" />
       </div>
       <nav className="admin-section-nav" aria-label="管理导航">
-        {adminLinks.map((link) => (
-          <a key={link.href} href={link.href} className="admin-section-link">
-            {link.label}
-          </a>
+        {adminGroups.filter((group) => group.items.length > 0).map((group) => (
+          <section key={group.label} className="admin-section-nav-group">
+            <h2>{group.label}</h2>
+            <div className="admin-section-nav-items">
+              {group.items.map((link) => (
+                <NavLink
+                  end
+                  key={link.href}
+                  to={link.href}
+                  className={({ isActive }) => `admin-section-link${isActive ? " active" : ""}`}
+                >
+                  {link.label}
+                </NavLink>
+              ))}
+            </div>
+          </section>
         ))}
       </nav>
 

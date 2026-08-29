@@ -3,6 +3,10 @@ import {
   adminGeneralSettingsSchema,
   updateAdminGeneralSettingsInputSchema,
   adminPermissionsResponseSchema,
+  adminPermissionCatalogResponseSchema,
+  adminRoleDefaultsResponseSchema,
+  adminUserPermissionDeltaResponseSchema,
+  adminUsersResponseSchema,
   adminRoleManagementResponseSchema,
   adminRoleResponseSchema,
   adminServiceAccountsResponseSchema,
@@ -46,6 +50,12 @@ import {
   type AdminGeneralSettings,
   type UpdateAdminGeneralSettingsInput,
   type AdminPermissionsResponse,
+  type AdminPermissionCatalogResponse,
+  type AdminRoleDefaultsResponse,
+  type UpdateAdminRoleDefaultsInput,
+  type AdminUserPermissionDeltaResponse,
+  type UpdateAdminUserPermissionDeltaInput,
+  type AdminUsersResponse,
   type AdminRoleManagementResponse,
   type AdminRoleResponse,
   type AdminServiceAccountsResponse,
@@ -336,6 +346,47 @@ export function updateAdminRole(roleId: string, input: UpdateAdminRoleInput): Pr
 
 export function listAdminPermissions(): Promise<AdminPermissionsResponse> {
   return request("/admin/permissions", { method: "GET" }, adminPermissionsResponseSchema);
+}
+export function listAdminPermissionCatalog(): Promise<AdminPermissionCatalogResponse> {
+  return request("/admin/permissions/catalog", { method: "GET" }, adminPermissionCatalogResponseSchema);
+}
+
+export function listAdminUsers(search = ""): Promise<AdminUsersResponse> {
+  const query = search.trim() ? `?search=${encodeURIComponent(search.trim())}` : "";
+  return request(`/admin/users${query}`, { method: "GET" }, adminUsersResponseSchema);
+}
+
+export function getAdminUserPermissions(userId: string): Promise<AdminUserPermissionDeltaResponse> {
+  return request(
+    `/admin/users/${encodeURIComponent(userId)}/permissions`,
+    { method: "GET" },
+    adminUserPermissionDeltaResponseSchema
+  );
+}
+
+export function updateAdminUserPermissions(
+  userId: string,
+  input: UpdateAdminUserPermissionDeltaInput
+): Promise<AdminUserPermissionDeltaResponse> {
+  return request(
+    `/admin/users/${encodeURIComponent(userId)}/permissions`,
+    { ...json(input), method: "PUT" },
+    adminUserPermissionDeltaResponseSchema
+  );
+}
+
+export function getAdminRoleDefaults(): Promise<AdminRoleDefaultsResponse> {
+  return request("/admin/roles/defaults", { method: "GET" }, adminRoleDefaultsResponseSchema);
+}
+
+export function updateAdminRoleDefaults(
+  input: UpdateAdminRoleDefaultsInput
+): Promise<AdminRoleDefaultsResponse> {
+  return request(
+    "/admin/roles/defaults",
+    { ...json(input), method: "PUT" },
+    adminRoleDefaultsResponseSchema
+  );
 }
 
 export function listAdminServiceAccounts(): Promise<AdminServiceAccountsResponse> {

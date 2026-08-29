@@ -30,6 +30,16 @@ docker compose --env-file /secure/path/urmotiv.env exec api pnpm --filter @urmot
 
 **禁止使用 `docker compose run`**：`run` 创建的进程由编排层转发 TTY，恢复输出可能被记录进容器日志或保留一次性容器，违背“密码永远只出现在服务器 TTY”的保证。命令要求在两个隐藏提示中各输入一次 `确认`。成功输出 `RECOVER_ADMIN_CREDENTIALS_OK`，新账号标识和随机新密码只写入服务器的 `/dev/tty`，不会出现在 API、日志或审计记录中。恢复会使该管理员的所有现有 Web 会话立即失效；新密码只由操作员在服务器 TTY 当场记下并登录修改，**绝不通过即时通讯、邮件或其他渠道分享或传输**。
 
+### root 本地恢复
+
+bootstrap 完成后，固定 `root` 仍没有本地凭据；紧急维护时只能在真实服务器 TTY 执行：
+
+```bash
+docker compose --env-file /secure/path/urmotiv.env exec api pnpm --filter @urmotiv/api recover-root-credentials
+```
+
+命令在访问数据库、生成凭据或写入秘密前检查输入和输出都是真实 TTY；禁止使用 `docker compose run`、管道或重定向。操作员需两次隐藏输入“确认”，固定结果只写标准输出，凭据值只写入服务器 `/dev/tty`，不进入 API、日志或审计记录。恢复后的 root 只能从专用本地入口登录，不走邮箱、CAS 或 OAuth。
+
 ### 执行前的路径金丝雀
 
 恢复本身不读取数据库、环境值或调用口令生成之前，就要求输入输出都是真实 TTY。先用同一个精确路径做一次非机密的随机标记金丝雀，确认能到达真实 TTY；随机标记可以直接生成（例如 `/dev/urandom` 前 16 字节的十六进制）：
@@ -78,7 +88,7 @@ docker compose --env-file /secure/path/urmotiv.env exec -T api pnpm --filter @ur
 
 核心权限包括 `auth.login`、`problem.create`、`problem.view.own`/`problem.view.all`、`problem.edit.own`/`problem.edit.all`、`problem.review`、`problem.status.change`、`problem.frozen.edit`、`problem.import`、`problem.export.own`/`problem.export.all`、`problem.testdata.read`/`problem.testdata.write`、`contest.*`、`plugin.manage`、`user.create` 和 `audit.read`。完整名称与作用域见[权限参考](permissions.md)。
 
-本版本的 `/admin` 页面提供插件、知识点目录、审核策略和角色与权限管理；角色管理页面使用 `GET/POST /api/v1/admin/roles` 和 `PUT /api/v1/admin/roles/:roleId`，可创建自定义角色、设置每项权限的允许或明确拒绝、分配人工账号或机器人账号。内置角色的名称和权限不可修改，但可以调整成员归属；服务端仍会检查 `user.permission.manage`，机器人账号不能通过角色解除固定禁止。所有修改都按角色修订号乐观并发检查并写入审计记录，冲突时应刷新后重试；不要直接在生产数据库临时写 SQL。
+本版本的管理页面路径为 `/admin/users`、`/admin/roles` 和 `/admin/roles/defaults`，分别用于用户权限增量、角色权限和默认角色维护；角色管理 API 使用 `GET/POST /api/v1/admin/roles` 和 `PUT /api/v1/admin/roles/:roleId`，可创建自定义角色、设置每项权限的允许或明确拒绝、分配人工账号或机器人账号。内置角色的名称和权限不可修改，但可以调整成员归属；服务端仍会检查 `user.permission.manage`，机器人账号不能通过角色解除固定禁止。所有修改都按角色修订号乐观并发检查并写入审计记录，冲突时应刷新后重试；不要直接在生产数据库临时写 SQL。
 
 ### 明确拒绝优先
 
