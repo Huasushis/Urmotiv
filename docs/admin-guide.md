@@ -78,7 +78,7 @@ docker compose --env-file /secure/path/urmotiv.env exec -T api pnpm --filter @ur
 
 核心权限包括 `auth.login`、`problem.create`、`problem.view.own`/`problem.view.all`、`problem.edit.own`/`problem.edit.all`、`problem.review`、`problem.status.change`、`problem.frozen.edit`、`problem.import`、`problem.export.own`/`problem.export.all`、`problem.testdata.read`/`problem.testdata.write`、`contest.*`、`plugin.manage`、`user.create` 和 `audit.read`。完整名称与作用域见[权限参考](permissions.md)。
 
-本版本的 `/admin` 页面提供插件、知识点目录和审核策略管理；HTTP 路由提供批量创建账号和机器人令牌管理，但没有公开的角色赋予/撤销页面或通用权限编辑 API。不要根据界面猜测不存在的端点，也不要直接在生产数据库临时写 SQL；组织需要改变角色成员关系时，应使用经过审核、留有审计记录的运维发布流程，并在发布后检查账号返回的 `roles` 与 `permissions`。
+本版本的 `/admin` 页面提供插件、知识点目录、审核策略和角色与权限管理；角色管理页面使用 `GET/POST /api/v1/admin/roles` 和 `PUT /api/v1/admin/roles/:roleId`，可创建自定义角色、设置每项权限的允许或明确拒绝、分配人工账号或机器人账号。内置角色的名称和权限不可修改，但可以调整成员归属；服务端仍会检查 `user.permission.manage`，机器人账号不能通过角色解除固定禁止。所有修改都按角色修订号乐观并发检查并写入审计记录，冲突时应刷新后重试；不要直接在生产数据库临时写 SQL。
 
 ### 明确拒绝优先
 
