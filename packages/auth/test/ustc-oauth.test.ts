@@ -9,9 +9,9 @@ const clientId = "synthetic-client-id";
 const clientSecret = "synthetic-client-secret-value";
 
 const baseConfig = {
-  authorizeUrl: "https://idp.example.test/oauth2/authorize",
-  tokenUrl: "https://idp.example.test/oauth2/accessToken",
-  profileUrl: "https://idp.example.test/oauth2/profile",
+  authorizeUrl: "https://id.ustc.edu.cn/cas/oauth2.0/authorize",
+  tokenUrl: "https://id.ustc.edu.cn/cas/oauth2.0/accessToken",
+  profileUrl: "https://id.ustc.edu.cn/cas/oauth2.0/profile",
   redirectUri: "https://site.example.test/api/v1/auth/ustc/callback",
   clientId,
   clientSecret,
@@ -97,7 +97,7 @@ function makeClient(
 }
 
 describe("USTC OAuth2 授权码流程", () => {
-  it("配置校验：只接受两个精确回调路径，拒绝编码、查询参数和其他路径", () => {
+  it("配置校验：只接受批准的 USTC 端点与固定回调路径", () => {
     expect(() =>
       ustcOAuthConfigurationSchema.parse({ ...baseConfig, clientId: "" }),
     ).toThrow();
@@ -107,17 +107,15 @@ describe("USTC OAuth2 授权码流程", () => {
     expect(() =>
       ustcOAuthConfigurationSchema.parse({
         ...baseConfig,
-        redirectUri: "https://site.example.test/oauth/ustc/callback",
+        authorizeUrl: "https://evil.example.test/cas/oauth2.0/authorize",
       }),
-    ).not.toThrow();
+    ).toThrow();
     for (const redirectUri of [
       "https://site.example.test/other/callback",
-      "https://site.example.test/oauth/ustc/callback/extra",
-      "https://site.example.test/oauth/%75stc/callback",
-      "https://site.example.test/api/v1/auth/ustc/%63allback",
-      "https://site.example.test/api/v1/auth/ustc/callback/../callback",
+      "https://site.example.test/oauth/ustc/callback",
+      "https://site.example.test/api/v1/auth/ustc/callback/extra",
       "https://site.example.test/api/v1/auth/ustc/callback?extra=1",
-      "http://site.example.test/oauth/ustc/callback",
+      "http://site.example.test/api/v1/auth/ustc/callback",
     ]) {
       expect(() =>
         ustcOAuthConfigurationSchema.parse({ ...baseConfig, redirectUri }),

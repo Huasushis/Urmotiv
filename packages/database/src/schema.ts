@@ -237,6 +237,27 @@ export const systemSettings = pgTable(
   },
   (table) => [check("system_settings_revision_ck", sql`${table.revision} > 0`)]
 );
+export const systemOAuthSettings = pgTable(
+  "system_oauth_settings",
+  {
+    id: varchar("id", { length: 32 }).primaryKey(),
+    enabled: boolean("enabled").notNull().default(false),
+    authorizeUrl: text("authorize_url").notNull().default(""),
+    tokenUrl: text("token_url").notNull().default(""),
+    profileUrl: text("profile_url").notNull().default(""),
+    redirectUri: text("redirect_uri").notNull().default("/api/v1/auth/ustc/callback"),
+    scope: text("scope").notNull().default(""),
+    clientIdEncrypted: text("client_id_encrypted"),
+    clientSecretEncrypted: text("client_secret_encrypted"),
+    revision: integer("revision").notNull().default(1),
+    updatedByUserId: bigint("updated_by_user_id", { mode: "bigint" }).references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [check("system_oauth_settings_revision_ck", sql`${table.revision} > 0`)]
+);
 
 export const userEmails = pgTable(
   "user_emails",

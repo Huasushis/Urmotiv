@@ -9,15 +9,13 @@ import {
 import { createApp } from "../src/app";
 
 const callbackPath = "/api/v1/auth/ustc/callback";
-const registeredCallbackPath = "/oauth/ustc/callback";
-const registeredCallbackUrl = `https://site.example.test${registeredCallbackPath}`;
 const callbackUrl = `https://site.example.test${callbackPath}`;
 const clientSecret = "synthetic-client-secret-value";
 
 const configuration: UstcOAuthConfiguration = {
-  authorizeUrl: "https://idp.example.test/oauth2/authorize",
-  tokenUrl: "https://idp.example.test/oauth2/accessToken",
-  profileUrl: "https://idp.example.test/oauth2/profile",
+  authorizeUrl: "https://id.ustc.edu.cn/cas/oauth2.0/authorize",
+  tokenUrl: "https://id.ustc.edu.cn/cas/oauth2.0/accessToken",
+  profileUrl: "https://id.ustc.edu.cn/cas/oauth2.0/profile",
   redirectUri: callbackUrl,
   clientId: "synthetic-client-id",
   clientSecret,
@@ -71,6 +69,7 @@ async function makeHarness(
     networkFailure?: boolean;
     redirectUri?: string;
     secureCookies?: boolean;
+    allowLoopbackInsecureCookies?: boolean;
   } = {},
 ) {
   const states = new TrackingStates();
@@ -101,10 +100,14 @@ async function makeHarness(
     stateSecret: Buffer.alloc(32, 9),
     states,
     fetch: fetch as unknown as typeof globalThis.fetch,
+    ...(options.allowLoopbackInsecureCookies
+      ? { allowLoopbackInsecureRedirect: true }
+      : {}),
   });
   const app = await createApp({
     ustcOAuthClient: client,
-    secureCookies: options.secureCookies ?? true
+    secureCookies: options.secureCookies ?? true,
+    allowLoopbackInsecureCookies: options.allowLoopbackInsecureCookies ?? false,
   });
   openApps.push(app);
   return {
@@ -129,7 +132,11 @@ function cookieLines(header: string | string[] | undefined): string[] {
   return Array.isArray(header) ? header : [header];
 }
 
-async function startFlow(app: FastifyInstance, returnPath = "/problems"): Promise<StartedFlow> {
+async function startFlow(
+  app: FastifyInstance,
+  returnPath = "/problems",
+  secureCookies = true,
+): Promise<StartedFlow> {
   const response = await app.inject({
     method: "GET",
     url: `/api/v1/auth/ustc/start?returnPath=${encodeURIComponent(returnPath)}`,
@@ -140,7 +147,7 @@ async function startFlow(app: FastifyInstance, returnPath = "/problems"): Promis
 
   const loginLocation = new URL(response.headers.location as string);
   const state = loginLocation.searchParams.get("state") as string;
-  const expectedCookieName = ustcOAuthBrowserBindingCookieName(state);
+  const expectedCookieName = ustcOAuthBrowserBindingCookieName(state, secureCookies);
   const line = cookieLines(response.headers["set-cookie"]).find((candidate) =>
     candidate.startsWith(`${expectedCookieName}=`),
   );
@@ -198,35 +205,53 @@ describe("USTC OAuth2 应用级流程", () => {
       }),
     );
   });
-
-  it("已登记的旧回调路径复用同一 state、浏览器绑定和换码处理器", async () => {
-    const { app, fetch, states } = await makeHarness({ redirectUri: registeredCallbackUrl });
-    const flow = await startFlow(app, "/problems?tab=2");
-    expect(new URL(flow.authorizeUrl).searchParams.get("redirect_uri")).toBe(
-      registeredCallbackUrl,
-    );
-
-    const callback = await app.inject({
-      method: "GET",
-      url: callbackRequest(flow.state, "legacy-code", registeredCallbackPath),
-      headers: { cookie: flow.cookiePair },
+  it("显式回环 HTTP 回调可启动，非回环 HTTP 仍被拒绝", async () => {
+    const { app } = await makeHarness({
+      redirectUri: "http://127.0.0.1:5173/api/v1/auth/ustc/callback",
+      secureCookies: false,
+      allowLoopbackInsecureCookies: true,
     });
-    expect(callback.statusCode).toBe(302);
-    expect(callback.headers.location).toContain("/problems?tab=2");
-    expect(states.consumeCalls).toBe(1);
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(callback.body).not.toContain("legacy-code");
-    expect(callback.body).not.toContain(clientSecret);
+    const flow = await startFlow(app, "/problems", false);
+    expect(new URL(flow.authorizeUrl).searchParams.get("redirect_uri")).toBe(
+      "http://127.0.0.1:5173/api/v1/auth/ustc/callback",
+    );
+    await expect(
+      makeHarness({
+        redirectUri: "http://127.0.0.2:5173/api/v1/auth/ustc/callback",
+        secureCookies: false,
+        allowLoopbackInsecureCookies: true,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      makeHarness({
+        redirectUri: "http://site.example.test/api/v1/auth/ustc/callback",
+        secureCookies: false,
+        allowLoopbackInsecureCookies: true,
+      }),
+    ).rejects.toThrow();
   });
 
-  it("旧回调路径的非法 state 与非精确路径统一拒绝且不调用 IdP", async () => {
-    const { app, fetch, states } = await makeHarness({ redirectUri: registeredCallbackUrl });
+  it("旧回调路径不再注册，不能复用 state 或调用 IdP", async () => {
+    const { app, fetch, states } = await makeHarness();
+    const flow = await startFlow(app, "/problems?tab=2");
+    const legacy = await app.inject({
+      method: "GET",
+      url: callbackRequest(flow.state, "legacy-code", "/oauth/ustc/callback"),
+      headers: { cookie: flow.cookiePair },
+    });
+    expect(legacy.statusCode).toBe(404);
+    expect(legacy.body).not.toContain("legacy-code");
+    expect(fetch).not.toHaveBeenCalled();
+    expect(states.consumeCalls).toBe(0);
+  });
+
+  it("旧回调路径及其子路径统一按不存在处理", async () => {
+    const { app, fetch, states } = await makeHarness();
     const invalidState = await app.inject({
       method: "GET",
-      url: callbackRequest("invalid-state", "legacy-secret-code", registeredCallbackPath),
+      url: callbackRequest("invalid-state", "legacy-secret-code", "/oauth/ustc/callback"),
     });
-    expect(invalidState.statusCode).toBe(401);
-    expect(publicFailure(invalidState)).toBe("UNAUTHENTICATED");
+    expect(invalidState.statusCode).toBe(404);
     expect(invalidState.body).not.toContain("legacy-secret-code");
     expect(fetch).not.toHaveBeenCalled();
     expect(states.consumeCalls).toBe(0);
@@ -236,7 +261,7 @@ describe("USTC OAuth2 应用级流程", () => {
       url: callbackRequest(
         "invalid-state",
         "legacy-secret-code",
-        `${registeredCallbackPath}/extra`,
+        "/oauth/ustc/callback/extra",
       ),
     });
     expect(wrongPath.statusCode).toBe(404);

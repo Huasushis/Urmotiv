@@ -187,6 +187,9 @@ try {
     ? undefined
     : new UstcOAuthClient({
         configuration: authenticationOptions.ustcOAuth.configuration,
+        ...(appOptions.allowLoopbackInsecureCookies
+          ? { allowLoopbackInsecureRedirect: true }
+          : {}),
         stateSecret: authenticationOptions.ustcOAuth.stateSecret,
         states: {
           put: (nonceDigest, expiresAt) => store.putLoginState(nonceDigest, expiresAt),

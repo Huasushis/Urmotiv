@@ -95,7 +95,7 @@ describe("最终集成红测：管理员与题库入口", () => {
       payload: {
         expectedRevision: initial.json().settings.revision,
         publicRegistrationEnabled: false,
-        publicSiteUrl: "https://urmotiv.example.test"
+        publicSiteUrl: origin
       }
     });
     expect(disabled.statusCode).toBe(200);
@@ -114,7 +114,7 @@ describe("最终集成红测：管理员与题库入口", () => {
       payload: {
         expectedRevision: disabled.json().settings.revision,
         publicRegistrationEnabled: true,
-        publicSiteUrl: "https://urmotiv.example.test"
+        publicSiteUrl: origin
       }
     });
     expect(reenabled.statusCode).toBe(200);
@@ -197,9 +197,9 @@ describe("最终集成红测：管理员与题库入口", () => {
       payload: {
         expectedRevision: 1,
         enabled: true,
-        authorizeUrl: "https://id.example.test/authorize",
-        tokenUrl: "https://id.example.test/token",
-        profileUrl: "https://id.example.test/profile",
+        authorizeUrl: "https://id.ustc.edu.cn/cas/oauth2.0/authorize",
+        tokenUrl: "https://id.ustc.edu.cn/cas/oauth2.0/accessToken",
+        profileUrl: "https://id.ustc.edu.cn/cas/oauth2.0/profile",
         redirectUri: `${oauthOrigin}/api/v1/auth/ustc/callback`,
         scope: "openid profile",
         clientId: "client-id",
@@ -215,7 +215,7 @@ describe("最终集成红测：管理员与题库入口", () => {
       headers: { origin: oauthOrigin }
     });
     expect(start.statusCode).toBe(302);
-    expect(start.headers.location).toMatch(/^https:\/\/id\.example\.test\/authorize\?/);
+    expect(start.headers.location).toMatch(/^https:\/\/id\.ustc\.edu\.cn\/cas\/oauth2\.0\/authorize\?/);
     expect(start.headers.location).not.toContain("client-secret-1234");
     const callbackFailure = await app.inject({
       method: "GET",
@@ -291,9 +291,9 @@ describe("最终集成红测：管理员与题库入口", () => {
       payload: {
         expectedRevision: 1,
         enabled: true,
-        authorizeUrl: "https://login.example.test/oauth/authorize",
-        tokenUrl: "https://login.example.test/oauth/token",
-        profileUrl: "https://login.example.test/api/profile",
+        authorizeUrl: "https://id.ustc.edu.cn/cas/oauth2.0/authorize",
+        tokenUrl: "https://id.ustc.edu.cn/cas/oauth2.0/accessToken",
+        profileUrl: "https://id.ustc.edu.cn/cas/oauth2.0/profile",
         redirectUri: `${origin}/api/v1/auth/ustc/callback`,
         scope: "openid profile",
         clientId: "client-id",
@@ -331,9 +331,9 @@ describe("最终集成红测：管理员与题库入口", () => {
       payload: {
         expectedRevision: 3,
         enabled: true,
-        authorizeUrl: "https://provider.example.test/authorize",
-        tokenUrl: "https://provider.example.test/token",
-        profileUrl: "https://provider.example.test/profile",
+        authorizeUrl: "https://id.ustc.edu.cn/cas/oauth2.0/authorize",
+        tokenUrl: "https://id.ustc.edu.cn/cas/oauth2.0/accessToken",
+        profileUrl: "https://id.ustc.edu.cn/cas/oauth2.0/profile",
         redirectUri: `${origin}/api/v1/auth/ustc/callback`,
         scope: "",
         clientId: ""
@@ -349,9 +349,9 @@ describe("最终集成红测：管理员与题库入口", () => {
       payload: {
         expectedRevision: 3,
         enabled: true,
-        authorizeUrl: "http://provider.example.test/authorize",
-        tokenUrl: "https://provider.example.test/token",
-        profileUrl: "https://provider.example.test/profile",
+        authorizeUrl: "http://id.ustc.edu.cn/cas/oauth2.0/authorize",
+        tokenUrl: "https://id.ustc.edu.cn/cas/oauth2.0/accessToken",
+        profileUrl: "https://id.ustc.edu.cn/cas/oauth2.0/profile",
         redirectUri: `${origin}/api/v1/auth/ustc/callback`,
         scope: "",
         clientId: "client-id",

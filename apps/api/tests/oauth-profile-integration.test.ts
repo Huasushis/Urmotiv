@@ -12,9 +12,9 @@ const callbackPath = "/api/v1/auth/ustc/callback";
 const callbackUrl = `https://site.example.test${callbackPath}`;
 const localOrigin = "https://site.example.test";
 const configuration: UstcOAuthConfiguration = {
-  authorizeUrl: "https://idp.example.test/oauth2/authorize",
-  tokenUrl: "https://idp.example.test/oauth2/accessToken",
-  profileUrl: "https://idp.example.test/oauth2/profile",
+  authorizeUrl: "https://id.ustc.edu.cn/cas/oauth2.0/authorize",
+  tokenUrl: "https://id.ustc.edu.cn/cas/oauth2.0/accessToken",
+  profileUrl: "https://id.ustc.edu.cn/cas/oauth2.0/profile",
   redirectUri: callbackUrl,
   clientId: "synthetic-client-id",
   clientSecret: "synthetic-client-secret-value",

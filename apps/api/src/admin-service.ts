@@ -19,15 +19,17 @@ import {
   type UpdateUstcOAuthSettingsInput,
   type UstcOAuthSettings
 } from "@urmotiv/contracts";
-import { corePermissionDefinitions, builtinRoleDefinitions } from "@urmotiv/database";
+import { isApprovedUstcOAuthEndpoint, ustcOAuthCallbackPath, ustcOAuthEndpointContract } from "@urmotiv/auth";
 import { sql, type SQL } from "drizzle-orm";
-import type { DatabaseHandle } from "@urmotiv/database";
+import { corePermissionDefinitions, builtinRoleDefinitions, type DatabaseHandle } from "@urmotiv/database";
 import type { StoredUser } from "./domain";
 import { ApiError, conflict, notFound } from "./errors";
 import { hasPermission } from "./permissions";
 import {
   InMemoryRoleManagementStore,
+  assertRoleMutationSafety,
   type RoleManagementStore,
+  type AdminRoleMutationContext,
   type StoredAdminRole
 } from "./admin-role-service";
 import type { DataStore } from "./repository";
@@ -43,6 +45,7 @@ export interface StoredUstcOAuthSettings {
   readonly clientIdEncrypted: string | null;
   readonly clientSecretEncrypted: string | null;
   readonly revision: number;
+  readonly overrideConfigured: boolean;
 }
 
 export interface RuntimeUstcOAuthSettings {
@@ -91,7 +94,7 @@ export interface AdminSettingsStore {
   encryptSecret(value: string): string;
   decryptSecret(value: string): string;
 }
-const canonicalCallbackPath = "/api/v1/auth/ustc/callback";
+const canonicalCallbackPath = ustcOAuthCallbackPath;
 const defaultUstcSettings: StoredUstcOAuthSettings = {
   enabled: false,
   authorizeUrl: "",
@@ -101,7 +104,8 @@ const defaultUstcSettings: StoredUstcOAuthSettings = {
   scope: "",
   clientIdEncrypted: null,
   clientSecretEncrypted: null,
-  revision: 1
+  revision: 1,
+  overrideConfigured: false
 };
 const defaultGeneralSettings: StoredGeneralSettings = {
   publicRegistrationEnabled: false,
@@ -166,7 +170,7 @@ export class InMemoryAdminSettingsStore implements AdminSettingsStore {
     if (expectedRevision !== this.settings.revision) {
       throw conflict("设置已被其他管理员修改，请刷新后重试。");
     }
-    this.settings = copy(settings);
+    this.settings = copy({ ...settings, overrideConfigured: true });
     this.audits.unshift({
       id: String(this.audits.length + 1),
       occurredAt: new Date().toISOString(),
@@ -301,34 +305,7 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
   }
 
   public async getUstcOAuthSettings(): Promise<StoredUstcOAuthSettings> {
-    const rows = await this.database.query<{
-      enabled: boolean;
-      authorize_url: string;
-      token_url: string;
-      profile_url: string;
-      redirect_uri: string;
-      scope: string;
-      client_id_encrypted: string | null;
-      client_secret_encrypted: string | null;
-      revision: number;
-    }>(sql`
-      SELECT enabled, authorize_url, token_url, profile_url, redirect_uri, scope,
-             client_id_encrypted, client_secret_encrypted, revision
-      FROM system_settings WHERE id = 'global'
-    `);
-    const row = rows[0];
-    if (row === undefined) return copy(defaultUstcSettings);
-    return {
-      enabled: row.enabled,
-      authorizeUrl: row.authorize_url,
-      tokenUrl: row.token_url,
-      profileUrl: row.profile_url,
-      redirectUri: row.redirect_uri,
-      scope: row.scope,
-      clientIdEncrypted: row.client_id_encrypted,
-      clientSecretEncrypted: row.client_secret_encrypted,
-      revision: Number(row.revision)
-    };
+    return this.getUstcOAuthSettingsFrom(this.database);
   }
 
   public async updateUstcOAuthSettings(
@@ -339,27 +316,32 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
     const actorId = databaseId(event.actorUserId);
     return this.database.transaction(async (transaction) => {
       const rows = await transaction.query<{ revision: number }>(sql`
-        SELECT revision FROM system_settings WHERE id = 'global' FOR UPDATE
+        SELECT revision FROM system_oauth_settings WHERE id = 'global' FOR UPDATE
       `);
       const currentRevision = Number(rows[0]?.revision ?? 1);
       if (currentRevision !== expectedRevision) {
-        throw conflict("设置已被其他管理员修改，请刷新后重试。");
+        throw conflict("OAuth 设置已被其他管理员修改，请刷新后重试。");
       }
       await transaction.execute(sql`
-        INSERT INTO system_settings (
+        INSERT INTO system_oauth_settings (
           id, enabled, authorize_url, token_url, profile_url, redirect_uri, scope,
           client_id_encrypted, client_secret_encrypted, revision, updated_by_user_id
         ) VALUES (
           'global', ${settings.enabled}, ${settings.authorizeUrl}, ${settings.tokenUrl},
           ${settings.profileUrl}, ${settings.redirectUri}, ${settings.scope},
-          ${settings.clientIdEncrypted}, ${settings.clientSecretEncrypted}, ${expectedRevision + 1}, ${actorId}
+          ${settings.clientIdEncrypted}, ${settings.clientSecretEncrypted},
+          ${expectedRevision + 1}, ${actorId}
         ) ON CONFLICT (id) DO UPDATE SET
-          enabled = EXCLUDED.enabled, authorize_url = EXCLUDED.authorize_url,
-          token_url = EXCLUDED.token_url, profile_url = EXCLUDED.profile_url,
-          redirect_uri = EXCLUDED.redirect_uri, scope = EXCLUDED.scope,
+          enabled = EXCLUDED.enabled,
+          authorize_url = EXCLUDED.authorize_url,
+          token_url = EXCLUDED.token_url,
+          profile_url = EXCLUDED.profile_url,
+          redirect_uri = EXCLUDED.redirect_uri,
+          scope = EXCLUDED.scope,
           client_id_encrypted = EXCLUDED.client_id_encrypted,
           client_secret_encrypted = EXCLUDED.client_secret_encrypted,
-          revision = EXCLUDED.revision, updated_by_user_id = EXCLUDED.updated_by_user_id,
+          revision = EXCLUDED.revision,
+          updated_by_user_id = EXCLUDED.updated_by_user_id,
           updated_at = now()
       `);
       await transaction.execute(sql`
@@ -417,7 +399,9 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
     };
   }
 
-  private async getUstcOAuthSettingsFrom(executor: { query<T extends Record<string, unknown>>(query: SQL): Promise<T[]> }): Promise<StoredUstcOAuthSettings> {
+  private async getUstcOAuthSettingsFrom(
+    executor: { query<T extends Record<string, unknown>>(query: SQL): Promise<T[]> }
+  ): Promise<StoredUstcOAuthSettings> {
     const rows = await executor.query<{
       enabled: boolean;
       authorize_url: string;
@@ -431,7 +415,7 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
     }>(sql`
       SELECT enabled, authorize_url, token_url, profile_url, redirect_uri, scope,
              client_id_encrypted, client_secret_encrypted, revision
-      FROM system_settings WHERE id = 'global'
+      FROM system_oauth_settings WHERE id = 'global'
     `);
     const row = rows[0];
     if (row === undefined) return copy(defaultUstcSettings);
@@ -444,7 +428,8 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
       scope: row.scope,
       clientIdEncrypted: row.client_id_encrypted,
       clientSecretEncrypted: row.client_secret_encrypted,
-      revision: Number(row.revision)
+      revision: Number(row.revision),
+      overrideConfigured: true
     };
   }
 }
@@ -526,11 +511,10 @@ export class AdminService {
     requestId: string
   ): Promise<{ role: AdminManagedRole }> {
     this.assertRoleManager(user);
+    const context = this.roleMutationContext(user, requestId);
     await this.validateRoleInput(input.permissions, input.userIds);
-    const role = await this.roleManagementStore.createRole(input, {
-      actorUserId: user.id,
-      requestId
-    });
+    assertRoleMutationSafety(input, context);
+    const role = await this.roleManagementStore.createRole(input, context);
     return { role: await this.toPublicManagedRole(role) };
   }
 
@@ -541,11 +525,9 @@ export class AdminService {
     requestId: string
   ): Promise<{ role: AdminManagedRole }> {
     this.assertRoleManager(user);
+    const context = this.roleMutationContext(user, requestId);
     await this.validateRoleInput(input.permissions, input.userIds);
-    const role = await this.roleManagementStore.updateRole(roleId, input, {
-      actorUserId: user.id,
-      requestId
-    });
+    const role = await this.roleManagementStore.updateRole(roleId, input, context);
     return { role: await this.toPublicManagedRole(role) };
   }
 
@@ -577,6 +559,10 @@ export class AdminService {
       throw new ApiError(422, "PUBLIC_REGISTRATION_UNAVAILABLE", "当前服务未配置可用的邮箱注册能力。");
     }
     const publicSiteUrl = this.validatePublicSiteUrl(input.publicSiteUrl);
+    const currentOAuth = await this.settingsStore.getUstcOAuthSettings();
+    if (currentOAuth.overrideConfigured) {
+      this.validateRedirect(currentOAuth.redirectUri, publicSiteUrl);
+    }
     const saved = await this.settingsStore.updateGeneralSettings(current.revision, {
       publicRegistrationEnabled: input.publicRegistrationEnabled,
       publicSiteUrl,
@@ -607,13 +593,13 @@ export class AdminService {
   }
   public async isUstcOAuthEnabled(fallback: boolean): Promise<boolean> {
     const current = await this.settingsStore.getUstcOAuthSettings();
-    if (current.revision <= 1 && !current.enabled) return fallback;
+    if (!current.overrideConfigured) return fallback;
     return current.enabled;
   }
 
   public async getRuntimeUstcOAuthSettings(): Promise<RuntimeUstcOAuthSettings | { enabled: false } | undefined> {
     const current = await this.settingsStore.getUstcOAuthSettings();
-    if (current.revision <= 1 && !current.enabled) return undefined;
+    if (!current.overrideConfigured) return undefined;
     if (!current.enabled) return { enabled: false };
     if (current.clientIdEncrypted === null || current.clientSecretEncrypted === null) {
       throw new ApiError(503, "OAUTH_SECRET_UNAVAILABLE", "USTC OAuth 密钥暂不可用。");
@@ -671,7 +657,28 @@ export class AdminService {
     this.assertOAuthManager(user);
     const current = await this.settingsStore.getUstcOAuthSettings();
     if (input.expectedRevision !== current.revision) {
-      throw conflict("设置已被其他管理员修改，请刷新后重试。");
+      throw conflict("OAuth 设置已被其他管理员修改，请刷新后重试。");
+    }
+    const general = await this.settingsStore.getGeneralSettings();
+    const clientIdChanged = input.clearClientId
+      ? current.clientIdEncrypted !== null
+      : input.clientId.trim().length > 0 &&
+        (current.clientIdEncrypted === null ||
+          this.settingsStore.decryptSecret(current.clientIdEncrypted) !== input.clientId);
+    const identityChanged =
+      current.authorizeUrl !== input.authorizeUrl ||
+      current.tokenUrl !== input.tokenUrl ||
+      current.profileUrl !== input.profileUrl ||
+      current.redirectUri !== input.redirectUri ||
+      clientIdChanged;
+    const clearingDisabledOverride = input.clearClientSecret && !input.enabled;
+    if (
+      current.clientSecretEncrypted !== null &&
+      identityChanged &&
+      input.clientSecret === undefined &&
+      !clearingDisabledOverride
+    ) {
+      throw new ApiError(422, "OAUTH_SECRET_REENTRY_REQUIRED", "修改 OAuth 端点、客户端或回调来源前必须重新输入客户端密钥。");
     }
     const nextSecret = input.clearClientSecret
       ? null
@@ -691,14 +698,15 @@ export class AdminService {
           ? current.clientIdEncrypted
           : this.encryptSecret(input.clientId),
       clientSecretEncrypted: nextSecret,
-      revision: current.revision + 1
+      revision: current.revision + 1,
+      overrideConfigured: true
     };
-    this.validateUstcSettings(next, (await this.settingsStore.getGeneralSettings()).publicSiteUrl);
+    this.validateUstcSettings(next, general.publicSiteUrl);
     const saved = await this.settingsStore.updateUstcOAuthSettings(current.revision, next, {
       actorUserId: user.id,
       requestId,
       action: "auth.ustc_oauth.settings.update",
-      objectType: "system_settings",
+      objectType: "system_oauth_settings",
       objectId: "global",
       result: "success",
       metadata: { secretChanged: input.clientSecret !== undefined || input.clearClientSecret }
@@ -733,6 +741,21 @@ export class AdminService {
             }];
       })
     });
+  }
+
+  private roleMutationContext(user: StoredUser, requestId: string): AdminRoleMutationContext {
+    const actorAllowCeiling = new Set<string>();
+    const actorDeniedPermissions = new Set<string>();
+    for (const grant of user.grants) {
+      if (grant.effect === "allow") actorAllowCeiling.add(grant.permission);
+      else actorDeniedPermissions.add(grant.permission);
+    }
+    return {
+      actorUserId: user.id,
+      requestId,
+      actorAllowCeiling: [...actorAllowCeiling],
+      actorDeniedPermissions: [...actorDeniedPermissions]
+    };
   }
 
   private async validateRoleInput(
@@ -787,9 +810,14 @@ export class AdminService {
   }
 
   private validateUstcSettings(settings: StoredUstcOAuthSettings, publicSiteUrl: string): void {
-    for (const field of [settings.authorizeUrl, settings.tokenUrl, settings.profileUrl]) {
+    const endpoints = [
+      [settings.authorizeUrl, ustcOAuthEndpointContract.authorizePath],
+      [settings.tokenUrl, ustcOAuthEndpointContract.tokenPath],
+      [settings.profileUrl, ustcOAuthEndpointContract.profilePath]
+    ] as const;
+    for (const [field, path] of endpoints) {
       if (field.length > 0 || settings.enabled) {
-        this.validateProviderUrl(field);
+        this.validateProviderUrl(field, path);
       }
     }
     this.validateRedirect(settings.redirectUri, publicSiteUrl);
@@ -803,25 +831,15 @@ export class AdminService {
     }
   }
 
-  private validateProviderUrl(value: string): void {
-    let parsed: URL;
-    try {
-      parsed = new URL(value);
-    } catch {
-      throw new ApiError(422, "OAUTH_URL_INVALID", "OAuth 地址必须是完整 URL。");
+  private validateProviderUrl(
+    value: string,
+    path: typeof ustcOAuthEndpointContract.authorizePath |
+      typeof ustcOAuthEndpointContract.tokenPath |
+      typeof ustcOAuthEndpointContract.profilePath
+  ): void {
+    if (!isApprovedUstcOAuthEndpoint(value, path)) {
+      throw new ApiError(422, "OAUTH_ENDPOINT_NOT_APPROVED", "OAuth 地址必须精确使用已批准的 USTC HTTPS authority/path。");
     }
-    if (parsed.username || parsed.password || parsed.hash) {
-      throw new ApiError(422, "OAUTH_URL_INVALID", "OAuth 地址不能包含账号、密码或片段。");
-    }
-    if (parsed.protocol === "https:") return;
-    if (
-      parsed.protocol === "http:" &&
-      this.options.allowLoopbackInsecureCookies &&
-      ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
-    ) {
-      return;
-    }
-    throw new ApiError(422, "OAUTH_URL_INSECURE", "OAuth 地址必须使用 HTTPS；仅允许显式开启的回环地址使用 HTTP。");
   }
 
   private validateRedirect(value: string, publicSiteUrl?: string): void {
@@ -875,6 +893,18 @@ export class AdminService {
       parsed.pathname !== "/"
     ) {
       throw new ApiError(422, "PUBLIC_SITE_URL_INVALID", "公开站点地址只能包含协议、域名和端口。");
+    }
+    const allowedOrigins = new Set(
+      this.options.allowedOrigins.flatMap((origin) => {
+        try {
+          return [new URL(origin).origin];
+        } catch {
+          return [];
+        }
+      })
+    );
+    if (!allowedOrigins.has(parsed.origin)) {
+      throw new ApiError(422, "PUBLIC_SITE_ORIGIN_NOT_ALLOWED", "公开站点地址必须使用部署配置的 Web origin。");
     }
     if (parsed.protocol === "https:") return parsed.origin;
     if (

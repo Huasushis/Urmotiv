@@ -4,6 +4,9 @@ import {
   randomBytes,
   timingSafeEqual
 } from "node:crypto";
+import { lookup as dnsLookup } from "node:dns/promises";
+import { request as httpsRequest } from "node:https";
+import { isIP } from "node:net";
 import { z } from "zod";
 import type { CasLoginStateStore } from "./cas";
 
@@ -14,19 +17,65 @@ const browserBindingDigestContext = "urmotiv:ustc-oauth:browser-binding:v1\0";
 const browserBindingSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const tokenResponseCap = 8_192;
 const profileResponseCap = 16_384;
-const ustcOAuthCallbackPaths = {
-  "/api/v1/auth/ustc/callback": true,
-  "/oauth/ustc/callback": true
-} as const;
 
-const httpUrlSchema = z.string().url().refine((value) => {
-  const url = new URL(value);
-  return (
-    (url.protocol === "https:" || url.protocol === "http:") &&
-    url.username.length === 0 &&
-    url.password.length === 0
+export const ustcOAuthCallbackPath = "/api/v1/auth/ustc/callback" as const;
+export const ustcOAuthEndpointContract = {
+  authority: "id.ustc.edu.cn",
+  authorizePath: "/cas/oauth2.0/authorize",
+  tokenPath: "/cas/oauth2.0/accessToken",
+  profilePath: "/cas/oauth2.0/profile"
+} as const;
+type UstcOAuthEndpointPath =
+  | typeof ustcOAuthEndpointContract.authorizePath
+  | typeof ustcOAuthEndpointContract.tokenPath
+  | typeof ustcOAuthEndpointContract.profilePath;
+
+export function isApprovedUstcOAuthEndpoint(value: string, path: UstcOAuthEndpointPath): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.hostname === ustcOAuthEndpointContract.authority &&
+      url.port === "" &&
+      url.pathname === path &&
+      url.search === "" &&
+      url.hash === "" &&
+      url.username === "" &&
+      url.password === ""
+    );
+  } catch {
+    return false;
+  }
+}
+
+function approvedEndpointSchema(path: UstcOAuthEndpointPath) {
+  return z.string().url().refine(
+    (value) => isApprovedUstcOAuthEndpoint(value, path),
+    "USTC OAuth 地址必须精确使用已批准的 HTTPS authority/path。"
   );
-}, "USTC OAuth 地址必须是不含账号密码的 HTTP 或 HTTPS 地址。");
+}
+
+const loopbackRedirectHostnames = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+function isLoopbackHttpRedirect(url: URL): boolean {
+  return url.protocol === "http:" && loopbackRedirectHostnames.has(url.hostname);
+}
+
+const redirectUriSchema = z.string().url().refine((value) => {
+  try {
+    const url = new URL(value);
+    return (
+      (url.protocol === "https:" || isLoopbackHttpRedirect(url)) &&
+      url.pathname === ustcOAuthCallbackPath &&
+      url.search === "" &&
+      url.hash === "" &&
+      url.username === "" &&
+      url.password === ""
+    );
+  } catch {
+    return false;
+  }
+}, "回调地址必须使用 HTTPS（回环地址可显式使用 HTTP）且精确指向 /api/v1/auth/ustc/callback，不能带查询参数或片段。");
 
 /**
  * USTC 统一身份认证 OAuth2 客户端配置。客户端密钥只在服务器进程内存中使用，
@@ -34,32 +83,10 @@ const httpUrlSchema = z.string().url().refine((value) => {
  */
 export const ustcOAuthConfigurationSchema = z
   .object({
-    authorizeUrl: httpUrlSchema,
-    tokenUrl: httpUrlSchema,
-    profileUrl: httpUrlSchema,
-    redirectUri: httpUrlSchema.refine((value) => {
-      const url = new URL(value);
-      const schemeEnd = value.indexOf("://");
-      const authorityStart = schemeEnd + 3;
-      const pathStart = value.indexOf("/", authorityStart);
-      const queryStart = value.indexOf("?", authorityStart);
-      const hashStart = value.indexOf("#", authorityStart);
-      const pathEnd = Math.min(
-        queryStart === -1 ? value.length : queryStart,
-        hashStart === -1 ? value.length : hashStart
-      );
-      const rawPath =
-        pathStart === -1 || pathStart > pathEnd ? "/" : value.slice(pathStart, pathEnd);
-      return (
-        url.protocol === "https:" &&
-        url.username.length === 0 &&
-        url.password.length === 0 &&
-        Object.hasOwn(ustcOAuthCallbackPaths, rawPath) &&
-        url.pathname === rawPath &&
-        url.search.length === 0 &&
-        url.hash.length === 0
-      );
-    }, "回调地址必须是 HTTPS 且精确指向 /api/v1/auth/ustc/callback 或 /oauth/ustc/callback，不能带查询参数或片段。"),
+    authorizeUrl: approvedEndpointSchema(ustcOAuthEndpointContract.authorizePath),
+    tokenUrl: approvedEndpointSchema(ustcOAuthEndpointContract.tokenPath),
+    profileUrl: approvedEndpointSchema(ustcOAuthEndpointContract.profilePath),
+    redirectUri: redirectUriSchema,
     clientId: z.string().trim().min(1, "client_id 不能为空。").max(200),
     clientSecret: z
       .string()
@@ -74,6 +101,7 @@ export type UstcOAuthConfiguration = z.infer<typeof ustcOAuthConfigurationSchema
 export interface UstcOAuthFetch {
   (input: string | URL | Request, init?: RequestInit): Promise<Response>;
 }
+export type UstcOAuthHostResolver = (hostname: string) => Promise<readonly string[]>;
 
 /**
  * 从 USTC OAuth2 资料端点解析出的稳定身份。subject 取自 attributes.gid（优先）
@@ -142,6 +170,8 @@ export class UstcOAuthClient {
   readonly #stateSecret: Uint8Array;
   readonly #states: CasLoginStateStore;
   readonly #fetch: UstcOAuthFetch;
+  readonly #customFetch: boolean;
+  readonly #resolveHostAddresses: UstcOAuthHostResolver;
   readonly #now: () => Date;
 
   public constructor(options: {
@@ -149,9 +179,19 @@ export class UstcOAuthClient {
     stateSecret: Uint8Array;
     states: CasLoginStateStore;
     fetch?: UstcOAuthFetch;
+    resolveHostAddresses?: UstcOAuthHostResolver;
     now?: () => Date;
+    /**
+     * HTTP redirects are permitted only for exact loopback origins when the
+     * caller has explicitly enabled the existing loopback-cookie safety mode.
+     */
+    allowLoopbackInsecureRedirect?: boolean;
   }) {
     const configuration = ustcOAuthConfigurationSchema.parse(options.configuration);
+    const redirectUri = new URL(configuration.redirectUri);
+    if (isLoopbackHttpRedirect(redirectUri) && options.allowLoopbackInsecureRedirect !== true) {
+      throw new Error("HTTP OAuth 回调地址必须显式开启回环安全模式。");
+    }
     this.#authorizeUrl = configuration.authorizeUrl;
     this.#tokenUrl = configuration.tokenUrl;
     this.#profileUrl = configuration.profileUrl;
@@ -164,7 +204,9 @@ export class UstcOAuthClient {
     }
     this.#stateSecret = new Uint8Array(options.stateSecret);
     this.#states = options.states;
+    this.#customFetch = options.fetch !== undefined;
     this.#fetch = options.fetch ?? globalThis.fetch;
+    this.#resolveHostAddresses = options.resolveHostAddresses ?? resolveHostAddresses;
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -236,17 +278,219 @@ export class UstcOAuthClient {
       this.#clientSecret,
       this.#redirectUri,
       input.code,
-      this.#fetch
+      (url, init) => this.fetchProvider(url, init)
     );
     const profile = await fetchProfile(
       this.#profileUrl,
       accessToken,
       this.#clientId,
-      this.#fetch
+      (url, init) => this.fetchProvider(url, init)
     );
     const identity = parseOAuthProfile(profile);
     return { identity, returnTo: payload.returnTo };
   }
+
+  private async fetchProvider(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+    const url = new URL(input instanceof Request ? input.url : input.toString());
+    let addresses: readonly string[];
+    try {
+      addresses = await this.#resolveHostAddresses(url.hostname);
+    } catch {
+      throw new UstcOAuthError("统一身份认证地址解析失败。", "provider_dns_blocked");
+    }
+    if (addresses.length === 0 || addresses.some(isBlockedNetworkAddress)) {
+      throw new UstcOAuthError("统一身份认证地址解析到不允许的网络。", "provider_dns_blocked");
+    }
+    if (this.#customFetch) {
+      return this.#fetch(input, init);
+    }
+    return pinnedHttpsFetch(url, addresses[0]!, init);
+  }
+}
+
+async function resolveHostAddresses(hostname: string): Promise<readonly string[]> {
+  const records = await dnsLookup(hostname, { all: true, verbatim: true });
+  return records.map((record) => record.address);
+}
+
+function isBlockedNetworkAddress(address: string): boolean {
+  const family = isIP(address);
+  if (family === 4) {
+    return isBlockedIPv4(address);
+  }
+  if (family === 6) {
+    return isBlockedIPv6(address);
+  }
+  return true;
+}
+
+function isBlockedIPv4(address: string): boolean {
+  const octets = address.split(".").map((part) => Number(part));
+  if (
+    octets.length !== 4 ||
+    octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
+  ) {
+    return true;
+  }
+  const value = octets.reduce((result, part) => result * 256 + part, 0);
+  const ranges: ReadonlyArray<readonly [number, number]> = [
+    [0, 8],
+    [0x0a000000, 8],
+    [0x64400000, 10],
+    [0x7f000000, 8],
+    [0xa9fe0000, 16],
+    [0xac100000, 12],
+    [0xc0000000, 24],
+    [0xc0000200, 24],
+    [0xc0a80000, 16],
+    [0xc6120000, 15],
+    [0xc6336400, 24],
+    [0xcb007100, 24],
+    [0xe0000000, 4],
+    [0xf0000000, 4]
+  ];
+  return ranges.some(([network, prefix]) => ipv4InRange(value, network, prefix));
+}
+
+function ipv4InRange(value: number, network: number, prefix: number): boolean {
+  if (prefix === 0) return true;
+  const mask = prefix === 32 ? 0xffffffff : (0xffffffff << (32 - prefix)) >>> 0;
+  return (value & mask) === ((network as number) & mask);
+}
+
+function isBlockedIPv6(address: string): boolean {
+  const value = parseIPv6(address);
+  if (value === undefined) return true;
+  const mappedPrefix = parseIPv6("::ffff:0:0");
+  if (mappedPrefix !== undefined && (value >> 32n) === (mappedPrefix >> 32n)) {
+    return isBlockedIPv4(String([
+      Number((value >> 24n) & 0xffn),
+      Number((value >> 16n) & 0xffn),
+      Number((value >> 8n) & 0xffn),
+      Number(value & 0xffn)
+    ].join(".")));
+  }
+  const ranges: ReadonlyArray<readonly [string, number]> = [
+    ["::", 128],
+    ["::1", 128],
+    ["fc00::", 7],
+    ["fe80::", 10],
+    ["ff00::", 8],
+    ["2001:db8::", 32]
+  ];
+  return ranges.some(([network, prefix]) => {
+    const parsedNetwork = parseIPv6(network);
+    return parsedNetwork !== undefined && ipv6InRange(value, parsedNetwork, prefix);
+  });
+}
+
+function parseIPv6(address: string): bigint | undefined {
+  const normalized = address.toLowerCase().split("%", 1)[0]!;
+  if (normalized.length === 0) return undefined;
+  const sections = normalized.split("::");
+  if (sections.length > 2) return undefined;
+  const parseSection = (section: string): number[] => {
+    if (section.length === 0) return [];
+    const parts = section.split(":");
+    const result: number[] = [];
+    for (const part of parts) {
+      if (part.includes(".")) {
+        const octets = part.split(".").map((value) => Number(value));
+        if (
+          octets.length !== 4 ||
+          octets.some((value) => !Number.isInteger(value) || value < 0 || value > 255)
+        ) {
+          return [];
+        }
+        result.push((octets[0]! << 8) | octets[1]!, (octets[2]! << 8) | octets[3]!);
+      } else {
+        if (!/^[0-9a-f]{1,4}$/u.test(part)) return [];
+        result.push(Number.parseInt(part, 16));
+      }
+    }
+    return result;
+  };
+  const left = parseSection(sections[0]!);
+  const right = sections.length === 2 ? parseSection(sections[1]!) : [];
+  if (left.length + right.length > 8 || (sections.length === 1 && left.length !== 8)) {
+    return undefined;
+  }
+  const groups = sections.length === 2
+    ? [...left, ...Array.from({ length: 8 - left.length - right.length }, () => 0), ...right]
+    : left;
+  if (groups.length !== 8) return undefined;
+  return groups.reduce((result, group) => (result << 16n) | BigInt(group), 0n);
+}
+
+function ipv6InRange(value: bigint, network: bigint, prefix: number): boolean {
+  if (prefix === 0) return true;
+  const mask = ((1n << 128n) - 1n) ^ ((1n << BigInt(128 - prefix)) - 1n);
+  return (value & mask) === (network & mask);
+}
+
+async function pinnedHttpsFetch(
+  url: URL,
+  address: string,
+  init?: RequestInit
+): Promise<Response> {
+  const body = init?.body === undefined
+    ? undefined
+    : Buffer.from(await new Response(init.body).arrayBuffer());
+  const headers = new Headers(init?.headers);
+  headers.set("host", url.host);
+  const requestHeaders: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    requestHeaders[key] = value;
+  });
+  return new Promise<Response>((resolve, reject) => {
+    const request = httpsRequest(
+      {
+        hostname: address,
+        port: url.port === "" ? 443 : Number(url.port),
+        path: `${url.pathname}${url.search}`,
+        method: init?.method ?? "GET",
+        headers: requestHeaders,
+        servername: url.hostname,
+        rejectUnauthorized: true
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        response.on("data", (chunk: Buffer | string) => {
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          size += bytes.byteLength;
+          if (size > 1_048_576) {
+            request.destroy(new Error("response too large"));
+            return;
+          }
+          chunks.push(bytes);
+        });
+        response.on("end", () => {
+          const responseHeaders = new Headers();
+          for (const [key, value] of Object.entries(response.headers)) {
+            if (value !== undefined) {
+              responseHeaders.set(key, Array.isArray(value) ? value.join(", ") : value);
+            }
+          }
+          resolve(new Response(Buffer.concat(chunks), {
+            status: response.statusCode ?? 502,
+            headers: responseHeaders
+          }));
+        });
+      }
+    );
+    request.once("error", reject);
+    const signal = init?.signal;
+    const abort = () => request.destroy(new Error("request aborted"));
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+    request.once("close", () => signal?.removeEventListener("abort", abort));
+    if (body !== undefined) request.write(body);
+    request.end();
+  });
 }
 
 function buildAuthorizeUrl(
@@ -291,7 +535,8 @@ async function exchangeCode(
       redirect: "error",
       signal: AbortSignal.timeout(15_000)
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof UstcOAuthError) throw error;
     throw new UstcOAuthError("令牌端点请求失败。", "token_network");
   }
   const text = await readBounded(response, tokenResponseCap, "token_exchange");
@@ -330,7 +575,8 @@ async function fetchProfile(
       redirect: "error",
       signal: AbortSignal.timeout(15_000)
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof UstcOAuthError) throw error;
     throw new UstcOAuthError("资料端点请求失败。", "profile_network");
   }
   const text = await readBounded(response, profileResponseCap, "profile");

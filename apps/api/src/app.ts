@@ -837,6 +837,18 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     return user;
   }
 
+  async function requireOAuthManager(request: FastifyRequest): Promise<StoredUser> {
+    const user = await requireUser(request);
+    if (
+      user.accountType !== "human" ||
+      !hasPermission(user, "system.manage", {}, dependencies.now()) ||
+      !hasPermission(user, "user.permission.manage", {}, dependencies.now())
+    ) {
+      throw notFound();
+    }
+    return user;
+  }
+
   async function requireAdminPermission(
     request: FastifyRequest,
     permission: Parameters<typeof hasPermission>[1]
@@ -897,6 +909,9 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       throw new ApiError(503, "OAUTH_CONFIGURATION_UNAVAILABLE", "USTC OAuth 配置暂不可用。");
     }
     const client = new UstcOAuthClient({
+      ...(dependencies.allowLoopbackInsecureCookies
+        ? { allowLoopbackInsecureRedirect: true }
+        : {}),
       configuration,
       stateSecret: dependencies.ustcOAuthStateSecret,
       states: {
@@ -1026,12 +1041,12 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   });
 
   app.put("/api/v1/admin/roles/:roleId", async (request, reply) => {
-    const params = z.object({ roleId: z.string().uuid() }).strict().parse(request.params);
     reply.header("cache-control", "private, no-store");
-    await requireAdminPermission(request, "user.permission.manage");
+    const actor = await requireAdminPermission(request, "user.permission.manage");
+    const params = z.object({ roleId: z.string().uuid() }).strict().parse(request.params);
     const input = updateAdminRoleInputSchema.strict().parse(request.body);
     return dependencies.adminService.updateRole(
-      await requireUser(request),
+      actor,
       params.roleId,
       input,
       request.id
@@ -1059,14 +1074,15 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   app.get("/api/v1/admin/oauth/ustc", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
-    return dependencies.adminService.getUstcOAuthSettings(await requireUser(request));
+    return dependencies.adminService.getUstcOAuthSettings(await requireOAuthManager(request));
   });
 
   app.put("/api/v1/admin/oauth/ustc", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
+    const actor = await requireOAuthManager(request);
     const input = updateUstcOAuthSettingsInputSchema.strict().parse(request.body);
     return dependencies.adminService.updateUstcOAuthSettings(
-      await requireUser(request),
+      actor,
       input,
       request.id
     );
@@ -1483,7 +1499,6 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     };
 
     app.get("/api/v1/auth/ustc/callback", handleUstcOAuthCallback);
-    app.get("/oauth/ustc/callback", handleUstcOAuthCallback);
 
   if (dependencies.casClient !== undefined) {
     app.get("/api/v1/auth/cas/start", async (request, reply) => {

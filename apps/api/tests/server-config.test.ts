@@ -312,9 +312,9 @@ describe("认证启动配置", () => {
     NODE_ENV: "production",
     URMOTIV_WEB_ORIGIN: "https://problems.example",
     URMOTIV_USTC_OAUTH_ENABLED: "true",
-    URMOTIV_USTC_OAUTH_AUTHORIZE_URL: "https://identity.example/oauth2/authorize",
-    URMOTIV_USTC_OAUTH_TOKEN_URL: "https://identity.example/oauth2/accessToken",
-    URMOTIV_USTC_OAUTH_PROFILE_URL: "https://identity.example/oauth2/profile",
+    URMOTIV_USTC_OAUTH_AUTHORIZE_URL: "https://id.ustc.edu.cn/cas/oauth2.0/authorize",
+    URMOTIV_USTC_OAUTH_TOKEN_URL: "https://id.ustc.edu.cn/cas/oauth2.0/accessToken",
+    URMOTIV_USTC_OAUTH_PROFILE_URL: "https://id.ustc.edu.cn/cas/oauth2.0/profile",
     URMOTIV_USTC_OAUTH_REDIRECT_URI:
       "https://problems.example/api/v1/auth/ustc/callback",
     URMOTIV_USTC_OAUTH_CLIENT_ID: "synthetic-client-id",
@@ -337,15 +337,15 @@ describe("认证启动配置", () => {
     );
   });
 
-  it("OAuth2 接受已登记的旧回调路径并保留精确地址", () => {
+  it("OAuth2 拒绝已登记的旧回调路径", () => {
     const legacyEnvironment = {
       ...validUstcOAuthEnvironment,
       URMOTIV_USTC_OAUTH_REDIRECT_URI:
         "https://problems.example/oauth/ustc/callback"
     };
-    expect(
-      readServerAuthenticationOptions(legacyEnvironment).ustcOAuth?.configuration.redirectUri
-    ).toBe("https://problems.example/oauth/ustc/callback");
+    expect(() => readServerAuthenticationOptions(legacyEnvironment)).toThrow(
+      "URMOTIV_USTC_OAUTH_CONFIGURATION_INVALID"
+    );
   });
 
   it("OAuth2 配置错误只返回固定错误码，不回显 client_secret 或地址", () => {
@@ -372,7 +372,7 @@ describe("认证启动配置", () => {
       {
         ...validUstcOAuthEnvironment,
         URMOTIV_USTC_OAUTH_REDIRECT_URI:
-          "https://problems.example/api/v1/auth/ustc/callback/../callback"
+          "https://problems.example/api/v1/auth/ustc/callback/extra"
       },
       {
         ...validUstcOAuthEnvironment,

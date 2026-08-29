@@ -26,6 +26,8 @@ export interface StoredAdminRole {
 export interface AdminRoleMutationContext {
   readonly actorUserId: string;
   readonly requestId: string;
+  readonly actorAllowCeiling: readonly string[];
+  readonly actorDeniedPermissions: readonly string[];
 }
 
 export interface RoleManagementStore {
@@ -50,6 +52,35 @@ function rolePermissionNames(input: readonly StoredAdminRolePermission[]): Set<s
   return new Set(input.map((permission) => `${permission.name}\u0000${permission.effect}`));
 }
 
+export function assertRoleMutationSafety(
+  input: Pick<CreateAdminRoleInput, "permissions" | "userIds">,
+  context: AdminRoleMutationContext,
+  role?: Pick<StoredAdminRole, "key" | "isBuiltIn">
+): void {
+  const memberIds = [...new Set(input.userIds)];
+  if (memberIds.includes("0") && role?.key !== "root") {
+    throw new ApiError(403, "ROLE_ROOT_MEMBERSHIP", "bootstrap root 账号只能属于 root 角色。");
+  }
+  if (role?.key === "root" && (
+    !role.isBuiltIn ||
+    memberIds.length !== 1 ||
+    memberIds[0] !== "0"
+  )) {
+    throw new ApiError(403, "ROLE_ROOT_MEMBERSHIP", "root 角色成员固定为 bootstrap root 账号。");
+  }
+  const allowCeiling = new Set(context.actorAllowCeiling);
+  const explicitDenies = new Set(context.actorDeniedPermissions);
+  for (const permission of input.permissions) {
+    if (permission.effect !== "allow") continue;
+    if (explicitDenies.has(permission.name)) {
+      throw new ApiError(403, "ROLE_PERMISSION_DENIED", "不能通过角色绕过调用者已有的明确拒绝。");
+    }
+    if (!allowCeiling.has(permission.name)) {
+      throw new ApiError(403, "ROLE_PERMISSION_CEILING", "角色权限不能超出调用者当前的允许权限上限。");
+    }
+  }
+}
+
 export class InMemoryRoleManagementStore implements RoleManagementStore {
   private readonly roles: StoredAdminRole[];
 
@@ -62,7 +93,7 @@ export class InMemoryRoleManagementStore implements RoleManagementStore {
       isBuiltIn: true,
       revision: 1,
       permissions: role.permissions.map((name) => ({ name, effect: "allow" as const })),
-      memberIds: [...(memberIdsByRoleKey[role.key] ?? [])]
+      memberIds: role.key === "root" ? ["0"] : [...(memberIdsByRoleKey[role.key] ?? [])]
     }));
   }
 
@@ -70,7 +101,8 @@ export class InMemoryRoleManagementStore implements RoleManagementStore {
     return this.roles.map(cloneRole);
   }
 
-  public async createRole(input: CreateAdminRoleInput, _context: AdminRoleMutationContext): Promise<StoredAdminRole> {
+  public async createRole(input: CreateAdminRoleInput, context: AdminRoleMutationContext): Promise<StoredAdminRole> {
+    assertRoleMutationSafety(input, context);
     if (this.roles.some((role) => role.key === input.key)) {
       throw conflict("角色标识已存在，请换一个标识。");
     }
@@ -91,11 +123,12 @@ export class InMemoryRoleManagementStore implements RoleManagementStore {
   public async updateRole(
     roleId: string,
     input: UpdateAdminRoleInput,
-    _context: AdminRoleMutationContext
+    context: AdminRoleMutationContext
   ): Promise<StoredAdminRole> {
     const index = this.roles.findIndex((role) => role.id === roleId);
     if (index < 0) throw notFound();
     const current = this.roles[index]!;
+    assertRoleMutationSafety(input, context, current);
     if (current.revision !== input.expectedRevision) {
       throw conflict("角色已被其他管理员修改，请刷新后重试。");
     }
@@ -155,6 +188,20 @@ function databaseId(value: string): bigint {
     throw new ApiError(422, "ROLE_USER_INVALID", "角色成员编号无效。");
   }
   return BigInt(value);
+}
+
+function uniqueSortedUserIds(userIds: readonly string[]): string[] {
+  return [...new Set(userIds)].sort((left, right) => {
+    const a = databaseId(left);
+    const b = databaseId(right);
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+}
+
+function sameUserIds(left: readonly string[], right: readonly string[]): boolean {
+  const a = uniqueSortedUserIds(left);
+  const b = uniqueSortedUserIds(right);
+  return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
 function sqlList(values: readonly string[], cast?: "uuid"): SQL {
@@ -222,9 +269,11 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
 
   public async createRole(input: CreateAdminRoleInput, context: AdminRoleMutationContext): Promise<StoredAdminRole> {
     const actorId = databaseId(context.actorUserId);
+    assertRoleMutationSafety(input, context);
     const roleId = randomUUID();
+    const affectedUsers = uniqueSortedUserIds([context.actorUserId, ...input.userIds]);
     return this.database.transaction(async (transaction) => {
-      await this.assertUsersExist(transaction, input.userIds);
+      await this.lockAffectedUsers(transaction, affectedUsers);
       const duplicate = await transaction.query<{ id: string }>(sql`SELECT id::text AS id FROM roles WHERE key = ${input.key}`);
       if (duplicate[0] !== undefined) throw conflict("角色标识已存在，请换一个标识。");
       await transaction.execute(sql`
@@ -244,47 +293,41 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
     context: AdminRoleMutationContext
   ): Promise<StoredAdminRole> {
     const actorId = databaseId(context.actorUserId);
+    const initial = await this.readRole(this.database, roleId);
+    const affectedUsers = uniqueSortedUserIds([
+      context.actorUserId,
+      ...initial.memberIds,
+      ...input.userIds
+    ]);
     return this.database.transaction(async (transaction) => {
-      const rows = await transaction.query<RoleRow>(sql`
-        SELECT id::text AS id, key, display_name, description, is_built_in, revision
-        FROM roles WHERE id = ${roleId}::uuid FOR UPDATE
-      `);
-      const current = rows[0];
-      if (current === undefined) throw notFound();
-      if (Number(current.revision) !== input.expectedRevision) {
+      await this.lockAffectedUsers(transaction, affectedUsers);
+      const current = await this.lockRoleState(transaction, roleId);
+      if (current.revision !== initial.revision || !sameUserIds(current.memberIds, initial.memberIds)) {
+        throw conflict("角色成员或修订号已被其他管理员修改，请刷新后重试。");
+      }
+      assertRoleMutationSafety(input, context, current);
+      if (current.revision !== input.expectedRevision) {
         throw conflict("角色已被其他管理员修改，请刷新后重试。");
       }
-      await this.assertUsersExist(transaction, input.userIds);
       const duplicate = await transaction.query<{ id: string }>(sql`
         SELECT id::text AS id FROM roles WHERE key = ${input.key} AND id <> ${roleId}::uuid
       `);
       if (duplicate[0] !== undefined) throw conflict("角色标识已存在，请换一个标识。");
-      if (current.is_built_in && (
+      if (current.isBuiltIn && (
         current.key !== input.key ||
-        current.display_name !== input.displayName ||
-        current.description !== input.description
+        current.displayName !== input.displayName ||
+        current.description !== input.description ||
+        rolePermissionNames(current.permissions).size !== rolePermissionNames(input.permissions).size ||
+        [...rolePermissionNames(current.permissions)].some((permission) => !rolePermissionNames(input.permissions).has(permission))
       )) {
         throw new ApiError(409, "BUILTIN_ROLE_IMMUTABLE", "内置角色的名称和权限不可修改。请调整成员归属或新建自定义角色。");
-      }
-      if (current.is_built_in) {
-        const existing = await transaction.query<GrantRow>(sql`
-          SELECT subject_role_id::text AS role_id, permission_name, effect
-          FROM permission_grants
-          WHERE subject_role_id = ${roleId}::uuid AND revoked_at IS NULL
-            AND (expires_at IS NULL OR expires_at > now()) AND scope = 'global'
-        `);
-        const existingNames = rolePermissionNames(existing.map((grant) => ({ name: grant.permission_name, effect: grant.effect })));
-        const requestedNames = rolePermissionNames(input.permissions);
-        if (existingNames.size !== requestedNames.size || [...existingNames].some((permission) => !requestedNames.has(permission))) {
-          throw new ApiError(409, "BUILTIN_ROLE_IMMUTABLE", "内置角色的名称和权限不可修改。请调整成员归属或新建自定义角色。");
-        }
       }
       await transaction.execute(sql`
         UPDATE roles SET key = ${input.key}, display_name = ${input.displayName}, description = ${input.description},
           revision = revision + 1, updated_at = now()
         WHERE id = ${roleId}::uuid
       `);
-      if (!current.is_built_in) {
+      if (!current.isBuiltIn) {
         await transaction.execute(sql`
           UPDATE permission_grants SET revoked_at = now(), revoked_by_user_id = ${actorId}
           WHERE subject_role_id = ${roleId}::uuid AND revoked_at IS NULL
@@ -297,14 +340,41 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
     });
   }
 
-  private async assertUsersExist(executor: RoleExecutor, userIds: readonly string[]): Promise<void> {
-    if (userIds.length === 0) return;
+  private async lockAffectedUsers(executor: RoleExecutor, userIds: readonly string[]): Promise<void> {
+    const sortedIds = uniqueSortedUserIds(userIds);
+    if (sortedIds.length === 0) return;
     const rows = await executor.query<{ id: string }>(sql`
-      SELECT id::text AS id FROM users WHERE id IN (${sqlList(userIds)})
+      SELECT id::text AS id
+      FROM users
+      WHERE id IN (${sqlList(sortedIds)})
+      ORDER BY id
+      FOR UPDATE
     `);
-    if (rows.length !== new Set(userIds).size) {
+    if (rows.length !== sortedIds.length) {
       throw new ApiError(422, "ROLE_USER_NOT_FOUND", "角色成员中包含不存在的账号。");
     }
+  }
+
+  private async lockRoleState(executor: RoleExecutor, roleId: string): Promise<StoredAdminRole> {
+    const rows = await executor.query<{ id: string }>(sql`
+      SELECT id::text AS id FROM roles WHERE id = ${roleId}::uuid FOR UPDATE
+    `);
+    if (rows[0] === undefined) throw notFound();
+    await executor.query<{ id: string }>(sql`
+      SELECT id::text AS id
+      FROM permission_grants
+      WHERE subject_role_id = ${roleId}::uuid
+      ORDER BY id
+      FOR UPDATE
+    `);
+    await executor.query<{ id: string }>(sql`
+      SELECT id::text AS id
+      FROM role_memberships
+      WHERE role_id = ${roleId}::uuid
+      ORDER BY id
+      FOR UPDATE
+    `);
+    return this.readRole(executor, roleId);
   }
 
   private async replacePermissions(
