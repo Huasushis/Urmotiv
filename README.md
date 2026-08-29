@@ -1,111 +1,144 @@
 # Urmotiv
 
-Urmotiv 是面向竞赛组织者的题库与命题协作系统：把题目草稿、题面资料、审题意见、组题方案和受控的导入导出放在同一套权限模型下。它不是在线评测机，也不会编译或执行参赛者代码。
+Urmotiv 是面向命题协作的题库系统：命题人编写 Markdown 题面与题解，审核人按服务端策略协作审题，管理员管理权限、导入任务和内置服务。
 
-## 适合什么场景
+## 目录
 
-- 投稿人写题、补充 Markdown 题面和附件，再提交到审题流程。
-- 审题人按当前题目版本留下通过、要求修改或不通过意见。
-- 命题组成员维护评测程序和内部资料，组长固定版本后组装比赛。
-- 管理员为组织配置账号、角色、知识点、插件和备份策略。
-- 需要迁移时，对 Hydro 或 FPS XML 题目包先预览、再导入；也可以导出可见题目的固定版本。
+- [安全](#安全)
+- [背景](#背景)
+- [前置条件](#前置条件)
+- [安装](#安装)
+- [启动](#启动)
+- [首次登录](#首次登录)
+- [导入与查找题目](#导入与查找题目)
+- [管理设置](#管理设置)
+- [内置插件](#内置插件)
+- [测试与部署](#测试与部署)
+- [API 与文档](#api-与文档)
+- [支持](#支持)
+- [参与贡献](#参与贡献)
+- [许可证](#许可证)
 
-## 主要能力
+## 安全
 
-- **版本化题目工作区**：题面、题解、样例、难度、知识点、评测限制和文件随修订版本保存。
-- **明确的审题状态**：草稿 → 待审 → 通过或不通过；待审版本的基础题面和基础题解会冻结，紧急修改必须填写原因。
-- **分层文件访问**：公开附件、内部附件、测试数据、标准程序和评测程序使用不同类别与权限。
-- **可审计的权限**：允许和明确拒绝都记录；单题拒绝优先于允许，机器人账号还有不可绕过的硬性禁用项。
-- **组题与风险信息**：比赛草案固定题目修订；有权限的命题组成员可以查看访问记录和泄题风险提示。
-- **受信任插件**：提交前检查、审核条目、审核规则和题目包格式在服务端注册；插件不能授予核心权限。
-- **独立服务边界**：Anklang 只做原题相似性检索，支持实时添加后查询并返回查询结果。题目的查重/检查信息属于 Urmotiv 的题目属性，插件可以写入，Fermata 可以读取；Anklang 不是流程、审核状态或权限的权威。
+- 所有权限在 API 服务端检查；无权读取的对象统一按不存在返回，不返回标题、文件名、计数或筛选总数。
+- 机器人账号固定不能删除用户、模拟登录、管理权限、管理系统、管理插件、管理令牌或查看审计记录；显式拒绝优先于角色和插件授权。
+- 题目包导入会检查路径穿越、符号链接、重复路径、压缩炸弹、超限文件和覆盖冲突；Urmotiv 不执行选手代码或任意插件代码。
+- OAuth 客户端编号与密钥只写入服务端，数据库保存加密值；读取接口只返回“是否已配置”。生产环境要求 HTTPS 与安全 Cookie。发现问题请参见[支持](#支持)，不要在公开 issue 中提交题面、答案、令牌或环境文件。
 
-### Anklang 原题检索插件
+## 背景
 
-内置 `org.ustc.urmotiv.anklang` 只生成仅检索结果候选参考，不执行模型审核、推荐工作流或最终裁决。管理员必须使用本地/私有 `baseUrl`（例如 `http://127.0.0.1:8730`），显式确认 `privateContentAuthorized: true`，并把非空认证令牌单独保存为 `serviceToken` 插件密钥；默认未授权、停用、缺密钥或设置错误时不会发出请求。
+题库内容、审核意见、附件和导入任务需要统一的权限边界与可追踪操作记录。Urmotiv 将题目正文以 Markdown 保存，使用版本与审核轮次保留协作历史，并把外部服务放在带版本的 HTTP 接口后。AI 审题服务 Fermata 和原题检索服务 Anklang 是独立项目，不共享 Urmotiv 数据库。
 
-索引同步通过 `ProblemService` 的窄适配器，在成功 submit、`pending_review`/`approved` 标题变化或冻结 `basicStatement` 变化后调用 `PUT /api/v1/index/problems`。draft/rejected、solution-only、无变化和删除不同步。网络/超时/408/429/502/503/504 按 `retryAttempts`（1–3 次，默认 2）有限重试；401/409/契约错误不重试；`indexTimeoutMs`（1–30 秒，默认 10 秒）到期或失败不会回滚本地提交。候选返回前按请求用户权限过滤 Urmotiv 来源，未知/隐藏/明确拒绝与当前题目自身候选静默移除，授权候选用当前标题替换。
+## 前置条件
 
-本地 Node 24 合成 E2E（端口占用即失败，不停止现有服务）：
+- Node.js 22 或更高版本。
+- pnpm 10（仓库声明的包管理器版本）。
+- PostgreSQL、S3 兼容对象存储（生产环境推荐 MinIO）和 Docker Compose。
+- 仅本地演示可使用内置 demo 登录；生产环境必须配置真实认证、数据库、对象存储、`URMOTIV_PLUGIN_SECRET_KEY` 和网页来源。
+
+## 安装
 
 ```bash
-ANKLANG_SOURCE_DIR=/path/to/anklang \
-  pnpm --filter @urmotiv/plugin-anklang e2e:synthetic
+pnpm install --frozen-lockfile
 ```
 
-## 当前界面入口
+生产环境准备私有环境文件后，先运行：
 
-本地 Compose 默认把 Web 发布到 `http://127.0.0.1:8080`。打开 `/login` 登录；登录后使用左侧导航：
+```bash
+bash scripts/deploy/validate-env.sh /绝对路径/urmotiv.env
+```
 
-- `/problems`：题目列表；`/problems/new`：新建草稿。
-- `/contests`：组题方案和比赛草案。
-- `/transfer`：题目包导入与导出。
-- `/profile`：自己的昵称、邮箱和头像。
-- `/admin`：仅有管理权限的账号可见，用于插件、知识点和审核策略。
+环境文件应为权限 `600`，不要将它加入 Git。
 
-首次部署还没有可登录的管理员。必须在服务器控制台用一次性 TTY（直接连接到终端的输入输出）初始化；服务在此之前会保持阻塞，详见[五分钟上手](docs/getting-started.md)和[管理员指南](docs/admin-guide.md)。
+## 启动
 
-## 五分钟上手
+开发模式同时启动 API 和网页：
 
-1. 准备 Docker Engine 与 Docker Compose v2；从上游仓库获取代码：
+```bash
+pnpm dev
+```
 
-   ```bash
-   git clone https://github.com/Huasushis/Urmotiv.git
-   cd Urmotiv
-   ```
+网页默认地址是 `http://localhost:5173`；API 健康检查是 `http://localhost:3000/api/v1/health`。首次开发可在环境中显式开启 demo 登录，不要在生产环境开启。
 
-2. 将 `deploy/env.production.example` 复制到 Git 目录之外的私有环境文件（权限 `600`），填写数据库、对象存储、站点来源和插件密钥。生成 32 字节 Base64URL 插件密钥可用：
+## 首次登录
 
-   ```bash
-   openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
-   ```
+本地 demo 模式下，在登录页选择已配置的 demo 账号。生产环境按部署的 CAS、USTC OAuth 或邮箱验证流程登录；成功后会话由服务端建立，网页不会自行提升权限。系统管理员恢复后，从可见的“管理”入口进入各个管理页面。
 
-3. 本地 HTTP 仅用于回环访问时，明确设置 `URMOTIV_WEB_ORIGIN=http://127.0.0.1:8080` 与 `URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES=true`；不要把这两个设置用于公网。验证并启动：
+## 导入与查找题目
 
-   ```bash
-   bash scripts/deploy/validate-env.sh /secure/path/urmotiv.env
-   docker compose --env-file /secure/path/urmotiv.env config
-   docker compose --env-file /secure/path/urmotiv.env up -d --build
-   ```
+在“导入”页面上传受支持的题目包，先查看检测结果与预览，再确认导入。导入成功后，题库缓存会刷新；“导入历史”只展示当前账号或当前权限允许查看的摘要，不展示原始文件名和其他账号的私有内容。题库页支持状态、来源、导入批次和导入源筛选，筛选条件会保存在 URL 查询参数中，便于复制和返回。
 
-4. 在仍连接到服务器的真实终端运行一次管理员初始化（邮箱和密码输入时不回显）：
+题面与题解使用 Markdown；题目附件按公开图片、公开文件、内部题解附件和评测数据区分权限。没有 `problem.view` 或相应导入权限时，API 按题目不存在处理。
 
-   ```bash
-   docker compose --env-file /secure/path/urmotiv.env run --rm --no-deps api pnpm --filter @urmotiv/api bootstrap-admin
-   docker compose --env-file /secure/path/urmotiv.env up -d api web worker
-   ```
+## 管理设置
 
-   看到 `BOOTSTRAP_ADMIN_OK` 后，浏览器打开 `http://127.0.0.1:8080/login`，选择“邮箱登录”。邮箱注册默认关闭；OAuth 默认关闭，均不会替代这次首次初始化。
+拥有相应服务端能力的系统管理员在“管理”首页可以点击进入：
 
-完整的变量表、SSH 转发、HTTPS 和升级步骤见[部署指南](docs/deployment.md)。
+- **常规设置**：查看邮箱登录、注册、Cookie 安全模式和网页来源等当前服务配置。
+- **角色与权限**：查看内置角色及权限说明；审核策略使用独立的 `review.policy.manage`，不等同于单题终审。
+- **服务账号与令牌**：查看机器人账号状态；令牌创建、撤销和下载不会在页面显示令牌值。
+- **审计记录**：查看不含题面、答案和密钥的操作摘要。
+- **Fermata 服务**：查看 AI 审题服务健康状态和公开配置。
+- **USTC OAuth**：分别填写授权 URL、令牌 URL、用户资料 URL、回调 URL和可选 scopes；固定回调路径为 `/api/v1/auth/ustc/callback`。客户端编号与密钥保存后输入框清空，读取只返回配置状态。
+- **插件配置**：管理已内置插件配置，不提供 ZIP/GitHub 安装、更新、卸载或任意代码执行。
+- **知识点目录**：查看和维护知识点分类与标签。
 
-## 文档导航
+OAuth 的 HTTP 回环开发例外必须显式开启；生产环境不接受 HTTP 回调或非安全 Cookie。旧版回调地址仅保留服务端兼容处理，新配置统一使用上述规范路径。
 
-| 目标 | 文档 |
-| --- | --- |
-| 第一次部署、登录、创建并提交题目 | [入门指南](docs/getting-started.md) |
-| 投稿、审题、Markdown、附件、组题和导入导出 | [用户指南](docs/user-guide.md) |
-| 首位管理员、角色、机器人、恢复、备份 | [管理员指南](docs/admin-guide.md) |
-| Docker、回环 HTTP、HTTPS、健康检查和升级 | [部署指南](docs/deployment.md) |
-| USTC OAuth 配置、回调与身份字段 | [USTC OAuth 指南](docs/ustc-oauth.md) |
-| `/api/v1` 路由与稳定请求/响应约定 | [版本化 API 与契约](docs/api-contracts.md) |
-| 受信任插件的清单、钩子、测试和发布 | [插件开发指南](docs/plugin-development.md) |
-| 权限作用域、允许/拒绝优先级 | [权限参考](docs/permissions.md) |
-| Hydro/FPS 题目包结构与安全规则 | [题目包参考](docs/problem-package.md) |
-| 内置题库格式与 OJ 兼容说明 | [OJ 兼容说明](docs/oj-compatibility.md) |
-| Fermata 管理接口与错误处理 | [Fermata 接入说明](docs/fermata-integration.md) |
-| 文件存储、Redis 队列和 Worker 边界 | [文件存储与后台任务](docs/storage-and-jobs.md) |
-| 知识点目录和管理规则 | [知识点目录规格](docs/tag-taxonomy.md) |
+## 内置插件
 
-## 状态与已知限制
+当前插件宿主只加载随 Urmotiv 发布并经过信任配置的内置插件。可在管理页查看插件状态和服务配置；插件不能解除机器人账号硬拒绝、显式拒绝、私有对象隐藏或密钥读取边界。外部插件安装和动态执行尚未纳入当前信任模型。
 
-当前仓库版本为 `0.1.0`。已实现题目协作、审题、组题、附件、题目包传输、权限和受信任内置插件；生产使用前仍应按部署指南接入邮件投递服务或明确关闭邮箱注册，并为外部服务分别设置凭据。
+## 测试与部署
 
-- Urmotiv 不运行参赛者程序，不提供编译器、沙箱或评测机。
-- 插件宿主只加载编译进服务端的受信任内置代码；当前没有管理员上传任意插件包并即时执行的能力。
-- Anklang、Fermata 是独立服务；服务不可用时的提交行为由各插件设置决定，不能把上游结果当作 Urmotiv 的最终审核决定。
-- 首次管理员初始化与遗失管理员密码恢复都要求真实服务器 TTY；恢复会撤销该管理员现有会话，并把新密码只写到服务器控制台。
+受影响包的类型检查与测试：
 
-## 许可证与上游来源
+```bash
+pnpm --filter @urmotiv/contracts typecheck
+pnpm --filter @urmotiv/api typecheck
+pnpm --filter @urmotiv/api test -- tests/final-integration-red.test.ts
+pnpm --filter @urmotiv/web typecheck
+pnpm --filter @urmotiv/web test -- src/pages/admin-page.test.tsx
+```
 
-本仓库以 MIT License 发布，许可证文本见 [`LICENSE`](LICENSE)。公开上游仓库为 <https://github.com/Huasushis/Urmotiv>；本 README 描述的是该仓库当前源码和契约，不承诺未列出的外部服务能力。
+构建全部工作区：
+
+```bash
+pnpm build
+```
+
+部署前先验证环境文件，再使用真实备份目录执行迁移、备份和滚动更新：
+
+```bash
+bash scripts/deploy/upgrade.sh /绝对路径/urmotiv.env /绝对路径/备份目录
+```
+
+部署脚本会执行数据库迁移并检查 `web` 容器内的 API 健康端点。不要重建或删除题库、对象存储和数据库服务；升级前后应由运维核对题目、修订和对象安全计数。
+
+## API 与文档
+
+- API 总览：[docs/api-contracts.md](docs/api-contracts.md)
+- 产品规格：[docs/spec.md](docs/spec.md)
+- 权限：[docs/permissions.md](docs/permissions.md)
+- 题目包：[docs/problem-package.md](docs/problem-package.md)
+- 管理员指南：[docs/admin-guide.md](docs/admin-guide.md)
+- USTC OAuth：[docs/ustc-oauth.md](docs/ustc-oauth.md)
+- Fermata 集成：[docs/fermata-integration.md](docs/fermata-integration.md)
+- 插件边界：[docs/plugins.md](docs/plugins.md)
+- 用户指南：[docs/user-guide.md](docs/user-guide.md)
+- 部署：[docs/deployment.md](docs/deployment.md)
+
+API 前缀为 `/api/v1`；健康检查为 `/api/v1/health`。接口请求和错误响应中的请求编号可用于内部排查，但不应与题面或密钥一起发送。
+
+## 支持
+
+请先阅读相关文档，再在项目 issue 中提交最小可复现步骤、版本、受影响 API 路径和脱敏错误编号。不要提交私有题面、题解、附件、模型原始回答、账号、密码、令牌或环境文件。安全漏洞请通过私下渠道联系维护者，并等待确认后再公开披露。
+
+## 参与贡献
+
+提交前请保持变更小而完整：先确认服务端权限和数据隐私边界，再补充能证明可观察行为的测试。运行受影响工作区的类型检查、测试和构建；页面变更还需用桌面与手机尺寸检查主要点击路径。贡献不得加入插件安装器、任意代码执行或动态包加载，也不得将私有资料复制到 Git。
+
+## 许可证
+
+本项目使用 [MIT License](LICENSE)。

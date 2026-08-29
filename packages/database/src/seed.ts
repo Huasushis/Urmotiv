@@ -26,7 +26,7 @@ const permissionText = {
   },
   "plugin.manage": {
     displayName: "管理插件",
-    description: "允许安装、启用、停用和配置受信任插件。"
+    description: "允许管理、启用、停用和配置受信任内置插件。"
   },
   "service_account.manage": {
     displayName: "管理机器人账号",
@@ -34,6 +34,10 @@ const permissionText = {
   },
   "tag.manage": { displayName: "管理知识点", description: "允许修改知识点标签树。" },
   "audit.read": { displayName: "查看审计记录", description: "允许查看重要操作的记录。" },
+  "review.policy.manage": {
+    displayName: "管理审核策略",
+    description: "允许修改新审核轮次使用的审核策略，不包含单题终审。"
+  },
   "problem.create": { displayName: "创建题目", description: "允许新建题目草稿。" },
   "problem.view.own": { displayName: "查看自己的题目", description: "允许查看自己创建的题目。" },
   "problem.edit.own": {
@@ -180,8 +184,8 @@ const roleDefinitions = [
       "problem.viewers.read",
       "contest.create",
       "contest.edit.own",
-      "contest.risk.read",
       "problem.status.change",
+      "review.policy.manage",
       "problem.access.grant",
       "problem.import",
       "problem.export.all",
@@ -195,7 +199,7 @@ const roleDefinitions = [
   {
     key: "system_administrator",
     displayName: "系统管理员",
-    description: "可以管理账号、权限、运行设置和插件，但不自动拥有最终审题权。",
+    description: "可以管理账号、权限、运行设置、题库入口和插件，但不自动拥有最终审题权。",
     permissions: [
       "auth.login",
       "user.create",
@@ -205,7 +209,10 @@ const roleDefinitions = [
       "plugin.manage",
       "service_account.manage",
       "tag.manage",
-      "audit.read"
+      "audit.read",
+      "review.policy.manage",
+      "problem.view.all",
+      "problem.import"
     ]
   },
   {
@@ -220,6 +227,9 @@ const roleDefinitions = [
   readonly description: string;
   readonly permissions: readonly CorePermission[];
 }[];
+
+export const corePermissionDefinitions = permissionText;
+export const builtinRoleDefinitions = roleDefinitions;
 
 export interface CoreSeedResult {
   readonly rootUserId: 0n;

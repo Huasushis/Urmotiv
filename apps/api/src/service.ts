@@ -342,13 +342,29 @@ export class ProblemService {
       roles: user.roles,
       isRoot: user.isRoot,
       canManageReviewPolicy:
-        isHuman && hasPermission(user, "problem.status.change", {}, now),
+        isHuman && hasPermission(user, "review.policy.manage", {}, now),
       canManagePlugins:
         isHuman &&
         hasPermission(user, "plugin.manage", {}, now) &&
         hasPermission(user, "system.manage", {}, now),
       canManageTags:
-        isHuman && hasPermission(user, "tag.manage", {}, now)
+        isHuman && hasPermission(user, "tag.manage", {}, now),
+      canManageSystem:
+        isHuman && hasPermission(user, "system.manage", {}, now),
+      canManagePermissions:
+        isHuman && hasPermission(user, "user.permission.manage", {}, now),
+      canManageServiceAccounts:
+        isHuman && hasPermission(user, "service_account.manage", {}, now),
+      canReadAudit:
+        isHuman && hasPermission(user, "audit.read", {}, now),
+      canManageProblemCatalog:
+        isHuman &&
+        (hasPermission(user, "problem.view.all", {}, now) ||
+          hasPermission(user, "problem.import", {}, now)),
+      canManageOAuth:
+        isHuman &&
+        hasPermission(user, "system.manage", {}, now) &&
+        hasPermission(user, "user.permission.manage", {}, now)
     };
   }
 
@@ -361,7 +377,10 @@ export class ProblemService {
       owner: query.owner,
       sort: query.sort,
       ...(query.status === undefined ? {} : { status: query.status }),
-      ...(query.type === undefined ? {} : { type: query.type })
+      ...(query.type === undefined ? {} : { type: query.type }),
+      ...(query.origin === undefined ? {} : { origin: query.origin }),
+      ...(query.batch === undefined ? {} : { batch: query.batch }),
+      ...(query.source === undefined ? {} : { source: query.source })
     };
     const page = await this.store.listVisibleProblems(filters, visibility);
     const items = await Promise.all(page.items.map((problem) => this.toListItem(problem, user)));
@@ -406,7 +425,10 @@ export class ProblemService {
       revision: 1,
       reviewRound: 0,
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
+      origin: "native",
+      importBatch: null,
+      importSource: null
     };
 
     const created = await this.store.createProblem(problem);
@@ -1702,6 +1724,9 @@ export class ProblemService {
       reviewRound: problem.reviewRound,
       createdAt: problem.createdAt,
       updatedAt: problem.updatedAt,
+      origin: problem.origin ?? "native",
+      importBatch: problem.importBatch ?? null,
+      importSource: problem.importSource ?? null,
       capabilities
     };
   }
@@ -1720,7 +1745,10 @@ export class ProblemService {
       owner: full.owner,
       revision: full.revision,
       updatedAt: full.updatedAt,
-      capabilities: full.capabilities
+      capabilities: full.capabilities,
+      origin: full.origin,
+      importBatch: full.importBatch,
+      importSource: full.importSource
     };
   }
 

@@ -181,3 +181,5 @@ export const updateFermataPublicSettingsInputSchema = z
     settings: fermataPublicSettingsSchema
   })
   .strict();
+
+export type UpdateFermataPublicSettingsInput = z.infer<typeof updateFermataPublicSettingsInputSchema>;

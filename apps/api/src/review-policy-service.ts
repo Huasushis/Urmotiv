@@ -18,11 +18,10 @@ export class ReviewPolicyService {
     private readonly decisions: ReviewDecisionRunner,
     private readonly now: () => Date = () => new Date()
   ) {}
-
   public assertCanManage(user: StoredUser): void {
     if (
       user.accountType !== "human" ||
-      !hasPermission(user, "problem.status.change", {}, this.now())
+      !hasPermission(user, "review.policy.manage", {}, this.now())
     ) {
       throw forbidden();
     }

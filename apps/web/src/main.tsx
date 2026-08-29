@@ -17,6 +17,7 @@ import { BatchAccountPage } from "./pages/batch-account-page";
 import { TransferPage } from "./pages/transfer-page";
 import { VerifyEmailPage } from "./pages/verify-email-page";
 
+import { AdminSectionPage } from "./pages/admin-section-page";
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: { retry: 1, refetchOnWindowFocus: false }
@@ -82,6 +83,15 @@ function App() {
         <Route path="/transfer" element={<TransferPage />} />
         <Route path="/profile" element={<ProfilePage />} />
         <Route path="/admin/accounts" element={<BatchAccountPage />} />
+        <Route path="/admin/settings" element={<AdminSectionPage section="settings" session={sessionData.user} />} />
+        <Route path="/admin/roles" element={<AdminSectionPage section="roles" session={sessionData.user} />} />
+        <Route path="/admin/service-accounts" element={<AdminSectionPage section="service-accounts" session={sessionData.user} />} />
+        <Route path="/admin/audit" element={<AdminSectionPage section="audit" session={sessionData.user} />} />
+        <Route path="/admin/fermata" element={<AdminSectionPage section="fermata" session={sessionData.user} />} />
+        <Route path="/admin/oauth" element={<AdminSectionPage section="oauth" session={sessionData.user} />} />
+        <Route path="/admin/plugins" element={<AdminSectionPage section="plugins" session={sessionData.user} />} />
+        <Route path="/admin/knowledge" element={<AdminSectionPage section="knowledge" session={sessionData.user} />} />
+        <Route path="/admin/imports" element={<AdminSectionPage section="imports" session={sessionData.user} />} />
         <Route path="/admin" element={<AdminPage session={sessionData.user} />} />
         <Route path="*" element={<Navigate to="/problems" replace />} />
       </Routes>

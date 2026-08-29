@@ -1,7 +1,6 @@
 import { ChevronLeft, ChevronRight, Filter, Plus, RefreshCw, Search } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
-import { Link } from "react-router-dom";
+import { useSearchParams, Link } from "react-router-dom";
 import type { ProblemListQuery, ProblemStatus, ProblemType } from "@urmotiv/contracts";
 import { getSession, listProblems, listTags } from "../lib/api";
 import { dateTime, difficultyText, statusText, statusTone, typeText } from "../lib/presentation";
@@ -9,12 +8,26 @@ import { dateTime, difficultyText, statusText, statusTone, typeText } from "../l
 type ProblemListPageProps = { ownOnly?: boolean; fixedStatus?: ProblemStatus };
 
 export function ProblemListPage({ ownOnly = false, fixedStatus }: ProblemListPageProps) {
-  const [search, setSearch] = useState("");
-  const [status, setStatus] = useState<ProblemStatus | "">(fixedStatus ?? "");
-  const [type, setType] = useState<ProblemType | "">("");
-  const [sort, setSort] = useState<ProblemListQuery["sort"]>("updated_desc");
-  const [page, setPage] = useState(1);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const search = searchParams.get("search") ?? "";
+  const status = searchParams.get("status") as ProblemStatus | "" || "";
+  const type = searchParams.get("type") as ProblemType | "" || "";
+  const sort = searchParams.get("sort") as ProblemListQuery["sort"] || "updated_desc";
+  const origin = searchParams.get("origin") ?? "";
+  const batch = searchParams.get("batch") ?? "";
+  const source = searchParams.get("source") ?? "";
+  const page = Math.max(1, Number(searchParams.get("page") ?? "1") || 1);
   const effectiveStatus = fixedStatus ?? status;
+
+  const updateQuery = (key: string, value: string) => {
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current);
+      if (value) next.set(key, value);
+      else next.delete(key);
+      if (key !== "page") next.delete("page");
+      return next;
+    }, { replace: true });
+  };
 
   const query: ProblemListQuery = {
     page,
@@ -23,7 +36,10 @@ export function ProblemListPage({ ownOnly = false, fixedStatus }: ProblemListPag
     owner: ownOnly ? "me" : "all",
     sort,
     ...(effectiveStatus ? { status: effectiveStatus } : {}),
-    ...(type ? { type } : {})
+    ...(type ? { type } : {}),
+    ...(origin ? { origin } : {}),
+    ...(batch ? { batch } : {}),
+    ...(source ? { source } : {})
   };
   const problems = useQuery({
     queryKey: ["problems", query],
@@ -35,11 +51,6 @@ export function ProblemListPage({ ownOnly = false, fixedStatus }: ProblemListPag
   const canCreateProblem = session.data?.user?.permissions.includes("problem.create") ?? false;
   const tagNames = new Map(tags.data?.items.map((tag) => [tag.id, tag.name]) ?? []);
   const pages = Math.max(1, Math.ceil((problems.data?.total ?? 0) / 20));
-
-  const resetPage = (change: () => void) => {
-    setPage(1);
-    change();
-  };
 
   return (
     <section className="problem-list-page">
@@ -68,7 +79,7 @@ export function ProblemListPage({ ownOnly = false, fixedStatus }: ProblemListPag
           <Search size={16} aria-hidden="true" />
           <input
             value={search}
-            onChange={(event) => resetPage(() => setSearch(event.target.value))}
+            onChange={(event) => updateQuery("search", event.target.value)}
             placeholder="搜索题号或名称"
           />
         </label>
@@ -76,7 +87,7 @@ export function ProblemListPage({ ownOnly = false, fixedStatus }: ProblemListPag
           <span>状态</span>
           <select
             value={status}
-            onChange={(event) => resetPage(() => setStatus(event.target.value as ProblemStatus | ""))}
+            onChange={(event) => updateQuery("status", event.target.value)}
             disabled={fixedStatus !== undefined}
           >
             <option value="">全部状态</option>
@@ -90,7 +101,7 @@ export function ProblemListPage({ ownOnly = false, fixedStatus }: ProblemListPag
           <span>题目类型</span>
           <select
             value={type}
-            onChange={(event) => resetPage(() => setType(event.target.value as ProblemType | ""))}
+            onChange={(event) => updateQuery("type", event.target.value)}
           >
             <option value="">全部类型</option>
             <option value="traditional">传统题</option>
@@ -99,10 +110,27 @@ export function ProblemListPage({ ownOnly = false, fixedStatus }: ProblemListPag
           </select>
         </label>
         <label>
+          <span>来源</span>
+          <select value={origin} onChange={(event) => updateQuery("origin", event.target.value)}>
+            <option value="">全部来源</option>
+            <option value="native">本站创建</option>
+            <option value="problem-package">题目包导入</option>
+            <option value="ustc_history">USTC 历史题库</option>
+          </select>
+        </label>
+        <label>
+          <span>导入批次</span>
+          <input value={batch} onChange={(event) => updateQuery("batch", event.target.value)} placeholder="批次标识" />
+        </label>
+        <label>
+          <span>导入源</span>
+          <input value={source} onChange={(event) => updateQuery("source", event.target.value)} placeholder="来源标识" />
+        </label>
+        <label>
           <span>排序</span>
           <select
             value={sort}
-            onChange={(event) => setSort(event.target.value as ProblemListQuery["sort"])}
+            onChange={(event) => updateQuery("sort", event.target.value)}
           >
             <option value="updated_desc">最近更新</option>
             <option value="updated_asc">最早更新</option>
@@ -202,7 +230,7 @@ export function ProblemListPage({ ownOnly = false, fixedStatus }: ProblemListPag
             title="上一页"
             aria-label="上一页"
             disabled={page <= 1}
-            onClick={() => setPage((value) => Math.max(1, value - 1))}
+            onClick={() => updateQuery("page", String(Math.max(1, page - 1)))}
           >
             <ChevronLeft size={17} aria-hidden="true" />
           </button>
@@ -212,7 +240,7 @@ export function ProblemListPage({ ownOnly = false, fixedStatus }: ProblemListPag
             title="下一页"
             aria-label="下一页"
             disabled={page >= pages}
-            onClick={() => setPage((value) => Math.min(pages, value + 1))}
+            onClick={() => updateQuery("page", String(Math.min(pages, page + 1)))}
           >
             <ChevronRight size={17} aria-hidden="true" />
           </button>

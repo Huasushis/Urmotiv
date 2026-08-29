@@ -103,6 +103,7 @@ export interface ServerAuthenticationOptions {
     readonly configuration: UstcOAuthConfiguration;
     readonly stateSecret: Uint8Array;
   };
+  readonly ustcOAuthStateSecret?: Uint8Array;
 }
 
 export function readServerOptions(environment: ServerEnvironment): ApiAppOptions {
@@ -150,7 +151,8 @@ export function readServerOptions(environment: ServerEnvironment): ApiAppOptions
 
   return {
     secureCookies: production && !insecureLoopbackCookies,
-    demoAuthEnabled,
+    allowLoopbackInsecureCookies: insecureLoopbackCookies,
+    ...(demoAuthEnabled ? { demoAuthEnabled } : {}),
     emailLoginEnabled: environment.URMOTIV_EMAIL_LOGIN_ENABLED !== "false",
     emailRegistrationEnabled: environment.URMOTIV_EMAIL_REGISTRATION_ENABLED === "true",
     ...(allowedOrigins.length === 0 ? {} : { allowedOrigins }),
@@ -231,6 +233,10 @@ export function readServerAuthenticationOptions(
     throw new Error("开启邮箱注册前必须开启邮箱登录。");
   }
   const verification = readEmailVerificationOptions(environment, emailRegistrationEnabled);
+  const ustcOAuthStateSecret = readUstcOAuthStateSecret(
+    environment,
+    environment.URMOTIV_USTC_OAUTH_ENABLED === "true"
+  );
   const ustcOAuth = readUstcOAuthOptions(environment);
   const casEnabled = environment.URMOTIV_CAS_ENABLED;
   if (casEnabled === undefined || casEnabled === "false") {
@@ -238,7 +244,8 @@ export function readServerAuthenticationOptions(
       emailLoginEnabled,
       emailRegistrationEnabled,
       ...(verification === undefined ? {} : { emailVerification: verification }),
-      ...(ustcOAuth === undefined ? {} : { ustcOAuth })
+      ...(ustcOAuth === undefined ? {} : { ustcOAuth }),
+      ...(ustcOAuthStateSecret === undefined ? {} : { ustcOAuthStateSecret })
     };
   }
   if (casEnabled !== "true") {
@@ -337,8 +344,31 @@ export function readServerAuthenticationOptions(
     emailRegistrationEnabled,
     ...(verification === undefined ? {} : { emailVerification: verification }),
     ...(ustcOAuth === undefined ? {} : { ustcOAuth }),
+    ...(ustcOAuthStateSecret === undefined ? {} : { ustcOAuthStateSecret }),
     cas: { configuration, stateSecret }
   };
+}
+
+function readUstcOAuthStateSecret(
+  environment: ServerEnvironment,
+  required: boolean
+): Uint8Array | undefined {
+  const secretText = environment.URMOTIV_USTC_OAUTH_STATE_SECRET;
+  if (!required && (secretText === undefined || secretText === "")) return undefined;
+  const value = secretText ?? "";
+  if (
+    value !== value.trim() ||
+    !casStateSecretPattern.test(value) ||
+    value === environment.URMOTIV_PLUGIN_SECRET_KEY ||
+    value === environment.URMOTIV_CAS_STATE_SECRET
+  ) {
+    throw new Error(ustcOAuthConfigurationError);
+  }
+  const decoded = Buffer.from(value, "base64url");
+  if (decoded.byteLength !== 32 || decoded.toString("base64url") !== value) {
+    throw new Error(ustcOAuthConfigurationError);
+  }
+  return new Uint8Array(decoded);
 }
 
 function readUstcOAuthOptions(
@@ -351,21 +381,11 @@ function readUstcOAuthOptions(
   if (enabled !== "true") {
     throw new Error(ustcOAuthConfigurationError);
   }
+  const decodedStateSecret = readUstcOAuthStateSecret(environment, true);
+  if (decodedStateSecret === undefined) {
+    throw new Error(ustcOAuthConfigurationError);
+  }
   const secretText = environment.URMOTIV_USTC_OAUTH_STATE_SECRET ?? "";
-  if (
-    !casStateSecretPattern.test(secretText) ||
-    secretText === environment.URMOTIV_PLUGIN_SECRET_KEY ||
-    secretText === environment.URMOTIV_CAS_STATE_SECRET
-  ) {
-    throw new Error(ustcOAuthConfigurationError);
-  }
-  const decodedStateSecret = Buffer.from(secretText, "base64url");
-  if (
-    decodedStateSecret.byteLength !== 32 ||
-    decodedStateSecret.toString("base64url") !== secretText
-  ) {
-    throw new Error(ustcOAuthConfigurationError);
-  }
   const textualValues = [
     environment.URMOTIV_USTC_OAUTH_AUTHORIZE_URL,
     environment.URMOTIV_USTC_OAUTH_TOKEN_URL,

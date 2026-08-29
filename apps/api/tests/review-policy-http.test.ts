@@ -147,7 +147,7 @@ describe("审核规则 HTTP 接口", () => {
       grants: [
         ...leader.grants,
         {
-          permission: "problem.status.change",
+          permission: "review.policy.manage",
           effect: "deny",
           scope: "global"
         }

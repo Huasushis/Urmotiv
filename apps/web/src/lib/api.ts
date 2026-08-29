@@ -1,7 +1,16 @@
 import {
-  batchAccountCreateResponseSchema,
+  adminAuditResponseSchema,
+  adminGeneralSettingsSchema,
+  updateAdminGeneralSettingsInputSchema,
+  adminPermissionsResponseSchema,
+  adminRoleManagementResponseSchema,
+  adminRoleResponseSchema,
+  adminServiceAccountsResponseSchema,
   adminPluginListResponseSchema,
   adminPluginResponseSchema,
+  importHistoryResponseSchema,
+  ustcOAuthSettingsSchema,
+  batchAccountCreateResponseSchema,
   contestListResponseSchema,
   contestSchema,
   emailVerificationPendingResponseSchema,
@@ -29,6 +38,24 @@ import {
   okResponseSchema,
   tagSchema,
   updateProfileInputSchema,
+  fermataHealthSchema,
+  fermataPublicSettingsResponseSchema,
+  type FermataHealth,
+  type FermataPublicSettings,
+  type AdminAuditResponse,
+  type AdminGeneralSettings,
+  type UpdateAdminGeneralSettingsInput,
+  type AdminPermissionsResponse,
+  type AdminRoleManagementResponse,
+  type AdminRoleResponse,
+  type AdminServiceAccountsResponse,
+  type UpdateFermataPublicSettingsInput,
+  type ImportHistoryQuery,
+  type ImportHistoryResponse,
+  type UstcOAuthSettings,
+  type CreateAdminRoleInput,
+  type UpdateAdminRoleInput,
+  type UpdateUstcOAuthSettingsInput,
   type ProfileView,
   type AdminPlugin,
   type AdminPluginListResponse,
@@ -268,6 +295,118 @@ export function avatarUrlFor(userId: string): string {
 
 export function listAdminPlugins(): Promise<AdminPluginListResponse> {
   return request("/admin/plugins", { method: "GET" }, adminPluginListResponseSchema);
+}
+
+export function getAdminGeneralSettings(): Promise<{ settings: AdminGeneralSettings }> {
+  return request(
+    "/admin/settings",
+    { method: "GET" },
+    z.object({ settings: adminGeneralSettingsSchema }).strict()
+  );
+}
+export function updateAdminGeneralSettings(
+  input: UpdateAdminGeneralSettingsInput
+): Promise<{ settings: AdminGeneralSettings }> {
+  return request(
+    "/admin/settings",
+    { ...json(input), method: "PUT" },
+    z.object({ settings: adminGeneralSettingsSchema }).strict()
+  );
+}
+
+export function listAdminRoles(): Promise<AdminRoleManagementResponse> {
+  return request("/admin/roles", { method: "GET" }, adminRoleManagementResponseSchema);
+}
+
+export function createAdminRole(input: CreateAdminRoleInput): Promise<AdminRoleResponse> {
+  return request(
+    "/admin/roles",
+    { ...json(input), method: "POST" },
+    adminRoleResponseSchema
+  );
+}
+
+export function updateAdminRole(roleId: string, input: UpdateAdminRoleInput): Promise<AdminRoleResponse> {
+  return request(
+    `/admin/roles/${encodeURIComponent(roleId)}`,
+    { ...json(input), method: "PUT" },
+    adminRoleResponseSchema
+  );
+}
+
+export function listAdminPermissions(): Promise<AdminPermissionsResponse> {
+  return request("/admin/permissions", { method: "GET" }, adminPermissionsResponseSchema);
+}
+
+export function listAdminServiceAccounts(): Promise<AdminServiceAccountsResponse> {
+  return request("/admin/service-accounts", { method: "GET" }, adminServiceAccountsResponseSchema);
+}
+
+export function listAdminAudit(page = 1, pageSize = 20): Promise<AdminAuditResponse> {
+  return request(
+    `/admin/audit?page=${page}&pageSize=${pageSize}`,
+    { method: "GET" },
+    adminAuditResponseSchema
+  );
+}
+
+const ustcOAuthResponseSchema = z.object({ settings: ustcOAuthSettingsSchema }).strict();
+
+export function getAdminUstcOAuthSettings(): Promise<{ settings: UstcOAuthSettings }> {
+  return request("/admin/oauth/ustc", { method: "GET" }, ustcOAuthResponseSchema);
+}
+
+export function updateAdminUstcOAuthSettings(
+  input: UpdateUstcOAuthSettingsInput
+): Promise<{ settings: UstcOAuthSettings }> {
+  const payload = input.clientSecret?.trim()
+    ? input
+    : { ...input, clientSecret: undefined };
+  return request(
+    "/admin/oauth/ustc",
+    { ...json(payload), method: "PUT" },
+    ustcOAuthResponseSchema
+  );
+}
+
+export function listImportHistory(
+  query: Partial<ImportHistoryQuery> = {}
+): Promise<ImportHistoryResponse> {
+  const parameters = new URLSearchParams();
+  if (query.page !== undefined) parameters.set("page", String(query.page));
+  if (query.pageSize !== undefined) parameters.set("pageSize", String(query.pageSize));
+  if (query.state !== undefined) parameters.set("state", query.state);
+  if (query.format !== undefined) parameters.set("format", query.format);
+  const suffix = parameters.toString() ? `?${parameters.toString()}` : "";
+  return request(`/transfer/imports${suffix}`, { method: "GET" }, importHistoryResponseSchema);
+}
+
+export function getFermataHealth(): Promise<{ health: FermataHealth }> {
+  return request(
+    "/admin/fermata/health",
+    { method: "GET" },
+    z.object({ health: fermataHealthSchema }).strict()
+  );
+}
+
+export function getFermataSettings(): Promise<{ settings: FermataPublicSettings; revision: number; secretsConfigured: boolean }> {
+  return request(
+    "/admin/fermata/settings",
+    { method: "GET" },
+    fermataPublicSettingsResponseSchema
+  );
+}
+
+export function updateFermataSettings(input: UpdateFermataPublicSettingsInput): Promise<{
+  settings: FermataPublicSettings;
+  revision: number;
+  secretsConfigured: boolean;
+}> {
+  return request(
+    "/admin/fermata/settings",
+    { ...json(input), method: "PUT" },
+    fermataPublicSettingsResponseSchema
+  );
 }
 
 export function listManagedTagCatalog(): Promise<ManagedTagCatalogResponse> {

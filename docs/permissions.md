@@ -35,11 +35,11 @@
 | `user.impersonate` | 以其他用户身份排查问题 | root 内部角色（不可登录）；真人账号默认不授予 |
 | `user.permission.manage` | 修改角色和权限 | root、受信任系统管理员 |
 | `system.manage` | 修改站点、认证、存储等重要配置 | root、受信任系统管理员 |
-| `plugin.manage` | 安装、启用、停用和配置插件 | root、受信任系统管理员 |
+| `plugin.manage` | 管理已内置插件的启停和配置 | root、受信任系统管理员 |
 | `service_account.manage` | 创建机器人账号和令牌 | root、受信任系统管理员 |
 | `tag.manage` | 以真人账号新增、重命名、移动、排序、停用、恢复和删除知识点目录，并处理对当前题目的影响 | 组长、指定管理员 |
 | `audit.read` | 查看审计记录 | root、指定管理员 |
-
+| `review.policy.manage` | 修改审核轮次使用的审核策略，不包含单题最终确认 | 组长、受信任系统管理员 |
 `user.permission.manage`、`system.manage` 和 `plugin.manage` 都是高风险权限，不能由拥有者给自己增加更高权限。
 
 ### 2.2 题目
@@ -146,9 +146,10 @@
 
 ### 系统管理员
 
-- 账号、权限、系统、插件、机器人、审计和标签管理权限；
-- 不默认拥有最终审题决定权；
-- 是否查看全部题面和测试数据由组织策略决定。
+- 账号、权限、系统、插件、机器人、审计、审核策略和标签管理权限；
+- 额外拥有 `problem.view.all` 与 `problem.import`，因此可以进入题库和导入历史；
+- 不默认拥有 `problem.status.change` 或 `problem.review`，不自动拥有最终审题决定权；
+- 不因管理权限自动读取题目附件、测试数据或客户端密钥。
 
 ### root
 

@@ -37,9 +37,9 @@ const memberGrants = [
 const leaderGrants = [
   ...memberGrants,
   allow("problem.status.change"),
+  allow("review.policy.manage"),
   allow("problem.access.grant"),
   allow("problem.import"),
-  allow("problem.export.all"),
   allow("contest.edit.all"),
   allow("contest.delete"),
   allow("contest.export"),
@@ -56,7 +56,10 @@ const administratorGrants = [
   allow("plugin.manage"),
   allow("service_account.manage"),
   allow("tag.manage"),
-  allow("audit.read")
+  allow("audit.read"),
+  allow("review.policy.manage"),
+  allow("problem.view.all"),
+  allow("problem.import")
 ];
 
 function demoUser(

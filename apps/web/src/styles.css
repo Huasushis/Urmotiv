@@ -2663,6 +2663,68 @@ textarea:read-only {
   width: min(100%, 920px);
 }
 
+.admin-two-column {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(0, 1.5fr);
+  gap: 18px;
+}
+
+.plain-panel {
+  min-width: 0;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.admin-form {
+  display: grid;
+  gap: 14px;
+}
+
+.admin-form > label {
+  display: grid;
+  gap: 6px;
+}
+
+.admin-form input:not([type="checkbox"]),
+.admin-form select,
+.admin-form textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.admin-form textarea {
+  min-height: 84px;
+  resize: vertical;
+}
+
+.admin-form fieldset {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.checkbox-row select {
+  margin-left: auto;
+  width: auto;
+}
+
 .admin-editor,
 .admin-plugin-list,
 .admin-plugin-editor {
@@ -3945,6 +4007,9 @@ textarea:read-only {
 
   .admin-actions .primary-button {
     width: 100%;
+  }
+  .admin-two-column {
+    grid-template-columns: 1fr;
   }
 
   .tag-admin-toolbar {

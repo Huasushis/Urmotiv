@@ -83,7 +83,7 @@ async function readSession(app: FastifyInstance, userId: string) {
 describe("会话中的管理能力", () => {
   it("只在拥有所需全局权限的人类账号上返回管理能力", async () => {
     const reviewManager = createUser("review-manager", "human", [
-      grant("problem.status.change")
+      grant("review.policy.manage")
     ]);
     const pluginManager = createUser("plugin-manager", "human", [
       grant("plugin.manage"),

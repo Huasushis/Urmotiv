@@ -214,6 +214,30 @@ export const users = pgTable(
   ]
 );
 
+export const systemSettings = pgTable(
+  "system_settings",
+  {
+    id: varchar("id", { length: 32 }).primaryKey(),
+    enabled: boolean("enabled").notNull().default(false),
+    authorizeUrl: text("authorize_url").notNull().default(""),
+    tokenUrl: text("token_url").notNull().default(""),
+    profileUrl: text("profile_url").notNull().default(""),
+    redirectUri: text("redirect_uri").notNull().default("/api/v1/auth/ustc/callback"),
+    scope: text("scope").notNull().default(""),
+    publicRegistrationEnabled: boolean("public_registration_enabled").notNull().default(false),
+    publicSiteUrl: text("public_site_url").notNull().default(""),
+    clientIdEncrypted: text("client_id_encrypted"),
+    clientSecretEncrypted: text("client_secret_encrypted"),
+    revision: integer("revision").notNull().default(1),
+    updatedByUserId: bigint("updated_by_user_id", { mode: "bigint" }).references(() => users.id, {
+      onDelete: "set null"
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [check("system_settings_revision_ck", sql`${table.revision} > 0`)]
+);
+
 export const userEmails = pgTable(
   "user_emails",
   {
@@ -322,6 +346,7 @@ export const roles = pgTable(
     displayName: varchar("display_name", { length: 120 }).notNull(),
     description: text("description").notNull(),
     isBuiltIn: boolean("is_built_in").notNull().default(false),
+    revision: integer("revision").notNull().default(1),
     createdByUserId: bigint("created_by_user_id", { mode: "bigint" }).references(
       () => users.id,
       { onDelete: "set null" }
@@ -636,6 +661,9 @@ export const problems = pgTable(
     status: problemStatus("status").notNull().default("draft"),
     currentRevision: integer("current_revision").notNull().default(1),
     currentReviewRound: integer("current_review_round").notNull().default(0),
+    origin: varchar("origin", { length: 100 }).notNull().default("native"),
+    importBatch: varchar("import_batch", { length: 200 }),
+    importSource: varchar("import_source", { length: 200 }),
     statusChangedByUserId: bigint("status_changed_by_user_id", { mode: "bigint" }).references(
       () => users.id,
       { onDelete: "restrict" }

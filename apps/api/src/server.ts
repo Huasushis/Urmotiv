@@ -17,6 +17,8 @@ import { InMemoryEmailVerificationOutbox } from "./email-verification";
 import { DatabaseContestStore } from "./database-contest-store";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "./database-demo";
 import { DatabaseDataStore } from "./database-store";
+import { DatabaseAdminSettingsStore } from "./admin-service";
+import { DatabaseRoleManagementStore } from "./admin-role-service";
 import { DatabasePluginStore } from "./database-plugin-store";
 import {
   DatabaseProblemPackageJobStore,
@@ -113,6 +115,7 @@ try {
   pluginHostReference = pluginHost;
   const problemFormatAdapters = new TrustedProblemFormatAdapterCatalog(pluginHost);
   const store = new DatabaseDataStore(database);
+  const serviceAccountTokens = new DatabaseServiceAccountTokenStore(database);
   const problemFileStore = new ProblemFileStore(database);
   const problemService = new ProblemService(store);
   const packageAudit = new DatabaseProblemPackageAuditWriter(database);
@@ -221,10 +224,16 @@ try {
       storage: fileStorage
     },
     transfer: transferService,
+    adminSettingsStore: new DatabaseAdminSettingsStore(database, pluginSecretBox),
+    roleManagementStore: new DatabaseRoleManagementStore(database),
+    serviceAccountTokenConfigured: async (userId) => {
+      const tokens = await serviceAccountTokens.listTokens(userId);
+      return tokens !== undefined && tokens.items.length > 0;
+    },
     reviewItems: new DatabaseReviewItemStore(database),
     loginRateLimiter,
     robots: new DatabaseRobotStore(database),
-    serviceAccountTokens: new DatabaseServiceAccountTokenStore(database),
+    serviceAccountTokens,
     tagCatalog: new DatabaseTagCatalogService(database)
   });
   void packageWorker.run();

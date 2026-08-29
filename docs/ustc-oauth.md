@@ -1,10 +1,23 @@
 # USTC OAuth 指南
 
-USTC OAuth 是可选的 OAuth 2.0 授权码登录（浏览器先到身份提供方授权，再由 Urmotiv 用一次性授权码换取资料）。它默认关闭，不影响邮箱登录。提供方地址、客户端编号、客户端密钥、DNS 和回调登记都由组织管理员在提供方后台手工完成；本文不记录任何真实地址、账号、客户端值或密钥。
+USTC OAuth 是可选的 OAuth 2.0 授权码登录（浏览器先到身份提供方授权，再由 Urmotiv 用一次性授权码换取资料）。默认关闭，不影响邮箱登录。提供方地址、客户端编号、客户端密钥和回调登记都由组织管理员完成；本文不记录任何真实地址、账号、客户端值或密钥。
 
-## 当前环境变量
+## 管理页设置（当前规范）
 
-启用时在 Urmotiv 的私有环境文件中设置以下变量；不要把客户端密钥或状态密钥写进 Git、数据库、日志、接口响应或截图：
+拥有 `system.manage` 与 `user.permission.manage` 的真人管理员可以打开 `/admin/oauth`，或使用：
+
+```text
+GET /api/v1/admin/oauth/ustc
+PUT /api/v1/admin/oauth/ustc
+```
+
+表单只有以下字段：**授权 URL**、**令牌 URL**、**用户资料 URL**、**回调 URL**、可选 **scopes**、客户端编号和客户端密钥。没有 issuer 或 base URL 字段。回调必须使用规范路径 `/api/v1/auth/ustc/callback`，可填写站点绝对 HTTPS 地址加该路径；保存时需要提交并发版本号。客户端编号和密钥不会出现在读取响应、审计记录或错误消息中；读取接口只返回是否已配置，表单在保存成功后清空两个输入框。客户端编号和密钥在数据库中使用服务端密钥加密保存，清除必须通过显式清除操作。
+
+启用前必须填写三个提供方 URL、客户端编号、客户端密钥和精确回调地址。提供方 URL 和回调地址生产环境必须使用 HTTPS，不能包含账号、密码、查询参数或片段。仅在显式开启回环不安全 Cookie 的本地环境，`localhost`、`127.0.0.1` 或 `::1` 才可使用 HTTP；生产环境安全 Cookie 与 HTTPS 检查失败时拒绝保存。
+
+## 环境变量兼容方式
+
+旧版部署仍可在 Urmotiv 私有环境文件中设置以下变量；这是兼容入口，新部署优先使用管理页并将状态密钥保留在环境文件中：
 
 ```dotenv
 URMOTIV_USTC_OAUTH_ENABLED=true
@@ -18,22 +31,14 @@ URMOTIV_USTC_OAUTH_STATE_SECRET=本地生成且不复用的32字节Base64URL值
 URMOTIV_USTC_OAUTH_SCOPE=提供方要求的最小资料范围
 ```
 
-上面含 `example` 和说明文字，只是字段示例，不能直接启动服务。部署时：
-
-- `AUTHORIZE_URL`、`TOKEN_URL`、`PROFILE_URL`、`REDIRECT_URI` 在生产必须是 HTTPS，地址不能带账号或密码。
-- `CLIENT_ID` 非空；`CLIENT_SECRET` 至少 16 个字符；`STATE_SECRET` 必须是恰好 32 字节随机值的无填充 Base64URL，且不能等于插件密钥或 CAS 状态密钥。
-- `SCOPE` 可按提供方要求填写；只申请得到 `gid`/`id`、`zjhm`（或备用 `jrzjhm`）、`name`、`email` 所需的最小范围。
-- `URMOTIV_WEB_ORIGIN` 必须是 HTTPS 的站点来源，且 `URMOTIV_USTC_OAUTH_REDIRECT_URI` 必须精确等于它加 `/api/v1/auth/ustc/callback`；不能添加查询参数、片段或其他路径。
-
-启用前运行环境校验：
+兼容环境变量仍按同样的 HTTPS、固定回调、最小 scopes 和密钥长度规则校验；不支持 issuer 或 base URL。生产部署前运行：
 
 ```bash
 bash scripts/deploy/validate-env.sh /secure/path/urmotiv.env
 docker compose --env-file /secure/path/urmotiv.env config
-docker compose --env-file /secure/path/urmotiv.env up -d api web
 ```
 
-校验脚本会拒绝重复变量、HTTP 回调、不匹配的来源或复用的状态密钥。环境文件权限必须为 `600`。
+环境文件权限必须为 `600`；不要把客户端密钥、状态密钥或完整 Compose 渲染结果写入 Git、日志、接口响应或截图。
 
 ## 提供方、DNS 和反向代理登记顺序
 

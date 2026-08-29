@@ -1,7 +1,7 @@
 import { AlertTriangle, Archive, ArrowDownToLine, ArrowUpFromLine, Download, FileArchive, Loader2 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import type { ExportPreviewResponse, ImportJobView, PackageFileCategory } from "@urmotiv/contracts";
 import {
   createExportJob,
@@ -10,6 +10,7 @@ import {
   getExportJob,
   getImportJob,
   getSession,
+  listImportHistory,
   previewExport,
   previewImport,
   uploadProblemPackage
@@ -127,6 +128,8 @@ function isJobFinished(state: TransferJobState | undefined): boolean {
 
 export function TransferPage() {
   const client = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const historyTab = searchParams.get("tab") === "history";
   const [mode, setMode] = useState<TransferMode>("import");
   const session = useQuery({ queryKey: ["session"], queryFn: getSession, staleTime: 60_000 });
   const currentUserId = session.data?.user?.id ?? "";
@@ -135,6 +138,11 @@ export function TransferPage() {
   const canExport = permissions.includes("problem.export.own") ||
     permissions.includes("problem.export.all");
   const canTransfer = canImport || canExport;
+  const history = useQuery({
+    queryKey: ["import-history", currentUserId],
+    queryFn: () => listImportHistory(),
+    enabled: historyTab && canImport
+  });
   useEffect(() => {
     if (!canImport) {
       client.removeQueries({ queryKey: ["transfer-import-job"] });
@@ -171,24 +179,51 @@ export function TransferPage() {
         <>
           <div className="segmented-control transfer-mode" role="group" aria-label="导入或导出">
             {canImport ? (
-              <button type="button" className={mode === "import" ? "selected" : ""} onClick={() => setMode("import")}>
+              <button
+                type="button"
+                className={!historyTab && mode === "import" ? "selected" : ""}
+                onClick={() => {
+                  setMode("import");
+                  setSearchParams({}, { replace: true });
+                }}
+              >
                 <ArrowUpFromLine size={16} aria-hidden="true" />
                 导入
               </button>
             ) : null}
             {canExport ? (
-              <button type="button" className={mode === "export" ? "selected" : ""} onClick={() => setMode("export")}>
+              <button
+                type="button"
+                className={!historyTab && mode === "export" ? "selected" : ""}
+                onClick={() => {
+                  setMode("export");
+                  setSearchParams({}, { replace: true });
+                }}
+              >
                 <ArrowDownToLine size={16} aria-hidden="true" />
                 导出
               </button>
             ) : null}
+            {canImport ? (
+              <button
+                type="button"
+                className={historyTab ? "selected" : ""}
+                onClick={() => setSearchParams({ tab: "history" }, { replace: true })}
+              >
+                导入历史
+              </button>
+            ) : null}
           </div>
-          {mode === "import" && canImport
+          {historyTab && canImport ? (
+            history.isPending ? <div className="plain-panel">正在读取导入历史……</div>
+              : history.isError ? <div className="plain-panel" role="alert">{history.error.message}</div>
+                : <div className="plain-panel"><h2>导入历史</h2><ul>{history.data.items.map((item) => <li key={item.id}>{item.state}，完成 {item.completedItems} 项，失败 {item.failedItems} 项，导入题目 {item.importedProblemIds.length} 项</li>)}</ul>{history.data.items.length === 0 ? <p>当前账号没有可显示的导入记录。</p> : null}</div>
+          ) : mode === "import" && canImport
             ? <ImportSection currentUserId={currentUserId} />
             : mode === "export" && canExport
               ? <ExportSection currentUserId={currentUserId} />
               : null}
-        </>
+          </>
       )}
     </section>
   );
@@ -274,6 +309,11 @@ function ImportSection({ currentUserId }: { currentUserId: string }) {
     retry: false,
     refetchInterval: (query) => (isJobFinished(query.state.data?.state) ? false : 1500)
   });
+  useEffect(() => {
+    if (importJobQuery.data?.state !== "succeeded") return;
+    void client.invalidateQueries({ queryKey: ["problems"] });
+    void client.invalidateQueries({ queryKey: ["import-history", currentUserId] });
+  }, [client, currentUserId, importJobQuery.data?.state]);
   const denied = [upload.error, preview.error, createImport.error, importJobQuery.error]
     .some(isAccessBoundaryError);
   useEffect(() => {

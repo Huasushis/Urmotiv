@@ -71,6 +71,9 @@ interface ProblemRow extends Record<string, unknown> {
   current_review_round: number;
   created_at: Date | string;
   updated_at: Date | string;
+  origin: string | null;
+  import_batch: string | null;
+  import_source: string | null;
   revision_id: string;
   title: string;
   type: StoredProblem["type"];
@@ -458,6 +461,9 @@ async function loadProblemRows(
       problem.current_review_round,
       problem.created_at,
       problem.updated_at,
+      problem.origin,
+      problem.import_batch,
+      problem.import_source,
       revision.id::text AS revision_id,
       revision.title,
       revision.type,
@@ -600,6 +606,9 @@ async function hydrateProblems(
         }),
     createdAt: toIso(row.created_at),
     updatedAt: toIso(row.updated_at),
+    origin: row.origin ?? "native",
+    importBatch: row.import_batch,
+    importSource: row.import_source
   }));
 }
 
@@ -2038,6 +2047,9 @@ export class DatabaseDataStore implements DataStore {
           status,
           current_revision,
           current_review_round,
+          origin,
+          import_batch,
+          import_source,
           created_at,
           updated_at
         ) VALUES (
@@ -2045,6 +2057,9 @@ export class DatabaseDataStore implements DataStore {
           ${problem.status}::problem_status,
           ${problem.revision},
           ${problem.reviewRound},
+          ${problem.origin ?? "native"},
+          ${problem.importBatch ?? null},
+          ${problem.importSource ?? null},
           ${problem.createdAt}::timestamptz,
           ${problem.updatedAt}::timestamptz
         )
@@ -2106,6 +2121,15 @@ export class DatabaseDataStore implements DataStore {
     }
     if (filters.type !== undefined) {
       conditions.push(sql`revision.type = ${filters.type}::problem_type`);
+    }
+    if (filters.origin !== undefined) {
+      conditions.push(sql`problem.origin = ${filters.origin}`);
+    }
+    if (filters.batch !== undefined) {
+      conditions.push(sql`problem.import_batch = ${filters.batch}`);
+    }
+    if (filters.source !== undefined) {
+      conditions.push(sql`problem.import_source = ${filters.source}`);
     }
     if (filters.search.length > 0) {
       conditions.push(sql`strpos(lower(revision.title), lower(${filters.search})) > 0`);

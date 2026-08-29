@@ -380,4 +380,49 @@ describe("管理页面", () => {
     expect(api.listAdminPlugins).not.toHaveBeenCalled();
     expect(api.listManagedTagCatalog).not.toHaveBeenCalled();
   });
+  it("系统管理员能从管理首页看到所有真实设置入口", () => {
+    const view = mount(
+      <AdminPage
+        session={session({
+          permissions: [
+            "system.manage",
+            "user.permission.manage",
+            "service_account.manage",
+            "audit.read",
+            "plugin.manage",
+            "tag.manage",
+            "problem.view.all",
+            "problem.import",
+            "review.policy.manage"
+          ],
+          canManageReviewPolicy: true,
+          canManagePlugins: true,
+          canManageTags: true,
+          canManageSystem: true,
+          canManagePermissions: true,
+          canManageServiceAccounts: true,
+          canReadAudit: true,
+          canManageProblemCatalog: true,
+          canManageOAuth: true
+        })}
+      />
+    );
+
+    const links = [...view.querySelectorAll<HTMLAnchorElement>("a")].map((link) => ({
+      href: link.getAttribute("href"),
+      text: link.textContent
+    }));
+    expect(links).toEqual(expect.arrayContaining([
+      expect.objectContaining({ href: "/admin/settings", text: expect.stringContaining("常规设置") }),
+      expect.objectContaining({ href: "/admin/roles", text: expect.stringContaining("角色与权限") }),
+      expect.objectContaining({ href: "/admin/service-accounts", text: expect.stringContaining("服务账号") }),
+      expect.objectContaining({ href: "/admin/audit", text: expect.stringContaining("审计") }),
+      expect.objectContaining({ href: "/admin/fermata", text: expect.stringContaining("Fermata") }),
+      expect.objectContaining({ href: "/admin/oauth", text: expect.stringContaining("USTC") }),
+      expect.objectContaining({ href: "/admin/plugins", text: expect.stringContaining("插件") }),
+      expect.objectContaining({ href: "/admin/knowledge", text: expect.stringContaining("知识点") }),
+      expect.objectContaining({ href: "/problems", text: expect.stringContaining("题库") })
+    ]));
+  });
+
 });

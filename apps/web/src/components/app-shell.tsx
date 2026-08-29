@@ -50,10 +50,15 @@ function buildNavItems(session: NonNullable<SessionResponse["user"]>) {
   if (transferPermissions.some((name) => session.permissions.includes(name))) {
     items.push({ to: "/transfer", label: "导入导出", icon: ArrowLeftRight });
   }
-  if (session.permissions.includes("user.create")) {
-    items.push({ to: "/admin/accounts", label: "批量账号", icon: UserPlus });
-  }
-  if (session.canManageReviewPolicy || session.canManagePlugins || session.canManageTags) {
+  if (session.accountType === "human" && (
+    session.permissions.includes("user.create") ||
+    session.canManageReviewPolicy ||
+    session.canManagePlugins ||
+    session.canManageTags ||
+    session.canManageSystem === true ||
+    session.canManagePermissions === true ||
+    session.canManageProblemCatalog === true
+  )) {
     items.push({ to: "/admin", label: "管理", icon: Settings });
   }
   return items;

@@ -7,7 +7,13 @@ export const sessionUserSchema = userSummarySchema.extend({
   isRoot: z.boolean(),
   canManageReviewPolicy: z.boolean(),
   canManagePlugins: z.boolean(),
-  canManageTags: z.boolean()
+  canManageTags: z.boolean(),
+  canManageSystem: z.boolean().optional(),
+  canManagePermissions: z.boolean().optional(),
+  canManageServiceAccounts: z.boolean().optional(),
+  canReadAudit: z.boolean().optional(),
+  canManageProblemCatalog: z.boolean().optional(),
+  canManageOAuth: z.boolean().optional()
 });
 
 export type SessionUser = z.infer<typeof sessionUserSchema>;

@@ -714,6 +714,18 @@ export class InMemoryDataStore implements DataStore {
         return false;
       }
 
+      if (filters.origin !== undefined && (problem.origin ?? "native") !== filters.origin) {
+        return false;
+      }
+
+      if (filters.batch !== undefined && (problem.importBatch ?? null) !== filters.batch) {
+        return false;
+      }
+
+      if (filters.source !== undefined && (problem.importSource ?? null) !== filters.source) {
+        return false;
+      }
+
       return search.length === 0 || problem.title.toLocaleLowerCase().includes(search);
     });
     const total = visible.length;

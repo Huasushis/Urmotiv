@@ -307,6 +307,12 @@ export const userSummarySchema = z.object({
 
 export type UserSummary = z.infer<typeof userSummarySchema>;
 
+export const problemMetadataSchema = z.object({
+  origin: z.string().trim().min(1).max(100).optional(),
+  importBatch: z.string().trim().max(200).nullable().optional(),
+  importSource: z.string().trim().max(200).nullable().optional()
+});
+
 export const problemSchema = problemDraftSchema.extend({
   id: z.string(),
   status: problemStatusSchema,
@@ -315,6 +321,7 @@ export const problemSchema = problemDraftSchema.extend({
   reviewRound: z.number().int().nonnegative(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
+  ...problemMetadataSchema.shape,
   capabilities: problemCapabilitiesSchema
 });
 
@@ -332,7 +339,10 @@ export const problemListItemSchema = problemSchema.pick({
   owner: true,
   revision: true,
   updatedAt: true,
-  capabilities: true
+  capabilities: true,
+  origin: true,
+  importBatch: true,
+  importSource: true
 });
 
 export type ProblemListItem = z.infer<typeof problemListItemSchema>;
@@ -353,7 +363,9 @@ export const problemListQuerySchema = z.object({
   status: problemStatusSchema.optional(),
   type: problemTypeSchema.optional(),
   owner: z.enum(["me", "all"]).default("all"),
-  sort: z.enum(["updated_desc", "updated_asc", "difficulty_asc", "difficulty_desc"]).default("updated_desc")
+  sort: z.enum(["updated_desc", "updated_asc", "difficulty_asc", "difficulty_desc"]).default("updated_desc"),
+  origin: z.string().trim().max(100).optional(),
+  batch: z.string().trim().max(200).optional(),
+  source: z.string().trim().max(200).optional()
 });
-
 export type ProblemListQuery = z.infer<typeof problemListQuerySchema>;

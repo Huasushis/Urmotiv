@@ -40,11 +40,14 @@ export interface StoredProblem {
   status: ProblemStatus;
   ownerId: string;
   revision: number;
-  reviewRound: number;
   /** The immutable rule and result for the current review round. */
   reviewRoundState?: StoredReviewRoundState;
+  reviewRound: number;
   createdAt: string;
   updatedAt: string;
+  origin?: string;
+  importBatch?: string | null;
+  importSource?: string | null;
 }
 
 export interface StoredReviewRule {
@@ -92,6 +95,9 @@ export interface ProblemListFilters {
   status?: ProblemStatus;
   type?: ProblemType;
   owner: "me" | "all";
+  origin?: string;
+  batch?: string;
+  source?: string;
   sort: "updated_desc" | "updated_asc" | "difficulty_asc" | "difficulty_desc";
 }
 

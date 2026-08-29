@@ -152,9 +152,9 @@ Accept: application/json
 | --- | --- |
 | `POST /api/v1/transfer/uploads?originalName=...` | 上传二进制题目包，返回临时 `fileId`、大小、摘要、过期时间和格式检测结果 |
 | `POST /api/v1/transfer/imports/preview` | JSON `{ "fileId": "00000000-0000-4000-8000-000000000001", "formatId": "hydro" }` 预览，不写入题库；`fileId` 应使用上传响应的真实 UUID |
-| `POST /api/v1/transfer/imports` | JSON 必须含上传响应的 `fileId`、返回的 `sha256`、`formatId` 和不含空白的 `idempotencyKey`；创建导入任务 |
-| `GET /api/v1/transfer/imports/:jobId` | 查询 `queued/reading/converting/writing/completed/failed/blocked` 阶段 |
-| `POST /api/v1/transfer/exports/preview` | 预览目标格式和题目选择，返回 `ready/blocked/not_found` |
+| `POST /api/v1/transfer/imports` | 需要 `problem.import`；根据预览结果创建导入任务，服务端再次检查权限和题目包安全性 |
+| `GET /api/v1/transfer/imports` | 需要 `problem.import`；非 `problem.view.all` 仅返回本人。分页读取导入历史摘要，不会返回原始文件名、请求人或不可见题目标识 |
+| `GET /api/v1/transfer/imports/:jobId` | 任务本人或 `problem.view.all`；查询导入任务阶段和结果 |
 | `POST /api/v1/transfer/exports` | 带题目固定修订、文件类别和幂等键创建导出任务 |
 | `GET /api/v1/transfer/exports/:jobId` | 查询导出任务 |
 | `GET /api/v1/transfer/exports/:jobId/download` | 成功任务的受权限检查下载 |
@@ -169,6 +169,12 @@ Accept: application/json
 | `PUT /api/v1/me/avatar`、`DELETE /api/v1/me/avatar` | 会话 | 上传或删除自己的头像；上传为二进制，最大 512 KiB |
 | `GET /api/v1/users/:userId/avatar` | 目标可见 | 受权限检查的头像下载，无头像返回 404 |
 | `POST /api/v1/admin/accounts/batch` | `user.create` | Tab 分隔的批量账号文本，每批最多 100 行 |
+| `GET /api/v1/admin/settings` | `system.manage` | 读取系统运行设置摘要，不返回密钥 |
+| `GET /api/v1/admin/roles`、`GET /api/v1/admin/permissions` | `user.permission.manage` | 读取内置角色和权限目录 |
+| `GET /api/v1/admin/service-accounts` | `service_account.manage` | 列出机器人账号摘要，不返回令牌 |
+| `GET /api/v1/admin/audit` | `audit.read` | 分页读取安全审计摘要，不返回题面、密钥或原始模型响应 |
+| `GET/PUT /api/v1/admin/oauth/ustc` | 人类管理员且同时具备 `system.manage`、`user.permission.manage` | 读取/更新 USTC OAuth 配置；响应只表示客户端密钥是否已配置 |
+| `GET /api/v1/admin/fermata/health`、`GET/PUT /api/v1/admin/fermata/settings`、`POST /api/v1/admin/fermata/wake` | `plugin.manage` + `system.manage` | 查看和控制 Fermata 内置插件；令牌只在插件内部使用 |
 | `GET /api/v1/admin/plugins` | `plugin.manage` + `system.manage` | 查看受信任内置插件状态和声明密钥是否已配置 |
 | `PATCH /api/v1/admin/plugins/:pluginId` | `plugin.manage` + `system.manage` | 带 `expectedRevision` 更新状态、设置或清除已声明密钥 |
 | `GET /api/v1/tag-catalog` | 已登录 | 读取公开知识点目录 |

@@ -7,6 +7,8 @@ import {
   type ExportJobView,
   type ExportPreviewRequest,
   type ExportPreviewResponse,
+  type ImportHistoryQuery,
+  type ImportHistoryResponse,
   type ImportJobView,
   type ImportPreviewRequest,
   type ImportPreviewResponse,
@@ -348,6 +350,62 @@ export class TransferService {
     const items = await this.#jobs.getImportItems(job.id);
     return toImportJobView(job, items);
   }
+
+  public async listImportHistory(
+    user: StoredUser,
+    query: ImportHistoryQuery
+  ): Promise<ImportHistoryResponse> {
+    if (
+      user.accountType !== "human" ||
+      !hasPermission(user, "problem.import", {}, this.#now())
+    ) {
+      throw notFound();
+    }
+    const canListAll = hasPermission(user, "problem.view.all", {}, this.#now());
+    const listImportJobs = this.#jobs.listImportJobs;
+    if (listImportJobs === undefined) {
+      return { items: [], page: query.page, pageSize: query.pageSize, total: 0 };
+    }
+    const result = await listImportJobs.call(this.#jobs, {
+      ...(canListAll ? {} : { requestedByUserId: user.id }),
+      ...(query.state === undefined ? {} : { state: query.state }),
+      ...(query.format === undefined ? {} : { selectedFormat: query.format }),
+      limit: query.pageSize,
+      offset: (query.page - 1) * query.pageSize
+    });
+    const items = await Promise.all(result.jobs.map(async (job) => {
+      const storedItems = await this.#jobs.getImportItems(job.id);
+      const importedProblemIds: string[] = [];
+      for (const item of storedItems) {
+        if (item.importedProblemId === null) continue;
+        try {
+          await this.#service.getProblem(user, item.importedProblemId);
+          importedProblemIds.push(item.importedProblemId);
+        } catch {
+          // Visibility changes after import must not expose the old object id.
+        }
+      }
+      return {
+        id: job.id,
+        state: job.state,
+        phase: job.report.phase,
+        progressPercent: job.progressPercent,
+        completedItems: job.report.completedItems,
+        failedItems: job.report.failedItems,
+        selectedFormat: job.selectedFormat,
+        createdAt: job.createdAt,
+        finishedAt: job.finishedAt,
+        importedProblemIds
+      };
+    }));
+    return {
+      items,
+      page: query.page,
+      pageSize: query.pageSize,
+      total: result.total
+    };
+  }
+
 
   public async previewExport(
     user: StoredUser,

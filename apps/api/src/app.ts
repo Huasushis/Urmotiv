@@ -3,6 +3,12 @@ import { Readable } from "node:stream";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import {
+  adminSettingsQuerySchema,
+  importHistoryQuerySchema,
+  createAdminRoleInputSchema,
+  updateAdminRoleInputSchema,
+  updateUstcOAuthSettingsInputSchema,
+  updateAdminGeneralSettingsInputSchema,
   applyReviewSuggestionsInputSchema,
   casCallbackQuerySchema,
   casStartQuerySchema,
@@ -55,9 +61,10 @@ import {
 import {
   CasAuthenticationError,
   casBrowserBindingCookieName,
+  UstcOAuthClient,
   UstcOAuthError,
   ustcOAuthBrowserBindingCookieName,
-  type UstcOAuthClient,
+  ustcOAuthConfigurationSchema,
   type UstcOAuthLoginStart,
   createEmailVerificationToken,
   digestSecretToken,
@@ -140,6 +147,12 @@ import {
   type RobotTokenIdentity,
 } from "./robot-store";
 import { DatabaseServiceAccountTokenStore } from "./service-account-store";
+import {
+  AdminService,
+  InMemoryAdminSettingsStore,
+  type AdminSettingsStore
+} from "./admin-service";
+import type { RoleManagementStore } from "./admin-role-service";
 import { PluginReviewDecisionRunner } from "./review-decision";
 import { ReviewPolicyService } from "./review-policy-service";
 import { DatabaseTagCatalogService } from "./tag-catalog-service";
@@ -180,6 +193,7 @@ export interface ApiAppOptions {
   contestStore?: ContestStore;
   allowedOrigins?: string[];
   secureCookies?: boolean;
+  allowLoopbackInsecureCookies?: boolean;
   demoAuthEnabled?: boolean;
   emailLoginEnabled?: boolean;
   emailRegistrationEnabled?: boolean;
@@ -188,6 +202,7 @@ export interface ApiAppOptions {
   batchAccountAuditWriter?: BatchAccountAuditWriter;
   casClient?: CasClient;
   ustcOAuthClient?: UstcOAuthClient;
+  ustcOAuthStateSecret?: Uint8Array;
   demoUserIds?: readonly string[];
   demoLoginUserIds?: Readonly<Record<string, string>>;
   pluginHost?: TrustedPluginHost;
@@ -202,9 +217,11 @@ export interface ApiAppOptions {
   robots?: DatabaseRobotStore;
   serviceAccountTokens?: DatabaseServiceAccountTokenStore;
   tagCatalog?: DatabaseTagCatalogService;
+  adminSettingsStore?: AdminSettingsStore;
+  roleManagementStore?: RoleManagementStore;
+  serviceAccountTokenConfigured?: (userId: string) => Promise<boolean>;
   trustedProxyCidrs?: readonly string[];
   loginRateLimiter?: LoginRateLimiter;
-  /** 对外抓取（如 QQ 头像 CDN）使用的实现；默认 globalThis.fetch，测试可注入。 */
   fetchImpl?: typeof fetch;
   now?: () => Date;
 }
@@ -214,8 +231,10 @@ interface AppDependencies {
   service: ProblemService;
   contestService: ContestService;
   reviewPolicyService: ReviewPolicyService;
+  adminService: AdminService;
   allowedOrigins: string[];
   secureCookies: boolean;
+  allowLoopbackInsecureCookies: boolean;
   demoAuthEnabled: boolean;
   emailLoginEnabled: boolean;
   emailRegistrationEnabled: boolean;
@@ -223,6 +242,7 @@ interface AppDependencies {
   emailVerificationWebUrl?: string;
   batchAccountAuditWriter?: BatchAccountAuditWriter;
   casClient?: CasClient;
+  ustcOAuthStateSecret?: Uint8Array;
   ustcOAuthClient?: UstcOAuthClient;
   demoUserIds: ReadonlySet<string>;
   demoLoginUserIds: ReadonlyMap<string, string>;
@@ -239,6 +259,7 @@ interface AppDependencies {
   loginRateLimiter?: LoginRateLimiter;
   fetchImpl: typeof fetch;
 }
+
 
 function formatZodErrors(error: ZodError): Record<string, string[]> {
   const fieldErrors: Record<string, string[]> = {};
@@ -571,11 +592,36 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
             )
         })
   });
+  const allowedOrigins = options.allowedOrigins ?? [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173"
+  ];
+  const secureCookies = options.secureCookies ?? false;
+  const allowLoopbackInsecureCookies = options.allowLoopbackInsecureCookies ?? false;
+  const adminSettingsStore = options.adminSettingsStore ?? new InMemoryAdminSettingsStore({
+    publicRegistrationEnabled: emailRegistrationEnabled,
+    publicSiteUrl: allowedOrigins[0] ?? "http://localhost:5173"
+  });
+  const adminService = new AdminService({
+    store,
+    settingsStore: adminSettingsStore,
+    secureCookies,
+    allowLoopbackInsecureCookies,
+    emailLoginEnabled: options.emailLoginEnabled ?? true,
+    emailRegistrationEnabled,
+    allowedOrigins,
+    ...(options.roleManagementStore === undefined ? {} : { roleManagementStore: options.roleManagementStore }),
+    ...(options.serviceAccountTokenConfigured === undefined
+      ? {}
+      : { tokenConfigured: options.serviceAccountTokenConfigured }),
+    now
+  });
   return {
     store,
     service,
     reviewPolicyService: new ReviewPolicyService(store, reviewDecisions, now),
     contestService: new ContestService(store, contestStore, { now }),
+    adminService,
     ...(options.problemFiles === undefined
       ? {}
       : {
@@ -594,11 +640,9 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     ...(options.tagCatalog === undefined ? {} : { tagCatalog: options.tagCatalog }),
     ...(options.loginRateLimiter === undefined ? {} : { loginRateLimiter: options.loginRateLimiter }),
     trustedProxyCidrs: options.trustedProxyCidrs ?? [],
-    allowedOrigins: options.allowedOrigins ?? [
-      "http://localhost:5173",
-      "http://127.0.0.1:5173"
-    ],
-    secureCookies: options.secureCookies ?? false,
+    allowedOrigins,
+    secureCookies,
+    allowLoopbackInsecureCookies,
     demoAuthEnabled,
     emailLoginEnabled: options.emailLoginEnabled ?? true,
     emailRegistrationEnabled,
@@ -615,6 +659,9 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     ...(options.ustcOAuthClient === undefined
       ? {}
       : { ustcOAuthClient: options.ustcOAuthClient }),
+    ...(options.ustcOAuthStateSecret === undefined
+      ? {}
+      : { ustcOAuthStateSecret: new Uint8Array(options.ustcOAuthStateSecret) }),
     demoUserIds: new Set(options.demoUserIds ?? defaultDemoUsers.map((user) => user.id)),
     demoLoginUserIds: new Map(Object.entries(options.demoLoginUserIds ?? {})),
     pluginHost,
@@ -635,6 +682,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   await app.register(cors, {
     origin: dependencies.allowedOrigins,
+    credentials: true
   });
   await app.register(cookie);
   // 原始字节上传（题目文件、传输包、头像）都依赖该透传解析器；无条件注册。
@@ -718,7 +766,6 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
     const errorName = error instanceof Error ? error.name : "UnknownError";
     app.log.error({ requestId: request.id, errorName }, "Unhandled API error");
-    sendError(reply, request.id, new ApiError(500, "INTERNAL_ERROR", "服务暂时无法处理请求。"));
   });
 
   app.setNotFoundHandler((request, reply) => {
@@ -790,6 +837,20 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     return user;
   }
 
+  async function requireAdminPermission(
+    request: FastifyRequest,
+    permission: Parameters<typeof hasPermission>[1]
+  ): Promise<StoredUser> {
+    const user = await requireUser(request);
+    if (
+      user.accountType !== "human" ||
+      !hasPermission(user, permission, {}, dependencies.now())
+    ) {
+      throw notFound();
+    }
+    return user;
+  }
+
   function requireServiceAccountTokenStore(): DatabaseServiceAccountTokenStore {
     if (dependencies.serviceAccountTokens === undefined) {
       throw new ApiError(503, "SERVICE_UNAVAILABLE", "机器人令牌管理服务暂不可用。");
@@ -814,13 +875,46 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     }
   }
 
-  function authSummary(user: StoredUser | undefined) {
+  async function resolveUstcOAuthClient(): Promise<UstcOAuthClient | undefined> {
+    const runtime = await dependencies.adminService.getRuntimeUstcOAuthSettings();
+    if (runtime === undefined) return dependencies.ustcOAuthClient;
+    if (!runtime.enabled) return undefined;
+    if (dependencies.ustcOAuthStateSecret === undefined) {
+      throw new ApiError(503, "OAUTH_STATE_SECRET_UNAVAILABLE", "USTC OAuth 登录状态密钥暂不可用。");
+    }
+    let configuration;
+    try {
+      configuration = ustcOAuthConfigurationSchema.parse({
+        authorizeUrl: runtime.authorizeUrl,
+        tokenUrl: runtime.tokenUrl,
+        profileUrl: runtime.profileUrl,
+        redirectUri: runtime.redirectUri,
+        clientId: runtime.clientId,
+        clientSecret: runtime.clientSecret,
+        ...(runtime.scope.length > 0 ? { scope: runtime.scope } : {})
+      });
+    } catch {
+      throw new ApiError(503, "OAUTH_CONFIGURATION_UNAVAILABLE", "USTC OAuth 配置暂不可用。");
+    }
+    const client = new UstcOAuthClient({
+      configuration,
+      stateSecret: dependencies.ustcOAuthStateSecret,
+      states: {
+        put: (nonceDigest, expiresAt) => dependencies.store.putLoginState(nonceDigest, expiresAt),
+        consume: (nonceDigest, now) => dependencies.store.consumeLoginState(nonceDigest, now)
+      },
+      now: dependencies.now
+    });
+    return client;
+  }
+
+  async function authSummary(user: StoredUser | undefined) {
     return {
       user: user === undefined ? null : dependencies.service.getSessionUser(user),
       auth: {
         emailEnabled: dependencies.emailLoginEnabled,
-        emailRegistrationEnabled: dependencies.emailRegistrationEnabled,
-        ustcOAuthEnabled: dependencies.ustcOAuthClient !== undefined,
+        emailRegistrationEnabled: await dependencies.adminService.isPublicRegistrationEnabled(),
+        ustcOAuthEnabled: await dependencies.adminService.isUstcOAuthEnabled(dependencies.ustcOAuthClient !== undefined),
         casEnabled: dependencies.casClient !== undefined,
         demoEnabled: dependencies.demoAuthEnabled
       }
@@ -892,6 +986,90 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   app.get("/api/v1/session", async (request) => {
     const user = await currentUser(request);
     return authSummary(user);
+  });
+
+  app.get("/api/v1/admin/settings", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requireAdminPermission(request, "system.manage");
+    return { settings: await dependencies.adminService.getGeneralSettings() };
+  });
+  app.put("/api/v1/admin/settings", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requireAdminPermission(request, "system.manage");
+    const input = updateAdminGeneralSettingsInputSchema.strict().parse(request.body);
+    return {
+      settings: await dependencies.adminService.updateGeneralSettings(
+        await requireUser(request),
+        input,
+        request.id
+      )
+    };
+  });
+
+  app.get("/api/v1/admin/roles", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requireAdminPermission(request, "user.permission.manage");
+    return dependencies.adminService.listRoleManagement();
+  });
+
+  app.post("/api/v1/admin/roles", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requireAdminPermission(request, "user.permission.manage");
+    const input = createAdminRoleInputSchema.strict().parse(request.body);
+    const result = await dependencies.adminService.createRole(
+      await requireUser(request),
+      input,
+      request.id
+    );
+    reply.code(201);
+    return result;
+  });
+
+  app.put("/api/v1/admin/roles/:roleId", async (request, reply) => {
+    const params = z.object({ roleId: z.string().uuid() }).strict().parse(request.params);
+    reply.header("cache-control", "private, no-store");
+    await requireAdminPermission(request, "user.permission.manage");
+    const input = updateAdminRoleInputSchema.strict().parse(request.body);
+    return dependencies.adminService.updateRole(
+      await requireUser(request),
+      params.roleId,
+      input,
+      request.id
+    );
+  });
+
+  app.get("/api/v1/admin/permissions", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requireAdminPermission(request, "user.permission.manage");
+    return { permissions: dependencies.adminService.listPermissions() };
+  });
+
+  app.get("/api/v1/admin/service-accounts", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requireServiceAccountManager(request);
+    return { items: await dependencies.adminService.listServiceAccounts() };
+  });
+
+  app.get("/api/v1/admin/audit", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requireAdminPermission(request, "audit.read");
+    const query = adminSettingsQuerySchema.strict().parse(request.query);
+    return dependencies.adminService.listAudit(query.page, query.pageSize);
+  });
+
+  app.get("/api/v1/admin/oauth/ustc", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    return dependencies.adminService.getUstcOAuthSettings(await requireUser(request));
+  });
+
+  app.put("/api/v1/admin/oauth/ustc", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const input = updateUstcOAuthSettingsInputSchema.strict().parse(request.body);
+    return dependencies.adminService.updateUstcOAuthSettings(
+      await requireUser(request),
+      input,
+      request.id
+    );
   });
   app.get("/api/v1/admin/service-accounts/:userId/tokens", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
@@ -1119,7 +1297,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   });
 
   app.post("/api/v1/auth/email-register", async (request, reply) => {
-    if (!dependencies.emailLoginEnabled || !dependencies.emailRegistrationEnabled) {
+    if (!(await dependencies.adminService.isPublicRegistrationEnabled())) {
       throw notFound();
     }
     const input = emailRegistrationInputSchema.strict().parse(request.body);
@@ -1141,7 +1319,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   });
 
   app.post("/api/v1/auth/email-verification/resend", async (request, reply) => {
-    if (!dependencies.emailLoginEnabled || !dependencies.emailRegistrationEnabled) {
+    if (!(await dependencies.adminService.isPublicRegistrationEnabled())) {
       throw notFound();
     }
     const input = resendEmailVerificationInputSchema.strict().parse(request.body);
@@ -1155,7 +1333,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   });
 
   app.post("/api/v1/auth/email-verification/verify", async (request) => {
-    if (!dependencies.emailLoginEnabled || !dependencies.emailRegistrationEnabled) {
+    if (!(await dependencies.adminService.isPublicRegistrationEnabled())) {
       throw notFound();
     }
     const input = emailVerificationInputSchema.strict().parse(request.body);
@@ -1196,14 +1374,15 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     return authSummary(credential.user);
   });
 
-  if (dependencies.ustcOAuthClient !== undefined) {
-    app.get("/api/v1/auth/ustc/start", async (request, reply) => {
+  app.get("/api/v1/auth/ustc/start", async (request, reply) => {
       reply.header("cache-control", "no-store");
       reply.header("referrer-policy", "no-referrer");
       const input = ustcOAuthStartQuerySchema.strict().parse(request.query);
+      const oauthClient = await resolveUstcOAuthClient();
+      if (oauthClient === undefined) throw notFound();
       let start: UstcOAuthLoginStart;
       try {
-        start = await dependencies.ustcOAuthClient!.startLogin(input.returnPath);
+        start = await oauthClient.startLogin(input.returnPath);
       } catch (error) {
         if (error instanceof UstcOAuthError) {
           throw new ApiError(
@@ -1236,6 +1415,8 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     ) => {
       reply.header("cache-control", "no-store");
       reply.header("referrer-policy", "no-referrer");
+      const oauthClient = await resolveUstcOAuthClient();
+      if (oauthClient === undefined) throw notFound();
       try {
         const parsedInput = ustcOAuthCallbackQuerySchema.strict().safeParse(request.query);
         if (!parsedInput.success) {
@@ -1246,7 +1427,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
           input.state,
           dependencies.secureCookies
         );
-        const completed = await dependencies.ustcOAuthClient!.finishLogin({
+        const completed = await oauthClient.finishLogin({
           ...input,
           browserBinding: readUnambiguousCookie(request, browserBindingCookieName)
         });
@@ -1303,7 +1484,6 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
     app.get("/api/v1/auth/ustc/callback", handleUstcOAuthCallback);
     app.get("/oauth/ustc/callback", handleUstcOAuthCallback);
-  }
 
   if (dependencies.casClient !== undefined) {
     app.get("/api/v1/auth/cas/start", async (request, reply) => {
@@ -2081,6 +2261,27 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       );
     });
   }
+
+  app.get("/api/v1/transfer/imports", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireUser(request);
+    const query = importHistoryQuerySchema.strict().parse(request.query);
+    if (dependencies.transfer === undefined) {
+      if (
+        user.accountType !== "human" ||
+        !hasPermission(user, "problem.import", {}, dependencies.now())
+      ) {
+        throw notFound();
+      }
+      return {
+        items: [],
+        page: query.page,
+        pageSize: query.pageSize,
+        total: 0
+      };
+    }
+    return dependencies.transfer.listImportHistory(user, query);
+  });
 
   if (transfer !== undefined) {
     app.post(

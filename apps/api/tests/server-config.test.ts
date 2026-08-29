@@ -15,6 +15,7 @@ describe("服务启动配置", () => {
       })
     ).toEqual({
       secureCookies: false,
+      allowLoopbackInsecureCookies: false,
       demoAuthEnabled: true,
       emailLoginEnabled: true,
       emailRegistrationEnabled: false,
@@ -31,7 +32,7 @@ describe("服务启动配置", () => {
   it("开发环境未配置来源时保留应用默认值", () => {
     expect(readServerOptions({})).toEqual({
       secureCookies: false,
-      demoAuthEnabled: false,
+      allowLoopbackInsecureCookies: false,
       emailLoginEnabled: true,
       emailRegistrationEnabled: false
     });

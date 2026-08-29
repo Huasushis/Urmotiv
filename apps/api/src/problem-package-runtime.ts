@@ -440,7 +440,10 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
       revision: 1,
       reviewRound: 0,
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
+      origin: "problem-package",
+      importBatch: input.importJobId,
+      importSource: "problem-package"
     };
 
     for (const file of problem.files) {

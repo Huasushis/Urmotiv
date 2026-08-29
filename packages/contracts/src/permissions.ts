@@ -9,6 +9,7 @@ export const corePermissions = [
   "service_account.manage",
   "tag.manage",
   "audit.read",
+  "review.policy.manage",
   "problem.create",
   "problem.view.own",
   "problem.edit.own",
@@ -44,10 +45,11 @@ export const robotHardDeniedPermissions = [
   "plugin.manage",
   "service_account.manage",
   "tag.manage",
+  "audit.read",
+  "review.policy.manage",
   "problem.delete.own",
   "problem.delete.all",
-  "contest.delete",
-  "audit.read"
+  "contest.delete"
 ] as const satisfies readonly CorePermission[];
 
 export type PermissionEffect = "allow" | "deny";

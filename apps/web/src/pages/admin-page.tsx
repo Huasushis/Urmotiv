@@ -69,9 +69,52 @@ function errorMessage(error: unknown): string {
 
 export function AdminPage({ session }: { session: SessionUser }) {
   const client = useQueryClient();
-  const canReview = session.canManageReviewPolicy;
-  const canManagePlugins = session.canManagePlugins;
-  const canManageTags = session.canManageTags;
+  const canReview = session.accountType === "human" && session.canManageReviewPolicy;
+  const canManagePlugins = session.accountType === "human" && session.canManagePlugins;
+  const canManageTags = session.accountType === "human" && session.canManageTags;
+  const canManageSystem = session.accountType === "human" && session.canManageSystem === true;
+  const canManagePermissions = session.accountType === "human" && session.canManagePermissions === true;
+  const canManageServiceAccounts = session.accountType === "human" && session.canManageServiceAccounts === true;
+  const canReadAudit = session.accountType === "human" && session.canReadAudit === true;
+  const canManageProblemCatalog = session.accountType === "human" && session.canManageProblemCatalog === true;
+  const canManageOAuth = session.accountType === "human" && session.canManageOAuth === true;
+  const hasPermission = (permission: string) => session.accountType === "human" && session.permissions.includes(permission);
+  const legacyCapabilityLinks = [
+    ...(canReview ? [{ href: "/admin", label: "审核规则" }] : []),
+    ...(canManagePlugins && !hasPermission("plugin.manage") ? [{ href: "/admin/plugins", label: "插件配置" }] : []),
+    ...(canManageTags && !hasPermission("tag.manage") ? [{ href: "/admin/knowledge", label: "知识点目录" }] : [])
+  ];
+  const adminLinks = [
+    ...legacyCapabilityLinks,
+    ...(canManageSystem
+      ? [{ href: "/admin/settings", label: "常规设置" }]
+      : []),
+    ...(canManagePermissions
+      ? [{ href: "/admin/roles", label: "角色与权限" }]
+      : []),
+    ...(canManageServiceAccounts
+      ? [{ href: "/admin/service-accounts", label: "服务账号与令牌" }]
+      : []),
+    ...(canReadAudit ? [{ href: "/admin/audit", label: "审计记录" }] : []),
+    ...(canManagePlugins && canManageSystem
+      ? [{ href: "/admin/fermata", label: "Fermata 服务" }]
+      : []),
+    ...(canManageOAuth
+      ? [{ href: "/admin/oauth", label: "USTC OAuth" }]
+      : []),
+    ...(canManagePlugins && hasPermission("plugin.manage")
+      ? [{ href: "/admin/plugins", label: "插件配置" }]
+      : []),
+    ...(canManageTags && hasPermission("tag.manage")
+      ? [{ href: "/admin/knowledge", label: "知识点目录" }]
+      : []),
+    ...(canManageProblemCatalog
+      ? [{ href: "/problems", label: "题库" }]
+      : []),
+    ...(canManageProblemCatalog
+      ? [{ href: "/transfer?tab=history", label: "导入历史" }]
+      : [])
+  ];
   const allowedModes: AdminMode[] = [
     ...(canReview ? ["review" as const] : []),
     ...(canManagePlugins ? ["plugins" as const] : []),
@@ -93,7 +136,7 @@ export function AdminPage({ session }: { session: SessionUser }) {
       setMode(fallbackMode);
     }
   }, [canManagePlugins, canManageTags, canReview, client, mode, session.id]);
-  if (!canReview && !canManagePlugins && !canManageTags) {
+  if (adminLinks.length === 0) {
     return (
       <section className="admin-page admin-no-access">
         <div className="page-heading">
@@ -122,6 +165,14 @@ export function AdminPage({ session }: { session: SessionUser }) {
         </div>
         <Settings className="page-heading-icon" size={32} aria-hidden="true" />
       </div>
+      <nav className="admin-section-nav" aria-label="管理导航">
+        {adminLinks.map((link) => (
+          <a key={link.href} href={link.href} className="admin-section-link">
+            {link.label}
+          </a>
+        ))}
+      </nav>
+
 
       {allowedModes.length > 1 ? (
         <div className="segmented-control admin-mode" role="group" aria-label="管理内容">
@@ -520,8 +571,8 @@ function PluginSection({
   if (plugins.data.items.length === 0) {
     return (
       <div className="plain-panel admin-empty">
-        <h2>还没有安装插件</h2>
-        <p>安装并重启服务后，插件会出现在这里。</p>
+        <h2>没有可用的内置插件</h2>
+        <p>插件随受信任的 Urmotiv 发布版本提供；页面不支持安装、下载或动态加载插件。</p>
       </div>
     );
   }

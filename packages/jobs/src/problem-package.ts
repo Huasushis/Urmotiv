@@ -372,6 +372,13 @@ export interface ProblemPackageJobStore {
   createImportJob(input: CreateProblemPackageImportJob): Promise<ProblemPackageImportJob>;
   createExportJob(input: CreateProblemPackageExportJob): Promise<ProblemPackageExportJob>;
   getImportJob(jobId: string): Promise<ProblemPackageImportJob | undefined>;
+  listImportJobs?(input: {
+    readonly requestedByUserId?: string;
+    readonly state?: ProblemPackageImportJob["state"];
+    readonly selectedFormat?: string;
+    readonly limit: number;
+    readonly offset: number;
+  }): Promise<{ readonly jobs: readonly ProblemPackageImportJob[]; readonly total: number }>;
   getImportItems(jobId: string): Promise<readonly ProblemPackageImportItem[]>;
   getExportJob(jobId: string): Promise<ProblemPackageExportJob | undefined>;
   startImportJob(jobId: string): Promise<ProblemPackageImportJob | undefined>;

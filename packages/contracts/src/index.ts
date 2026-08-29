@@ -2,6 +2,7 @@ export * from "./api";
 export * from "./auth";
 export * from "./contest";
 export * from "./ip-address";
+export * from "./admin";
 export * from "./permissions";
 export * from "./profile";
 export * from "./problem-file";

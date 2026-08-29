@@ -31,7 +31,7 @@ import {
   type ProblemPackageJobStore
 } from "@urmotiv/jobs";
 import type { DatabaseExecutor, DatabaseHandle } from "@urmotiv/database";
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import {
   DatabaseProblemPackageAuditWriter,
@@ -325,6 +325,24 @@ export class InMemoryProblemPackageJobStore implements ProblemPackageJobStore, H
     uuidSchema.parse(jobId);
     const job = this.#imports.get(jobId);
     return job === undefined ? undefined : copy(job);
+  }
+
+  public async listImportJobs(input: {
+    readonly requestedByUserId?: string;
+    readonly state?: ProblemPackageImportJob["state"];
+    readonly selectedFormat?: string;
+    readonly limit: number;
+    readonly offset: number;
+  }): Promise<{ readonly jobs: readonly ProblemPackageImportJob[]; readonly total: number }> {
+    const filtered = [...this.#imports.values()]
+      .filter((job) => input.requestedByUserId === undefined || job.requestedByUserId === input.requestedByUserId)
+      .filter((job) => input.state === undefined || job.state === input.state)
+      .filter((job) => input.selectedFormat === undefined || job.selectedFormat === input.selectedFormat)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    return {
+      jobs: filtered.slice(input.offset, input.offset + input.limit).map(copy),
+      total: filtered.length
+    };
   }
 
   public async findImportJobForReplay(
@@ -854,6 +872,46 @@ export class DatabaseProblemPackageJobStore implements ProblemPackageJobStore, H
 
   public async getImportJob(jobId: string): Promise<ProblemPackageImportJob | undefined> {
     return findImportById(this.database, uuidSchema.parse(jobId));
+  }
+
+  public async listImportJobs(input: {
+    readonly requestedByUserId?: string;
+    readonly state?: ProblemPackageImportJob["state"];
+    readonly selectedFormat?: string;
+    readonly limit: number;
+    readonly offset: number;
+  }): Promise<{ readonly jobs: readonly ProblemPackageImportJob[]; readonly total: number }> {
+    const conditions: SQL[] = [sql`true`];
+    if (input.requestedByUserId !== undefined) {
+      conditions.push(sql`requested_by_user_id = ${requireDatabaseId(input.requestedByUserId, "请求用户编号")}`);
+    }
+    if (input.state !== undefined) {
+      conditions.push(sql`state = ${input.state}::task_state`);
+    }
+    if (input.selectedFormat !== undefined) {
+      conditions.push(sql`selected_format = ${input.selectedFormat}`);
+    }
+    const where = sql.join(conditions, sql` AND `);
+    const rows = await this.database.query<ImportJobRow>(sql`
+      SELECT id::text, requested_by_user_id::text, client_request_digest,
+             source_file_id::text, input_digest, detected_format, selected_format,
+             selected_format_version, choices, state::text, progress_percent, report,
+             failure_code, failure_message, idempotency_key, started_at, finished_at,
+             execution_attempt, lease_id, lease_expires_at, created_at
+      FROM import_jobs WHERE ${where}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ${input.limit} OFFSET ${input.offset}
+    `);
+    const totals = await this.database.query<{ total: number }>(sql`
+      SELECT count(*)::integer AS total FROM import_jobs WHERE ${where}
+    `);
+    const jobs = await Promise.all(rows.map(async (row) => {
+      const itemCounts = await this.database.query<{ count: number }>(sql`
+        SELECT count(*)::integer AS count FROM import_job_items WHERE job_id = ${row.id}::uuid
+      `);
+      return hydrateImport(row, itemCounts[0]?.count ?? 0);
+    }));
+    return { jobs, total: Number(totals[0]?.total ?? 0) };
   }
 
   public async findImportJobForReplay(
