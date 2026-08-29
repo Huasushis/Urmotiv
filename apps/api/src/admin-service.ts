@@ -28,6 +28,7 @@ import { hasPermission } from "./permissions";
 import {
   InMemoryRoleManagementStore,
   assertRoleMutationSafety,
+  createAdminRoleMutationContext,
   type RoleManagementStore,
   type AdminRoleMutationContext,
   type StoredAdminRole
@@ -744,18 +745,7 @@ export class AdminService {
   }
 
   private roleMutationContext(user: StoredUser, requestId: string): AdminRoleMutationContext {
-    const actorAllowCeiling = new Set<string>();
-    const actorDeniedPermissions = new Set<string>();
-    for (const grant of user.grants) {
-      if (grant.effect === "allow") actorAllowCeiling.add(grant.permission);
-      else actorDeniedPermissions.add(grant.permission);
-    }
-    return {
-      actorUserId: user.id,
-      requestId,
-      actorAllowCeiling: [...actorAllowCeiling],
-      actorDeniedPermissions: [...actorDeniedPermissions]
-    };
+    return createAdminRoleMutationContext(user, requestId, this.now());
   }
 
   private async validateRoleInput(

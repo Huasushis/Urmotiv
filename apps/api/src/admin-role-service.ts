@@ -1,11 +1,16 @@
 import { randomUUID } from "node:crypto";
 import {
+  corePermissions,
   type CreateAdminRoleInput,
+  type PermissionGrant,
   type UpdateAdminRoleInput
 } from "@urmotiv/contracts";
 import { builtinRoleDefinitions, type DatabaseHandle } from "@urmotiv/database";
 import { sql, type SQL } from "drizzle-orm";
+import type { StoredUser } from "./domain";
 import { ApiError, conflict, notFound } from "./errors";
+import { hasPermission } from "./permissions";
+import { loadUsers } from "./database-store";
 
 export interface StoredAdminRolePermission {
   readonly name: string;
@@ -45,6 +50,39 @@ function cloneRole(role: StoredAdminRole): StoredAdminRole {
     ...role,
     permissions: role.permissions.map((permission) => ({ ...permission })),
     memberIds: [...role.memberIds]
+  };
+}
+
+function isActiveGrant(grant: PermissionGrant, now: Date): boolean {
+  if (grant.expiresAt === undefined) return true;
+  const expiresAt = Date.parse(grant.expiresAt);
+  return Number.isFinite(expiresAt) && expiresAt > now.getTime();
+}
+
+export function createAdminRoleMutationContext(
+  user: StoredUser,
+  requestId: string,
+  now = new Date()
+): AdminRoleMutationContext {
+  const actorAllowCeiling = corePermissions.filter((permission) =>
+    hasPermission(user, permission, {}, now)
+  );
+  const actorDeniedPermissions = [
+    ...new Set(
+      user.grants
+        .filter((grant) =>
+          grant.effect === "deny" &&
+          grant.scope === "global" &&
+          isActiveGrant(grant, now)
+        )
+        .map((grant) => grant.permission)
+    )
+  ];
+  return {
+    actorUserId: user.id,
+    requestId,
+    actorAllowCeiling,
+    actorDeniedPermissions
   };
 }
 
@@ -274,15 +312,17 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
     const affectedUsers = uniqueSortedUserIds([context.actorUserId, ...input.userIds]);
     return this.database.transaction(async (transaction) => {
       await this.lockAffectedUsers(transaction, affectedUsers);
+      const refreshedContext = await this.reloadActorMutationContext(transaction, context);
+      assertRoleMutationSafety(input, refreshedContext);
       const duplicate = await transaction.query<{ id: string }>(sql`SELECT id::text AS id FROM roles WHERE key = ${input.key}`);
       if (duplicate[0] !== undefined) throw conflict("角色标识已存在，请换一个标识。");
       await transaction.execute(sql`
         INSERT INTO roles (id, key, display_name, description, is_built_in, revision, created_by_user_id)
         VALUES (${roleId}::uuid, ${input.key}, ${input.displayName}, ${input.description}, false, 1, ${actorId})
       `);
-      await this.replacePermissions(transaction, roleId, input.permissions, actorId, context.requestId);
+      await this.replacePermissions(transaction, roleId, input.permissions, actorId, refreshedContext.requestId);
       await this.replaceMembers(transaction, roleId, input.userIds, actorId);
-      await this.writeAudit(transaction, context, "admin.role.create", roleId);
+      await this.writeAudit(transaction, refreshedContext, "admin.role.create", roleId);
       return this.readRole(transaction, roleId);
     });
   }
@@ -301,11 +341,12 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
     ]);
     return this.database.transaction(async (transaction) => {
       await this.lockAffectedUsers(transaction, affectedUsers);
+      const refreshedContext = await this.reloadActorMutationContext(transaction, context);
       const current = await this.lockRoleState(transaction, roleId);
       if (current.revision !== initial.revision || !sameUserIds(current.memberIds, initial.memberIds)) {
         throw conflict("角色成员或修订号已被其他管理员修改，请刷新后重试。");
       }
-      assertRoleMutationSafety(input, context, current);
+      assertRoleMutationSafety(input, refreshedContext, current);
       if (current.revision !== input.expectedRevision) {
         throw conflict("角色已被其他管理员修改，请刷新后重试。");
       }
@@ -335,7 +376,7 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
         await this.replacePermissions(transaction, roleId, input.permissions, actorId, context.requestId);
       }
       await this.replaceMembers(transaction, roleId, input.userIds, actorId);
-      await this.writeAudit(transaction, context, "admin.role.update", roleId);
+      await this.writeAudit(transaction, refreshedContext, "admin.role.update", roleId);
       return this.readRole(transaction, roleId);
     });
   }
@@ -353,6 +394,24 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
     if (rows.length !== sortedIds.length) {
       throw new ApiError(422, "ROLE_USER_NOT_FOUND", "角色成员中包含不存在的账号。");
     }
+  }
+
+  private async reloadActorMutationContext(
+    executor: RoleExecutor,
+    context: AdminRoleMutationContext
+  ): Promise<AdminRoleMutationContext> {
+    const actor = (await loadUsers(executor, [databaseId(context.actorUserId)]))[0];
+    if (actor === undefined || actor.accountType !== "human") {
+      throw notFound();
+    }
+    const refreshedContext = createAdminRoleMutationContext(
+      actor,
+      context.requestId
+    );
+    if (!refreshedContext.actorAllowCeiling.includes("user.permission.manage")) {
+      throw notFound();
+    }
+    return refreshedContext;
   }
 
   private async lockRoleState(executor: RoleExecutor, roleId: string): Promise<StoredAdminRole> {

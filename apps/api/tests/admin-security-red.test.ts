@@ -22,11 +22,17 @@ const oauthEndpoints = {
 };
 const openApps: Array<Awaited<ReturnType<typeof createApp>>> = [];
 
-function grant(permission: string, effect: PermissionGrant["effect"] = "allow"): PermissionGrant {
+function grant(
+  permission: string,
+  effect: PermissionGrant["effect"] = "allow",
+  scope: PermissionGrant["scope"] = "global",
+  extra: Pick<PermissionGrant, "objectId" | "expiresAt"> = {}
+): PermissionGrant {
   return {
     permission: permission as CorePermission,
     effect,
-    scope: "global"
+    scope,
+    ...extra
   };
 }
 
@@ -109,6 +115,63 @@ describe("管理员权限提升攻击红测", () => {
     expect(response.json().error.code).toBe("ROLE_PERMISSION_CEILING");
   });
 
+  it("忽略 own/object 作用域的 allow，不能扩大为全局角色权限", async () => {
+    for (const scopedGrant of [
+      grant("problem.view.all", "allow", "own"),
+      grant("problem.view.all", "allow", "object", { objectId: "problem-1" })
+    ]) {
+      const manager = restrictedManager({
+        grants: [grant("auth.login"), grant("user.permission.manage"), scopedGrant]
+      });
+      const app = await makeApp([manager]);
+      openApps.push(app);
+      const cookie = await login(app, manager.id);
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/v1/admin/roles",
+        headers: { cookie, origin },
+        payload: {
+          key: `scoped_ceiling_${scopedGrant.scope}`,
+          displayName: "作用域权限",
+          description: "",
+          permissions: [{ name: "problem.view.all", effect: "allow" }],
+          userIds: []
+        }
+      });
+      expect(response.statusCode).toBe(403);
+      expect(response.json().error.code).toBe("ROLE_PERMISSION_CEILING");
+    }
+  });
+
+  it("忽略已过期的 allow，不能扩大为全局角色权限", async () => {
+    const manager = restrictedManager({
+      grants: [
+        grant("auth.login"),
+        grant("user.permission.manage"),
+        grant("problem.view.all", "allow", "global", {
+          expiresAt: new Date(Date.now() - 1_000).toISOString()
+        })
+      ]
+    });
+    const app = await makeApp([manager]);
+    openApps.push(app);
+    const cookie = await login(app, manager.id);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/roles",
+      headers: { cookie, origin },
+      payload: {
+        key: "expired_ceiling",
+        displayName: "过期权限",
+        description: "",
+        permissions: [{ name: "problem.view.all", effect: "allow" }],
+        userIds: []
+      }
+    });
+    expect(response.statusCode).toBe(403);
+    expect(response.json().error.code).toBe("ROLE_PERMISSION_CEILING");
+  });
+
   it("拒绝绕过调用者对权限的明确 deny", async () => {
     const manager = restrictedManager({
       grants: [
@@ -127,6 +190,34 @@ describe("管理员权限提升攻击红测", () => {
       payload: {
         key: "deny_bypass",
         displayName: "绕过拒绝",
+        description: "",
+        permissions: [{ name: "problem.view.all", effect: "allow" }],
+        userIds: []
+      }
+    });
+    expect(response.statusCode).toBe(403);
+    expect(response.json().error.code).toBe("ROLE_PERMISSION_DENIED");
+  });
+
+  it("全局 allow 被明确 deny 覆盖时不能授权角色", async () => {
+    const manager = restrictedManager({
+      grants: [
+        grant("auth.login"),
+        grant("user.permission.manage"),
+        grant("problem.view.all", "allow"),
+        grant("problem.view.all", "deny")
+      ]
+    });
+    const app = await makeApp([manager]);
+    openApps.push(app);
+    const cookie = await login(app, manager.id);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/roles",
+      headers: { cookie, origin },
+      payload: {
+        key: "deny_override",
+        displayName: "明确拒绝",
         description: "",
         permissions: [{ name: "problem.view.all", effect: "allow" }],
         userIds: []
