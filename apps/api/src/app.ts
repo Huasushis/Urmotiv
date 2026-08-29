@@ -64,7 +64,7 @@ import {
   type CasClient,
   hashPassword,
   normalizeEmail,
-  verifyPassword
+  verifyEmailLoginPassword
 } from "@urmotiv/auth";
 import type { FileStorage } from "@urmotiv/storage";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
@@ -130,6 +130,7 @@ import {
 } from "./plugin-host";
 import { computeProblemContentHash } from "./database-store";
 import { resolveClientAddress } from "./client-address";
+import type { LoginRateLimiter } from "./login-rate-limiter";
 import { avatarMaxBytes } from "./avatar";
 import * as profile from "./profile-service";
 import {
@@ -202,6 +203,7 @@ export interface ApiAppOptions {
   serviceAccountTokens?: DatabaseServiceAccountTokenStore;
   tagCatalog?: DatabaseTagCatalogService;
   trustedProxyCidrs?: readonly string[];
+  loginRateLimiter?: LoginRateLimiter;
   /** 对外抓取（如 QQ 头像 CDN）使用的实现；默认 globalThis.fetch，测试可注入。 */
   fetchImpl?: typeof fetch;
   now?: () => Date;
@@ -234,6 +236,7 @@ interface AppDependencies {
   serviceAccountTokens?: DatabaseServiceAccountTokenStore;
   tagCatalog?: DatabaseTagCatalogService;
   trustedProxyCidrs: readonly string[];
+  loginRateLimiter?: LoginRateLimiter;
   fetchImpl: typeof fetch;
 }
 
@@ -589,6 +592,7 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
       ? {}
       : { serviceAccountTokens: options.serviceAccountTokens }),
     ...(options.tagCatalog === undefined ? {} : { tagCatalog: options.tagCatalog }),
+    ...(options.loginRateLimiter === undefined ? {} : { loginRateLimiter: options.loginRateLimiter }),
     trustedProxyCidrs: options.trustedProxyCidrs ?? [],
     allowedOrigins: options.allowedOrigins ?? [
       "http://localhost:5173",
@@ -1170,14 +1174,24 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       throw notFound();
     }
     const input = loginInputSchema.strict().parse(request.body);
+    const limiter = dependencies.loginRateLimiter;
+    const sourceAddress = resolveClientAddress(request, dependencies.trustedProxyCidrs);
+    if (limiter !== undefined && limiter.isBlocked(sourceAddress)) {
+      throw new ApiError(429, "LOGIN_RATE_LIMITED", "登录尝试过于频繁，请稍后再试。");
+    }
     const credential = await dependencies.store.findEmailCredential(normalizeEmail(input.email));
+    // 邮箱未知 / 口令错误 / 账号不可登录都执行一次 Argon2id 校验并返回同一错误体：
+    // 未知邮箱对固定合成摘要校验，避免从耗时或响应差异中探测账号存在性。
+    const verified = await verifyEmailLoginPassword(credential?.passwordHash, input.password);
     if (
       credential === undefined ||
-      !(await verifyPassword(credential.passwordHash, input.password)) ||
+      !verified ||
       !hasPermission(credential.user, "auth.login", {}, dependencies.now())
     ) {
+      limiter?.recordFailure(sourceAddress);
       throw unauthorized();
     }
+    limiter?.recordSuccess(sourceAddress);
     await beginSession(credential.user, reply);
     return authSummary(credential.user);
   });

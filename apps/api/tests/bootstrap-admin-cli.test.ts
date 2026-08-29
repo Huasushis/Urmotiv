@@ -448,6 +448,88 @@ describe("administrator credential recovery CLI", () => {
     expect(output.text).toContain(adminCredentialsRecoveryCliResults.inputMismatch);
   });
 
+  it("runs a TTY-only canary that writes the marker once through the /dev/tty writer and prints only fixed result+count", async () => {
+    const marker = "canary-7f3c9a11d2e4";
+    const output = new FakeTtyOutput();
+    const ttyWrites: Array<{ accountIdentifier: string; password: string }> = [];
+    const createDatabase = vi.fn(() => {
+      throw new Error("canary must not create a database");
+    });
+    const generatePassword = vi.fn(() => {
+      throw new Error("canary must not generate a password");
+    });
+    const hash = vi.fn(async () => {
+      throw new Error("canary must not hash");
+    });
+    const recover = vi.fn(async () => {
+      throw new Error("canary must not recover");
+    });
+    const openSecretWriter = vi.fn(() => ({
+      writeCredentials(accountIdentifier: string, password: string) {
+        ttyWrites.push({ accountIdentifier, password });
+      },
+      close() {}
+    }));
+    const exitCode = await runAdminCredentialsRecoveryCli({
+      args: ["--canary", marker],
+      // 金丝雀不读数据库，也可在没有 DATABASE_URL 的环境中证明到达路径。
+      environment: {},
+      input: new FakeTtyInput(),
+      output,
+      dependencies: { createDatabase, generatePassword, hash, recover, openSecretWriter }
+    });
+    expect(exitCode).toBe(adminCredentialsRecoveryCliExitCodes.success);
+    // stdout 只报告固定结果与次数；标记经 /dev/tty 写入边界送达一次。
+    expect(output.text).toBe(`${adminCredentialsRecoveryCliResults.canary} count=1\n`);
+    expect(output.text).not.toContain(marker);
+    expect(ttyWrites).toEqual([{ accountIdentifier: marker, password: "canary" }]);
+    expect(openSecretWriter).toHaveBeenCalledTimes(1);
+    expect(createDatabase).not.toHaveBeenCalled();
+    expect(generatePassword).not.toHaveBeenCalled();
+    expect(hash).not.toHaveBeenCalled();
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it("-T 非 TTY 金丝雀在数据库或口令生成之前以 TTY_REQUIRED 失败关闭，且不打开写入边界", async () => {
+    const output = new FakeTtyOutput();
+    const createDatabase = vi.fn(() => {
+      throw new Error("non-tty canary must not create a database");
+    });
+    const hash = vi.fn(async () => {
+      throw new Error("non-tty canary must not hash");
+    });
+    const openSecretWriter = vi.fn(() => {
+      throw new Error("non-tty canary must not open the tty writer");
+    });
+    const exitCode = await runAdminCredentialsRecoveryCli({
+      args: ["--canary", "canary-non-tty-marker"],
+      environment: { DATABASE_URL: "postgres://synthetic.invalid/urmotiv" },
+      input: new FakeTtyInput(false),
+      output,
+      dependencies: { createDatabase, hash, openSecretWriter }
+    });
+    expect(exitCode).toBe(adminCredentialsRecoveryCliExitCodes.ttyRequired);
+    expect(output.text).toBe(`${adminCredentialsRecoveryCliResults.ttyRequired}\n`);
+    expect(createDatabase).not.toHaveBeenCalled();
+    expect(hash).not.toHaveBeenCalled();
+    expect(openSecretWriter).not.toHaveBeenCalled();
+  });
+
+  it("malformed canary arguments fall through to the usage error", async () => {
+    for (const args of [["--canary"], ["--canary", ""], ["--canary", "x", "extra"], ["--canary", "a".repeat(257)]]) {
+      const output = new FakeTtyOutput();
+      await expect(
+        runAdminCredentialsRecoveryCli({
+          args,
+          environment: { DATABASE_URL: "postgres://synthetic.invalid/urmotiv" },
+          input: new FakeTtyInput(),
+          output
+        })
+      ).resolves.toBe(adminCredentialsRecoveryCliExitCodes.usageError);
+      expect(output.text).toBe(`${adminCredentialsRecoveryCliResults.usageError}\n`);
+    }
+  });
+
   it("generates 256-bit base64url passwords and never exposes a writer failure", async () => {
     const first = generateAdminCredentialsRecoveryPassword();
     const second = generateAdminCredentialsRecoveryPassword();

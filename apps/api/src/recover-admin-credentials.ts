@@ -20,6 +20,7 @@ import { hashPassword } from "@urmotiv/auth";
 
 export const adminCredentialsRecoveryCliResults = Object.freeze({
   success: "RECOVER_ADMIN_CREDENTIALS_OK",
+  canary: "RECOVER_ADMIN_CREDENTIALS_CANARY_OK",
   usageError: "RECOVER_ADMIN_CREDENTIALS_USAGE_ERROR",
   ttyRequired: "RECOVER_ADMIN_CREDENTIALS_TTY_REQUIRED",
   postgresRequired: "RECOVER_ADMIN_CREDENTIALS_POSTGRES_REQUIRED",
@@ -90,9 +91,40 @@ const defaultDependencies: AdminCredentialsRecoveryCliDependencies = {
   openSecretWriter: openAdminCredentialsRecoveryTty
 };
 
+/** 解析 --canary <marker>；格式不对时返回 undefined 以便走既有 usageError。 */
+function parseCanaryMarker(args: readonly string[]): string | undefined {
+  if (args.length !== 2 || args[0] !== "--canary") {
+    return undefined;
+  }
+  const marker = args[1]?.trim() ?? "";
+  return marker.length === 0 || marker.length > 256 ? undefined : marker;
+}
+
 export async function runAdminCredentialsRecoveryCli(
   options: RunAdminCredentialsRecoveryCliOptions
 ): Promise<number> {
+  const dependencies = { ...defaultDependencies, ...options.dependencies };
+  const canaryMarker = parseCanaryMarker(options.args);
+  if (canaryMarker !== undefined) {
+    // 金丝雀只验证到达真实 TTY 的精确路径：非 TTY 在任何数据库或口令生成之前
+    // 失败关闭；真实 TTY 时把非机密标记经恢复使用的同一个 /dev/tty 写入边界
+    // 送达操作员终端一次，stdout 只报告固定结果与次数，绝不读取环境或生成口令。
+    if (!isRealTty(options.input, options.output)) {
+      return writeCliResult(
+        options.output,
+        adminCredentialsRecoveryCliResults.ttyRequired,
+        adminCredentialsRecoveryCliExitCodes.ttyRequired
+      );
+    }
+    const canaryWriter = dependencies.openSecretWriter();
+    try {
+      canaryWriter.writeCredentials(canaryMarker, "canary");
+    } finally {
+      canaryWriter.close();
+    }
+    options.output.write(`${adminCredentialsRecoveryCliResults.canary} count=1\n`);
+    return adminCredentialsRecoveryCliExitCodes.success;
+  }
   if (options.args.length !== 0) {
     return writeCliResult(
       options.output,
@@ -117,7 +149,6 @@ export async function runAdminCredentialsRecoveryCli(
     );
   }
 
-  const dependencies = { ...defaultDependencies, ...options.dependencies };
   let database: DatabaseHandle | undefined;
   let secretWriter: AdminCredentialsRecoverySecretWriter | undefined;
   let result: { code: string; exitCode: number } = {

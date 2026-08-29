@@ -22,19 +22,35 @@ docker compose --env-file /secure/path/urmotiv.env up -d api web worker
 
 ### 遗失密码恢复
 
-恢复只针对已完成 bootstrap 后**恰好一名**仍启用、具内置“系统管理员”角色且已有本地密码的人工管理员。服务器操作员必须在真实 TTY 执行，命令不接受任何参数：
+恢复只针对已完成 bootstrap 后**恰好一名**仍启用、具内置“系统管理员”角色且已有本地密码的人工管理员。服务器操作员必须在真实 TTY 执行；用下面的 `compose exec` 精确命令（容器内 `/dev/tty` 直接连到操作员终端）：
 
 ```bash
-docker compose --env-file /secure/path/urmotiv.env run --rm --no-deps api pnpm --filter @urmotiv/api recover-admin-credentials
+docker compose --env-file /secure/path/urmotiv.env exec api pnpm --filter @urmotiv/api recover-admin-credentials
 ```
 
-命令要求在两个隐藏提示中各输入一次 `确认`。成功输出 `RECOVER_ADMIN_CREDENTIALS_OK`，新账号标识和随机新密码只写入服务器的 `/dev/tty`，不会出现在 API、日志或审计记录中。恢复会使该管理员的所有现有 Web 会话立即失效；用控制台显示的新密码重新登录，再在受控流程中修改密码。
+**禁止使用 `docker compose run`**：`run` 创建的进程由编排层转发 TTY，恢复输出可能被记录进容器日志或保留一次性容器，违背“密码永远只出现在服务器 TTY”的保证。命令要求在两个隐藏提示中各输入一次 `确认`。成功输出 `RECOVER_ADMIN_CREDENTIALS_OK`，新账号标识和随机新密码只写入服务器的 `/dev/tty`，不会出现在 API、日志或审计记录中。恢复会使该管理员的所有现有 Web 会话立即失效；新密码只由操作员在服务器 TTY 当场记下并登录修改，**绝不通过即时通讯、邮件或其他渠道分享或传输**。
+
+### 执行前的路径金丝雀
+
+恢复本身不读取数据库、环境值或调用口令生成之前，就要求输入输出都是真实 TTY。先用同一个精确路径做一次非机密的随机标记金丝雀，确认能到达真实 TTY；随机标记可以直接生成（例如 `/dev/urandom` 前 16 字节的十六进制）：
+
+```bash
+CANARY_MARKER=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+docker compose --env-file /secure/path/urmotiv.env exec api pnpm --filter @urmotiv/api recover-admin-credentials --canary "$CANARY_MARKER"
+```
+
+金丝雀与恢复共用同一条 `/dev/tty` 写入边界：非机密标记只经该边界送达操作员终端一次，stdout 只报告固定结果与次数（`RECOVER_ADMIN_CREDENTIALS_CANARY_OK count=1`），不会读取数据库、环境内容或生成口令。用 `-T`（强制非 TTY）执行同一金丝雀会立即输出 `RECOVER_ADMIN_CREDENTIALS_TTY_REQUIRED`，证实非 TTY 路径在任何数据库连接、口令生成或 TTY 写入之前失败关闭：
+
+```bash
+docker compose --env-file /secure/path/urmotiv.env exec -T api pnpm --filter @urmotiv/api recover-admin-credentials --canary "$CANARY_MARKER"
+```
 
 常见固定结果：
 
 | 结果 | 含义 |
 | --- | --- |
-| `RECOVER_ADMIN_CREDENTIALS_TTY_REQUIRED` | 输入或输出不是实际 TTY；退出管道后重试 |
+| `RECOVER_ADMIN_CREDENTIALS_TTY_REQUIRED` | 输入或输出不是实际 TTY（例如 `-T`）；在真实 TTY 重试；发生在任何数据库访问或口令生成之前 |
+| `RECOVER_ADMIN_CREDENTIALS_CANARY_OK` | 带 `--canary <marker>` 的金丝雀：只报告标记存在与出现次数，未触碰数据库或口令 |
 | `RECOVER_ADMIN_CREDENTIALS_CONFIRMATION_REQUIRED` | 两次确认不是精确的“确认” |
 | `RECOVER_ADMIN_CREDENTIALS_UNAVAILABLE` | bootstrap 未完成、候选管理员不是恰好一名，或账号已停用 |
 | `RECOVER_ADMIN_CREDENTIALS_POSTGRES_REQUIRED` | 环境文件没有 `DATABASE_URL` |
@@ -42,6 +58,10 @@ docker compose --env-file /secure/path/urmotiv.env run --rm --no-deps api pnpm -
 | `OUTCOME_UNKNOWN` | 操作结果不能安全确认；不要再次猜测执行，先核对数据库和审计状态 |
 
 这项设计故意没有 Web“忘记密码”后门；操作员不能在不接触服务器 TTY 的情况下代替管理员重置密码。
+
+### 邮箱登录限流
+
+`/api/v1/auth/email-login` 只按解析后的来源地址（远端或受信代理后的地址）做服务端限流：同一来源在窗口内失败次数超过上限后，连续尝试统一返回通用的 `429 LOGIN_RATE_LIMITED`，响应不含任何邮箱或账号信息。限流绝不按邮箱或账号键控，窗口过期后自动恢复，成功登录立即清除该来源的失败记录；地址无法解析时放行。演示登录、OAuth/CAS 与其余认证入口不参与此限流。
 
 ## 角色和权限模型
 
