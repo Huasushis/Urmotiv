@@ -83,7 +83,7 @@ docker compose --env-file /secure/path/urmotiv.env exec api pnpm --filter @urmot
 
 拥有相应服务端能力的系统管理员在“管理”首页可以点击进入这些路径：
 
-- **常规设置**：查看邮箱登录、注册、Cookie 安全模式和网页来源等当前服务配置。
+- **常规设置**：维护邮箱登录、注册和 SMTP，并从部署允许的网页来源中选择公开站点 URL。公开地址不能绕过 `URMOTIV_WEB_ORIGIN` 任意填写；更换域名时先更新部署配置并重启。
 - **用户权限**：`/admin/users`，查看账号并维护单个用户的允许/拒绝增量。
 - **角色与权限**：`/admin/roles`，查看内置角色并管理自定义角色。
 - **默认角色**：`/admin/roles/defaults`，维护人工账号和机器人账号的默认角色。

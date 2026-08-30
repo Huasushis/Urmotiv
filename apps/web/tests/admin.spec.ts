@@ -372,6 +372,8 @@ test("常规设置按分组排列且复选框保持正常尺寸", async ({ page 
   await expect(page.getByRole("heading", { name: "常规设置" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "账号注册与登录" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "SMTP 发信" })).toBeVisible();
+  await expect(page.getByLabel("公开站点 URL")).toHaveValue("https://urmotiv.example.test");
+  await expect(page.getByText("可选地址来自服务器部署的网页来源列表。", { exact: false })).toBeVisible();
   const toggles = page.locator(".settings-toggle-row input[type=checkbox]");
   await expect(toggles).toHaveCount(4);
   for (const toggle of await toggles.all()) {

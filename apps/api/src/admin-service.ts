@@ -308,7 +308,8 @@ function asIso(value: Date | string): string {
 export class DatabaseAdminSettingsStore implements AdminSettingsStore {
   public constructor(
     private readonly database: DatabaseHandle,
-    private readonly secretBox?: PluginSecretBox
+    private readonly secretBox?: PluginSecretBox,
+    private readonly defaultPublicSiteUrl = defaultGeneralSettings.publicSiteUrl
   ) {}
 
   public encryptSecret(value: string): string {
@@ -352,7 +353,7 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
     return {
       emailLoginEnabled: row.email_login_enabled,
       publicRegistrationEnabled: row.public_registration_enabled,
-      publicSiteUrl: row.public_site_url || defaultGeneralSettings.publicSiteUrl,
+      publicSiteUrl: row.public_site_url || this.defaultPublicSiteUrl,
       smtpHost: row.smtp_host,
       smtpPort: Number(row.smtp_port),
       smtpSecure: row.smtp_secure,
@@ -541,7 +542,7 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
     return {
       emailLoginEnabled: row.email_login_enabled,
       publicRegistrationEnabled: row.public_registration_enabled,
-      publicSiteUrl: row.public_site_url || defaultGeneralSettings.publicSiteUrl,
+      publicSiteUrl: row.public_site_url || this.defaultPublicSiteUrl,
       smtpHost: row.smtp_host,
       smtpPort: Number(row.smtp_port),
       smtpSecure: row.smtp_secure,

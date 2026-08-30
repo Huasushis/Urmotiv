@@ -31,6 +31,18 @@ afterEach(async () => {
 });
 
 describe("管理员设置修订号隔离", () => {
+  it("数据库尚未保存公开地址时使用当前部署的 Web origin", async () => {
+    const store = new DatabaseAdminSettingsStore(
+      database,
+      new AesGcmPluginSecretBox(Buffer.alloc(32, 4)),
+      "http://127.0.0.1:8080"
+    );
+
+    await expect(store.getGeneralSettings()).resolves.toEqual(
+      expect.objectContaining({ publicSiteUrl: "http://127.0.0.1:8080" })
+    );
+  });
+
   it("普通设置修订号变化不阻塞或改变 OAuth override", async () => {
     const store = new DatabaseAdminSettingsStore(
       database,

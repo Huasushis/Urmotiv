@@ -83,7 +83,11 @@ try {
     await seedDatabaseDemoData(database);
   }
   const pluginSecretBox = createPluginSecretBox(process.env.URMOTIV_PLUGIN_SECRET_KEY);
-  const adminSettingsStore = new DatabaseAdminSettingsStore(database, pluginSecretBox);
+  const adminSettingsStore = new DatabaseAdminSettingsStore(
+    database,
+    pluginSecretBox,
+    appOptions.allowedOrigins?.[0] ?? "http://localhost:5173"
+  );
   let pluginHostReference: TrustedPluginHost | undefined;
   const anklangRuntime: AnklangHookRuntime = {
     readSettings: async () => pluginHostReference?.readEnabledPluginSettings(anklangPluginId),

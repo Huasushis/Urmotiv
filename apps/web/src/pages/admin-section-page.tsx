@@ -147,12 +147,30 @@ function SettingsSection() {
   const update = (key: keyof GeneralDraft, value: string | boolean | number) => {
     setDraft((current) => current === null ? current : { ...current, [key]: value });
   };
+  const publicSiteOptions = query.data.settings.webOrigins;
+  const currentSiteAllowed = publicSiteOptions.includes(draft.publicSiteUrl);
   return (
     <form className="plain-panel admin-form" onSubmit={(event) => { event.preventDefault(); mutation.mutate(draft); }}>
       <section className="settings-form-section">
         <div><h2>站点</h2><p>认证回调和邮件链接使用这个地址；生产环境必须是 HTTPS。</p></div>
         <div className="settings-section-controls">
-          <label>公开站点 URL<input value={draft.publicSiteUrl} onChange={(event) => update("publicSiteUrl", event.target.value)} placeholder="https://urmotiv.example" required /></label>
+          <label>
+            公开站点 URL
+            <select
+              value={draft.publicSiteUrl}
+              onChange={(event) => update("publicSiteUrl", event.currentTarget.value)}
+              aria-describedby="public-site-url-help"
+              required
+            >
+              {!currentSiteAllowed ? (
+                <option value={draft.publicSiteUrl} disabled>{draft.publicSiteUrl}（不在当前部署允许列表）</option>
+              ) : null}
+              {publicSiteOptions.map((origin) => <option value={origin} key={origin}>{origin}</option>)}
+            </select>
+            <small id="public-site-url-help">
+              可选地址来自服务器部署的网页来源列表。更换正式域名时，先更新部署配置并重启服务，再回到这里选择；不能在这里直接填入任意域名。
+            </small>
+          </label>
         </div>
       </section>
       <section className="settings-form-section">
