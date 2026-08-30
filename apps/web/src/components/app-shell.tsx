@@ -1,10 +1,15 @@
 import {
   ArrowLeftRight,
   BookOpen,
+  ChevronDown,
   ClipboardCheck,
   FilePenLine,
   ListChecks,
-  Settings
+  LogOut,
+  Menu,
+  Settings,
+  UserRound,
+  X
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
@@ -13,6 +18,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type { SessionResponse } from "@urmotiv/contracts";
 import { avatarUrlFor, logout } from "../lib/api";
 import { clearProblemDrafts } from "../lib/client-security";
+import { canOpenAdmin } from "./admin-layout";
 
 type AppShellProps = {
   session: NonNullable<SessionResponse["user"]>;
@@ -41,53 +47,6 @@ const baseNavItems = [
   { to: "/reviews", label: "待审", icon: ClipboardCheck }
 ];
 
-const managementGroups = [
-  {
-    label: "系统",
-    items: [
-      { to: "/admin/settings", label: "常规设置" },
-      { to: "/admin/audit", label: "审计记录" }
-    ]
-  },
-  {
-    label: "账号与权限",
-    items: [
-      { to: "/admin/users", label: "用户管理" },
-      { to: "/admin/roles", label: "角色与权限" },
-      { to: "/admin/roles/defaults", label: "默认角色" },
-      { to: "/admin/service-accounts", label: "服务账号" }
-    ]
-  },
-  {
-    label: "内容与迁移",
-    items: [
-      { to: "/admin/accounts", label: "批量账号" },
-      { to: "/admin/imports", label: "导入历史" },
-      { to: "/admin/knowledge", label: "知识点目录" }
-    ]
-  },
-  {
-    label: "集成",
-    items: [
-      { to: "/admin/plugins", label: "插件配置" },
-      { to: "/admin/oauth", label: "USTC OAuth" },
-      { to: "/admin/fermata", label: "Fermata 服务" }
-    ]
-  }
-];
-
-function canManage(session: NonNullable<SessionResponse["user"]>): boolean {
-  return session.accountType === "human" && (
-    session.permissions.includes("user.create") ||
-    session.canManageReviewPolicy ||
-    session.canManagePlugins ||
-    session.canManageTags ||
-    session.canManageSystem === true ||
-    session.canManagePermissions === true ||
-    session.canManageProblemCatalog === true
-  );
-}
-
 function buildNavItems(session: NonNullable<SessionResponse["user"]>) {
   const items = [...baseNavItems];
   if (contestPermissions.some((name) => session.permissions.includes(name))) {
@@ -96,7 +55,7 @@ function buildNavItems(session: NonNullable<SessionResponse["user"]>) {
   if (transferPermissions.some((name) => session.permissions.includes(name))) {
     items.push({ to: "/transfer", label: "导入导出", icon: ArrowLeftRight });
   }
-  return { items, showManagement: canManage(session) };
+  return { items, showManagement: canOpenAdmin(session) };
 }
 
 function HeaderAvatar({ user }: { user: NonNullable<SessionResponse["user"]> }) {
@@ -125,6 +84,7 @@ function HeaderAvatar({ user }: { user: NonNullable<SessionResponse["user"]> }) 
 
 export function AppShell({ session, demoEnabled, children }: AppShellProps) {
   const { items: navItems, showManagement } = buildNavItems(session);
+  const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const client = useQueryClient();
   const signOut = useMutation({
     mutationFn: logout,
@@ -143,56 +103,71 @@ export function AppShell({ session, demoEnabled, children }: AppShellProps) {
         跳到主要内容
       </a>
       <header className="global-header">
-        <NavLink className="brand" to="/problems" aria-label="Urmotiv 题目">
-          <span className="brand-mark">U</span>
-          <span>Urmotiv</span>
-        </NavLink>
-        <nav className="global-nav" aria-label="主导航">
-          {navItems.map(({ to, label, icon: Icon }) => (
-            <NavLink key={to} to={to} className={({ isActive }) => (isActive ? "active" : "")}>
-              <Icon size={16} aria-hidden="true" />
-              <span>{label}</span>
-            </NavLink>
-          ))}
-          {showManagement ? (
-            <div className="global-nav-management">
-              <NavLink end to="/admin" className={({ isActive }) => (isActive ? "active" : "")}>
+        <div className="global-header-inner">
+          <NavLink className="brand" to="/problems" aria-label="Urmotiv 题目">
+            <span className="brand-mark">U</span>
+            <span>Urmotiv</span>
+          </NavLink>
+          <button
+            type="button"
+            className="mobile-nav-toggle"
+            aria-label={mobileNavigationOpen ? "关闭导航" : "打开导航"}
+            aria-expanded={mobileNavigationOpen}
+            onClick={() => setMobileNavigationOpen((open) => !open)}
+          >
+            {mobileNavigationOpen ? <X size={20} aria-hidden="true" /> : <Menu size={20} aria-hidden="true" />}
+          </button>
+          <nav className={`global-nav${mobileNavigationOpen ? " open" : ""}`} aria-label="主导航">
+            {navItems.map(({ to, label, icon: Icon }) => (
+              <NavLink
+                key={to}
+                to={to}
+                onClick={() => setMobileNavigationOpen(false)}
+                className={({ isActive }) => (isActive ? "active" : "")}
+              >
+                <Icon size={16} aria-hidden="true" />
+                <span>{label}</span>
+              </NavLink>
+            ))}
+            {showManagement ? (
+              <NavLink
+                to="/admin"
+                onClick={() => setMobileNavigationOpen(false)}
+                className={({ isActive }) => (isActive ? "active" : "")}
+              >
                 <Settings size={16} aria-hidden="true" />
                 <span>管理</span>
               </NavLink>
-              <div className="management-nav-groups" aria-label="管理分组">
-                {managementGroups.map((group) => (
-                  <section key={group.label} className="management-nav-group">
-                    <span className="management-nav-group-label">{group.label}</span>
-                    <div className="management-nav-group-items">
-                      {group.items.map((item) => (
-                        <NavLink end key={item.to} to={item.to} className={({ isActive }) => (isActive ? "active" : "")}>
-                          {item.label}
-                        </NavLink>
-                      ))}
-                    </div>
-                  </section>
-                ))}
+            ) : null}
+          </nav>
+          <details className="user-menu">
+            <summary aria-label="打开账号菜单">
+              <HeaderAvatar user={session} />
+              <span className="user-menu-name">{session.nickname}</span>
+              <ChevronDown size={15} aria-hidden="true" />
+            </summary>
+            <div className="user-menu-popover">
+              <div className="user-menu-identity">
+                <strong>{session.nickname}</strong>
+                <span>用户 #{session.id}</span>
               </div>
+              <NavLink to="/profile">
+                <UserRound size={16} aria-hidden="true" />
+                个人资料
+              </NavLink>
+              {showManagement ? (
+                <NavLink to="/admin">
+                  <Settings size={16} aria-hidden="true" />
+                  控制面板
+                </NavLink>
+              ) : null}
+              {demoEnabled ? <NavLink to="/demo-login">切换演示账号</NavLink> : null}
+              <button type="button" onClick={() => signOut.mutate()} disabled={signOut.isPending}>
+                <LogOut size={16} aria-hidden="true" />
+                {signOut.isPending ? "正在退出…" : "退出登录"}
+              </button>
             </div>
-          ) : null}
-        </nav>
-        <div className="user-context">
-          <NavLink className="user-profile-link" to="/profile" aria-label="个人资料">
-            <HeaderAvatar user={session} />
-            <div className="user-name">
-              <strong>{session.nickname}</strong>
-              <span>{session.roles.join("、") || "已登录"}</span>
-            </div>
-          </NavLink>
-          {demoEnabled ? (
-            <NavLink to="/demo-login" className="quiet-link">
-              切换演示账号
-            </NavLink>
-          ) : null}
-          <button type="button" className="text-button" onClick={() => signOut.mutate()} disabled={signOut.isPending}>
-            退出
-          </button>
+          </details>
         </div>
       </header>
       <main id="main-content" className="main-content" tabIndex={-1}>{children}</main>

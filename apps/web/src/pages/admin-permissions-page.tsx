@@ -20,6 +20,7 @@ import {
   updateAdminRoleDefaults,
   updateAdminUserPermissions
 } from "../lib/api";
+import { AdminLayout } from "../components/admin-layout";
 
 type AdminPermissionSection = "users" | "roles" | "defaults";
 
@@ -396,8 +397,10 @@ function RolesPanel({
   );
 }
 
-function isManageableUser(user: AdminUserListItem): boolean {
-  return user.accountType === "human" && user.id !== "0" && !user.roles.includes("root");
+function isVisibleManagedUser(user: AdminUserListItem, canViewRoot: boolean): boolean {
+  return user.accountType === "human" && (
+    canViewRoot || (user.id !== "0" && !user.roles.includes("root"))
+  );
 }
 
 function PermissionDeltaMatrix({
@@ -464,25 +467,34 @@ function PermissionDeltaMatrix({
 
 function UserPanel({
   catalogGroups,
-  users
+  session
 }: {
   catalogGroups: AdminPermissionCatalogGroup[];
-  users: AdminUserListItem[];
+  session: SessionUser;
 }) {
   const client = useQueryClient();
-  const humanUsers = users.filter(isManageableUser);
   const [search, setSearch] = useState("");
-  const [selectedUserId, setSelectedUserId] = useState<string | null>(humanUsers[0]?.id ?? null);
+  const [querySearch, setQuerySearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [draft, setDraft] = useState<UserPermissionDraft | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [effective, setEffective] = useState<AdminPermissionEffectiveEntry[] | null>(null);
   const usersQuery = useQuery({
-    queryKey: ["admin-users", search],
-    queryFn: () => listAdminUsers(search),
+    queryKey: ["admin-users", querySearch, page],
+    queryFn: () => listAdminUsers(querySearch, page),
     staleTime: 15_000
   });
-  const visibleUsers = (usersQuery.data?.items ?? humanUsers).filter(isManageableUser);
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setQuerySearch(search.trim());
+      setPage(1);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [search]);
+  const visibleUsers = (usersQuery.data?.items ?? []).filter((user) => isVisibleManagedUser(user, session.isRoot));
+  const totalPages = Math.max(1, Math.ceil((usersQuery.data?.total ?? 0) / (usersQuery.data?.pageSize ?? 30)));
   const selectedVisibleUser = visibleUsers.find((user) => user.id === selectedUserId);
   const protectedUser = selectedVisibleUser?.id === "0" || selectedVisibleUser?.roles.includes("root") === true;
   const permissionQuery = useQuery({
@@ -522,8 +534,11 @@ function UserPanel({
   };
 
   useEffect(() => {
-    const first = visibleUsers[0]?.id ?? null;
+    const first = visibleUsers.find((user) => user.id !== "0" && !user.roles.includes("root"))?.id
+      ?? visibleUsers[0]?.id
+      ?? null;
     if (!visibleUsers.some((user) => user.id === selectedUserId) && first !== selectedUserId) {
+      setSelectedUserId(first);
       setDraft(null);
       setEffective(null);
       setRefreshError(null);
@@ -548,34 +563,54 @@ function UserPanel({
     () => effective === null || draft === null ? [] : previewEffectiveEntries(effective, draft),
     [draft, effective]
   );
-  const noManageableUsers = selectedUserId === null && !usersQuery.isPending;
+  const noManageableUsers = visibleUsers.length === 0 && !usersQuery.isPending;
   if (permissionQuery.isError) return <ErrorState message={permissionQuery.error.message} />;
   return (
     <div className="permission-user-panel">
       <div className="admin-section-heading">
         <div>
           <h2>账号权限</h2>
-          <p>只显示普通人类账号；角色基线、用户 allow additions、用户 deny removals 分开保存，冲突时用户拒绝优先。</p>
+          <p>按账号搜索和分页；角色权限为基线，用户允许与用户拒绝用于单独微调，冲突时拒绝优先。</p>
         </div>
       </div>
       <div className="permission-user-layout">
         <div className="permission-user-list plain-panel">
-          <label>搜索账号<input value={search} placeholder="昵称或账号 ID" onChange={(event) => setSearch(event.target.value)} /></label>
-          <div role="list" aria-label="普通账号列表">
-            {visibleUsers.map((user) => (
-              <button type="button" role="listitem" key={user.id} className={selectedUserId === user.id ? "selected" : ""} onClick={() => { setSelectedUserId(user.id); setDraft(null); setEffective(null); setRefreshError(null); mutation.reset(); }}>
-                <strong>{user.nickname}</strong>
-                <small>{user.id} · {user.roles.join("、") || "无角色"}</small>
-              </button>
-            ))}
+          <label>搜索账号<input value={search} placeholder="昵称、用户名或账号 ID" onChange={(event) => setSearch(event.target.value)} /></label>
+          <div className="permission-user-table-wrap">
+            <table className="permission-user-table">
+              <thead><tr><th>账号</th><th>状态</th><th>角色</th></tr></thead>
+              <tbody>
+                {visibleUsers.map((user) => (
+                  <tr key={user.id} className={selectedUserId === user.id ? "selected" : ""}>
+                    <td>
+                      <button type="button" className="permission-user-select" onClick={() => { setSelectedUserId(user.id); setDraft(null); setEffective(null); setRefreshError(null); mutation.reset(); }}>
+                        <strong>{user.nickname}</strong>
+                        <small>{user.username ?? user.id}</small>
+                      </button>
+                    </td>
+                    <td>{user.enabled ? "正常" : "停用"}</td>
+                    <td>{user.roles.join("、") || "无"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
             {!usersQuery.isPending && visibleUsers.length === 0 ? <p>没有匹配的普通账号。</p> : null}
+            {usersQuery.isPending ? <p role="status">正在读取账号列表……</p> : null}
+          </div>
+          <div className="permission-user-pagination" aria-label="账号分页">
+            <span>共 {usersQuery.data?.total ?? 0} 个账号</span>
+            <div>
+              <button type="button" className="secondary-button compact-button" disabled={page <= 1 || usersQuery.isPending} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</button>
+              <span>{page} / {totalPages}</span>
+              <button type="button" className="secondary-button compact-button" disabled={page >= totalPages || usersQuery.isPending} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>下一页</button>
+            </div>
           </div>
         </div>
         <div className="permission-user-editor plain-panel">
           {noManageableUsers ? (
             <div className="permission-user-empty" role="status">
               <h3>没有可管理的普通用户</h3>
-              <p>root 和 root 身份受到保护；当前没有可编辑账号，页面保持只读说明，不会请求受保护资源。</p>
+              <p>请修改搜索条件或切换页码；受保护的 root 只对 root 本人显示。</p>
             </div>
           ) : selectedVisibleUser === undefined || draft === null || permissionQuery.isPending ? <p role="status">正在读取账号权限……</p> : (
             <>
@@ -722,11 +757,9 @@ export function AdminPermissionsPage({
   const needsCatalog = section !== "defaults";
   const needsRoles = section !== "users";
   const needsDefaults = section === "defaults" && session.isRoot;
-  const needsUsers = section === "users";
   const catalogQuery = useQuery({ queryKey: ["admin-permission-catalog"], queryFn: listAdminPermissionCatalog, enabled: needsCatalog });
   const rolesQuery = useQuery({ queryKey: ["admin-roles"], queryFn: listAdminRoles, enabled: needsRoles });
   const defaultsQuery = useQuery({ queryKey: ["admin-role-defaults"], queryFn: getAdminRoleDefaults, enabled: needsDefaults });
-  const usersQuery = useQuery({ queryKey: ["admin-users", ""], queryFn: () => listAdminUsers(), enabled: needsUsers });
   const copy = {
     users: {
       title: "用户管理",
@@ -744,26 +777,23 @@ export function AdminPermissionsPage({
   if (
     needsCatalog && catalogQuery.isPending ||
     needsRoles && rolesQuery.isPending ||
-    needsDefaults && defaultsQuery.isPending ||
-    needsUsers && usersQuery.isPending
+    needsDefaults && defaultsQuery.isPending
   ) {
-    return <section className="admin-page"><div className="page-heading"><div><p className="eyebrow">管理 / {copy.title}</p><h1>{copy.title}</h1></div></div><div className="plain-panel" role="status">正在读取{copy.title}……</div></section>;
+    return <AdminLayout session={session} title={copy.title} description={copy.description}><div className="plain-panel" role="status">正在读取{copy.title}……</div></AdminLayout>;
   }
-  if (needsCatalog && catalogQuery.isError) return <ErrorState message={catalogQuery.error.message} />;
-  if (needsRoles && rolesQuery.isError) return <ErrorState message={rolesQuery.error.message} />;
-  if (needsDefaults && defaultsQuery.isError) return <ErrorState message={defaultsQuery.error.message} />;
-  if (needsUsers && usersQuery.isError) return <ErrorState message={usersQuery.error.message} />;
+  if (needsCatalog && catalogQuery.isError) return <AdminLayout session={session} title={copy.title} description={copy.description}><ErrorState message={catalogQuery.error.message} /></AdminLayout>;
+  if (needsRoles && rolesQuery.isError) return <AdminLayout session={session} title={copy.title} description={copy.description}><ErrorState message={rolesQuery.error.message} /></AdminLayout>;
+  if (needsDefaults && defaultsQuery.isError) return <AdminLayout session={session} title={copy.title} description={copy.description}><ErrorState message={defaultsQuery.error.message} /></AdminLayout>;
   const catalog = catalogQuery.data;
   const roles = rolesQuery.data;
   const defaults = defaultsQuery.data?.defaults;
   return (
-    <section className={`admin-page admin-permissions-page admin-permissions-page-${section}`}>
-      <div className="page-heading">
-        <div><p className="eyebrow">管理 / {copy.title}</p><h1>{copy.title}</h1><p>{copy.description}</p></div>
-      </div>
+    <AdminLayout session={session} title={copy.title} description={copy.description}>
+      <div className={`admin-permissions-page admin-permissions-page-${section}`}>
       {section === "roles" && catalog !== undefined && roles !== undefined ? <RolesPanel catalogGroups={catalog.groups} rolesQuery={roles} /> : null}
-      {section === "users" && catalog !== undefined && usersQuery.data !== undefined ? <UserPanel catalogGroups={catalog.groups} users={usersQuery.data.items} /> : null}
+      {section === "users" && catalog !== undefined ? <UserPanel catalogGroups={catalog.groups} session={session} /> : null}
       {section === "defaults" && roles !== undefined ? defaults !== undefined ? <DefaultsPanel roles={roles.roles} defaults={defaults} session={session} /> : <div className="plain-panel permission-defaults"><h2>默认角色</h2><p>只有 root 可以查看和修改默认角色；当前账号可以看到受保护的只读说明。</p></div> : null}
-    </section>
+      </div>
+    </AdminLayout>
   );
 }

@@ -377,9 +377,10 @@ export function listAdminPermissionCatalog(): Promise<AdminPermissionCatalogResp
   return request("/admin/permissions/catalog", { method: "GET" }, adminPermissionCatalogResponseSchema);
 }
 
-export function listAdminUsers(search = ""): Promise<AdminUsersResponse> {
-  const query = search.trim() ? `?search=${encodeURIComponent(search.trim())}` : "";
-  return request(`/admin/users${query}`, { method: "GET" }, adminUsersResponseSchema);
+export function listAdminUsers(search = "", page = 1, pageSize = 30): Promise<AdminUsersResponse> {
+  const query = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+  if (search.trim()) query.set("search", search.trim());
+  return request(`/admin/users?${query.toString()}`, { method: "GET" }, adminUsersResponseSchema);
 }
 
 export function getAdminUserPermissions(userId: string): Promise<AdminUserPermissionDeltaResponse> {

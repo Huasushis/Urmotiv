@@ -553,22 +553,27 @@ export class AdminService {
     });
   }
 
-  public async listManagedUsers(search = ""): Promise<AdminUsersResponse> {
+  public async listManagedUsers(search = "", page = 1, pageSize = 30): Promise<AdminUsersResponse> {
     const normalizedSearch = search.trim().toLocaleLowerCase();
     const users = (await this.options.store.listUsers()).filter((user) =>
       normalizedSearch.length === 0 ||
       user.id.toLocaleLowerCase().includes(normalizedSearch) ||
-      user.nickname.toLocaleLowerCase().includes(normalizedSearch)
-    );
+      user.nickname.toLocaleLowerCase().includes(normalizedSearch) ||
+      user.username?.toLocaleLowerCase().includes(normalizedSearch) === true
+    ).sort((left, right) => left.nickname.localeCompare(right.nickname, "zh-CN"));
+    const offset = (page - 1) * pageSize;
     return adminUsersResponseSchema.parse({
-      items: users.map((user) => ({
+      items: users.slice(offset, offset + pageSize).map((user) => ({
         id: user.id,
         nickname: user.nickname,
+        username: user.username ?? null,
         accountType: user.accountType,
         enabled: !user.disabled,
         roles: user.roles
       })),
-      total: users.length
+      total: users.length,
+      page,
+      pageSize
     });
   }
 

@@ -88,7 +88,9 @@ const users: AdminUsersResponse = {
     { id: "0", nickname: "root", accountType: "human", enabled: true, roles: ["root"] },
     { id: "author", nickname: "投稿人", accountType: "human", enabled: true, roles: ["投稿人"] }
   ],
-  total: 2
+  total: 2,
+  page: 1,
+  pageSize: 30
 };
 
 const permissionDelta: AdminUserPermissionDeltaResponse = {
@@ -228,7 +230,7 @@ describe("权限管理页", () => {
 
   it("没有可管理普通用户时显示空态而不请求受保护账号", async () => {
     api.listAdminPermissionCatalog.mockResolvedValue(catalog);
-    api.listAdminUsers.mockResolvedValue({ items: [], total: 0 });
+    api.listAdminUsers.mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 30 });
     const view = mount(<AdminPermissionsPage session={session} section="users" />);
 
     await waitFor(() => expect(view.textContent).toContain("没有可管理的普通用户"));
@@ -250,7 +252,8 @@ describe("权限管理页", () => {
       return updated;
     });
     const view = mount(<AdminPermissionsPage session={session} section="users" />);
-    await waitFor(() => expect(view.textContent).toContain("投稿人"));
+    await waitFor(() => expect([...view.querySelectorAll<HTMLButtonElement>("button")]
+      .some((button) => button.textContent?.includes("保存用户权限"))).toBe(true));
 
     const save = [...view.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("保存用户权限"));
     await act(async () => { save?.click(); });

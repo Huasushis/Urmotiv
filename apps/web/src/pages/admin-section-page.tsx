@@ -3,26 +3,20 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   getAdminGeneralSettings,
   getAdminUstcOAuthSettings,
-  getFermataHealth,
-  getFermataSettings,
   listAdminAudit,
-  listAdminPlugins,
   listAdminServiceAccounts,
   listImportHistory,
-  listManagedTagCatalog,
   updateAdminGeneralSettings,
   updateAdminUstcOAuthSettings
 } from "../lib/api";
 import type { SessionUser } from "@urmotiv/contracts";
+import { AdminLayout } from "../components/admin-layout";
 
 export type AdminSection =
   | "settings"
   | "service-accounts"
   | "audit"
-  | "fermata"
   | "oauth"
-  | "plugins"
-  | "knowledge"
   | "imports";
 
 function ErrorState({ message }: { message: string }) {
@@ -33,28 +27,18 @@ function LoadingState() {
   return <div className="plain-panel" role="status">正在读取服务端数据……</div>;
 }
 
-function SectionFrame({ section, children }: { section: AdminSection; children: React.ReactNode }) {
+function SectionFrame({ section, session, children }: { section: AdminSection; session: SessionUser; children: React.ReactNode }) {
   const labels: Record<AdminSection, string> = {
     settings: "常规设置",
     "service-accounts": "服务账号与令牌",
     audit: "审计记录",
-    fermata: "Fermata 服务",
-    oauth: "USTC OAuth",
-    plugins: "插件配置",
-    knowledge: "知识点目录",
+    oauth: "统一身份认证",
     imports: "导入历史"
   };
   return (
-    <section className="admin-page admin-section-page">
-      <div className="page-heading">
-        <div>
-          <p className="eyebrow">管理 / {labels[section]}</p>
-          <h1>{labels[section]}</h1>
-        </div>
-      </div>
-      <p><a href="/admin">返回管理首页</a></p>
+    <AdminLayout session={session} title={labels[section]}>
       {children}
-    </section>
+    </AdminLayout>
   );
 }
 
@@ -162,20 +146,6 @@ function AuditSection() {
   );
 }
 
-function FermataSection() {
-  const health = useQuery({ queryKey: ["admin-fermata-health"], queryFn: getFermataHealth });
-  const settings = useQuery({ queryKey: ["admin-fermata-settings"], queryFn: getFermataSettings });
-  if (health.isPending || settings.isPending) return <LoadingState />;
-  if (health.isError) return <ErrorState message={health.error.message} />;
-  if (settings.isError) return <ErrorState message={settings.error.message} />;
-  return (
-    <div className="admin-two-column">
-      <div className="plain-panel"><h2>服务状态</h2><p>{health.data.health.status}，工作进程{health.data.health.workerRunning ? "运行中" : "未运行"}，活动任务 {health.data.health.activeTasks}</p></div>
-      <div className="plain-panel"><h2>公开设置</h2><dl><dt>启用</dt><dd>{settings.data.settings.enabled ? "是" : "否"}</dd><dt>轮询间隔</dt><dd>{settings.data.settings.pollingIntervalSeconds} 秒</dd><dt>模型配置</dt><dd>{settings.data.settings.modelProfileName}</dd><dt>实验版本</dt><dd>{settings.data.settings.experimentVersion}</dd></dl></div>
-    </div>
-  );
-}
-
 type OAuthDraft = {
   enabled: boolean;
   authorizeUrl: string;
@@ -254,20 +224,6 @@ function OAuthSection() {
   );
 }
 
-function PluginsSection() {
-  const query = useQuery({ queryKey: ["admin-plugins"], queryFn: listAdminPlugins });
-  if (query.isPending) return <LoadingState />;
-  if (query.isError) return <ErrorState message={query.error.message} />;
-  return <div className="plain-panel"><h2>内置插件</h2><ul>{query.data.items.map((plugin) => <li key={plugin.id}><strong>{plugin.name}</strong> {plugin.version}：{plugin.state === "enabled" ? "已启用" : plugin.failureCode ?? "未启用"}</li>)}</ul><p>本页面只管理已内置插件配置；不提供 ZIP/GitHub 安装或动态执行入口。</p></div>;
-}
-
-function KnowledgeSection() {
-  const query = useQuery({ queryKey: ["admin-tag-catalog"], queryFn: listManagedTagCatalog });
-  if (query.isPending) return <LoadingState />;
-  if (query.isError) return <ErrorState message={query.error.message} />;
-  return <div className="plain-panel"><h2>知识点目录</h2><ul>{query.data.items.map((tag) => <li key={tag.id}>{tag.name}（{tag.itemKind === "tag" ? tag.group : tag.description}）</li>)}</ul></div>;
-}
-
 function ImportHistorySection() {
   const query = useQuery({ queryKey: ["import-history"], queryFn: () => listImportHistory() });
   if (query.isPending) return <LoadingState />;
@@ -275,18 +231,15 @@ function ImportHistorySection() {
   return <div className="plain-panel"><h2>导入历史</h2><ul>{query.data.items.map((item) => <li key={item.id}>{item.state}，完成 {item.completedItems} 项，失败 {item.failedItems} 项，导入题目 {item.importedProblemIds.length} 项</li>)}</ul>{query.data.items.length === 0 ? <p>当前账号没有可显示的导入记录。</p> : null}</div>;
 }
 
-export function AdminSectionPage({ section, session: _session }: { section: AdminSection; session: SessionUser }) {
+export function AdminSectionPage({ section, session }: { section: AdminSection; session: SessionUser }) {
   const content = useMemo(() => {
     switch (section) {
       case "settings": return <SettingsSection />;
       case "service-accounts": return <ServiceAccountsSection />;
       case "audit": return <AuditSection />;
-      case "fermata": return <FermataSection />;
       case "oauth": return <OAuthSection />;
-      case "plugins": return <PluginsSection />;
-      case "knowledge": return <KnowledgeSection />;
       case "imports": return <ImportHistorySection />;
     }
   }, [section]);
-  return <SectionFrame section={section}>{content}</SectionFrame>;
+  return <SectionFrame section={section} session={session}>{content}</SectionFrame>;
 }

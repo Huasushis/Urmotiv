@@ -204,13 +204,16 @@ export type AdminPermissionCatalogResponse = z.infer<typeof adminPermissionCatal
 export const adminUserListItemSchema = z.object({
   id: z.string().trim().min(1).max(80),
   nickname: z.string().trim().min(1).max(120),
+  username: z.string().trim().min(1).max(80).nullable().optional(),
   accountType: z.enum(["human", "robot"]),
   enabled: z.boolean(),
   roles: z.array(z.string()).max(100)
 }).strict();
 export const adminUsersResponseSchema = z.object({
-  items: z.array(adminUserListItemSchema).max(5_000),
-  total: z.number().int().nonnegative()
+  items: z.array(adminUserListItemSchema).max(100),
+  total: z.number().int().nonnegative(),
+  page: z.number().int().positive().default(1),
+  pageSize: z.number().int().min(1).max(100).default(30)
 }).strict();
 export type AdminUserListItem = z.infer<typeof adminUserListItemSchema>;
 export type AdminUsersResponse = z.infer<typeof adminUsersResponseSchema>;

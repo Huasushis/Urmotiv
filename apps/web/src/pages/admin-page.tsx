@@ -4,14 +4,11 @@ import {
   CheckCircle2,
   KeyRound,
   Loader2,
-  Plug,
   RefreshCw,
   Save,
-  Settings,
-  ShieldAlert,
-  Tags
+  ShieldAlert
 } from "lucide-react";
-import { NavLink } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import type {
@@ -23,6 +20,7 @@ import type {
 } from "@urmotiv/contracts";
 import { applySettingsFormDefaults, SettingsForm } from "../components/settings-form";
 import { TagCatalogAdmin } from "../components/tag-catalog-admin";
+import { AdminLayout, adminNavigationGroups, canOpenAdmin } from "../components/admin-layout";
 import {
   ApiError,
   getReviewPolicy,
@@ -32,7 +30,7 @@ import {
 } from "../lib/api";
 import { isAccessBoundaryError } from "../lib/client-security";
 
-type AdminMode = "review" | "plugins" | "tags";
+export type AdminPageSection = "dashboard" | "review" | "plugins" | "knowledge";
 
 const pluginStateText: Record<AdminPlugin["state"], string> = {
   enabled: "已启用",
@@ -68,69 +66,29 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "保存失败，请稍后重试。";
 }
 
-export function AdminPage({ session }: { session: SessionUser }) {
+export function AdminPage({
+  session,
+  section = "dashboard"
+}: {
+  session: SessionUser;
+  section?: AdminPageSection;
+}) {
   const client = useQueryClient();
   const canReview = session.accountType === "human" && session.canManageReviewPolicy;
   const canManagePlugins = session.accountType === "human" && session.canManagePlugins;
   const canManageTags = session.accountType === "human" && session.canManageTags;
-  const canManageSystem = session.accountType === "human" && session.canManageSystem === true;
-  const canManagePermissions = session.accountType === "human" && session.canManagePermissions === true;
-  const canManageServiceAccounts = session.accountType === "human" && session.canManageServiceAccounts === true;
-  const canReadAudit = session.accountType === "human" && session.canReadAudit === true;
-  const canManageProblemCatalog = session.accountType === "human" && session.canManageProblemCatalog === true;
-  const canManageOAuth = session.accountType === "human" && session.canManageOAuth === true;
-  const canOpenAdmin = canReview ||
-    canManagePlugins ||
-    canManageTags ||
-    canManageSystem ||
-    canManagePermissions ||
-    canManageServiceAccounts ||
-    canReadAudit ||
-    canManageProblemCatalog ||
-    canManageOAuth;
-  const adminGroups = [
-    {
-      label: "系统",
-      items: [
-        ...(canOpenAdmin ? [{ href: "/admin", label: "管理首页" }] : []),
-        ...(canManageSystem ? [{ href: "/admin/settings", label: "常规设置" }] : []),
-        ...(canReadAudit ? [{ href: "/admin/audit", label: "审计记录" }] : [])
-      ]
-    },
-    {
-      label: "用户与权限",
-      items: [
-        ...(canManagePermissions ? [
-          { href: "/admin/users", label: "用户管理" },
-          { href: "/admin/roles", label: "角色与权限" },
-          { href: "/admin/roles/defaults", label: "默认角色" }
-        ] : []),
-        ...(canManageServiceAccounts ? [{ href: "/admin/service-accounts", label: "服务账号与令牌" }] : [])
-      ]
-    },
-    {
-      label: "审核与内容",
-      items: [
-        ...(canManageTags ? [{ href: "/admin/knowledge", label: "知识点目录" }] : []),
-        ...(canManageProblemCatalog ? [{ href: "/problems", label: "题库" }] : [])
-      ]
-    },
-    {
-      label: "集成",
-      items: [
-        ...(canManagePlugins ? [{ href: "/admin/plugins", label: "插件配置" }] : []),
-        ...(canManageOAuth ? [{ href: "/admin/oauth", label: "USTC OAuth" }] : []),
-        ...(canManagePlugins && canManageSystem ? [{ href: "/admin/fermata", label: "Fermata 服务" }] : [])
-      ]
-    }
-  ];
-  const adminLinks = adminGroups.flatMap((group) => group.items);
-  const allowedModes: AdminMode[] = [
-    ...(canReview ? ["review" as const] : []),
-    ...(canManagePlugins ? ["plugins" as const] : []),
-    ...(canManageTags ? ["tags" as const] : [])
-  ];
-  const [mode, setMode] = useState<AdminMode>(allowedModes[0] ?? "review");
+  const navigationItems = adminNavigationGroups(session)
+    .flatMap((group) => group.items)
+    .filter((item) => item.to !== "/admin");
+  const resolvedSection: AdminPageSection = section === "dashboard" && navigationItems.length === 1
+    ? navigationItems[0]?.to === "/admin/review"
+      ? "review"
+      : navigationItems[0]?.to === "/admin/plugins"
+        ? "plugins"
+        : navigationItems[0]?.to === "/admin/knowledge"
+          ? "knowledge"
+          : "dashboard"
+    : section;
   useEffect(() => {
     if (!canReview) {
       client.removeQueries({ queryKey: ["review-policy"] });
@@ -141,12 +99,9 @@ export function AdminPage({ session }: { session: SessionUser }) {
     if (!canManageTags) {
       client.removeQueries({ queryKey: ["admin-tag-catalog"] });
     }
-    const fallbackMode = canReview ? "review" : canManagePlugins ? "plugins" : canManageTags ? "tags" : null;
-    if (fallbackMode !== null && !allowedModes.includes(mode)) {
-      setMode(fallbackMode);
-    }
-  }, [canManagePlugins, canManageTags, canReview, client, mode, session.id]);
-  if (adminLinks.length === 0) {
+  }, [canManagePlugins, canManageTags, canReview, client, session.id]);
+
+  if (!canOpenAdmin(session)) {
     return (
       <section className="admin-page admin-no-access">
         <div className="page-heading">
@@ -165,90 +120,51 @@ export function AdminPage({ session }: { session: SessionUser }) {
     );
   }
 
+  if (resolvedSection === "review") {
+    return (
+      <AdminLayout session={session} title="审核规则" description="设置审核意见如何汇总；每次保存都会由服务端重新核对权限。">
+        {canReview ? <ReviewPolicySection key={session.id} currentUserId={session.id} /> : <AdminNotFound />}
+      </AdminLayout>
+    );
+  }
+
+  if (resolvedSection === "plugins") {
+    return (
+      <AdminLayout session={session} title="插件" description="管理已安装插件及各插件相互隔离的设置和密钥。">
+        {canManagePlugins ? <PluginSection key={session.id} currentUserId={session.id} /> : <AdminNotFound />}
+      </AdminLayout>
+    );
+  }
+
+  if (resolvedSection === "knowledge") {
+    return (
+      <AdminLayout session={session} title="知识点目录" description="维护分组、知识点和它们的层级关系。">
+        {canManageTags ? <TagCatalogAdmin key={session.id} currentUserId={session.id} /> : <AdminNotFound />}
+      </AdminLayout>
+    );
+  }
+
+  const groups = adminNavigationGroups(session)
+    .map((group) => ({ ...group, items: group.items.filter((item) => item.to !== "/admin") }))
+    .filter((group) => group.items.length > 0);
   return (
-    <section className="admin-page">
-      <div className="page-heading admin-heading">
-        <div>
-          <p className="eyebrow">管理</p>
-          <h1>站点管理</h1>
-          <p>审核规则决定意见如何汇总；插件设置用于连接外部服务；知识点目录管理分类与标签。每次保存都会由服务端再次核对权限和内容。</p>
-        </div>
-        <Settings className="page-heading-icon" size={32} aria-hidden="true" />
-      </div>
-      <nav className="admin-section-nav" aria-label="管理导航">
-        {adminGroups.filter((group) => group.items.length > 0).map((group) => (
-          <section key={group.label} className="admin-section-nav-group">
+    <AdminLayout session={session} title="控制面板" description="站点、题库、用户和插件设置均从右侧分组进入。">
+      <div className="admin-dashboard-grid">
+        {groups.map((group) => (
+          <section key={group.label} className="plain-panel admin-dashboard-group">
             <h2>{group.label}</h2>
-            <div className="admin-section-nav-items">
-              {group.items.map((link) => (
-                <NavLink
-                  end
-                  key={link.href}
-                  to={link.href}
-                  className={({ isActive }) => `admin-section-link${isActive ? " active" : ""}`}
-                >
-                  {link.label}
-                </NavLink>
-              ))}
+            <div>
+              {group.items.map((item) => <Link key={item.to} to={item.to}>{item.label}<span aria-hidden="true">›</span></Link>)}
             </div>
           </section>
         ))}
-      </nav>
-
-
-      {allowedModes.length > 1 ? (
-        <div className="segmented-control admin-mode" role="group" aria-label="管理内容">
-          {canReview ? (
-            <button
-              type="button"
-              className={mode === "review" ? "selected" : ""}
-              aria-pressed={mode === "review"}
-              onClick={() => setMode("review")}
-            >
-              <BookOpenCheck size={16} aria-hidden="true" />
-              审核规则
-            </button>
-          ) : null}
-          {canManagePlugins ? (
-            <button
-              type="button"
-              className={mode === "plugins" ? "selected" : ""}
-              aria-pressed={mode === "plugins"}
-              onClick={() => setMode("plugins")}
-            >
-              <Plug size={16} aria-hidden="true" />
-              插件
-            </button>
-          ) : null}
-          {canManageTags ? (
-            <button
-              type="button"
-              className={mode === "tags" ? "selected" : ""}
-              aria-pressed={mode === "tags"}
-              onClick={() => setMode("tags")}
-            >
-              <Tags size={16} aria-hidden="true" />
-              知识点目录
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-
-      {mode === "review" && canReview ? (
-        <ReviewPolicySection key={session.id} currentUserId={session.id} />
-      ) : null}
-      {mode === "plugins" && canManagePlugins ? (
-        <PluginSection
-          key={session.id}
-          currentUserId={session.id}
-          onOpenReviewPolicy={canReview ? () => setMode("review") : undefined}
-        />
-      ) : null}
-      {mode === "tags" && canManageTags ? (
-        <TagCatalogAdmin key={session.id} currentUserId={session.id} />
-      ) : null}
-    </section>
+      </div>
+    </AdminLayout>
   );
+}
+
+function AdminNotFound() {
+  return <div className="plain-panel" role="status">设置不存在或当前账号不能访问。</div>;
 }
 
 type ReviewDraft = {

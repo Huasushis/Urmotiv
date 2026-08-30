@@ -90,10 +90,10 @@ function App() {
         <Route path="/admin/roles/defaults" element={<AdminPermissionsPage section="defaults" session={sessionData.user} />} />
         <Route path="/admin/service-accounts" element={<AdminSectionPage section="service-accounts" session={sessionData.user} />} />
         <Route path="/admin/audit" element={<AdminSectionPage section="audit" session={sessionData.user} />} />
-        <Route path="/admin/fermata" element={<AdminSectionPage section="fermata" session={sessionData.user} />} />
         <Route path="/admin/oauth" element={<AdminSectionPage section="oauth" session={sessionData.user} />} />
-        <Route path="/admin/plugins" element={<AdminSectionPage section="plugins" session={sessionData.user} />} />
-        <Route path="/admin/knowledge" element={<AdminSectionPage section="knowledge" session={sessionData.user} />} />
+        <Route path="/admin/review" element={<AdminPage section="review" session={sessionData.user} />} />
+        <Route path="/admin/plugins" element={<AdminPage section="plugins" session={sessionData.user} />} />
+        <Route path="/admin/knowledge" element={<AdminPage section="knowledge" session={sessionData.user} />} />
         <Route path="/admin/imports" element={<AdminSectionPage section="imports" session={sessionData.user} />} />
         <Route path="/admin" element={<AdminPage session={sessionData.user} />} />
         <Route path="*" element={<Navigate to="/problems" replace />} />

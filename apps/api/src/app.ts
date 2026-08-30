@@ -1218,8 +1218,12 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   app.get("/api/v1/admin/users", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
     await requireAdminPermission(request, "user.permission.manage");
-    const query = z.object({ search: z.string().trim().max(160).optional() }).strict().parse(request.query);
-    return dependencies.adminService.listManagedUsers(query.search);
+    const query = z.object({
+      search: z.string().trim().max(160).optional(),
+      page: z.coerce.number().int().min(1).max(100_000).default(1),
+      pageSize: z.coerce.number().int().min(1).max(100).default(30)
+    }).strict().parse(request.query);
+    return dependencies.adminService.listManagedUsers(query.search, query.page, query.pageSize);
   });
   app.get("/api/v1/admin/users/:userId/permissions", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
