@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { hashPassword } from "@urmotiv/auth";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { createApp } from "../src/app";
 import { createDemoUsers, demoTags } from "../src/demo-data";
@@ -91,6 +92,51 @@ describe("邮箱登录失败路径的响应一致性", () => {
     const setCookie = signedIn.headers["set-cookie"];
     const cookie = (Array.isArray(setCookie) ? setCookie[0] : setCookie) ?? "";
     expect(cookie).toContain("urmotiv_session=");
+  });
+});
+
+describe("用户名登录", () => {
+  it("忽略用户名大小写登录，且未知用户名与错误口令返回同一错误", async () => {
+    const password = "synthetic-username-password";
+    const passwordHash = await hashPassword(password);
+    const user = {
+      ...createDemoUsers()[0]!,
+      id: "username-user",
+      username: "PB-SYNTH-0001"
+    };
+    const store = new InMemoryDataStore([user], demoTags);
+    vi.spyOn(store, "findUsernameCredential").mockImplementation(async (username) =>
+      username.trim().toLocaleLowerCase() === "pb-synth-0001"
+        ? { user, passwordHash }
+        : undefined
+    );
+    const app = await createApp({ store });
+    openApps.push(app);
+
+    const signedIn = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/username-login",
+      headers: { origin },
+      payload: { username: "pb-SYNTH-0001", password }
+    });
+    expect(signedIn.statusCode).toBe(200);
+    expect(signedIn.headers["set-cookie"]).toBeDefined();
+
+    const wrongPassword = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/username-login",
+      headers: { origin },
+      payload: { username: "PB-SYNTH-0001", password: "wrong-password" }
+    });
+    const unknownUsername = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/username-login",
+      headers: { origin },
+      payload: { username: "absent-user", password: "wrong-password" }
+    });
+    expect(wrongPassword.statusCode).toBe(401);
+    expect(unknownUsername.statusCode).toBe(401);
+    expect(loginErrorShape(wrongPassword.body)).toEqual(loginErrorShape(unknownUsername.body));
   });
 });
 

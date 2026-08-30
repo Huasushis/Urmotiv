@@ -11,7 +11,11 @@ import type {
   VisibleProblemPage
 } from "./domain";
 import { canViewProblem, type ProblemVisibility } from "./permissions";
-import { BatchAccountConflictError, type HashedBatchAccount } from "./batch-account";
+import {
+  BatchAccountConflictError,
+  normalizeUsernameKey,
+  type HashedBatchAccount
+} from "./batch-account";
 import type { BatchAccountAuditEvent, BatchAccountAuditWriter } from "./account-audit";
 import { initialReviewPolicyRule } from "./review-decision";
 
@@ -99,6 +103,7 @@ export interface DataStore {
   ): Promise<{ readonly mediaType: string; readonly content: Uint8Array; readonly updatedAt: string } | undefined>;
   clearUserAvatar(userId: string): Promise<StoredUser | undefined>;
   findRootCredential(): Promise<RootCredential | undefined>;
+  findUsernameCredential(username: string): Promise<EmailCredential | undefined>;
   findEmailCredential(normalizedEmail: string): Promise<EmailCredential | undefined>;
   getUserPermissionDelta(userId: string): Promise<UserPermissionDelta>;
   replaceUserPermissionDelta(input: ReplaceUserPermissionDeltaInput): Promise<UserPermissionDelta>;
@@ -448,6 +453,23 @@ export class InMemoryDataStore implements DataStore {
     return { user: copy(user), passwordHash: this.rootPasswordHash };
   }
 
+  public async findUsernameCredential(username: string): Promise<EmailCredential | undefined> {
+    const normalizedUsername = username.trim().toLocaleLowerCase();
+    const user = [...this.users.values()].find((candidate) =>
+      !candidate.isRoot &&
+      candidate.username?.trim().toLocaleLowerCase() === normalizedUsername
+    );
+    if (user === undefined || user.disabled) {
+      return undefined;
+    }
+    const credential = [...this.emailCredentials.values()].find((candidate) =>
+      candidate.userId === user.id && candidate.verified
+    );
+    return credential === undefined
+      ? undefined
+      : { user: copy(user), passwordHash: credential.passwordHash };
+  }
+
   public async getUserPermissionDelta(userId: string): Promise<UserPermissionDelta> {
     const delta = this.permissionDeltas.get(userId);
     return delta === undefined
@@ -577,9 +599,12 @@ export class InMemoryDataStore implements DataStore {
       [...this.users.values()]
         .map((user) => user.username)
         .filter((username): username is string => username !== undefined && username !== null)
+        .map(normalizeUsernameKey)
     );
     const identityOwners = new Set(
-      [...this.userIdentifiers.values()].flatMap((identifiers) => identifiers.map((identifier) => identifier.value))
+      [...this.userIdentifiers.values()].flatMap((identifiers) =>
+        identifiers.map((identifier) => normalizeUsernameKey(identifier.value))
+      )
     );
     const conflicts: Record<string, string[]> = {};
     for (const account of input.accounts) {
@@ -588,7 +613,10 @@ export class InMemoryDataStore implements DataStore {
       }
       if (
         account.username !== null &&
-        (usernameOwners.has(account.username) || identityOwners.has(account.username))
+        (
+          usernameOwners.has(normalizeUsernameKey(account.username)) ||
+          identityOwners.has(normalizeUsernameKey(account.username))
+        )
       ) {
         conflicts[`lines.${account.line}`] = ["邮箱或用户名已被其他账号使用。"];
       }
@@ -761,6 +789,17 @@ export class InMemoryDataStore implements DataStore {
       }
     }
     if (input.strictReconciliation === true) {
+      const inputUsername = input.username;
+      if (
+        inputUsername !== undefined &&
+        [...this.users.values()].some((candidate) =>
+          candidate.username !== undefined &&
+          candidate.username !== null &&
+          normalizeUsernameKey(candidate.username) === normalizeUsernameKey(inputUsername)
+        )
+      ) {
+        throw new ExternalIdentityCollisionError();
+      }
       for (const identifiers of this.userIdentifiers.values()) {
         if (
           input.studentIds?.some((candidate) =>

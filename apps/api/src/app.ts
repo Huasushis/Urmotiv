@@ -13,6 +13,7 @@ import {
   updateAdminGeneralSettingsInputSchema,
   loginInputSchema,
   rootLoginInputSchema,
+  usernameLoginInputSchema,
   emailRegistrationInputSchema,
   casStartQuerySchema,
   casCallbackQuerySchema,
@@ -714,6 +715,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     const writesSessionCookie =
       routeUrl === "/api/v1/auth/demo-login" ||
       routeUrl === "/api/v1/auth/root-login" ||
+      routeUrl === "/api/v1/auth/username-login" ||
       routeUrl === "/api/v1/auth/email-login" ||
       routeUrl === "/api/v1/auth/email-verification/verify" ||
       routeUrl === "/api/v1/auth/email-verification/resend" ||
@@ -1591,6 +1593,32 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     limiter?.recordSuccess(sourceAddress);
     const session = await beginSession(credential.user, reply);
     return authSummary(credential.user, session);
+  });
+
+  app.post("/api/v1/auth/username-login", async (request, reply) => {
+    if (!dependencies.emailLoginEnabled) {
+      throw notFound();
+    }
+    const input = usernameLoginInputSchema.strict().parse(request.body);
+    const limiter = dependencies.loginRateLimiter;
+    const sourceAddress = resolveClientAddress(request, dependencies.trustedProxyCidrs);
+    if (limiter !== undefined && limiter.isBlocked(sourceAddress)) {
+      throw new ApiError(429, "LOGIN_RATE_LIMITED", "登录尝试过于频繁，请稍后再试。");
+    }
+    const credential = await dependencies.store.findUsernameCredential(input.username);
+    const verified = await verifyEmailLoginPassword(credential?.passwordHash, input.password);
+    if (
+      credential === undefined ||
+      credential.user.isRoot ||
+      !verified ||
+      !hasPermission(credential.user, "auth.login", {}, dependencies.now())
+    ) {
+      limiter?.recordFailure(sourceAddress);
+      throw unauthorized();
+    }
+    limiter?.recordSuccess(sourceAddress);
+    await beginSession(credential.user, reply);
+    return authSummary(credential.user);
   });
 
   app.post("/api/v1/auth/email-login", async (request, reply) => {

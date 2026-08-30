@@ -226,11 +226,28 @@ export interface CoreSeedResult {
 
 export async function seedCoreDatabase(handle: DatabaseHandle): Promise<CoreSeedResult> {
   await handle.transaction(async (transaction) => {
-    await transaction.execute(sql`
-      INSERT INTO users (id, nickname, account_type, password_hash)
-      VALUES (0, 'root', 'human', NULL)
-      ON CONFLICT (id) DO NOTHING
+    const usernameColumns = await transaction.query<{ present: boolean }>(sql`
+      SELECT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'users'
+          AND column_name = 'username'
+      ) AS present
     `);
+    if (usernameColumns[0]?.present === true) {
+      await transaction.execute(sql`
+        INSERT INTO users (id, nickname, username, account_type, password_hash)
+        VALUES (0, 'root', 'root', 'human', NULL)
+        ON CONFLICT (id) DO NOTHING
+      `);
+    } else {
+      await transaction.execute(sql`
+        INSERT INTO users (id, nickname, account_type, password_hash)
+        VALUES (0, 'root', 'human', NULL)
+        ON CONFLICT (id) DO NOTHING
+      `);
+    }
 
     for (const permission of corePermissions) {
       const copy = permissionText[permission];
@@ -316,6 +333,7 @@ export async function hasExactDefaultCoreSeed(
   const rootRows = await executor.query<{
     id: string;
     nickname: string;
+    username: string | null;
     account_type: string;
     password_hash: string | null;
     auth_revision: number;
@@ -326,6 +344,7 @@ export async function hasExactDefaultCoreSeed(
     SELECT
       id::text AS id,
       nickname,
+      username,
       account_type::text AS account_type,
       password_hash,
       auth_revision::integer AS auth_revision,
@@ -338,6 +357,7 @@ export async function hasExactDefaultCoreSeed(
   if (!sameRows(rootRows, [{
     id: "0",
     nickname: "root",
+    username: "root",
     account_type: "human",
     password_hash: null,
     auth_revision: 1,

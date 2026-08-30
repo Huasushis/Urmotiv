@@ -6,12 +6,13 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const api = vi.hoisted(() => ({
-  demoLogin: vi.fn()
+  demoLogin: vi.fn(),
+  accountLogin: vi.fn()
 }));
 
 vi.mock("../lib/api", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/api")>();
-  return { ...original, demoLogin: api.demoLogin };
+  return { ...original, demoLogin: api.demoLogin, accountLogin: api.accountLogin };
 });
 
 import { DemoLoginPage } from "./demo-login-page";
@@ -79,6 +80,26 @@ afterEach(() => {
 });
 
 describe("切换登录账号", () => {
+  it("邮箱登录关闭时仍显示可供 root 使用的用户名登录表单", () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => {
+      root?.render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter>
+            <DemoLoginPage existingSession={{ ...previousSession, user: null }} />
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+    });
+    expect(container.textContent).toContain("用户名或邮箱");
+    expect(container.textContent).toContain("root 恢复账号仍可在此登录");
+    expect(container.querySelector('input[autocomplete="username"]')).not.toBeNull();
+    expect(container.querySelector('button[type="submit"]')?.textContent).toBe("登录");
+  });
+
   it("清除上一账号的题目与私密审核缓存后再保存新会话", async () => {
     api.demoLogin.mockResolvedValue(nextSession);
     const client = new QueryClient({

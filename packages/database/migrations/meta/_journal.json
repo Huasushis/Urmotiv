@@ -169,6 +169,13 @@
       "when": 1787875200000,
       "tag": "0023_role_defaults",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1787961600000,
+      "tag": "0024_unique_usernames",
+      "breakpoints": true
     }
   ]
 }

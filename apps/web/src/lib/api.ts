@@ -246,6 +246,32 @@ export function emailLogin(input: { email: string; password: string }): Promise<
   return request("/auth/email-login", json(input), sessionResponseSchema);
 }
 
+export function usernameLogin(input: { username: string; password: string }): Promise<SessionResponse> {
+  return request("/auth/username-login", json(input), sessionResponseSchema);
+}
+
+export function rootLogin(input: {
+  identifier: "root" | "0";
+  password: string;
+}): Promise<SessionResponse> {
+  return request("/auth/root-login", json(input), sessionResponseSchema);
+}
+
+export function accountLogin(input: { identifier: string; password: string }): Promise<SessionResponse> {
+  const identifier = input.identifier.trim();
+  const normalizedIdentifier = identifier.toLocaleLowerCase();
+  if (normalizedIdentifier === "root" || normalizedIdentifier === "0") {
+    return rootLogin({
+      identifier: normalizedIdentifier as "root" | "0",
+      password: input.password
+    });
+  }
+  if (identifier.includes("@")) {
+    return emailLogin({ email: identifier, password: input.password });
+  }
+  return usernameLogin({ username: identifier, password: input.password });
+}
+
 export function emailRegister(input: {
   email: string;
   password: string;

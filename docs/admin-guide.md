@@ -38,7 +38,7 @@ bootstrap 完成后，固定 `root` 仍没有本地凭据；紧急维护时只�
 docker compose --env-file /secure/path/urmotiv.env exec api pnpm --filter @urmotiv/api recover-root-credentials
 ```
 
-命令在访问数据库、生成凭据或写入秘密前检查输入和输出都是真实 TTY；禁止使用 `docker compose run`、管道或重定向。操作员需两次隐藏输入“确认”，固定结果只写标准输出，凭据值只写入服务器 `/dev/tty`，不进入 API、日志或审计记录。恢复后的 root 只能从专用本地入口登录，不走邮箱、CAS 或 OAuth。
+命令在访问数据库、生成凭据或写入秘密前检查输入和输出都是真实 TTY；禁止使用 `docker compose run`、管道或重定向。操作员需两次隐藏输入“确认”，固定结果只写标准输出，凭据值只写入服务器 `/dev/tty`，不进入 API、日志或审计记录。恢复后打开网页 `/login`，在“用户名或邮箱”中输入 `root` 和刚生成的口令；网页会调用 root 专用本地入口，不走邮箱、CAS 或 OAuth。
 
 ### 执行前的路径金丝雀
 

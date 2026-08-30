@@ -49,6 +49,13 @@ export const rootLoginInputSchema = z.object({
   identifier: z.enum(["root", "0"]),
   password: z.string().min(8).max(1_024)
 }).strict();
+export const usernameLoginInputSchema = z.object({
+  username: z.string().trim().min(1).max(255).refine(
+    (value) => !/\s/u.test(value),
+    "用户名不能包含空白字符。"
+  ),
+  password: z.string().min(1).max(1_024)
+}).strict();
 export const loginInputSchema = z.object({
   email: z.string().trim().email().max(320),
   password: z.string().min(1).max(1_024)

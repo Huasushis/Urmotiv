@@ -95,9 +95,17 @@ describe("database migration and initial data", () => {
     const root = await handle.client.query<{
       id: string;
       nickname: string;
+      username: string;
       account_type: string;
-    }>("SELECT id::text AS id, nickname, account_type FROM users WHERE id = 0");
-    expect(root.rows).toEqual([{ id: "0", nickname: "root", account_type: "human" }]);
+    }>("SELECT id::text AS id, nickname, username, account_type FROM users WHERE id = 0");
+    expect(root.rows).toEqual([{ id: "0", nickname: "root", username: "root", account_type: "human" }]);
+
+    await handle.client.query(
+      "INSERT INTO users (nickname, username, account_type) VALUES ('username-owner', 'PB-SYNTH-UNIQUE', 'human')"
+    );
+    await expect(handle.client.query(
+      "INSERT INTO users (nickname, username, account_type) VALUES ('username-conflict', 'pb-synth-unique', 'human')"
+    )).rejects.toMatchObject({ code: "23505" });
 
     const permissions = await handle.client.query<{ count: number }>(
       "SELECT count(*)::integer AS count FROM permission_definitions WHERE source = 'core'"
@@ -113,6 +121,28 @@ describe("database migration and initial data", () => {
     expect(rootMemberships.rows[0]?.count).toBe(1);
   });
 
+  it("upgrades an existing root account and enforces normalized username uniqueness", async () => {
+    const handle = createEmptyDatabase();
+    await migrateDatabase(handle, { migrationsFolder: migrationFolderThrough(23) });
+    await handle.client.query(`
+      INSERT INTO users (id, nickname, username, account_type)
+      VALUES (0, 'root', NULL, 'human')
+    `);
+
+    await migrateDatabase(handle);
+
+    const root = await handle.client.query<{ username: string }>(
+      "SELECT username FROM users WHERE id = 0"
+    );
+    expect(root.rows).toEqual([{ username: "root" }]);
+    await handle.client.query(
+      "INSERT INTO users (nickname, username, account_type) VALUES ('username-owner', 'PB-SYNTH-UPGRADE', 'human')"
+    );
+    await expect(handle.client.query(
+      "INSERT INTO users (nickname, username, account_type) VALUES ('username-conflict', 'pb-synth-upgrade', 'human')"
+    )).rejects.toMatchObject({ code: "23505" });
+  });
+
   it("never injects a login credential into the seed-only root account", async () => {
     const handle = await createMigratedDatabase();
     await seedCoreDatabase(handle);
@@ -120,15 +150,17 @@ describe("database migration and initial data", () => {
 
     const root = await handle.client.query<{
       nickname: string;
+      username: string;
       password_hash: string | null;
       password_changed_at: string | null;
     }>(`
-      SELECT nickname, password_hash, password_changed_at
+      SELECT nickname, username, password_hash, password_changed_at
       FROM users
       WHERE id = 0
     `);
     expect(root.rows).toEqual([{
       nickname: "root",
+      username: "root",
       password_hash: null,
       password_changed_at: null
     }]);

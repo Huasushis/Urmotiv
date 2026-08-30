@@ -65,6 +65,10 @@ function validateUsername(value: string, line: number, fieldErrors: BatchAccount
   return username;
 }
 
+export function normalizeUsernameKey(username: string): string {
+  return username.trim().toLocaleLowerCase();
+}
+
 export function parseBatchAccountText(text: string): ParsedBatchAccount[] {
   const fieldErrors: BatchAccountFieldErrors = {};
   const rows: ParsedBatchAccount[] = [];
@@ -131,10 +135,11 @@ export function parseBatchAccountText(text: string): ParsedBatchAccount[] {
     }
     seenEmails.add(row.normalizedEmail);
     if (row.username !== null) {
-      if (seenUsernames.has(row.username)) {
+      const usernameKey = normalizeUsernameKey(row.username);
+      if (seenUsernames.has(usernameKey)) {
         addFieldError(fieldErrors, `lines.${row.line}`, "本批次中用户名重复。");
       }
-      seenUsernames.add(row.username);
+      seenUsernames.add(usernameKey);
     }
   }
 

@@ -186,6 +186,10 @@ export const users = pgTable(
       sql`${table.username} IS NULL OR length(btrim(${table.username})) > 0`
     ),
     check(
+      "users_root_username_ck",
+      sql`${table.id} <> 0 OR ${table.username} = 'root'`
+    ),
+    check(
       "users_real_name_not_blank_ck",
       sql`${table.realName} IS NULL OR length(btrim(${table.realName})) > 0`
     ),
@@ -210,6 +214,9 @@ export const users = pgTable(
     ),
     index("users_account_type_idx").on(table.accountType),
     index("users_active_idx").on(table.disabledAt),
+    uniqueIndex("users_username_normalized_uq")
+      .on(sql`lower(btrim(${table.username}))`)
+      .where(sql`${table.username} IS NOT NULL`),
     index("users_qq_idx").on(table.qq).where(sql`${table.qq} IS NOT NULL`)
   ]
 );

@@ -30,13 +30,13 @@ const formalPublicTableNames = Object.values(databaseSchema)
   .sort(compareText);
 
 const expectedSequenceStates = [
-  { schema: "drizzle", name: "__drizzle_migrations_id_seq", last_value: "24", is_called: true },
+  { schema: "drizzle", name: "__drizzle_migrations_id_seq", last_value: "25", is_called: true },
   { schema: "public", name: "audit_events_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "contests_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "problems_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "users_id_seq", last_value: "1", is_called: false }
 ] as const;
-const expectedMigrationCount = 24;
+const expectedMigrationCount = 25;
 
 export type AdminBootstrapStatus = "blocked" | "open" | "completed";
 

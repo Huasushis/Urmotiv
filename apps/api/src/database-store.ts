@@ -20,7 +20,7 @@ import type {
 } from "./domain";
 import type { ProblemPermissionFilter, ProblemVisibility } from "./permissions";
 import { DatabaseBatchAccountAuditWriter, type BatchAccountAuditWriter } from "./account-audit";
-import { BatchAccountConflictError } from "./batch-account";
+import { BatchAccountConflictError, normalizeUsernameKey } from "./batch-account";
 import {
   ExternalIdentityCollisionError,
   type BatchAccountCreationInput,
@@ -1559,6 +1559,24 @@ export class DatabaseDataStore implements DataStore {
     return user === undefined || !user.isRoot ? undefined : { user, passwordHash };
   }
 
+  public async findUsernameCredential(username: string): Promise<EmailCredential | undefined> {
+    const rows = await this.handle.query<{ user_id: string; password_hash: string | null }>(sql`
+      SELECT user_record.id::text AS user_id, user_record.password_hash
+      FROM users user_record
+      WHERE user_record.id <> 0
+        AND lower(btrim(user_record.username)) = lower(btrim(${username}))
+        AND user_record.account_type = 'human'
+        AND user_record.disabled_at IS NULL
+      LIMIT 1
+    `);
+    const row = rows[0];
+    if (row === undefined || row.password_hash === null) {
+      return undefined;
+    }
+    const user = await this.getUser(row.user_id);
+    return user === undefined ? undefined : { user, passwordHash: row.password_hash };
+  }
+
   public async getUserPermissionDelta(userId: string): Promise<UserPermissionDelta> {
     return readPermissionDelta(this.handle, userId);
   }
@@ -1725,7 +1743,8 @@ export class DatabaseDataStore implements DataStore {
     const actorId = requireDatabaseId(input.actorUserId, "创建者编号");
     const usernames = input.accounts
       .map((account) => account.username)
-      .filter((username): username is string => username !== null);
+      .filter((username): username is string => username !== null)
+      .map(normalizeUsernameKey);
     const writer = auditWriter ?? new DatabaseBatchAccountAuditWriter(this.handle);
 
     try {
@@ -1740,18 +1759,18 @@ export class DatabaseDataStore implements DataStore {
           usernames.length === 0
             ? []
             : await transaction.query<{ username: string }>(sql`
-                SELECT username
+                SELECT lower(btrim(username)) AS username
                 FROM users
-                WHERE username IN (${sqlList(usernames)})
+                WHERE lower(btrim(username)) IN (${sqlList(usernames)})
                 FOR UPDATE
               `);
         const identityRows =
           usernames.length === 0
             ? []
             : await transaction.query<{ value: string }>(sql`
-                SELECT value
+                SELECT lower(btrim(value)) AS value
                 FROM user_identifiers
-                WHERE value IN (${sqlList(usernames)})
+                WHERE lower(btrim(value)) IN (${sqlList(usernames)})
                 FOR UPDATE
               `);
         const existingEmails = new Set(emailRows.map((row) => row.normalized_address));
@@ -1763,7 +1782,10 @@ export class DatabaseDataStore implements DataStore {
         for (const account of input.accounts) {
           if (
             existingEmails.has(account.normalizedEmail) ||
-            (account.username !== null && existingUsernames.has(account.username))
+            (
+              account.username !== null &&
+              existingUsernames.has(normalizeUsernameKey(account.username))
+            )
           ) {
             conflicts[`lines.${account.line}`] = ["邮箱或用户名已被其他账号使用。"];
           }
@@ -2051,6 +2073,11 @@ export class DatabaseDataStore implements DataStore {
         throw new Error("统一身份认证账号创建后无法读取。");
       }
       return user;
+    }).catch((error: unknown) => {
+      if (input.strictReconciliation === true && isUniqueViolation(error)) {
+        throw new ExternalIdentityCollisionError();
+      }
+      throw error;
     });
   }
 

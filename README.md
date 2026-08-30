@@ -63,7 +63,7 @@ pnpm dev
 
 ## 首次登录
 
-本地登录和外部登录是两条不同路径：开发环境可以使用已配置的 demo 账号；普通生产账号按部署启用的邮箱验证、CAS 或 USTC OAuth 流程登录。服务器紧急维护时，恢复后的固定 root 账号只走本地 `/api/v1/auth/root-login`，不走邮箱、CAS 或 USTC OAuth，也不作为日常账号。
+本地登录和外部登录是两条不同路径：开发环境可以使用已配置的 demo 账号；普通生产账号可在 `/login` 输入唯一用户名或已验证邮箱，也可按部署配置使用 CAS 或 USTC OAuth。服务器紧急维护时，恢复后的固定 root 账号在同一登录页输入用户名 `root`，网页只调用本地 `/api/v1/auth/root-login`，不走邮箱、CAS 或 USTC OAuth，也不作为日常账号。
 
 root 本地凭据恢复必须在真实服务器 TTY 执行，使用固定命令：
 
@@ -71,7 +71,7 @@ root 本地凭据恢复必须在真实服务器 TTY 执行，使用固定命令�
 docker compose --env-file /secure/path/urmotiv.env exec api pnpm --filter @urmotiv/api recover-root-credentials
 ```
 
-`recover-root-credentials` 会在访问数据库、生成凭据或写入秘密前拒绝非 TTY；禁止使用 `docker compose run`、管道或重定向。命令要求两次隐藏输入“确认”，固定结果只写标准输出；新凭据值只写入服务器 `/dev/tty`，不会进入 API、日志或审计记录。
+`recover-root-credentials` 会在访问数据库、生成凭据或写入秘密前拒绝非 TTY；禁止使用 `docker compose run`、管道或重定向。命令要求两次隐藏输入“确认”，固定结果只写标准输出；新凭据值只写入服务器 `/dev/tty`，不会进入 API、日志或审计记录。记下该随机口令后打开 `/login`，用用户名 `root` 登录。
 
 ## 导入与查找题目
 

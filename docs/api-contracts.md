@@ -48,6 +48,8 @@ Accept: application/json
 | --- | --- | --- |
 | `GET /api/v1/session` | 无 | 返回当前用户与已启用的登录方式 |
 | `POST /api/v1/auth/email-login` | 无 | JSON `{ "email", "password" }`；成功设置 HttpOnly 会话 Cookie |
+| `POST /api/v1/auth/username-login` | 无 | JSON `{ "username", "password" }`；用户名忽略大小写，root 不走此入口 |
+| `POST /api/v1/auth/root-login` | 无 | 仅接受固定标识 `root`/`0` 与服务器 TTY 恢复生成的口令；成功设置 HttpOnly 会话 Cookie |
 | `POST /api/v1/auth/email-register` | 无 | 仅在邮箱注册显式开启且配置投递时可用；返回验证等待状态 |
 | `POST /api/v1/auth/email-verification/resend` | 无 | 重新发送验证邮件 |
 | `POST /api/v1/auth/email-verification/verify` | 无 | JSON `{ "token" }`，消费一次性验证令牌 |

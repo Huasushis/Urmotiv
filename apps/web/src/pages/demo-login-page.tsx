@@ -6,8 +6,8 @@ import type { SessionResponse } from "@urmotiv/contracts";
 import {
   casStartUrl,
   ustcOAuthStartUrl,
+  accountLogin,
   demoLogin,
-  emailLogin,
   emailRegister,
   resendEmailVerification
 } from "../lib/api";
@@ -26,7 +26,7 @@ const demoAccounts = [
 export function DemoLoginPage({ existingSession }: { existingSession: SessionResponse | undefined }) {
   const client = useQueryClient();
   const navigate = useNavigate();
-  const [email, setEmail] = useState("");
+  const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [nickname, setNickname] = useState("");
   const [registering, setRegistering] = useState(false);
@@ -39,16 +39,16 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
     navigate("/problems");
   };
   const login = useMutation({ mutationFn: demoLogin, onSuccess: complete });
-  const emailLoginAction = useMutation({
-    mutationFn: () => emailLogin({ email, password }),
+  const accountLoginAction = useMutation({
+    mutationFn: () => accountLogin({ identifier, password }),
     onSuccess: complete
   });
   const emailRegistrationAction = useMutation({
-    mutationFn: () => emailRegister({ email, password, nickname }),
+    mutationFn: () => emailRegister({ email: identifier, password, nickname }),
     onSuccess: () => setVerificationPending(true)
   });
   const resendAction = useMutation({
-    mutationFn: () => resendEmailVerification(email),
+    mutationFn: () => resendEmailVerification(identifier),
     onSuccess: () => setVerificationPending(true)
   });
 
@@ -65,24 +65,22 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
           <div><p className="eyebrow">账号登录</p><h2 id="login-title">进入 Urmotiv</h2></div>
           <ShieldCheck size={22} aria-hidden="true" />
         </div>
-        {auth?.emailEnabled !== false ? (
-          <form className="login-form" onSubmit={(event) => {
+        <form className="login-form" onSubmit={(event) => {
             event.preventDefault();
             if (registering) {
               emailRegistrationAction.mutate();
               return;
             }
-            emailLoginAction.mutate();
+            accountLoginAction.mutate();
           }}>
             {registering ? <label>昵称<input value={nickname} onChange={(event) => setNickname(event.target.value)} required maxLength={120} /></label> : null}
-            <label>邮箱<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
+            <label>{registering ? "邮箱" : "用户名或邮箱"}<input type={registering ? "email" : "text"} autoComplete={registering ? "email" : "username"} value={identifier} onChange={(event) => setIdentifier(event.target.value)} required /></label>
             <label>密码<input type="password" autoComplete={registering ? "new-password" : "current-password"} value={password} onChange={(event) => setPassword(event.target.value)} required minLength={registering ? 12 : 8} /></label>
-            <button type="submit" className="primary-button" disabled={emailLoginAction.isPending || emailRegistrationAction.isPending}>{registering ? "发送验证邮件" : "邮箱登录"}</button>
+            <button type="submit" className="primary-button" disabled={accountLoginAction.isPending || emailRegistrationAction.isPending}>{registering ? "发送验证邮件" : "登录"}</button>
             {auth?.emailRegistrationEnabled ? (
               <button type="button" className="text-button" onClick={() => setRegistering((value) => !value)}>{registering ? "已有账号，去登录" : "注册新账号"}</button>
             ) : null}
           </form>
-        ) : null}
         {verificationPending ? (
           <div className="notice-line" role="status">
             验证邮件已安排发送。请打开邮件中的链接完成验证，再使用邮箱和密码登录。
@@ -94,7 +92,8 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
         {auth?.ustcOAuthEnabled ? <button type="button" className="cas-button" onClick={() => { window.location.assign(ustcOAuthStartUrl("/problems")); }}>使用 USTC OAuth2 统一身份认证登录</button> : null}
         {auth?.casEnabled ? <button type="button" className="cas-button" onClick={() => { window.location.assign(casStartUrl("/problems")); }}>使用统一身份认证登录</button> : null}
         {auth?.demoEnabled ? <div className="demo-login-section"><p className="eyebrow">开发演示</p><div className="demo-account-list">{demoAccounts.map((account) => <button type="button" className="demo-account" key={account.id} disabled={login.isPending} onClick={() => login.mutate(account.id)}><span><strong>{account.title}</strong><small>{account.description}</small></span><LogIn size={17} aria-hidden="true" /></button>)}</div></div> : null}
-        {emailLoginAction.error ? <p className="form-error">{emailLoginAction.error.message}</p> : null}
+        {auth?.emailEnabled === false ? <p className="notice-line">普通账号密码登录已关闭；root 恢复账号仍可在此登录。</p> : null}
+        {accountLoginAction.error ? <p className="form-error">{accountLoginAction.error.message}</p> : null}
         {emailRegistrationAction.error ? <p className="form-error">{emailRegistrationAction.error.message}</p> : null}
         {resendAction.error ? <p className="form-error">{resendAction.error.message}</p> : null}
         {login.error ? <p className="form-error">{login.error.message}</p> : null}
