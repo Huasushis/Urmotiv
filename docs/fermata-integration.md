@@ -10,9 +10,21 @@ HTTP 接口调用 Fermata 的管理端口，不直接执行模型推理。
 - 你在 Urmotiv 中同时拥有 `plugin.manage` 和 `system.manage` 权限。
 - Fermata 管理员已生成管理令牌并安全交付给你。
 
+## 审核如何触发
+
+Fermata 不是在 Urmotiv 的“提交审核”请求里同步运行。它使用一个单独的机器人账号，按公开设置中的轮询间隔主动领取处于 `pending_review`（待审核）的任务；“立即检查”只会跳过当前等待，马上再轮询一次。领取后任务带有租约，Fermata 在处理期间续租，完成后把结构化审核意见提交回当前审核轮次。
+
+机器人意见是否会直接参与自动通过/不通过，由 Urmotiv 的“审核规则”决定。默认设置“计算机器人意见”为关闭，因此 Fermata 意见默认只作为可见参考，不会单独改变题目状态；人工审题意见仍按人数规则汇总，拥有 `problem.status.change` 的人工管理员也可以填写理由后直接执行人工终审。
+
 ## 配置步骤
 
-### 1. 配置并启用 Fermata 控制插件
+### 1. 建立 Fermata 的机器人身份
+
+在 Urmotiv 的“管理 → 服务账号”创建一个机器人账号，并为它生成仅包含所需权限的令牌。典型审题令牌需要 `auth.login`、`problem.view.all`、`problem.review` 和 `problem.testdata.read`。令牌只显示一次，应写入 Fermata 私有环境中的 `URMOTIV_ROBOT_TOKEN`；`URMOTIV_BASE_URL` 必须是从 Fermata 运行环境实际能够访问到的 Urmotiv 地址。Fermata 位于独立容器时，`127.0.0.1` 指向 Fermata 容器自身，不能用它代指宿主机上的 Urmotiv。
+
+Urmotiv 不会自动把令牌写进另一个服务的环境，也不会在以后重新显示令牌。机器人令牌与下文的 Fermata 管理令牌是两个不同方向、不同用途的凭据。
+
+### 2. 配置并启用 Fermata 控制插件
 
 在 Urmotiv 管理后台的插件管理页面找到 `org.ustc.urmotiv.fermata-control`，先提交设置，再单独启用插件：
 
@@ -22,7 +34,9 @@ HTTP 接口调用 Fermata 的管理端口，不直接执行模型推理。
 
 提交设置时带当前 `settingsRevision`；设置冲突返回 `409`。配置保存不会自动改变插件状态：确认服务可达后，在同一插件卡片执行启用；修改设置和令牌不需要重启，每次调用都会重新读取最新值。
 
-### 2. 验证连通性
+控制插件只负责 Urmotiv 调用 Fermata 的健康、公开设置和立即检查接口；它不会代替上一步的机器人身份，也不会仅凭“启用插件”就开始模型审核。
+
+### 3. 验证连通性
 
 调用健康检查接口确认 Urmotiv 能到达 Fermata：
 

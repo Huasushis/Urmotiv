@@ -28,6 +28,7 @@ import {
   ApiError,
   applyReviewSuggestions,
   createReview,
+  finalizeReview,
   getProblem,
   getReviewSuggestions,
   listProblemAccess,
@@ -1048,6 +1049,7 @@ export function ReviewTab({
   const [improvements, setImprovements] = useState("");
   const [publicComment, setPublicComment] = useState("");
   const [privateNote, setPrivateNote] = useState("");
+  const [manualDecisionReason, setManualDecisionReason] = useState("");
   const [selectedSuggestionFields, setSelectedSuggestionFields] = useState<ReviewSuggestionField[]>([]);
   const [suggestionConfirmationOpen, setSuggestionConfirmationOpen] = useState(false);
   const [suggestionNotice, setSuggestionNotice] = useState<string | null>(null);
@@ -1115,6 +1117,28 @@ export function ReviewTab({
       }
       client.invalidateQueries({ queryKey: ["problem", problem.id] });
       client.invalidateQueries({ queryKey: ["problems"] });
+    }
+  });
+
+  const manualDecision = useMutation({
+    mutationFn: (decision: "approve" | "reject") =>
+      finalizeReview(problem.id, {
+        decision,
+        reason: manualDecisionReason.trim(),
+        expectedRound: problem.reviewRound,
+        expectedRevision: problem.revision
+      }),
+    onSuccess: (nextSummary) => {
+      client.setQueryData(
+        ["reviews", problem.id, problem.reviewRound, currentUserId],
+        nextSummary
+      );
+      setManualDecisionReason("");
+      if (nextSummary.status === "approved" || nextSummary.status === "rejected") {
+        onStatusChange?.(nextSummary.status);
+      }
+      void client.invalidateQueries({ queryKey: ["problem", problem.id] });
+      void client.invalidateQueries({ queryKey: ["problems"] });
     }
   });
 
@@ -1245,6 +1269,53 @@ export function ReviewTab({
         <div className="inline-error">当前审核规则暂时不可用，新的审核意见不会被保存，请联系组长检查设置。</div>
       ) : summary?.decisionReason ? (
         <p className="review-decision-reason">{summary.decisionReason}</p>
+      ) : null}
+
+      {problem.status === "pending_review" && problem.capabilities.canChangeStatus ? (
+        <section className="manual-review-decision plain-panel" aria-labelledby="manual-review-decision-title">
+          <div>
+            <p className="eyebrow">管理员操作</p>
+            <h2 id="manual-review-decision-title">人工终审</h2>
+            <p>直接确认本轮通过或不通过，不受自动审核人数规则限制；操作理由会进入本轮审核记录。</p>
+          </div>
+          <label className="field">
+            <span>人工终审理由</span>
+            <textarea
+              rows={3}
+              maxLength={2_000}
+              value={manualDecisionReason}
+              onChange={(event) => {
+                setManualDecisionReason(event.currentTarget.value);
+                manualDecision.reset();
+              }}
+              placeholder="说明人工确认的依据"
+            />
+          </label>
+          <div className="manual-review-decision-actions">
+            <button
+              type="button"
+              className="primary-button"
+              disabled={manualDecisionReason.trim().length === 0 || manualDecision.isPending || submissionBlocked}
+              onClick={() => {
+                if (window.confirm("确认将这道题人工终审为通过？")) manualDecision.mutate("approve");
+              }}
+            >
+              人工确认通过
+            </button>
+            <button
+              type="button"
+              className="danger-button"
+              disabled={manualDecisionReason.trim().length === 0 || manualDecision.isPending || submissionBlocked}
+              onClick={() => {
+                if (window.confirm("确认将这道题人工终审为不通过？")) manualDecision.mutate("reject");
+              }}
+            >
+              人工确认不通过
+            </button>
+          </div>
+          {submissionBlocked ? <p className="field-help">请先保存题目工作区中的修改，再执行人工终审。</p> : null}
+          {manualDecision.isError ? <p className="inline-error" role="alert">{manualDecision.error.message}</p> : null}
+        </section>
       ) : null}
 
       <section className="external-analysis-section">

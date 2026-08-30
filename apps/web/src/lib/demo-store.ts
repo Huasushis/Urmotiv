@@ -1,6 +1,7 @@
 import type {
   ApplyReviewSuggestionsInput,
   CreateProblemInput,
+  ManualReviewDecisionInput,
   Problem,
   ProblemAccessListResponse,
   ProblemAccessRecord,
@@ -757,6 +758,39 @@ export async function createDemoReview(id: string, input: ReviewInput): Promise<
     };
     saveProblems(all);
   }
+  return summary;
+}
+
+export async function finalizeDemoReview(
+  id: string,
+  input: ManualReviewDecisionInput
+): Promise<ReviewRoundSummary> {
+  const { problem, index, all } = findProblem(id);
+  if (!decorate(problem).capabilities.canChangeStatus) {
+    throw new ApiError("当前账号不能最终确认这道题的状态。", 403);
+  }
+  if (problem.status !== "pending_review") {
+    throw new ApiError("只有待审核的题目可以进行人工终审。", 409);
+  }
+  if (input.expectedRound !== problem.reviewRound || input.expectedRevision !== problem.revision) {
+    throw new ApiError("题目或审核轮次已经变化，请刷新后重试。", 409);
+  }
+  const current = await listDemoReviews(id);
+  const status = input.decision === "approve" ? "approved" : "rejected";
+  const summary: ReviewRoundSummary = {
+    ...current,
+    status,
+    decisionReason: input.reason,
+    decisionSource: "manual"
+  };
+  reviewsByProblem[id] = summary;
+  all[index] = {
+    ...problem,
+    status,
+    revision: problem.revision + 1,
+    updatedAt: now()
+  };
+  saveProblems(all);
   return summary;
 }
 

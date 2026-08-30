@@ -467,6 +467,54 @@ test("评价公开字段、本人修改和状态联动在桌面与手机上保�
   await page.screenshot({ path: testInfo.outputPath("review-workflow.png"), fullPage: true });
 });
 
+test("系统管理员可以在桌面和手机上人工终审待审核题目", async ({ page }, testInfo) => {
+  await loginAsAuthor(page);
+  const problem = await postJson(page, "/api/v1/problems", {
+    title: `人工终审联调题-${testInfo.project.name}-${Date.now()}`,
+    type: "traditional",
+    tagIds: ["algorithm.implementation"],
+    content: {
+      basicStatement: "给定一个整数，输出它本身。",
+      basicSolution: "直接输出输入值。",
+      background: "",
+      statement: "",
+      inputFormat: "",
+      outputFormat: "",
+      constraints: "",
+      solution: "",
+      hints: ""
+    },
+    samples: []
+  });
+  const problemId = problem.id as string;
+  await postJson(page, `/api/v1/problems/${problemId}/submit`, {
+    expectedRevision: problem.revision
+  });
+
+  await loginAs(page, /系统管理员/);
+  await page.goto(`/problems/${problemId}?tab=reviews`);
+  await expect(page.getByRole("heading", { name: "人工终审", exact: true })).toBeVisible();
+  const approve = page.getByRole("button", { name: "人工确认通过" });
+  await expect(approve).toBeDisabled();
+  await page.getByLabel("人工终审理由").fill("系统管理员已经核对题面、题解与测试资料。");
+  await expect(approve).toBeEnabled();
+  await page.screenshot({ path: testInfo.outputPath("manual-review-decision-form.png"), fullPage: true });
+  page.once("dialog", (dialog) => dialog.accept());
+  await approve.click();
+
+  await expect(page.locator(".review-summary").getByText("审核通过")).toBeVisible();
+  await expect(page.getByText("系统管理员已经核对题面、题解与测试资料。")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "人工终审", exact: true })).toHaveCount(0);
+  const stored = await page.request.get(`/api/v1/problems/${problemId}`).then((response) => response.json()) as {
+    status: string;
+  };
+  expect(stored.status).toBe("approved");
+  expect(await page.evaluate(
+    () => document.documentElement.scrollWidth <= document.documentElement.clientWidth
+  )).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("manual-review-decision.png"), fullPage: true });
+});
+
 test("审核建议在真实 API 中只读展示、明确写回并诚实处理并发冲突", async ({ page }, testInfo) => {
   test.slow();
   await loginAsAuthor(page);

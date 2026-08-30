@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const api = vi.hoisted(() => ({
   applyReviewSuggestions: vi.fn(),
   createReview: vi.fn(),
+  finalizeReview: vi.fn(),
   getProblem: vi.fn(),
   getReviewSuggestions: vi.fn(),
   listProblemAccess: vi.fn(),
@@ -272,6 +273,54 @@ afterEach(() => {
 });
 
 describe("题目审核标签页", () => {
+  it("有状态权限的管理员可以填写理由并人工终审", async () => {
+    const statusChanged = vi.fn();
+    const administratorProblem: Problem = {
+      ...problem(false),
+      capabilities: {
+        ...problem(false).capabilities,
+        canChangeStatus: true
+      }
+    };
+    api.listReviews.mockResolvedValue(reviewSummary());
+    api.listReviewItems.mockResolvedValue({ round: 1, items: [] });
+    api.listTags.mockResolvedValue({ items: [] });
+    api.finalizeReview.mockResolvedValue(reviewSummary({
+      status: "approved",
+      decisionReason: "管理员已经核对题面、题解与测试资料。",
+      decisionSource: "manual"
+    }));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    const view = mount(
+      <ReviewTab
+        problem={administratorProblem}
+        currentUserId="administrator"
+        onStatusChange={statusChanged}
+      />
+    );
+
+    await waitFor(() => expect(view.textContent).toContain("人工终审"));
+    const reason = fieldControl(view, "人工终审理由");
+    const approve = [...view.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "人工确认通过"
+    );
+    expect(approve?.disabled).toBe(true);
+    await changeValue(reason, "管理员已经核对题面、题解与测试资料。");
+    expect(approve?.disabled).toBe(false);
+    await act(async () => approve?.click());
+
+    await waitFor(() => expect(api.finalizeReview).toHaveBeenCalledTimes(1));
+    expect(api.finalizeReview).toHaveBeenCalledWith("problem-1", {
+      decision: "approve",
+      reason: "管理员已经核对题面、题解与测试资料。",
+      expectedRound: 1,
+      expectedRevision: 2
+    });
+    await waitFor(() => expect(statusChanged).toHaveBeenCalledWith("approved"));
+    confirm.mockRestore();
+  });
+
   it("回填并只保存当前用户自己的评价，保留知识点修正", async () => {
     const initial = reviewSummary();
     const statusChanged = vi.fn();
@@ -352,7 +401,7 @@ describe("题目审核标签页", () => {
     expect(input).not.toHaveProperty("id");
     expect(input).not.toHaveProperty("reviewerId");
     await waitFor(() => expect(statusChanged).toHaveBeenCalledWith("approved"));
-    expect(view.textContent).toContain("审核通过");
+    await waitFor(() => expect(view.textContent).toContain("审核通过"));
     expect(view.querySelector(".review-form")).toBeNull();
   });
 

@@ -72,6 +72,7 @@ import {
   type UpdateFermataPublicSettingsInput,
   type ImportHistoryQuery,
   type ImportHistoryResponse,
+  type ManualReviewDecisionInput,
   type UstcOAuthSettings,
   type CreateAdminRoleInput,
   type UpdateAdminRoleInput,
@@ -802,6 +803,21 @@ export function createReview(id: string, input: ReviewInput): Promise<ReviewRoun
   return fallback(
     () => request(`/problems/${encodeURIComponent(id)}/reviews`, json(input), reviewRoundSummarySchema),
     async () => (await import("./demo-store")).createDemoReview(id, input)
+  );
+}
+
+export function finalizeReview(
+  id: string,
+  input: ManualReviewDecisionInput
+): Promise<ReviewRoundSummary> {
+  return fallback(
+    () =>
+      request(
+        `/problems/${encodeURIComponent(id)}/review-decision`,
+        json(input),
+        reviewRoundSummarySchema
+      ),
+    async () => (await import("./demo-store")).finalizeDemoReview(id, input)
   );
 }
 

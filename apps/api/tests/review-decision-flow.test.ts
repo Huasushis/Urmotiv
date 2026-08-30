@@ -459,18 +459,18 @@ async function withdraw(
 }
 
 describe("可配置审核决定流程", () => {
-  it("只有人类最终决定者能管理审核策略，明确拒绝优先，并发修改只接受一次", async () => {
+  it("只有人类审核策略管理员能管理审核策略，明确拒绝优先，并发修改只接受一次", async () => {
     const leader = demoUser("leader");
     const explicitlyDenied: StoredUser = {
       ...leader,
-      id: "status-denied",
-      nickname: "明确拒绝最终决定权",
-      grants: [...leader.grants, deny("problem.status.change")]
+      id: "policy-denied",
+      nickname: "明确拒绝审核策略管理权",
+      grants: [...leader.grants, deny("review.policy.manage")]
     };
     const privilegedRobot: StoredUser = {
       ...leader,
       id: "privileged-robot",
-      nickname: "误授最终决定权的机器人",
+      nickname: "误授审核策略管理权的机器人",
       accountType: "robot"
     };
     const { app } = await makeApp({

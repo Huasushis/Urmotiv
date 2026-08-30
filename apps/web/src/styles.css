@@ -1845,6 +1845,48 @@ textarea:read-only {
   font-size: 15px;
 }
 
+.manual-review-decision {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 0.9fr);
+  align-items: end;
+  gap: 14px 20px;
+  margin-bottom: 22px;
+  padding: 16px;
+  border-left: 3px solid var(--teal);
+}
+
+.manual-review-decision h2,
+.manual-review-decision p {
+  margin: 0;
+}
+
+.manual-review-decision > div:first-child {
+  align-self: start;
+}
+
+.manual-review-decision > div:first-child > p:last-child {
+  margin-top: 6px;
+  color: var(--text-soft);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.manual-review-decision > .field {
+  grid-row: span 2;
+}
+
+.manual-review-decision-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.manual-review-decision > .field-help,
+.manual-review-decision > .inline-error {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
 .review-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(360px, 440px);
@@ -5207,6 +5249,23 @@ textarea:read-only {
   .metadata-list,
   .review-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .manual-review-decision {
+    grid-template-columns: 1fr;
+  }
+
+  .manual-review-decision > .field {
+    grid-row: auto;
+  }
+
+  .manual-review-decision-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .manual-review-decision-actions button {
+    width: 100%;
   }
 
   .two-editor-grid,
