@@ -138,6 +138,136 @@ describe("最终集成红测：管理员与题库入口", () => {
     expect(denied.statusCode).toBe(404);
   });
 
+  it("SMTP 设置由管理端持久化、密码不回显并立即驱动注册与登录开关", async () => {
+    const outbox = new InMemoryEmailVerificationOutbox();
+    const settingsStore = new InMemoryAdminSettingsStore({ publicSiteUrl: origin });
+    const app = await createApp({
+      store: new InMemoryDataStore(createDemoUsers(), demoTags),
+      demoAuthEnabled: true,
+      demoUserIds: ["administrator"],
+      adminSettingsStore: settingsStore,
+      emailVerificationDelivery: outbox,
+      allowedOrigins: [origin],
+      allowLoopbackInsecureCookies: true
+    });
+    openApps.push(app);
+    const administratorCookie = await login(app, "administrator");
+    const initial = await app.inject({
+      method: "GET",
+      url: "/api/v1/admin/settings",
+      headers: { cookie: administratorCookie }
+    });
+    expect(initial.statusCode).toBe(200);
+    expect(initial.json().settings).toMatchObject({
+      emailLoginEnabled: true,
+      emailRegistrationEnabled: false,
+      publicRegistrationEnabled: false,
+      smtpConfigured: false,
+      smtpPasswordConfigured: false
+    });
+
+    const incomplete = await app.inject({
+      method: "PUT",
+      url: "/api/v1/admin/settings",
+      headers: { cookie: administratorCookie, origin },
+      payload: {
+        expectedRevision: 1,
+        publicRegistrationEnabled: true,
+        publicSiteUrl: origin,
+        emailLoginEnabled: true
+      }
+    });
+    expect(incomplete.statusCode).toBe(422);
+    expect(incomplete.json().error.code).toBe("PUBLIC_REGISTRATION_UNAVAILABLE");
+
+    const smtpPassword = "smtp-password-for-test";
+    const configured = await app.inject({
+      method: "PUT",
+      url: "/api/v1/admin/settings",
+      headers: { cookie: administratorCookie, origin },
+      payload: {
+        expectedRevision: 1,
+        publicRegistrationEnabled: true,
+        publicSiteUrl: origin,
+        emailLoginEnabled: true,
+        smtpHost: "smtp.example.test",
+        smtpPort: 587,
+        smtpSecure: false,
+        smtpUsername: "mailer",
+        smtpPassword,
+        smtpFromEmail: "noreply@example.test",
+        smtpFromName: "Urmotiv"
+      }
+    });
+    expect(configured.statusCode).toBe(200);
+    expect(configured.json().settings).toMatchObject({
+      emailRegistrationEnabled: true,
+      publicRegistrationEnabled: true,
+      smtpConfigured: true,
+      smtpPasswordConfigured: true
+    });
+    expect(JSON.stringify(configured.json())).not.toContain(smtpPassword);
+    const stored = await settingsStore.getGeneralSettings();
+    expect(stored.smtpPasswordEncrypted).not.toBe(smtpPassword);
+    expect(settingsStore.decryptSecret(stored.smtpPasswordEncrypted!)).toBe(smtpPassword);
+    await expect(app.inject({
+      method: "POST",
+      url: "/api/v1/auth/email-register",
+      headers: { origin },
+      payload: {
+        email: "smtp-registration@example.test",
+        password: "safe-password-123",
+        nickname: "SMTP Registration"
+      }
+    })).resolves.toMatchObject({ statusCode: 202 });
+    expect(outbox.messages).toHaveLength(1);
+    expect(outbox.messages[0]?.verificationUrl).toMatch(/^http:\/\/localhost:5173\/#\/verify-email\?/);
+
+    const disabled = await app.inject({
+      method: "PUT",
+      url: "/api/v1/admin/settings",
+      headers: { cookie: administratorCookie, origin },
+      payload: {
+        expectedRevision: configured.json().settings.revision,
+        publicRegistrationEnabled: false,
+        publicSiteUrl: origin,
+        emailLoginEnabled: false
+      }
+    });
+    expect(disabled.statusCode).toBe(200);
+    const session = await app.inject({ method: "GET", url: "/api/v1/session" });
+    expect(session.json().auth).toMatchObject({
+      emailEnabled: false,
+      emailRegistrationEnabled: false
+    });
+    const loginAttempt = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/username-login",
+      headers: { origin },
+      payload: { username: "administrator", password: "unused-password" }
+    });
+    expect(loginAttempt.statusCode).toBe(404);
+
+    const cleared = await app.inject({
+      method: "PUT",
+      url: "/api/v1/admin/settings",
+      headers: { cookie: administratorCookie, origin },
+      payload: {
+        expectedRevision: disabled.json().settings.revision,
+        publicRegistrationEnabled: false,
+        publicSiteUrl: origin,
+        emailLoginEnabled: false,
+        clearSmtpPassword: true
+      }
+    });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json().settings).toMatchObject({
+      smtpConfigured: false,
+      smtpPasswordConfigured: false
+    });
+    expect((await settingsStore.getGeneralSettings()).smtpPasswordEncrypted).toBeNull();
+  });
+
 
   it("管理员可以读取 USTC OAuth 设置且无权请求按不存在处理", async () => {
     const users = createDemoUsers();

@@ -2941,6 +2941,49 @@ textarea:read-only {
   gap: 14px;
 }
 
+.settings-form-section {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.7fr) minmax(0, 1.3fr);
+  gap: 18px 28px;
+  padding-block: 4px 22px;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-form-section > div:first-child h2,
+.settings-runtime-note h2 {
+  margin: 0 0 6px;
+  font-size: 17px;
+}
+
+.settings-form-section > div:first-child p,
+.settings-runtime-note p {
+  margin: 0;
+  color: var(--text-muted);
+  line-height: 1.55;
+}
+
+.settings-form-section > label,
+.settings-field-grid label {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+}
+
+.settings-form-section > .checkbox-row {
+  display: flex;
+  align-self: start;
+}
+
+.settings-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.settings-runtime-note {
+  padding: 4px 0 8px;
+}
+
 .admin-form > label {
   display: grid;
   gap: 6px;
@@ -4868,6 +4911,15 @@ textarea:read-only {
   .settings-form-fields,
   .admin-secret-list {
     grid-template-columns: 1fr;
+  }
+
+  .settings-form-section,
+  .settings-field-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-form-section {
+    gap: 14px;
   }
 
   .admin-actions {

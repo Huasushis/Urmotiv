@@ -73,9 +73,27 @@ export interface RuntimeUstcOAuthSettings {
 }
 
 export interface StoredGeneralSettings {
+  readonly emailLoginEnabled: boolean;
   readonly publicRegistrationEnabled: boolean;
   readonly publicSiteUrl: string;
+  readonly smtpHost: string;
+  readonly smtpPort: number;
+  readonly smtpSecure: boolean;
+  readonly smtpUsername: string;
+  readonly smtpPasswordEncrypted: string | null;
+  readonly smtpFromEmail: string;
+  readonly smtpFromName: string;
   readonly revision: number;
+}
+
+export interface RuntimeSmtpSettings {
+  readonly host: string;
+  readonly port: number;
+  readonly secure: boolean;
+  readonly username: string;
+  readonly password: string | null;
+  readonly fromEmail: string;
+  readonly fromName: string;
 }
 
 
@@ -127,10 +145,33 @@ const defaultUstcSettings: StoredUstcOAuthSettings = {
   overrideConfigured: false
 };
 const defaultGeneralSettings: StoredGeneralSettings = {
+  emailLoginEnabled: true,
   publicRegistrationEnabled: false,
   publicSiteUrl: "http://localhost:5173",
+  smtpHost: "",
+  smtpPort: 587,
+  smtpSecure: false,
+  smtpUsername: "",
+  smtpPasswordEncrypted: null,
+  smtpFromEmail: "",
+  smtpFromName: "Urmotiv",
   revision: 1
 };
+
+function smtpConfigurationReady(settings: StoredGeneralSettings): boolean {
+  const authReady = settings.smtpUsername.length === 0
+    ? settings.smtpPasswordEncrypted === null
+    : settings.smtpPasswordEncrypted !== null;
+  return settings.smtpHost.length > 0 &&
+    settings.smtpFromEmail.length > 0 &&
+    settings.smtpPort >= 1 &&
+    settings.smtpPort <= 65_535 &&
+    authReady;
+}
+
+function looksLikeEmailAddress(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/u.test(value);
+}
 
 function copy<T>(value: T): T {
   return structuredClone(value);
@@ -278,18 +319,36 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
 
   public async getGeneralSettings(): Promise<StoredGeneralSettings> {
     const rows = await this.database.query<{
+      email_login_enabled: boolean;
       public_registration_enabled: boolean;
       public_site_url: string;
+      smtp_host: string;
+      smtp_port: number;
+      smtp_secure: boolean;
+      smtp_username: string;
+      smtp_password_encrypted: string | null;
+      smtp_from_email: string;
+      smtp_from_name: string;
       revision: number;
     }>(sql`
-      SELECT public_registration_enabled, public_site_url, revision
+      SELECT email_login_enabled, public_registration_enabled, public_site_url,
+             smtp_host, smtp_port, smtp_secure, smtp_username,
+             smtp_password_encrypted, smtp_from_email, smtp_from_name, revision
       FROM system_settings WHERE id = 'global'
     `);
     const row = rows[0];
     if (row === undefined) return copy(defaultGeneralSettings);
     return {
+      emailLoginEnabled: row.email_login_enabled,
       publicRegistrationEnabled: row.public_registration_enabled,
       publicSiteUrl: row.public_site_url || defaultGeneralSettings.publicSiteUrl,
+      smtpHost: row.smtp_host,
+      smtpPort: Number(row.smtp_port),
+      smtpSecure: row.smtp_secure,
+      smtpUsername: row.smtp_username,
+      smtpPasswordEncrypted: row.smtp_password_encrypted,
+      smtpFromEmail: row.smtp_from_email,
+      smtpFromName: row.smtp_from_name,
       revision: Number(row.revision)
     };
   }
@@ -310,13 +369,26 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
       }
       await transaction.execute(sql`
         INSERT INTO system_settings (
-          id, public_registration_enabled, public_site_url, revision, updated_by_user_id
+          id, email_login_enabled, public_registration_enabled, public_site_url,
+          smtp_host, smtp_port, smtp_secure, smtp_username, smtp_password_encrypted,
+          smtp_from_email, smtp_from_name, revision, updated_by_user_id
         ) VALUES (
-          'global', ${settings.publicRegistrationEnabled}, ${settings.publicSiteUrl},
+          'global', ${settings.emailLoginEnabled}, ${settings.publicRegistrationEnabled},
+          ${settings.publicSiteUrl}, ${settings.smtpHost}, ${settings.smtpPort},
+          ${settings.smtpSecure}, ${settings.smtpUsername}, ${settings.smtpPasswordEncrypted},
+          ${settings.smtpFromEmail}, ${settings.smtpFromName},
           ${expectedRevision + 1}, ${actorId}
         ) ON CONFLICT (id) DO UPDATE SET
+          email_login_enabled = EXCLUDED.email_login_enabled,
           public_registration_enabled = EXCLUDED.public_registration_enabled,
           public_site_url = EXCLUDED.public_site_url,
+          smtp_host = EXCLUDED.smtp_host,
+          smtp_port = EXCLUDED.smtp_port,
+          smtp_secure = EXCLUDED.smtp_secure,
+          smtp_username = EXCLUDED.smtp_username,
+          smtp_password_encrypted = EXCLUDED.smtp_password_encrypted,
+          smtp_from_email = EXCLUDED.smtp_from_email,
+          smtp_from_name = EXCLUDED.smtp_from_name,
           revision = EXCLUDED.revision,
           updated_by_user_id = EXCLUDED.updated_by_user_id,
           updated_at = now()
@@ -435,18 +507,36 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
     executor: { query<T extends Record<string, unknown>>(query: SQL): Promise<T[]> }
   ): Promise<StoredGeneralSettings> {
     const rows = await executor.query<{
+      email_login_enabled: boolean;
       public_registration_enabled: boolean;
       public_site_url: string;
+      smtp_host: string;
+      smtp_port: number;
+      smtp_secure: boolean;
+      smtp_username: string;
+      smtp_password_encrypted: string | null;
+      smtp_from_email: string;
+      smtp_from_name: string;
       revision: number;
     }>(sql`
-      SELECT public_registration_enabled, public_site_url, revision
+      SELECT email_login_enabled, public_registration_enabled, public_site_url,
+             smtp_host, smtp_port, smtp_secure, smtp_username,
+             smtp_password_encrypted, smtp_from_email, smtp_from_name, revision
       FROM system_settings WHERE id = 'global'
     `);
     const row = rows[0];
     if (row === undefined) return copy(defaultGeneralSettings);
     return {
+      emailLoginEnabled: row.email_login_enabled,
       publicRegistrationEnabled: row.public_registration_enabled,
       publicSiteUrl: row.public_site_url || defaultGeneralSettings.publicSiteUrl,
+      smtpHost: row.smtp_host,
+      smtpPort: Number(row.smtp_port),
+      smtpSecure: row.smtp_secure,
+      smtpUsername: row.smtp_username,
+      smtpPasswordEncrypted: row.smtp_password_encrypted,
+      smtpFromEmail: row.smtp_from_email,
+      smtpFromName: row.smtp_from_name,
       revision: Number(row.revision)
     };
   }
@@ -791,16 +881,7 @@ export class AdminService {
 
   public async getGeneralSettings(): Promise<AdminGeneralSettings> {
     const current = await this.settingsStore.getGeneralSettings();
-    return adminGeneralSettingsSchema.parse({
-      emailLoginEnabled: this.options.emailLoginEnabled,
-      emailRegistrationEnabled: this.options.emailRegistrationEnabled,
-      publicRegistrationEnabled: current.publicRegistrationEnabled,
-      publicSiteUrl: current.publicSiteUrl,
-      secureCookies: this.options.secureCookies,
-      loopbackInsecureCookies: this.options.allowLoopbackInsecureCookies,
-      webOrigins: [...this.options.allowedOrigins],
-      revision: current.revision
-    });
+    return this.toPublicGeneralSettings(current);
   }
 
   public async updateGeneralSettings(
@@ -814,40 +895,79 @@ export class AdminService {
     if (input.expectedRevision !== current.revision) {
       throw conflict("设置已被其他管理员修改，请刷新后重试。");
     }
-    if (input.publicRegistrationEnabled && !this.options.emailRegistrationEnabled) {
-      throw new ApiError(422, "PUBLIC_REGISTRATION_UNAVAILABLE", "当前服务未配置可用的邮箱注册能力。");
-    }
     const publicSiteUrl = this.validatePublicSiteUrl(input.publicSiteUrl);
+    const smtpPasswordEncrypted = input.clearSmtpPassword
+      ? null
+      : input.smtpPassword !== undefined && input.smtpPassword.length > 0
+        ? this.settingsStore.encryptSecret(input.smtpPassword)
+        : current.smtpPasswordEncrypted;
+    const next: StoredGeneralSettings = {
+      emailLoginEnabled: input.emailLoginEnabled ?? current.emailLoginEnabled,
+      publicRegistrationEnabled: input.publicRegistrationEnabled,
+      publicSiteUrl,
+      smtpHost: input.smtpHost ?? current.smtpHost,
+      smtpPort: input.smtpPort ?? current.smtpPort,
+      smtpSecure: input.smtpSecure ?? current.smtpSecure,
+      smtpUsername: input.smtpUsername ?? current.smtpUsername,
+      smtpPasswordEncrypted,
+      smtpFromEmail: input.smtpFromEmail ?? current.smtpFromEmail,
+      smtpFromName: input.smtpFromName ?? current.smtpFromName,
+      revision: current.revision + 1
+    };
+    this.validateSmtpSettings(next);
+    if (next.publicRegistrationEnabled && !next.emailLoginEnabled) {
+      throw new ApiError(422, "PUBLIC_REGISTRATION_UNAVAILABLE", "启用邮箱注册前必须先启用邮箱登录。");
+    }
+    if (
+      next.publicRegistrationEnabled &&
+      !this.options.emailRegistrationEnabled &&
+      !smtpConfigurationReady(next)
+    ) {
+      throw new ApiError(422, "PUBLIC_REGISTRATION_UNAVAILABLE", "启用邮箱注册前必须完整配置 SMTP 发信服务。");
+    }
     const currentOAuth = await this.settingsStore.getUstcOAuthSettings();
     if (currentOAuth.overrideConfigured) {
       this.validateRedirect(currentOAuth.redirectUri, publicSiteUrl);
     }
-    const saved = await this.settingsStore.updateGeneralSettings(current.revision, {
-      publicRegistrationEnabled: input.publicRegistrationEnabled,
-      publicSiteUrl,
-      revision: current.revision + 1
-    }, this.auditedAdminEvent(user, auditContext, {
+    const saved = await this.settingsStore.updateGeneralSettings(current.revision, next, this.auditedAdminEvent(user, auditContext, {
       requestId,
       action: "system.general_settings.update",
       objectType: "system_settings",
       objectId: "global",
       result: "success"
     }));
-    return adminGeneralSettingsSchema.parse({
-      emailLoginEnabled: this.options.emailLoginEnabled,
-      emailRegistrationEnabled: this.options.emailRegistrationEnabled,
-      publicRegistrationEnabled: saved.publicRegistrationEnabled,
-      publicSiteUrl: saved.publicSiteUrl,
-      secureCookies: this.options.secureCookies,
-      loopbackInsecureCookies: this.options.allowLoopbackInsecureCookies,
-      webOrigins: [...this.options.allowedOrigins],
-      revision: saved.revision
-    });
+    return this.toPublicGeneralSettings(saved);
+  }
+
+  public async isEmailLoginEnabled(): Promise<boolean> {
+    return (await this.settingsStore.getGeneralSettings()).emailLoginEnabled;
   }
 
   public async isPublicRegistrationEnabled(): Promise<boolean> {
-    if (!this.options.emailLoginEnabled || !this.options.emailRegistrationEnabled) return false;
-    return (await this.settingsStore.getGeneralSettings()).publicRegistrationEnabled;
+    const current = await this.settingsStore.getGeneralSettings();
+    return current.emailLoginEnabled &&
+      current.publicRegistrationEnabled &&
+      (this.options.emailRegistrationEnabled || smtpConfigurationReady(current));
+  }
+
+  public async getEmailVerificationWebUrl(): Promise<string> {
+    return (await this.settingsStore.getGeneralSettings()).publicSiteUrl;
+  }
+
+  public async getRuntimeSmtpSettings(): Promise<RuntimeSmtpSettings | undefined> {
+    const current = await this.settingsStore.getGeneralSettings();
+    if (!smtpConfigurationReady(current)) return undefined;
+    return {
+      host: current.smtpHost,
+      port: current.smtpPort,
+      secure: current.smtpSecure,
+      username: current.smtpUsername,
+      password: current.smtpPasswordEncrypted === null
+        ? null
+        : this.settingsStore.decryptSecret(current.smtpPasswordEncrypted),
+      fromEmail: current.smtpFromEmail,
+      fromName: current.smtpFromName
+    };
   }
   public async isUstcOAuthEnabled(fallback: boolean): Promise<boolean> {
     const current = await this.settingsStore.getUstcOAuthSettings();
@@ -1278,6 +1398,40 @@ export class AdminService {
       return parsed.origin;
     }
     throw new ApiError(422, "PUBLIC_SITE_URL_INSECURE", "生产公开站点地址必须使用 HTTPS；仅允许显式开启的回环地址使用 HTTP。");
+  }
+
+  private validateSmtpSettings(settings: StoredGeneralSettings): void {
+    if (/\s|:\/\//u.test(settings.smtpHost)) {
+      throw new ApiError(422, "SMTP_HOST_INVALID", "SMTP 主机只填写域名或 IP 地址，不要包含协议和空白字符。");
+    }
+    if (settings.smtpFromEmail.length > 0 && !looksLikeEmailAddress(settings.smtpFromEmail)) {
+      throw new ApiError(422, "SMTP_FROM_INVALID", "发件邮箱地址格式不正确。");
+    }
+    if (settings.smtpFromName.length === 0 && settings.smtpHost.length > 0) {
+      throw new ApiError(422, "SMTP_FROM_NAME_REQUIRED", "配置 SMTP 时必须填写发件人名称。");
+    }
+  }
+
+  private toPublicGeneralSettings(settings: StoredGeneralSettings): AdminGeneralSettings {
+    const smtpConfigured = smtpConfigurationReady(settings);
+    return adminGeneralSettingsSchema.parse({
+      emailLoginEnabled: settings.emailLoginEnabled,
+      emailRegistrationEnabled: this.options.emailRegistrationEnabled || smtpConfigured,
+      publicRegistrationEnabled: settings.publicRegistrationEnabled,
+      publicSiteUrl: settings.publicSiteUrl,
+      smtpConfigured,
+      smtpHost: settings.smtpHost,
+      smtpPort: settings.smtpPort,
+      smtpSecure: settings.smtpSecure,
+      smtpUsername: settings.smtpUsername,
+      smtpFromEmail: settings.smtpFromEmail,
+      smtpFromName: settings.smtpFromName,
+      smtpPasswordConfigured: settings.smtpPasswordEncrypted !== null,
+      secureCookies: this.options.secureCookies,
+      loopbackInsecureCookies: this.options.allowLoopbackInsecureCookies,
+      webOrigins: [...this.options.allowedOrigins],
+      revision: settings.revision
+    });
   }
 
   private toPublicUstcSettings(settings: StoredUstcOAuthSettings): UstcOAuthSettings {

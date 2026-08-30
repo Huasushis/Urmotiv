@@ -32,11 +32,13 @@
     "@urmotiv/storage": "workspace:*",
     "drizzle-orm": "latest",
     "fastify": "latest",
+    "nodemailer": "7.0.11",
     "undici": "7.29.0",
     "zod": "latest"
   },
   "devDependencies": {
     "@types/node": "latest",
+    "@types/nodemailer": "7.0.11",
     "tsx": "latest",
     "typescript": "latest",
     "vitest": "latest"

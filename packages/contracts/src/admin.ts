@@ -7,6 +7,14 @@ export const adminGeneralSettingsSchema = z.object({
   emailRegistrationEnabled: z.boolean(),
   publicRegistrationEnabled: z.boolean(),
   publicSiteUrl: z.string(),
+  smtpConfigured: z.boolean(),
+  smtpHost: z.string().max(253),
+  smtpPort: z.number().int().min(1).max(65_535),
+  smtpSecure: z.boolean(),
+  smtpUsername: z.string().max(512),
+  smtpFromEmail: z.string().max(320),
+  smtpFromName: z.string().max(200),
+  smtpPasswordConfigured: z.boolean(),
   secureCookies: z.boolean(),
   loopbackInsecureCookies: z.boolean(),
   webOrigins: z.array(z.string()).max(32),
@@ -17,8 +25,21 @@ export type AdminGeneralSettings = z.infer<typeof adminGeneralSettingsSchema>;
 export const updateAdminGeneralSettingsInputSchema = z.object({
   expectedRevision: z.number().int().positive(),
   publicRegistrationEnabled: z.boolean(),
-  publicSiteUrl: urlOrPath
-}).strict();
+  publicSiteUrl: urlOrPath,
+  emailLoginEnabled: z.boolean().optional(),
+  smtpHost: z.string().trim().max(253).optional(),
+  smtpPort: z.number().int().min(1).max(65_535).optional(),
+  smtpSecure: z.boolean().optional(),
+  smtpUsername: z.string().trim().max(512).optional(),
+  smtpFromEmail: z.string().trim().max(320).optional(),
+  smtpFromName: z.string().trim().max(200).optional(),
+  smtpPassword: z.string().max(4096).optional(),
+  clearSmtpPassword: z.boolean().default(false)
+}).strict().superRefine((value, context) => {
+  if (value.smtpPassword !== undefined && value.clearSmtpPassword) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["smtpPassword"], message: "不能同时设置和清除 SMTP 密码。" });
+  }
+});
 export type UpdateAdminGeneralSettingsInput = z.infer<typeof updateAdminGeneralSettingsInputSchema>;
 
 export const ustcOAuthSettingsSchema = z.object({

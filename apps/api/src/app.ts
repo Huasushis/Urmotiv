@@ -101,6 +101,7 @@ import {
 import { InMemoryDataStore, type DataStore } from "./repository";
 import {
   createEmailVerificationUrl,
+  SmtpEmailVerificationDelivery,
   type EmailVerificationDelivery
 } from "./email-verification";
 import type { ProblemFileStore } from "./problem-file-store";
@@ -575,6 +576,7 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
   const emailRegistrationEnabled = options.emailRegistrationEnabled ?? false;
   if (
     emailRegistrationEnabled &&
+    options.adminSettingsStore === undefined &&
     (options.emailVerificationDelivery === undefined || options.emailVerificationWebUrl === undefined)
   ) {
     throw new Error("启用邮箱注册前必须配置服务端邮件投递和验证页面地址。");
@@ -604,6 +606,7 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
   const secureCookies = options.secureCookies ?? false;
   const allowLoopbackInsecureCookies = options.allowLoopbackInsecureCookies ?? false;
   const adminSettingsStore = options.adminSettingsStore ?? new InMemoryAdminSettingsStore({
+    emailLoginEnabled: options.emailLoginEnabled ?? true,
     publicRegistrationEnabled: emailRegistrationEnabled,
     publicSiteUrl: allowedOrigins[0] ?? "http://localhost:5173"
   });
@@ -621,6 +624,11 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
       : { tokenConfigured: options.serviceAccountTokenConfigured }),
     now
   });
+  const emailVerificationDelivery = options.emailVerificationDelivery ?? (
+    options.adminSettingsStore === undefined
+      ? undefined
+      : new SmtpEmailVerificationDelivery(() => adminService.getRuntimeSmtpSettings())
+  );
   return {
     store,
     service,
@@ -651,9 +659,9 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     demoAuthEnabled,
     emailLoginEnabled: options.emailLoginEnabled ?? true,
     emailRegistrationEnabled,
-    ...(options.emailVerificationDelivery === undefined
+    ...(emailVerificationDelivery === undefined
       ? {}
-      : { emailVerificationDelivery: options.emailVerificationDelivery }),
+      : { emailVerificationDelivery }),
     ...(options.emailVerificationWebUrl === undefined
       ? {}
       : { emailVerificationWebUrl: options.emailVerificationWebUrl }),
@@ -1002,7 +1010,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       user: user === undefined ? null : dependencies.service.getSessionUser(user),
       ...(identity === undefined ? {} : { identity }),
       auth: {
-        emailEnabled: dependencies.emailLoginEnabled,
+        emailEnabled: await dependencies.adminService.isEmailLoginEnabled(),
         emailRegistrationEnabled: await dependencies.adminService.isPublicRegistrationEnabled(),
         ustcOAuthEnabled: await dependencies.adminService.isUstcOAuthEnabled(dependencies.ustcOAuthClient !== undefined),
         casEnabled: dependencies.casClient !== undefined,
@@ -1039,10 +1047,11 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     recipient: string
   ): Promise<void> {
     const delivery = dependencies.emailVerificationDelivery;
-    const webUrl = dependencies.emailVerificationWebUrl;
-    if (delivery === undefined || webUrl === undefined) {
+    if (delivery === undefined) {
       throw new Error("邮箱验证投递未配置。");
     }
+    const webUrl = dependencies.emailVerificationWebUrl ??
+      await dependencies.adminService.getEmailVerificationWebUrl();
     const token = createEmailVerificationToken();
     const expiresAt = new Date(
       dependencies.now().getTime() + emailVerificationLifetimeSeconds * 1000
@@ -1600,7 +1609,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   });
 
   app.post("/api/v1/auth/username-login", async (request, reply) => {
-    if (!dependencies.emailLoginEnabled) {
+    if (!(await dependencies.adminService.isEmailLoginEnabled())) {
       throw notFound();
     }
     const input = usernameLoginInputSchema.strict().parse(request.body);
@@ -1626,7 +1635,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   });
 
   app.post("/api/v1/auth/email-login", async (request, reply) => {
-    if (!dependencies.emailLoginEnabled) {
+    if (!(await dependencies.adminService.isEmailLoginEnabled())) {
       throw notFound();
     }
     const input = loginInputSchema.strict().parse(request.body);

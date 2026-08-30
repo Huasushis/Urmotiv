@@ -44,8 +44,17 @@ function SectionFrame({ section, session, children }: { section: AdminSection; s
 
 type GeneralDraft = {
   expectedRevision: number;
+  emailLoginEnabled: boolean;
   publicRegistrationEnabled: boolean;
   publicSiteUrl: string;
+  smtpHost: string;
+  smtpPort: number;
+  smtpSecure: boolean;
+  smtpUsername: string;
+  smtpFromEmail: string;
+  smtpFromName: string;
+  smtpPassword: string;
+  clearSmtpPassword: boolean;
 };
 
 function SettingsSection() {
@@ -57,8 +66,17 @@ function SettingsSection() {
     const settings = query.data.settings;
     setDraft((current) => current ?? {
       expectedRevision: settings.revision,
+      emailLoginEnabled: settings.emailLoginEnabled,
       publicRegistrationEnabled: settings.publicRegistrationEnabled,
-      publicSiteUrl: settings.publicSiteUrl
+      publicSiteUrl: settings.publicSiteUrl,
+      smtpHost: settings.smtpHost,
+      smtpPort: settings.smtpPort,
+      smtpSecure: settings.smtpSecure,
+      smtpUsername: settings.smtpUsername,
+      smtpFromEmail: settings.smtpFromEmail,
+      smtpFromName: settings.smtpFromName,
+      smtpPassword: "",
+      clearSmtpPassword: false
     });
   }, [query.data]);
   const mutation = useMutation({
@@ -66,8 +84,17 @@ function SettingsSection() {
     onSuccess: (result) => {
       setDraft({
         expectedRevision: result.settings.revision,
+        emailLoginEnabled: result.settings.emailLoginEnabled,
         publicRegistrationEnabled: result.settings.publicRegistrationEnabled,
-        publicSiteUrl: result.settings.publicSiteUrl
+        publicSiteUrl: result.settings.publicSiteUrl,
+        smtpHost: result.settings.smtpHost,
+        smtpPort: result.settings.smtpPort,
+        smtpSecure: result.settings.smtpSecure,
+        smtpUsername: result.settings.smtpUsername,
+        smtpFromEmail: result.settings.smtpFromEmail,
+        smtpFromName: result.settings.smtpFromName,
+        smtpPassword: "",
+        clearSmtpPassword: false
       });
       void client.invalidateQueries({ queryKey: ["admin-general-settings"] });
     }
@@ -75,41 +102,41 @@ function SettingsSection() {
   if (query.isPending) return <LoadingState />;
   if (query.isError) return <ErrorState message={query.error.message} />;
   if (draft === null) return <LoadingState />;
-  const update = (key: keyof GeneralDraft, value: string | boolean) => {
+  const update = (key: keyof GeneralDraft, value: string | boolean | number) => {
     setDraft((current) => current === null ? current : { ...current, [key]: value });
   };
   return (
     <form className="plain-panel admin-form" onSubmit={(event) => { event.preventDefault(); mutation.mutate(draft); }}>
-      <p>公开注册和公开站点地址由服务端保存；生产站点必须使用 HTTPS，认证回调会使用此规范域名。</p>
-      <dl>
-        <dt>邮箱登录</dt><dd>{query.data.settings.emailLoginEnabled ? "已启用" : "已关闭"}</dd>
-        <dt>邮件投递能力</dt><dd>{query.data.settings.emailRegistrationEnabled ? "已配置" : "未配置"}</dd>
-        <dt>安全 Cookie</dt><dd>{query.data.settings.secureCookies ? "已启用" : "未启用"}</dd>
-        <dt>回环 HTTP Cookie</dt><dd>{query.data.settings.loopbackInsecureCookies ? "显式允许" : "禁止"}</dd>
-        <dt>允许的网页来源</dt><dd>{query.data.settings.webOrigins.join("、") || "无"}</dd>
-      </dl>
-      <label>
-        公开站点 URL
-        <input
-          value={draft.publicSiteUrl}
-          onChange={(event) => update("publicSiteUrl", event.target.value)}
-          placeholder="https://urmotiv.example"
-          required
-        />
-      </label>
-      <label>
-        <input
-          type="checkbox"
-          checked={draft.publicRegistrationEnabled}
-          disabled={!query.data.settings.emailLoginEnabled || !query.data.settings.emailRegistrationEnabled}
-          onChange={(event) => update("publicRegistrationEnabled", event.target.checked)}
-        />
-        允许公开注册
-      </label>
-      {!query.data.settings.emailRegistrationEnabled
-        ? <p>当前部署未配置邮件投递，不能启用公开注册。</p>
-        : null}
-      <button type="submit" disabled={mutation.isPending}>保存常规设置</button>
+      <section className="settings-form-section">
+        <div><h2>站点</h2><p>认证回调和邮件链接使用这个地址；生产环境必须是 HTTPS。</p></div>
+        <label>公开站点 URL<input value={draft.publicSiteUrl} onChange={(event) => update("publicSiteUrl", event.target.value)} placeholder="https://urmotiv.example" required /></label>
+      </section>
+      <section className="settings-form-section">
+        <div><h2>账号注册与登录</h2><p>root 登录不受这里的邮箱登录开关影响。</p></div>
+        <label className="checkbox-row"><input type="checkbox" checked={draft.emailLoginEnabled} onChange={(event) => update("emailLoginEnabled", event.target.checked)} />允许用户名或邮箱登录</label>
+        <label className="checkbox-row"><input type="checkbox" checked={draft.publicRegistrationEnabled} onChange={(event) => update("publicRegistrationEnabled", event.target.checked)} />允许访客通过邮箱注册账号</label>
+      </section>
+      <section className="settings-form-section">
+        <div>
+          <h2>SMTP 发信</h2>
+          <p>SMTP 是向邮箱发送验证码的标准服务。当前状态：{query.data.settings.smtpConfigured ? "已可用" : "未完整配置"}。</p>
+        </div>
+        <div className="settings-field-grid">
+          <label>SMTP 主机<input value={draft.smtpHost} onChange={(event) => update("smtpHost", event.target.value)} placeholder="smtp.example.com" /></label>
+          <label>端口<input type="number" min={1} max={65535} value={draft.smtpPort} onChange={(event) => update("smtpPort", Number(event.target.value))} /></label>
+          <label>用户名<input value={draft.smtpUsername} onChange={(event) => update("smtpUsername", event.target.value)} autoComplete="off" /></label>
+          <label>密码{query.data.settings.smtpPasswordConfigured ? "（已保存；留空不修改）" : ""}<input type="password" value={draft.smtpPassword} onChange={(event) => update("smtpPassword", event.target.value)} autoComplete="new-password" /></label>
+          <label>发件邮箱<input type="email" value={draft.smtpFromEmail} onChange={(event) => update("smtpFromEmail", event.target.value)} placeholder="noreply@example.com" /></label>
+          <label>发件人名称<input value={draft.smtpFromName} onChange={(event) => update("smtpFromName", event.target.value)} /></label>
+        </div>
+        <label className="checkbox-row"><input type="checkbox" checked={draft.smtpSecure} onChange={(event) => update("smtpSecure", event.target.checked)} />连接后立即使用 TLS（通常用于 465 端口；587 会自动升级为加密连接）</label>
+        {query.data.settings.smtpPasswordConfigured ? <label className="checkbox-row"><input type="checkbox" checked={draft.clearSmtpPassword} onChange={(event) => update("clearSmtpPassword", event.target.checked)} />清除已保存的 SMTP 密码</label> : null}
+      </section>
+      <section className="settings-runtime-note">
+        <h2>部署安全状态</h2>
+        <p>安全 Cookie：{query.data.settings.secureCookies ? "启用" : "关闭"}；允许网页来源：{query.data.settings.webOrigins.join("、") || "无"}。</p>
+      </section>
+      <button type="submit" className="primary-button" disabled={mutation.isPending}>{mutation.isPending ? "正在保存…" : "保存常规设置"}</button>
       {mutation.isError ? <p role="alert">{mutation.error.message}</p> : null}
       {mutation.isSuccess ? <p role="status">常规设置已保存。</p> : null}
     </form>

@@ -231,8 +231,16 @@ export const systemSettings = pgTable(
     profileUrl: text("profile_url").notNull().default(""),
     redirectUri: text("redirect_uri").notNull().default("/api/v1/auth/ustc/callback"),
     scope: text("scope").notNull().default(""),
+    emailLoginEnabled: boolean("email_login_enabled").notNull().default(true),
     publicRegistrationEnabled: boolean("public_registration_enabled").notNull().default(false),
     publicSiteUrl: text("public_site_url").notNull().default(""),
+    smtpHost: text("smtp_host").notNull().default(""),
+    smtpPort: integer("smtp_port").notNull().default(587),
+    smtpSecure: boolean("smtp_secure").notNull().default(false),
+    smtpUsername: text("smtp_username").notNull().default(""),
+    smtpPasswordEncrypted: text("smtp_password_encrypted"),
+    smtpFromEmail: text("smtp_from_email").notNull().default(""),
+    smtpFromName: text("smtp_from_name").notNull().default("Urmotiv"),
     clientIdEncrypted: text("client_id_encrypted"),
     clientSecretEncrypted: text("client_secret_encrypted"),
     revision: integer("revision").notNull().default(1),
@@ -242,7 +250,10 @@ export const systemSettings = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
   },
-  (table) => [check("system_settings_revision_ck", sql`${table.revision} > 0`)]
+  (table) => [
+    check("system_settings_revision_ck", sql`${table.revision} > 0`),
+    check("system_settings_smtp_port_ck", sql`${table.smtpPort} BETWEEN 1 AND 65535`)
+  ]
 );
 export const systemOAuthSettings = pgTable(
   "system_oauth_settings",

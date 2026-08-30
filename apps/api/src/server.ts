@@ -13,7 +13,6 @@ import {
 } from "@urmotiv/jobs";
 import { createFileStorage } from "@urmotiv/storage";
 import { createApp } from "./app";
-import { InMemoryEmailVerificationOutbox } from "./email-verification";
 import { DatabaseContestStore } from "./database-contest-store";
 import { databaseDemoUserIds, seedDatabaseDemoData } from "./database-demo";
 import { DatabaseDataStore } from "./database-store";
@@ -84,6 +83,7 @@ try {
     await seedDatabaseDemoData(database);
   }
   const pluginSecretBox = createPluginSecretBox(process.env.URMOTIV_PLUGIN_SECRET_KEY);
+  const adminSettingsStore = new DatabaseAdminSettingsStore(database, pluginSecretBox);
   let pluginHostReference: TrustedPluginHost | undefined;
   const anklangRuntime: AnklangHookRuntime = {
     readSettings: async () => pluginHostReference?.readEnabledPluginSettings(anklangPluginId),
@@ -196,8 +196,6 @@ try {
           consume: (nonceDigest, now) => store.consumeLoginState(nonceDigest, now)
         }
       });
-  const emailVerificationOptions = authenticationOptions.emailVerification;
-
   // 只按来源地址限制登录尝试；生产使用真实时钟与进程内存储。
   const loginRateLimiter = new LoginRateLimiter({
     maxFailedAttempts: 20,
@@ -209,12 +207,6 @@ try {
   const app = await createApp({
     ...appOptions,
     ...authenticationOptions,
-    ...(emailVerificationOptions === undefined
-      ? {}
-      : {
-          emailVerificationDelivery: new InMemoryEmailVerificationOutbox(),
-          emailVerificationWebUrl: emailVerificationOptions.webUrl
-        }),
     ...(casClient === undefined ? {} : { casClient }),
     ...(ustcOAuthClient === undefined ? {} : { ustcOAuthClient }),
     store,
@@ -227,7 +219,7 @@ try {
       storage: fileStorage
     },
     transfer: transferService,
-    adminSettingsStore: new DatabaseAdminSettingsStore(database, pluginSecretBox),
+    adminSettingsStore,
     roleManagementStore: new DatabaseRoleManagementStore(database),
     serviceAccountTokenConfigured: async (userId) => {
       const tokens = await serviceAccountTokens.listTokens(userId);
