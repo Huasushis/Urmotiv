@@ -260,6 +260,7 @@ export const systemOAuthSettings = pgTable(
   {
     id: varchar("id", { length: 32 }).primaryKey(),
     enabled: boolean("enabled").notNull().default(false),
+    autoCreateUsers: boolean("auto_create_users").notNull().default(true),
     authorizeUrl: text("authorize_url").notNull().default(""),
     tokenUrl: text("token_url").notNull().default(""),
     profileUrl: text("profile_url").notNull().default(""),

@@ -183,6 +183,13 @@
       "when": 1788134400000,
       "tag": "0025_runtime_mail_settings",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1788220800000,
+      "tag": "0026_ustc_oauth_account_creation",
+      "breakpoints": true
     }
   ]
 }

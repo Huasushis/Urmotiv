@@ -117,6 +117,7 @@ export interface DataStore {
   findPendingEmailVerification(normalizedEmail: string): Promise<EmailVerificationTarget | undefined>;
   replaceEmailVerificationToken(input: EmailVerificationToken): Promise<void>;
   consumeEmailVerificationToken(tokenDigest: string, now: string): Promise<string | undefined>;
+  hasExternalIdentity(provider: string, subject: string): Promise<boolean>;
   findOrCreateExternalUser(input: ExternalIdentity): Promise<StoredUser>;
   putLoginState(nonceDigest: string, expiresAt: string): Promise<void>;
   consumeLoginState(nonceDigest: string, now: string): Promise<boolean>;
@@ -715,6 +716,10 @@ export class InMemoryDataStore implements DataStore {
     token.consumed = true;
     credential.verified = true;
     return token.userId;
+  }
+
+  public async hasExternalIdentity(provider: string, subject: string): Promise<boolean> {
+    return this.externalIdentities.has(`${provider}\u0000${subject}`);
   }
 
   public async findOrCreateExternalUser(input: ExternalIdentity): Promise<StoredUser> {

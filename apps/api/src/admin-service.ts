@@ -50,6 +50,7 @@ import type { PluginSecretBox } from "./plugin-host";
 
 export interface StoredUstcOAuthSettings {
   readonly enabled: boolean;
+  readonly autoCreateUsers: boolean;
   readonly authorizeUrl: string;
   readonly tokenUrl: string;
   readonly profileUrl: string;
@@ -134,6 +135,7 @@ export interface AdminSettingsStore {
 const canonicalCallbackPath = ustcOAuthCallbackPath;
 const defaultUstcSettings: StoredUstcOAuthSettings = {
   enabled: false,
+  autoCreateUsers: true,
   authorizeUrl: "",
   tokenUrl: "",
   profileUrl: "",
@@ -185,11 +187,20 @@ export class InMemoryAdminSettingsStore implements AdminSettingsStore {
   private generalSettings: StoredGeneralSettings = copy(defaultGeneralSettings);
   private readonly audits: AdminAuditEvent[] = [];
 
-  public constructor(initialGeneralSettings?: Partial<StoredGeneralSettings>) {
+  public constructor(
+    initialGeneralSettings?: Partial<StoredGeneralSettings>,
+    initialUstcOAuthSettings?: Partial<StoredUstcOAuthSettings>
+  ) {
     if (initialGeneralSettings !== undefined) {
       this.generalSettings = {
         ...this.generalSettings,
         ...initialGeneralSettings
+      };
+    }
+    if (initialUstcOAuthSettings !== undefined) {
+      this.settings = {
+        ...this.settings,
+        ...initialUstcOAuthSettings
       };
     }
   }
@@ -426,15 +437,16 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
       }
       await transaction.execute(sql`
         INSERT INTO system_oauth_settings (
-          id, enabled, authorize_url, token_url, profile_url, redirect_uri, scope,
+          id, enabled, auto_create_users, authorize_url, token_url, profile_url, redirect_uri, scope,
           client_id_encrypted, client_secret_encrypted, revision, updated_by_user_id
         ) VALUES (
-          'global', ${settings.enabled}, ${settings.authorizeUrl}, ${settings.tokenUrl},
+          'global', ${settings.enabled}, ${settings.autoCreateUsers}, ${settings.authorizeUrl}, ${settings.tokenUrl},
           ${settings.profileUrl}, ${settings.redirectUri}, ${settings.scope},
           ${settings.clientIdEncrypted}, ${settings.clientSecretEncrypted},
           ${expectedRevision + 1}, ${actorId}
         ) ON CONFLICT (id) DO UPDATE SET
           enabled = EXCLUDED.enabled,
+          auto_create_users = EXCLUDED.auto_create_users,
           authorize_url = EXCLUDED.authorize_url,
           token_url = EXCLUDED.token_url,
           profile_url = EXCLUDED.profile_url,
@@ -546,6 +558,7 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
   ): Promise<StoredUstcOAuthSettings> {
     const rows = await executor.query<{
       enabled: boolean;
+      auto_create_users: boolean;
       authorize_url: string;
       token_url: string;
       profile_url: string;
@@ -555,7 +568,7 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
       client_secret_encrypted: string | null;
       revision: number;
     }>(sql`
-      SELECT enabled, authorize_url, token_url, profile_url, redirect_uri, scope,
+      SELECT enabled, auto_create_users, authorize_url, token_url, profile_url, redirect_uri, scope,
              client_id_encrypted, client_secret_encrypted, revision
       FROM system_oauth_settings WHERE id = 'global'
     `);
@@ -563,6 +576,7 @@ export class DatabaseAdminSettingsStore implements AdminSettingsStore {
     if (row === undefined) return copy(defaultUstcSettings);
     return {
       enabled: row.enabled,
+      autoCreateUsers: row.auto_create_users,
       authorizeUrl: row.authorize_url,
       tokenUrl: row.token_url,
       profileUrl: row.profile_url,
@@ -975,6 +989,10 @@ export class AdminService {
     return current.enabled;
   }
 
+  public async isUstcOAuthUserAutoCreationEnabled(): Promise<boolean> {
+    return (await this.settingsStore.getUstcOAuthSettings()).autoCreateUsers;
+  }
+
   public async getRuntimeUstcOAuthSettings(): Promise<RuntimeUstcOAuthSettings | { enabled: false } | undefined> {
     const current = await this.settingsStore.getUstcOAuthSettings();
     if (!current.overrideConfigured) return undefined;
@@ -1066,6 +1084,7 @@ export class AdminService {
         : this.encryptSecret(input.clientSecret);
     const next: StoredUstcOAuthSettings = {
       enabled: input.enabled,
+      autoCreateUsers: input.autoCreateUsers ?? current.autoCreateUsers,
       authorizeUrl: input.authorizeUrl,
       tokenUrl: input.tokenUrl,
       profileUrl: input.profileUrl,
@@ -1087,7 +1106,10 @@ export class AdminService {
       objectType: "system_oauth_settings",
       objectId: "global",
       result: "success",
-      metadata: { secretChanged: input.clientSecret !== undefined || input.clearClientSecret }
+      metadata: {
+        secretChanged: input.clientSecret !== undefined || input.clearClientSecret,
+        autoCreateUsers: next.autoCreateUsers
+      }
     }));
     return { settings: this.toPublicUstcSettings(saved) };
   }
@@ -1437,6 +1459,7 @@ export class AdminService {
   private toPublicUstcSettings(settings: StoredUstcOAuthSettings): UstcOAuthSettings {
     return {
       enabled: settings.enabled,
+      autoCreateUsers: settings.autoCreateUsers,
       authorizeUrl: settings.authorizeUrl,
       tokenUrl: settings.tokenUrl,
       profileUrl: settings.profileUrl,

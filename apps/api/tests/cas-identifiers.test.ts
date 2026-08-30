@@ -169,6 +169,7 @@ describe("统一身份认证的学号落库", () => {
   it("OAuth2 首次登录写入 username/realName/email，后续同一 gid 安全更新", async () => {
     const database = await openDatabase();
     const store = new DatabaseDataStore(database);
+    expect(await store.hasExternalIdentity("ustc-oauth", "synthetic-gid-1")).toBe(false);
     const first = await store.findOrCreateExternalUser({
       provider: "ustc-oauth",
       subject: "synthetic-gid-1",
@@ -179,6 +180,8 @@ describe("统一身份认证的学号落库", () => {
       strictReconciliation: true,
       studentIds: [{ attribute: "zjhm", value: "PB21000077" }]
     });
+    expect(await store.hasExternalIdentity("ustc-oauth", "synthetic-gid-1")).toBe(true);
+    expect(await store.hasExternalIdentity("ustc-oauth", "synthetic-gid-unknown")).toBe(false);
     const profile = await readProfileView(first, store);
     expect(profile).toEqual(
       expect.objectContaining({

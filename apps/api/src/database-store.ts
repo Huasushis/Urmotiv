@@ -1920,6 +1920,17 @@ export class DatabaseDataStore implements DataStore {
     return rows[0]?.user_id;
   }
 
+  public async hasExternalIdentity(provider: string, subject: string): Promise<boolean> {
+    const rows = await this.handle.query<{ present: boolean }>(sql`
+      SELECT EXISTS (
+        SELECT 1
+        FROM external_identities
+        WHERE provider = ${provider} AND subject = ${subject}
+      ) AS present
+    `);
+    return rows[0]?.present === true;
+  }
+
   public async findOrCreateExternalUser(input: ExternalIdentity): Promise<StoredUser> {
     return this.handle.transaction(async (transaction) => {
       const existing = await transaction.query<{ user_id: string }>(sql`

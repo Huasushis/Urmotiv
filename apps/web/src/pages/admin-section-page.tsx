@@ -175,6 +175,7 @@ function AuditSection() {
 
 type OAuthDraft = {
   enabled: boolean;
+  autoCreateUsers: boolean;
   authorizeUrl: string;
   tokenUrl: string;
   profileUrl: string;
@@ -196,6 +197,7 @@ function OAuthSection() {
     const settings = query.data.settings;
     setDraft((current) => current ?? {
       enabled: settings.enabled,
+      autoCreateUsers: settings.autoCreateUsers,
       authorizeUrl: settings.authorizeUrl,
       tokenUrl: settings.tokenUrl,
       profileUrl: settings.profileUrl,
@@ -213,6 +215,7 @@ function OAuthSection() {
     onSuccess: (result) => {
       setDraft({
         enabled: result.settings.enabled,
+        autoCreateUsers: result.settings.autoCreateUsers,
         authorizeUrl: result.settings.authorizeUrl,
         tokenUrl: result.settings.tokenUrl,
         profileUrl: result.settings.profileUrl,
@@ -235,6 +238,7 @@ function OAuthSection() {
     <form className="plain-panel admin-form" onSubmit={(event) => { event.preventDefault(); mutation.mutate(draft); }}>
       <p>客户端编号和密钥只写入服务端；保存成功后表单会清空这两个输入框，读取接口只返回是否已配置。</p>
       <label><input type="checkbox" checked={draft.enabled} onChange={(event) => update("enabled", event.target.checked)} /> 启用 USTC OAuth</label>
+      <label className="checkbox-row"><input type="checkbox" checked={draft.autoCreateUsers} onChange={(event) => update("autoCreateUsers", event.target.checked)} />首次统一身份登录时自动创建账号</label>
       <label>授权 URL<input value={draft.authorizeUrl} onChange={(event) => update("authorizeUrl", event.target.value)} required={draft.enabled} /></label>
       <label>令牌 URL<input value={draft.tokenUrl} onChange={(event) => update("tokenUrl", event.target.value)} required={draft.enabled} /></label>
       <label>个人资料 URL<input value={draft.profileUrl} onChange={(event) => update("profileUrl", event.target.value)} required={draft.enabled} /></label>

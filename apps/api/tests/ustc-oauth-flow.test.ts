@@ -7,6 +7,9 @@ import {
   type UstcOAuthConfiguration,
 } from "@urmotiv/auth";
 import { createApp } from "../src/app";
+import { InMemoryAdminSettingsStore } from "../src/admin-service";
+import { createDemoUsers, demoTags } from "../src/demo-data";
+import { InMemoryDataStore } from "../src/repository";
 
 const callbackPath = "/api/v1/auth/ustc/callback";
 const callbackUrl = `https://site.example.test${callbackPath}`;
@@ -70,6 +73,7 @@ async function makeHarness(
     redirectUri?: string;
     secureCookies?: boolean;
     allowLoopbackInsecureCookies?: boolean;
+    autoCreateUsers?: boolean;
   } = {},
 ) {
   const states = new TrackingStates();
@@ -104,7 +108,12 @@ async function makeHarness(
       ? { allowLoopbackInsecureRedirect: true }
       : {}),
   });
+  const store = new InMemoryDataStore(createDemoUsers(), demoTags);
   const app = await createApp({
+    store,
+    adminSettingsStore: new InMemoryAdminSettingsStore(undefined, {
+      autoCreateUsers: options.autoCreateUsers ?? true
+    }),
     ustcOAuthClient: client,
     secureCookies: options.secureCookies ?? true,
     allowLoopbackInsecureCookies: options.allowLoopbackInsecureCookies ?? false,
@@ -114,6 +123,7 @@ async function makeHarness(
     app,
     fetch,
     states,
+    store,
     setProfileBody(value: string) {
       profileBody = value;
     },
@@ -308,6 +318,46 @@ describe("USTC OAuth2 应用级流程", () => {
     expect((after.json() as { id: string }).id).toBe(userId);
     expect((after.json() as { nickname: string }).nickname).toBe(nickname);
     expect(states.consumeCalls).toBe(2);
+  });
+
+  it("关闭首次登录建号后拒绝陌生身份，但已绑定身份仍可登录", async () => {
+    const harness = await makeHarness({ autoCreateUsers: false });
+    const first = await startFlow(harness.app);
+    const rejected = await harness.app.inject({
+      method: "GET",
+      url: callbackRequest(first.state, "new-account-disabled"),
+      headers: { cookie: first.cookiePair }
+    });
+    expect(rejected.statusCode).toBe(401);
+    expect(publicFailure(rejected)).toBe("UNAUTHENTICATED");
+    expect(await harness.store.hasExternalIdentity("ustc-oauth", "stable-gid-456")).toBe(false);
+
+    const existing = await harness.store.findOrCreateExternalUser({
+      provider: "ustc-oauth",
+      subject: "stable-gid-456",
+      nickname: "张三",
+      username: "PB21000077",
+      realName: "张三",
+      email: "zhangsan@example.test",
+      strictReconciliation: true,
+      studentIds: [{ attribute: "zjhm", value: "PB21000077" }]
+    });
+    const second = await startFlow(harness.app);
+    const accepted = await harness.app.inject({
+      method: "GET",
+      url: callbackRequest(second.state, "existing-account"),
+      headers: { cookie: second.cookiePair }
+    });
+    expect(accepted.statusCode).toBe(302);
+    const sessionCookie = cookieLines(accepted.headers["set-cookie"])
+      .find((line) => line.startsWith("urmotiv_session="))!
+      .split(";", 1)[0]!;
+    const profile = await harness.app.inject({
+      method: "GET",
+      url: "/api/v1/me",
+      headers: { cookie: sessionCookie }
+    });
+    expect(profile.json()).toMatchObject({ id: existing.id, username: "PB21000077" });
   });
 
   it("同一 zjhm 已绑定到其他 gid 时不自动改绑，直接失败关闭", async () => {

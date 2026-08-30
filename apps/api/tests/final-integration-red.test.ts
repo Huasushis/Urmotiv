@@ -289,6 +289,7 @@ describe("最终集成红测：管理员与题库入口", () => {
     expect(settings.json()).toMatchObject({
       settings: {
         enabled: false,
+        autoCreateUsers: true,
         authorizeUrl: "",
         tokenUrl: "",
         profileUrl: "",
@@ -327,6 +328,7 @@ describe("最终集成红测：管理员与题库入口", () => {
       payload: {
         expectedRevision: 1,
         enabled: true,
+        autoCreateUsers: false,
         authorizeUrl: "https://id.ustc.edu.cn/cas/oauth2.0/authorize",
         tokenUrl: "https://id.ustc.edu.cn/cas/oauth2.0/accessToken",
         profileUrl: "https://id.ustc.edu.cn/cas/oauth2.0/profile",
@@ -339,6 +341,7 @@ describe("最终集成红测：管理员与题库入口", () => {
       }
     });
     expect(enabled.statusCode).toBe(200);
+    expect(enabled.json().settings.autoCreateUsers).toBe(false);
     const start = await app.inject({
       method: "GET",
       url: "/api/v1/auth/ustc/start?returnPath=%2Fproblems",
@@ -373,6 +376,7 @@ describe("最终集成红测：管理员与题库入口", () => {
       }
     });
     expect(disabled.statusCode).toBe(200);
+    expect(disabled.json().settings.autoCreateUsers).toBe(false);
     const hidden = await app.inject({ method: "GET", url: "/api/v1/auth/ustc/start" });
     expect(hidden.statusCode).toBe(404);
   });

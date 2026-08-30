@@ -44,6 +44,7 @@ export type UpdateAdminGeneralSettingsInput = z.infer<typeof updateAdminGeneralS
 
 export const ustcOAuthSettingsSchema = z.object({
   enabled: z.boolean(),
+  autoCreateUsers: z.boolean(),
   authorizeUrl: urlOrPath,
   tokenUrl: urlOrPath,
   profileUrl: urlOrPath,
@@ -58,6 +59,7 @@ export type UstcOAuthSettings = z.infer<typeof ustcOAuthSettingsSchema>;
 export const updateUstcOAuthSettingsInputSchema = z.object({
   expectedRevision: z.number().int().positive(),
   enabled: z.boolean(),
+  autoCreateUsers: z.boolean().optional(),
   authorizeUrl: urlOrPath,
   tokenUrl: urlOrPath,
   profileUrl: urlOrPath,

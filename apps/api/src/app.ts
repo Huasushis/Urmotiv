@@ -1733,6 +1733,12 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
         if (!subject.success || !username.success || !realName.success || !nickname.success) {
           throw unauthorized();
         }
+        if (
+          !(await dependencies.store.hasExternalIdentity(completed.identity.provider, subject.data)) &&
+          !(await dependencies.adminService.isUstcOAuthUserAutoCreationEnabled())
+        ) {
+          throw unauthorized();
+        }
         let email: string;
         try {
           if (completed.identity.email === undefined) {
