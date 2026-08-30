@@ -91,7 +91,11 @@ describe("会话中的管理能力", () => {
     ]);
     const pluginOnly = createUser("plugin-only", "human", [grant("plugin.manage")]);
     const tagManager = createUser("tag-manager", "human", [grant("tag.manage")]);
-    const app = await makeApp([reviewManager, pluginManager, pluginOnly, tagManager]);
+    const problemManager = createUser("problem-manager", "human", [
+      grant("problem.view.all"),
+      grant("problem.status.change")
+    ]);
+    const app = await makeApp([reviewManager, pluginManager, pluginOnly, tagManager, problemManager]);
 
     await expect(readSession(app, reviewManager.id)).resolves.toMatchObject({
       canManageReviewPolicy: true,
@@ -113,6 +117,9 @@ describe("会话中的管理能力", () => {
       canManagePlugins: false,
       canManageTags: true
     });
+    await expect(readSession(app, problemManager.id)).resolves.toMatchObject({
+      canManageProblemStatuses: true
+    });
   });
 
   it("自己的对象或指定对象范围不会被当成全局管理权限", async () => {
@@ -127,7 +134,8 @@ describe("会话中的管理能力", () => {
     await expect(readSession(app, scopedUser.id)).resolves.toMatchObject({
       canManageReviewPolicy: false,
       canManagePlugins: false,
-      canManageTags: false
+      canManageTags: false,
+      canManageProblemStatuses: false
     });
   });
 
@@ -145,7 +153,8 @@ describe("会话中的管理能力", () => {
     await expect(readSession(app, deniedUser.id)).resolves.toMatchObject({
       canManageReviewPolicy: false,
       canManagePlugins: false,
-      canManageTags: false
+      canManageTags: false,
+      canManageProblemStatuses: false
     });
   });
 
@@ -166,7 +175,8 @@ describe("会话中的管理能力", () => {
     await expect(readSession(app, robot.id)).resolves.toMatchObject({
       canManageReviewPolicy: false,
       canManagePlugins: false,
-      canManageTags: false
+      canManageTags: false,
+      canManageProblemStatuses: false
     });
   });
 });

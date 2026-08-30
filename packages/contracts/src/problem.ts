@@ -343,6 +343,7 @@ export const problemListItemSchema = problemSchema.pick({
   tagIds: true,
   owner: true,
   revision: true,
+  reviewRound: true,
   updatedAt: true,
   capabilities: true,
   origin: true,
@@ -374,3 +375,86 @@ export const problemListQuerySchema = z.object({
   source: z.string().trim().max(200).optional()
 });
 export type ProblemListQuery = z.infer<typeof problemListQuerySchema>;
+
+export const batchProblemStatusActions = ["submit", "approve", "reject", "withdraw"] as const;
+export const batchProblemStatusActionSchema = z.enum(batchProblemStatusActions);
+export type BatchProblemStatusAction = z.infer<typeof batchProblemStatusActionSchema>;
+
+export const batchProblemStatusItemSchema = z
+  .object({
+    id: z.string().trim().min(1).max(200),
+    expectedRevision: z.number().int().positive(),
+    expectedRound: z.number().int().nonnegative()
+  })
+  .strict();
+
+export const batchProblemStatusInputSchema = z
+  .object({
+    action: batchProblemStatusActionSchema,
+    items: z.array(batchProblemStatusItemSchema).min(1).max(200),
+    reason: z.string().trim().max(2_000).default("")
+  })
+  .strict()
+  .superRefine((input, context) => {
+    const seen = new Set<string>();
+    for (const [index, item] of input.items.entries()) {
+      if (seen.has(item.id)) {
+        context.addIssue({
+          code: "custom",
+          path: ["items", index, "id"],
+          message: "同一道题不能在一次批量操作中重复出现。"
+        });
+      }
+      seen.add(item.id);
+    }
+    if (input.action !== "submit" && input.reason.length === 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["reason"],
+        message: "请填写批量状态变更理由。"
+      });
+    }
+    if (
+      (input.action === "approve" || input.action === "reject") &&
+      input.items.some((item) => item.expectedRound < 1)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["items"],
+        message: "人工终审必须指定当前审核轮次。"
+      });
+    }
+  });
+
+export type BatchProblemStatusInput = z.infer<typeof batchProblemStatusInputSchema>;
+
+export const batchProblemStatusSuccessSchema = z
+  .object({
+    id: z.string(),
+    ok: z.literal(true),
+    status: problemStatusSchema,
+    revision: z.number().int().positive()
+  })
+  .strict();
+
+export const batchProblemStatusFailureSchema = z
+  .object({
+    id: z.string(),
+    ok: z.literal(false),
+    code: z.string().min(1).max(80),
+    message: z.string().min(1).max(500)
+  })
+  .strict();
+
+export const batchProblemStatusResponseSchema = z
+  .object({
+    results: z.array(
+      z.discriminatedUnion("ok", [
+        batchProblemStatusSuccessSchema,
+        batchProblemStatusFailureSchema
+      ])
+    )
+  })
+  .strict();
+
+export type BatchProblemStatusResponse = z.infer<typeof batchProblemStatusResponseSchema>;

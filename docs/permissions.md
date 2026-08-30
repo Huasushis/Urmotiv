@@ -55,7 +55,7 @@
 | `problem.edit.all` | 编辑全部题目中当前允许编辑的字段 |
 | `problem.delete.all` | 删除题目；使用软删除并记录审计 |
 | `problem.review` | 对有查看权限的待审题目提交意见 |
-| `problem.status.change` | 最终确认通过、不通过或强制撤回 |
+| `problem.status.change` | 单题或批量提交审核、最终确认通过/不通过或强制撤回；批量后台还要求全局 `problem.view.all` |
 | `problem.frozen.edit` | 修改冻结字段；仅紧急修正，必须填写原因 |
 | `problem.access.grant` | 给指定用户授予或拒绝单题权限 |
 | `problem.viewers.read` | 查看谁看过题面及活动时长 |

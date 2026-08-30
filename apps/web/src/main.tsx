@@ -84,6 +84,7 @@ function App() {
         <Route path="/transfer" element={<TransferPage />} />
         <Route path="/profile" element={<ProfilePage />} />
         <Route path="/admin/accounts" element={<BatchAccountPage />} />
+        <Route path="/admin/problems" element={<ProblemListPage managementSession={sessionData.user} />} />
         <Route path="/admin/settings" element={<AdminSectionPage section="settings" session={sessionData.user} />} />
         <Route path="/admin/users" element={<AdminPermissionsPage section="users" session={sessionData.user} />} />
         <Route path="/admin/roles" element={<AdminPermissionsPage section="roles" session={sessionData.user} />} />

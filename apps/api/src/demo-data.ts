@@ -59,6 +59,7 @@ const administratorGrants = [
   allow("audit.read"),
   allow("review.policy.manage"),
   allow("problem.view.all"),
+  allow("problem.status.change"),
   allow("problem.import")
 ];
 

@@ -1,5 +1,7 @@
 import type {
   ApplyReviewSuggestionsInput,
+  BatchProblemStatusInput,
+  BatchProblemStatusResponse,
   CreateProblemInput,
   ManualReviewDecisionInput,
   Problem,
@@ -391,7 +393,9 @@ const administratorPermissions = [
   "plugin.manage",
   "service_account.manage",
   "tag.manage",
-  "audit.read"
+  "audit.read",
+  "problem.view.all",
+  "problem.status.change"
 ] as const;
 
 const robotHardDenied = new Set([
@@ -458,7 +462,13 @@ export async function getDemoSession(): Promise<SessionResponse> {
         user.accountType === "human" &&
         permissions.includes("plugin.manage") &&
         permissions.includes("system.manage"),
-      canManageTags: user.accountType === "human" && permissions.includes("tag.manage")
+      canManageTags: user.accountType === "human" && permissions.includes("tag.manage"),
+      canManageProblemCatalog:
+        user.accountType === "human" && permissions.includes("problem.view.all"),
+      canManageProblemStatuses:
+        user.accountType === "human" &&
+        permissions.includes("problem.view.all") &&
+        permissions.includes("problem.status.change")
     },
     auth: {
       emailEnabled: false,
@@ -515,6 +525,67 @@ export async function listDemoProblems(query: ProblemListQuery): Promise<Problem
     page: query.page,
     pageSize: query.pageSize
   };
+}
+
+export async function batchChangeDemoProblemStatus(
+  input: BatchProblemStatusInput
+): Promise<BatchProblemStatusResponse> {
+  const permissions = sessionPermissionsFor(currentUserId());
+  if (
+    !permissions.includes("problem.view.all") ||
+    !permissions.includes("problem.status.change")
+  ) {
+    throw new ApiError("未找到请求的资源。", 404);
+  }
+
+  const results: BatchProblemStatusResponse["results"] = [];
+  for (const item of input.items) {
+    try {
+      const found = findProblem(item.id);
+      const problem = found.problem;
+      requireRevision(problem, item.expectedRevision);
+      let status: ProblemStatus;
+      let reviewRound = problem.reviewRound;
+      if (input.action === "submit") {
+        if (problem.status !== "draft" && problem.status !== "rejected") {
+          throw new ApiError("只有草稿或审核不通过的题目可以提交审核。", 409);
+        }
+        status = "pending_review";
+        reviewRound += 1;
+      } else if (input.action === "withdraw") {
+        if (problem.status !== "pending_review" && problem.status !== "approved") {
+          throw new ApiError("只有待审核或已通过的题目可以撤回修改。", 409);
+        }
+        status = "draft";
+      } else {
+        if (problem.status !== "pending_review") {
+          throw new ApiError("只有待审核的题目可以进行人工终审。", 409);
+        }
+        if (item.expectedRound !== problem.reviewRound) {
+          throw new ApiError("审核轮次已变化，请刷新后重试。", 409);
+        }
+        status = input.action === "approve" ? "approved" : "rejected";
+      }
+      const next: Problem = {
+        ...problem,
+        status,
+        reviewRound,
+        revision: problem.revision + 1,
+        updatedAt: now()
+      };
+      found.all[found.index] = next;
+      saveProblems(found.all);
+      results.push({ id: item.id, ok: true, status, revision: next.revision });
+    } catch (error) {
+      results.push({
+        id: item.id,
+        ok: false,
+        code: error instanceof ApiError ? "CONFLICT" : "INTERNAL_ERROR",
+        message: error instanceof Error ? error.message : "操作失败，请稍后重试。"
+      });
+    }
+  }
+  return { results };
 }
 
 export async function getDemoProblem(id: string): Promise<Problem> {

@@ -22,6 +22,7 @@ export function canOpenAdmin(session: SessionUser): boolean {
     session.canManageServiceAccounts === true ||
     session.canReadAudit === true ||
     session.canManageProblemCatalog === true ||
+    session.canManageProblemStatuses === true ||
     session.canManageOAuth === true ||
     session.permissions.includes("user.create")
   );
@@ -36,6 +37,7 @@ export function adminNavigationGroups(session: SessionUser): AdminNavigationGrou
   const canManageServiceAccounts = session.accountType === "human" && session.canManageServiceAccounts === true;
   const canReadAudit = session.accountType === "human" && session.canReadAudit === true;
   const canManageProblemCatalog = session.accountType === "human" && session.canManageProblemCatalog === true;
+  const canManageProblemStatuses = session.accountType === "human" && session.canManageProblemStatuses === true;
   const canManageOAuth = session.accountType === "human" && session.canManageOAuth === true;
   const canCreateUsers = session.accountType === "human" && session.permissions.includes("user.create");
 
@@ -47,6 +49,7 @@ export function adminNavigationGroups(session: SessionUser): AdminNavigationGrou
     {
       label: "题库",
       items: [
+        ...(canManageProblemStatuses ? [{ to: "/admin/problems", label: "题目管理" }] : []),
         ...(canReview ? [{ to: "/admin/review", label: "审核规则" }] : []),
         ...(canManageTags ? [{ to: "/admin/knowledge", label: "知识点目录" }] : []),
         ...(canManageProblemCatalog ? [{ to: "/problems", label: "题库" }] : []),

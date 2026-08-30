@@ -83,7 +83,7 @@ docker compose --env-file /secure/path/urmotiv.env exec -T api pnpm --filter @ur
 | `reviewer` | 审题人 | 查看可见待审题目并提交审题意见；可读取内部评测资料 |
 | `problem_setter` | 命题组成员 | 编辑可见题目、维护评测资料、组题和查看访问风险 |
 | `leader` | 组长 | 终审题目、授予单题访问权、管理组题、题目包导入导出和知识点 |
-| `system_administrator` | 系统管理员 | 账号、权限、系统设置、插件、机器人账号、知识点和审计 |
+| `system_administrator` | 系统管理员 | 账号、权限、题目批量状态管理、系统设置、插件、机器人账号、知识点和审计 |
 | `root` | root | 仅用于首次配置和紧急恢复的种子角色；不应作为日常登录身份 |
 
 核心权限包括 `auth.login`、`problem.create`、`problem.view.own`/`problem.view.all`、`problem.edit.own`/`problem.edit.all`、`problem.review`、`problem.status.change`、`problem.frozen.edit`、`problem.import`、`problem.export.own`/`problem.export.all`、`problem.testdata.read`/`problem.testdata.write`、`contest.*`、`plugin.manage`、`user.create` 和 `audit.read`。完整名称与作用域见[权限参考](permissions.md)。

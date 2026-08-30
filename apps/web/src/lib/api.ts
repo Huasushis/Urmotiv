@@ -19,6 +19,7 @@ import {
   importHistoryResponseSchema,
   ustcOAuthSettingsSchema,
   batchAccountCreateResponseSchema,
+  batchProblemStatusResponseSchema,
   contestListResponseSchema,
   contestSchema,
   emailVerificationPendingResponseSchema,
@@ -124,7 +125,9 @@ import {
   type UpdateProfileInput,
   type UpdateReviewPolicyInput,
   type UpdateProblemInput,
-  type BatchAccountCreateResponse
+  type BatchAccountCreateResponse,
+  type BatchProblemStatusInput,
+  type BatchProblemStatusResponse
 } from "@urmotiv/contracts";
 import { z } from "zod";
 
@@ -691,6 +694,15 @@ export function listProblems(query: ProblemListQuery): Promise<ProblemListRespon
   return fallback(
     () => request(`/problems${suffix ? `?${suffix}` : ""}`, { method: "GET" }, problemListResponseSchema),
     async () => (await import("./demo-store")).listDemoProblems(query)
+  );
+}
+
+export function batchChangeProblemStatus(
+  input: BatchProblemStatusInput
+): Promise<BatchProblemStatusResponse> {
+  return fallback(
+    () => request("/admin/problems/status", json(input), batchProblemStatusResponseSchema),
+    async () => (await import("./demo-store")).batchChangeDemoProblemStatus(input)
   );
 }
 

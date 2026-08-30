@@ -766,6 +766,91 @@ textarea:read-only {
   min-width: 920px;
 }
 
+.admin-problem-management {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.admin-problem-management .filter-bar {
+  margin-bottom: 0;
+}
+
+.problem-batch-toolbar {
+  display: grid;
+  gap: 15px;
+}
+
+.problem-batch-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.problem-batch-heading h2,
+.problem-batch-heading p {
+  margin: 0;
+}
+
+.problem-batch-heading h2 {
+  margin-top: 3px;
+  font-size: 18px;
+}
+
+.problem-batch-heading > div > p:last-child {
+  margin-top: 5px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.problem-batch-controls {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.55fr) minmax(260px, 1.45fr) auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.problem-batch-controls .primary-button {
+  min-height: 38px;
+}
+
+.problem-batch-result {
+  padding: 11px 12px;
+  border: 1px solid #a7cbc2;
+  border-radius: 5px;
+  background: var(--green-soft);
+  color: var(--green);
+  font-size: 13px;
+}
+
+.problem-batch-result ul {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0 0;
+  padding-left: 20px;
+  color: var(--text-soft);
+}
+
+.problem-table .selection-column {
+  width: 48px;
+  padding-right: 7px;
+  padding-left: 12px;
+  text-align: center;
+}
+
+.problem-table .selection-column input {
+  width: 17px;
+  min-height: 17px;
+  margin: 0;
+  accent-color: var(--teal);
+}
+
+.data-table tbody tr.selected-row,
+.data-table tbody tr.selected-row:hover {
+  background: var(--teal-soft);
+}
+
 .data-table th {
   padding: 11px 12px;
   border-bottom: 1px solid var(--border);
@@ -5172,6 +5257,43 @@ textarea:read-only {
     height: auto;
     padding: 38px 12px;
     text-align: center;
+  }
+
+  .problem-batch-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .problem-batch-heading .text-button {
+    align-self: flex-start;
+  }
+
+  .problem-batch-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .problem-batch-controls .primary-button {
+    width: 100%;
+  }
+
+  .admin-problem-management .problem-table td:first-child {
+    display: flex;
+    padding: 5px 0;
+    text-align: right;
+  }
+
+  .admin-problem-management .problem-table td:first-child::before {
+    display: block;
+  }
+
+  .admin-problem-management .problem-table td:nth-child(2) {
+    display: block;
+    padding-bottom: 10px;
+    text-align: left;
+  }
+
+  .admin-problem-management .problem-table td:nth-child(2)::before {
+    display: none;
   }
 
   .login-page {

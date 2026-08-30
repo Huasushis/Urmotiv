@@ -62,6 +62,7 @@ import {
   uploadProblemFileQuerySchema,
   withdrawProblemInputSchema,
   batchAccountCreateInputSchema,
+  batchProblemStatusInputSchema,
   createAdminServiceAccountInputSchema,
   createServiceAccountTokenInputSchema,
   updateAdminServiceAccountInputSchema
@@ -1282,6 +1283,13 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     reply.header("cache-control", "private, no-store");
     await requireServiceAccountManager(request);
     return { items: await dependencies.adminService.listServiceAccounts() };
+  });
+
+  app.post("/api/v1/admin/problems/status", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const user = await requireAdminPermission(request, "problem.status.change");
+    const input = batchProblemStatusInputSchema.parse(request.body);
+    return dependencies.service.batchChangeProblemStatus(user, input, request.id);
   });
 
   app.post("/api/v1/admin/service-accounts", async (request, reply) => {

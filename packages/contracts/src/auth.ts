@@ -13,6 +13,7 @@ export const sessionUserSchema = userSummarySchema.extend({
   canManageServiceAccounts: z.boolean().optional(),
   canReadAudit: z.boolean().optional(),
   canManageProblemCatalog: z.boolean().optional(),
+  canManageProblemStatuses: z.boolean().optional(),
   canManageOAuth: z.boolean().optional()
 });
 

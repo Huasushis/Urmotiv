@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import {
   type ApplyReviewSuggestionsInput,
+  type BatchProblemStatusInput,
+  type BatchProblemStatusResponse,
   problemDraftSchema,
   type CreateProblemInput,
   type ForceFrozenFieldEditInput,
@@ -361,6 +363,10 @@ export class ProblemService {
         isHuman &&
         (hasPermission(user, "problem.view.all", {}, now) ||
           hasPermission(user, "problem.import", {}, now)),
+      canManageProblemStatuses:
+        isHuman &&
+        hasPermission(user, "problem.view.all", {}, now) &&
+        hasPermission(user, "problem.status.change", {}, now),
       canManageOAuth:
         isHuman &&
         hasPermission(user, "system.manage", {}, now) &&
@@ -390,6 +396,82 @@ export class ProblemService {
       page: query.page,
       pageSize: query.pageSize
     };
+  }
+
+  public async batchChangeProblemStatus(
+    user: StoredUser,
+    input: BatchProblemStatusInput,
+    requestId?: string
+  ): Promise<BatchProblemStatusResponse> {
+    const checkedAt = this.now();
+    if (
+      user.accountType !== "human" ||
+      !hasPermission(user, "problem.view.all", {}, checkedAt) ||
+      !hasPermission(user, "problem.status.change", {}, checkedAt)
+    ) {
+      throw notFound();
+    }
+
+    const results: BatchProblemStatusResponse["results"] = new Array(input.items.length);
+    let nextIndex = 0;
+    const runNext = async (): Promise<void> => {
+      while (nextIndex < input.items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const item = input.items[index]!;
+        try {
+          let updated: Problem;
+          if (input.action === "submit") {
+            updated = await this.submitProblem(user, item.id, item.expectedRevision);
+          } else if (input.action === "withdraw") {
+            updated = await this.withdrawProblem(
+              user,
+              item.id,
+              item.expectedRevision,
+              input.reason,
+              requestId
+            );
+          } else {
+            await this.finalizeReview(
+              user,
+              item.id,
+              {
+                decision: input.action === "approve" ? "approve" : "reject",
+                reason: input.reason,
+                expectedRound: item.expectedRound,
+                expectedRevision: item.expectedRevision
+              },
+              requestId
+            );
+            updated = await this.getProblem(user, item.id);
+          }
+          results[index] = {
+            id: item.id,
+            ok: true,
+            status: updated.status,
+            revision: updated.revision
+          };
+        } catch (error) {
+          results[index] = error instanceof ApiError
+            ? {
+                id: item.id,
+                ok: false,
+                code: error.code,
+                message: error.message
+              }
+            : {
+                id: item.id,
+                ok: false,
+                code: "INTERNAL_ERROR",
+                message: "操作失败，请稍后重试。"
+              };
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(4, input.items.length) }, () => runNext())
+    );
+    return { results };
   }
 
   public async createProblem(user: StoredUser, input: CreateProblemInput): Promise<Problem> {
@@ -657,7 +739,13 @@ export class ProblemService {
     expectedRevision: number
   ): Promise<Problem> {
     const current = await this.findVisibleProblem(user, problemId);
-    if (current.ownerId !== user.id || !canEditProblem(user, current, this.now())) {
+    const target = { ownerId: current.ownerId, objectId: current.id };
+    const canSubmitOwnProblem =
+      current.ownerId === user.id && canEditProblem(user, current, this.now());
+    const canSubmitAsAdministrator =
+      user.accountType === "human" &&
+      hasPermission(user, "problem.status.change", target, this.now());
+    if (!canSubmitOwnProblem && !canSubmitAsAdministrator) {
       throw forbidden();
     }
 
@@ -1785,6 +1873,7 @@ export class ProblemService {
       tagIds: full.tagIds,
       owner: full.owner,
       revision: full.revision,
+      reviewRound: full.reviewRound,
       updatedAt: full.updatedAt,
       capabilities: full.capabilities,
       origin: full.origin,

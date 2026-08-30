@@ -31,13 +31,13 @@ afterEach(async () => {
 });
 
 describe("最终集成红测：管理员与题库入口", () => {
-  it("系统管理员获得题库查看/导入和独立审核策略权限，但不获得终审权", () => {
+  it("系统管理员获得题库查看、导入、批量状态管理和审核策略权限", () => {
     const administrator = createDemoUsers().find((user) => user.id === "administrator");
     expect(administrator).toBeDefined();
     expect(hasPermission(administrator!, "problem.view.all")).toBe(true);
     expect(hasPermission(administrator!, "problem.import")).toBe(true);
     expect(hasPermission(administrator!, "review.policy.manage")).toBe(true);
-    expect(hasPermission(administrator!, "problem.status.change")).toBe(false);
+    expect(hasPermission(administrator!, "problem.status.change")).toBe(true);
   });
 
   it("审核策略能力不再由题目终审权限投影", () => {
