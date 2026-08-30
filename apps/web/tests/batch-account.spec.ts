@@ -10,9 +10,16 @@ async function loginAsLeader(page: Page): Promise<void> {
 }
 
 test.describe("批量创建账号", () => {
-  test("通过导航进入页面并创建合成多行账号，只反馈数量", async ({ page }) => {
+  test("通过导航进入页面并创建合成多行账号，只反馈数量", async ({ page }, testInfo) => {
     await loginAsLeader(page);
-    await page.getByRole("link", { name: "批量账号" }).click();
+    if (testInfo.project.name === "mobile-chromium") {
+      await page.getByRole("button", { name: "打开导航" }).click();
+    }
+    await page.getByRole("link", { name: "管理", exact: true }).click();
+    await page.locator(".admin-dashboard-grid").getByRole("link", {
+      name: "批量创建账号",
+      exact: true
+    }).click();
     await expect(page).toHaveURL(/\/admin\/accounts$/);
     await expect(page.getByRole("heading", { name: "批量创建账号" })).toBeVisible();
 

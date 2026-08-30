@@ -11,6 +11,31 @@ async function loginAsLeader(page: Page): Promise<void> {
   await expect(page).toHaveURL(/\/problems$/);
 }
 
+async function enableHydroFormatPlugin(page: Page): Promise<void> {
+  await page.goto("/demo-login");
+  await page.getByRole("button", { name: /系统管理员/ }).click();
+  await expect(page).toHaveURL(/\/problems$/);
+  const response = await page.request.get("/api/v1/admin/plugins");
+  expect(response.ok()).toBe(true);
+  const body = (await response.json()) as {
+    items: Array<{ id: string; state: string; settingsRevision: number }>;
+  };
+  const plugin = body.items.find((item) => item.id === "org.ustc.urmotiv.hydro-format");
+  if (plugin === undefined) {
+    throw new Error("测试环境没有注册 Hydro 格式插件。");
+  }
+  if (plugin.state !== "enabled") {
+    const updated = await page.request.patch(
+      "/api/v1/admin/plugins/org.ustc.urmotiv.hydro-format",
+      {
+        headers: { Origin: "http://127.0.0.1:5173" },
+        data: { expectedRevision: plugin.settingsRevision, state: "enabled" }
+      }
+    );
+    expect(updated.ok(), await updated.text()).toBe(true);
+  }
+}
+
 async function nativePackageZip(title: string): Promise<Buffer> {
   const problem = canonicalProblemSchema.parse({
     title,
@@ -40,29 +65,82 @@ async function nativePackageZip(title: string): Promise<Buffer> {
   return Buffer.from(writeZipArchive(generated.files));
 }
 
-test("组长在导入导出页完成整包导入并能打开新题目", async ({ page }, testInfo) => {
+function hydroMultiPackageZip(titles: readonly string[]): Buffer {
+  const encoder = new TextEncoder();
+  const files = titles.flatMap((title, index) => {
+    const root = `problem-${index + 1}`;
+    return [
+      {
+        path: `${root}/problem.yaml`,
+        content: encoder.encode([
+          `title: ${title}`,
+          "tag:",
+          "  - algorithm.implementation"
+        ].join("\n"))
+      },
+      {
+        path: `${root}/problem.md`,
+        content: encoder.encode([
+          "# Description",
+          "",
+          `这是第 ${index + 1} 道公开合成导入测试题。`,
+          "",
+          "# Format",
+          "",
+          "输入一个整数并原样输出。"
+        ].join("\n"))
+      },
+      {
+        path: `${root}/solution/solution.md`,
+        content: encoder.encode("直接输出输入。\n")
+      },
+      {
+        path: `${root}/testdata/config.yaml`,
+        content: encoder.encode([
+          "time: 1000ms",
+          "memory: 256m",
+          "cases:",
+          "  - input: 001.in",
+          "    output: 001.out",
+          "    score: 100"
+        ].join("\n"))
+      },
+      { path: `${root}/testdata/001.in`, content: encoder.encode(`${index + 1}\n`) },
+      { path: `${root}/testdata/001.out`, content: encoder.encode(`${index + 1}\n`) }
+    ];
+  });
+  return Buffer.from(writeZipArchive(files));
+}
+
+test("组长自动识别并导入一个含多题的 Hydro 题目包", async ({ page }, testInfo) => {
+  await enableHydroFormatPlugin(page);
   await loginAsLeader(page);
   await page.goto("/transfer");
   await expect(page.getByRole("heading", { name: "导入导出" })).toBeVisible();
 
-  const zip = await nativePackageZip("端到端导入示例题");
+  const titles = ["Hydro 多题导入示例一", "Hydro 多题导入示例二"] as const;
+  const zip = hydroMultiPackageZip(titles);
   await page.locator('input[type="file"]').setInputFiles({
-    name: "e2e-problem.zip",
+    name: "e2e-hydro-multiple.zip",
     mimeType: "application/zip",
     buffer: zip
   });
 
-  await expect(page.getByText(/Urmotiv 完整包/).first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator(".plain-list li").filter({ hasText: "Hydro 题目包" })).toBeVisible({
+    timeout: 15_000
+  });
+  await expect(page.getByLabel("来源格式")).toHaveValue("hydro");
   await page.getByRole("button", { name: /查看内容/ }).click();
-  await expect(page.getByText("端到端导入示例题").first()).toBeVisible({ timeout: 15_000 });
+  const previewMetadata = page.locator(".metadata-list").nth(1);
+  await expect(previewMetadata.locator("dd").first()).toHaveText("2", { timeout: 15_000 });
 
   await page.getByRole("button", { name: /确认导入/ }).click();
-  const problemLink = page.getByRole("link", { name: /查看题目/ }).first();
-  await expect(problemLink).toBeVisible({ timeout: 30_000 });
+  const problemLinks = page.getByRole("link", { name: /查看题目/ });
+  await expect(problemLinks).toHaveCount(2, { timeout: 30_000 });
   await page.screenshot({ path: testInfo.outputPath("transfer-import-done.png"), fullPage: true });
 
-  await problemLink.click();
-  await expect(page.getByRole("heading", { name: "端到端导入示例题" })).toBeVisible({
+  await problemLinks.first().click();
+  await expect(page.getByRole("heading", { name: titles[0] })).toBeVisible({
     timeout: 15_000
   });
 });
@@ -159,6 +237,7 @@ test("题目工作台提供原题检索按钮，未形成可信结果时不会�
   await loginAsLeader(page);
   await page.goto("/problems/new");
   await page.getByLabel("题目名称").fill("查重按钮联调题");
+  await page.getByRole("button", { name: "选择知识点" }).click();
   await page.locator(".tag-picker-group summary").first().click();
   await page.locator(".tag-choice").first().click();
   await page.locator('section[aria-label="基础题面"] textarea').fill("给定 n，输出 n。");

@@ -100,7 +100,7 @@ describe("退出登录", () => {
       </AppShell>
     );
     const signOut = [...view.querySelectorAll<HTMLButtonElement>("button")].find(
-      (button) => button.textContent === "退出"
+      (button) => button.textContent === "退出登录"
     );
     expect(signOut).not.toBeUndefined();
 
@@ -136,7 +136,7 @@ describe("管理导航", () => {
       .find((link) => link.textContent === "管理");
     expect(management?.getAttribute("href")).toBe("/admin");
   });
-  it("按清晰分组提供独立用户、角色和默认角色入口并标记当前路由", () => {
+  it("主导航只保留一个管理入口，并在管理子路由上标记为当前栏目", () => {
     const client = new QueryClient();
     const view = mount(
       client,
@@ -149,14 +149,11 @@ describe("管理导航", () => {
     const hrefs = links.map((link) => link.getAttribute("href"));
     expect(view.querySelector("details.management-menu")).toBeNull();
     expect(hrefs.filter((href) => href === "/transfer")).toHaveLength(1);
-    expect(links.map((link) => link.textContent)).toEqual(
-      expect.arrayContaining(["用户管理", "角色与权限", "默认角色"])
-    );
-    const usersLink = links.find((link) => link.getAttribute("href") === "/admin/users");
-    const rolesLink = links.find((link) => link.getAttribute("href") === "/admin/roles");
-    expect(usersLink?.classList.contains("active")).toBe(true);
-    expect(usersLink?.getAttribute("aria-current")).toBe("page");
-    expect(rolesLink?.classList.contains("active")).toBe(false);
+    expect(hrefs.filter((href) => href === "/admin")).toHaveLength(1);
+    expect(hrefs).not.toContain("/admin/users");
+    const management = links.find((link) => link.getAttribute("href") === "/admin");
+    expect(management?.classList.contains("active")).toBe(true);
+    expect(management?.getAttribute("aria-current")).toBe("page");
     expect(new Set(hrefs).size).toBe(hrefs.length);
   });
 
@@ -207,7 +204,7 @@ describe("导航权限", () => {
     expect(labels).not.toContain("导入导出");
   });
 
-  it("主导航保留可访问名称并使用横向滚动提示类", () => {
+  it("主导航、手机开关和账号菜单都保留明确的可访问名称", () => {
     const client = new QueryClient();
     const view = mount(
       client,
@@ -222,9 +219,11 @@ describe("导航权限", () => {
     const navigation = view.querySelector<HTMLElement>('nav[aria-label="主导航"]');
     expect(navigation?.classList.contains("global-nav")).toBe(true);
     expect(view.querySelector(".global-header")).not.toBeNull();
+    expect(view.querySelector('button[aria-label="打开导航"]')).not.toBeNull();
+    expect(view.querySelector('summary[aria-label="打开账号菜单"]')).not.toBeNull();
     const quietLink = [...view.querySelectorAll<HTMLAnchorElement>("a")]
       .find((link) => link.textContent === "切换演示账号");
-    expect(quietLink?.classList.contains("quiet-link")).toBe(true);
+    expect(quietLink?.getAttribute("href")).toBe("/demo-login");
   });
 });
 

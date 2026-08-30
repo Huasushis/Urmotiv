@@ -241,7 +241,7 @@ test("组长保存审核规则，冲突时保留输入并可主动重新读取",
   });
 
   await loginAs(page, /组长/);
-  await page.goto("/admin");
+  await page.goto("/admin/review");
   const requiredApprovals = page.getByLabel("通过所需人数");
   await requiredApprovals.fill("3");
   await page.getByRole("button", { name: "保存审核规则" }).click();
@@ -286,7 +286,7 @@ test("系统管理员保存插件设置后密钥输入框恢复为空", async ({
   });
 
   await loginAs(page, /系统管理员/);
-  await page.goto("/admin");
+  await page.goto("/admin/plugins");
   await expect(page.getByRole("heading", { name: "原题检索" })).toBeVisible();
   const timeout = page.getByLabel("最长等待时间（毫秒）");
   const providerBaseUrl = page.getByLabel(/嵌入提供方地址/);
@@ -337,18 +337,19 @@ test("手机视口中的插件设置没有横向溢出", async ({ page }, testIn
   });
 
   await loginAs(page, /系统管理员/);
-  await page.goto("/admin");
+  await page.goto("/admin/plugins");
   await expect(page.getByRole("heading", { name: "原题检索" })).toBeVisible();
 
   const overflow = await page.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth
   );
   expect(overflow).toBeLessThanOrEqual(1);
-  const modes = page.getByRole("group", { name: "管理内容" }).getByRole("button");
-  for (let index = 0; index < await modes.count(); index += 1) {
-    const box = await modes.nth(index).boundingBox();
-    expect(box?.height ?? 0).toBeGreaterThanOrEqual(44);
-  }
+  const mobileNavigation = page.locator(".admin-mobile-navigation");
+  await expect(mobileNavigation).toBeVisible();
+  await expect(mobileNavigation.locator("summary")).toContainText("插件");
+  await expect(page.locator(".admin-sidebar")).toBeHidden();
+  const navigationBox = await mobileNavigation.locator("summary").boundingBox();
+  expect(navigationBox?.height ?? 0).toBeGreaterThanOrEqual(44);
   await page.screenshot({ path: testInfo.outputPath("admin-plugins-mobile.png"), fullPage: true });
 });
 
@@ -359,8 +360,8 @@ test("手机视口中的审核规则没有横向溢出", async ({ page }, testIn
   });
 
   await loginAs(page, /组长/);
-  await page.goto("/admin");
-  await expect(page.getByRole("heading", { name: "审核规则" })).toBeVisible();
+  await page.goto("/admin/review");
+  await expect(page.getByRole("heading", { name: "审核规则", level: 1 })).toBeVisible();
 
   const overflow = await page.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth
@@ -393,8 +394,7 @@ test("知识点管理员可以展开分类并查看安全的停用影响汇总",
   });
 
   await loginAs(page, /系统管理员/);
-  await page.goto("/admin");
-  await page.getByRole("button", { name: "知识点目录" }).click();
+  await page.goto("/admin/knowledge");
   await expect(page.getByText("目录版本 12")).toBeVisible();
   await page.getByRole("button", { name: /图论/ }).first().click();
   await page.getByRole("button", { name: "最短路" }).click();
@@ -422,8 +422,7 @@ test("手机视口中的知识点目录可展开且没有横向溢出", async ({
   });
 
   await loginAs(page, /系统管理员/);
-  await page.goto("/admin");
-  await page.getByRole("button", { name: "知识点目录" }).click();
+  await page.goto("/admin/knowledge");
   await page.getByRole("button", { name: /图论/ }).first().click();
   await page.getByRole("button", { name: "最短路" }).click();
   await expect(page.getByRole("heading", { name: "最短路" })).toBeVisible();

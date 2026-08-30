@@ -1,4 +1,4 @@
-import { NavLink } from "react-router-dom";
+import { NavLink, useLocation } from "react-router-dom";
 import type { ReactNode } from "react";
 import type { SessionUser } from "@urmotiv/contracts";
 
@@ -92,9 +92,38 @@ export function AdminLayout({
   actions?: ReactNode;
 }) {
   const groups = adminNavigationGroups(session);
+  const location = useLocation();
+  const currentLabel = groups
+    .flatMap((group) => group.items)
+    .find((item) => item.to === location.pathname)?.label ?? title;
   return (
     <section className="admin-page">
       <div className="admin-layout">
+        <details className="admin-mobile-navigation" key={location.pathname}>
+          <summary>
+            <span>管理栏目</span>
+            <strong>{currentLabel}</strong>
+          </summary>
+          <nav aria-label="管理导航（移动端）">
+            {groups.map((group) => (
+              <section key={group.label}>
+                <h2>{group.label}</h2>
+                <div>
+                  {group.items.map((item) => (
+                    <NavLink
+                      end
+                      key={item.to}
+                      to={item.to}
+                      className={({ isActive }) => isActive ? "active" : ""}
+                    >
+                      {item.label}
+                    </NavLink>
+                  ))}
+                </div>
+              </section>
+            ))}
+          </nav>
+        </details>
         <div className="admin-content">
           <header className="admin-page-header">
             <div>

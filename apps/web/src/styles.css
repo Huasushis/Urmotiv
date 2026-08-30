@@ -2821,6 +2821,10 @@ textarea:read-only {
   min-width: 0;
 }
 
+.admin-mobile-navigation {
+  display: none;
+}
+
 .admin-page-header {
   display: flex;
   align-items: flex-end;
@@ -4516,18 +4520,96 @@ textarea:read-only {
     gap: 20px;
   }
 
-  .admin-sidebar {
-    position: static;
-    grid-row: 1;
+  .admin-mobile-navigation {
+    display: block;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
   }
 
-  .admin-sidebar > nav {
+  .admin-mobile-navigation > summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    min-height: 52px;
+    padding: 0 15px;
+    color: var(--text-soft);
+    cursor: pointer;
+    list-style: none;
+  }
+
+  .admin-mobile-navigation > summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .admin-mobile-navigation > summary::after {
+    content: "⌄";
+    color: var(--text-faint);
+    font-size: 18px;
+    transition: transform 120ms ease;
+  }
+
+  .admin-mobile-navigation[open] > summary {
+    border-bottom: 1px solid var(--border);
+  }
+
+  .admin-mobile-navigation[open] > summary::after {
+    transform: rotate(180deg);
+  }
+
+  .admin-mobile-navigation > summary span {
+    font-size: 12px;
+    font-weight: 650;
+  }
+
+  .admin-mobile-navigation > summary strong {
+    margin-left: auto;
+    color: var(--teal-dark);
+    font-size: 14px;
+  }
+
+  .admin-mobile-navigation > nav {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0;
+    padding: 8px;
   }
 
-  .admin-sidebar-group + .admin-sidebar-group {
-    border-top: 0;
+  .admin-mobile-navigation section {
+    min-width: 0;
+    padding: 7px;
+  }
+
+  .admin-mobile-navigation h2 {
+    margin: 0 0 4px;
+    color: var(--text-faint);
+    font-size: 11px;
+  }
+
+  .admin-mobile-navigation section > div {
+    display: grid;
+  }
+
+  .admin-mobile-navigation a {
+    min-width: 0;
+    min-height: 42px;
+    padding: 11px 9px;
+    border-radius: 4px;
+    color: var(--text-soft);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .admin-mobile-navigation a:hover,
+  .admin-mobile-navigation a.active {
+    background: var(--teal-soft);
+    color: var(--teal-dark);
+  }
+
+  .admin-sidebar {
+    display: none;
   }
 }
 
@@ -4582,10 +4664,6 @@ textarea:read-only {
   .admin-page-header {
     align-items: flex-start;
     flex-direction: column;
-  }
-
-  .admin-sidebar > nav {
-    grid-template-columns: 1fr;
   }
 
   .admin-dashboard-grid {

@@ -17,6 +17,13 @@ async function loginAs(page: Page, name: RegExp) {
   return (await response.json()) as { user: { id: string } };
 }
 
+async function selectFirstKnowledgeTag(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "选择知识点" }).click();
+  const group = page.locator(".tag-picker-group").first();
+  await group.locator("summary").click();
+  await group.locator(".tag-choice").first().click();
+}
+
 async function postJson(page: Page, path: string, data: unknown) {
   const response = await page.request.post(path, {
     data,
@@ -63,8 +70,9 @@ test("投稿人可以创建带 Markdown 内容的草稿并看到六个工作区�
   await loginAsAuthor(page);
   await page.getByRole("link", { name: "新建题目" }).click();
   await page.getByLabel("题目名称").fill("页面联调示例题");
-  await page.locator(".tag-picker-group summary").first().click();
-  await page.locator(".tag-choice").first().click();
+  await page.getByLabel("思维难度（可选）").selectOption("3");
+  await page.getByLabel("代码难度（可选）").selectOption("4");
+  await selectFirstKnowledgeTag(page);
   await page.locator('section[aria-label="基础题面"] textarea').fill("求 $1+1$ 的值。");
   await page.locator('section[aria-label="基础题解"] textarea').fill("直接计算即可。");
   await page.getByRole("button", { name: "创建草稿" }).click();
@@ -73,7 +81,26 @@ test("投稿人可以创建带 Markdown 内容的草稿并看到六个工作区�
   for (const label of ["概要", "题面", "样例与约束", "数据与评测", "题解与资料", "审核记录"]) {
     await expect(page.getByRole("tab", { name: label })).toBeVisible();
   }
+  await expect(page.getByLabel("思维难度")).toHaveValue("3");
+  await expect(page.getByLabel("代码难度")).toHaveValue("4");
   await page.screenshot({ path: testInfo.outputPath("problem-workspace.png"), fullPage: true });
+});
+
+test("作者可以二次确认删除自己的草稿", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "删除交互只需运行一次");
+  await loginAsAuthor(page);
+  await page.goto("/problems/new");
+  await page.getByLabel("题目名称").fill(`待删除草稿-${Date.now()}`);
+  await selectFirstKnowledgeTag(page);
+  await page.getByRole("button", { name: "创建草稿" }).click();
+
+  await page.getByRole("button", { name: "删除" }).click();
+  const confirmation = page.getByRole("alertdialog", { name: "确认删除题目？" });
+  await expect(confirmation).toBeVisible();
+  await expect(confirmation).toContainText("从题库和“我的投稿”中消失");
+  await confirmation.getByRole("button", { name: "确认删除" }).click();
+  await expect(page).toHaveURL(/\/submissions$/);
+  await expect(page.getByRole("heading", { name: "我的投稿" })).toBeVisible();
 });
 
 test("手机视口中的 Markdown 编辑器在编辑和预览间切换", async ({ page }, testInfo) => {
@@ -123,30 +150,22 @@ test("关键文字、导航提示和编辑操作在桌面与 360px 触屏上可�
   expect(contrast.onSubtle).toBeGreaterThanOrEqual(4.5);
 
   const navigation = page.getByRole("navigation", { name: "主导航" });
+  if (mobile) {
+    await page.getByRole("button", { name: "打开导航" }).click();
+  }
   await expect(navigation).toBeVisible();
   if (mobile) {
     const navigationSize = await navigation.evaluate((element) => ({
       clientWidth: element.clientWidth,
       scrollWidth: element.scrollWidth
     }));
-    expect(navigationSize.scrollWidth).toBeGreaterThan(navigationSize.clientWidth);
-    const header = page.locator(".global-header");
-    const cue = await header.evaluate((element) => {
-      const style = getComputedStyle(element, "::after");
-      return {
-        content: style.content,
-        pointerEvents: style.pointerEvents,
-        animationName: style.animationName
-      };
-    });
-    expect(cue.content).not.toBe("none");
-    expect(cue.pointerEvents).toBe("none");
-    expect(cue.animationName).toBe("none");
-    await navigation.getByRole("link").last().focus();
-    await expect.poll(() =>
-      header.evaluate((element) => getComputedStyle(element, "::after").opacity)
-    ).toBe("0");
+    expect(navigationSize.scrollWidth).toBeLessThanOrEqual(navigationSize.clientWidth + 1);
+    for (const link of await navigation.getByRole("link").all()) {
+      const box = await link.boundingBox();
+      expect(box?.height ?? 0).toBeGreaterThanOrEqual(42);
+    }
   } else {
+    await page.getByLabel("打开账号菜单").click();
     const quietLink = page.getByRole("link", { name: "切换演示账号" });
     const quietBox = await quietLink.boundingBox();
     expect(quietBox?.height ?? 0).toBeGreaterThanOrEqual(24);
@@ -656,7 +675,7 @@ test("组长把审核通过的固定题目版本加入组题方案", async ({ pa
 
   await expect(page.getByRole("heading", { name: contestTitle })).toBeVisible();
   await expect(page.getByText("第 3 版")).toBeVisible();
-  await expect(page.getByText("1 人", { exact: true })).toBeVisible();
+  await expect(page.locator(".contest-metadata").getByText("1", { exact: true })).toBeVisible();
   await expect(page.getByText(authorSession.user.id, { exact: true })).toBeVisible();
   await expect(page.locator(".contest-detail-table td").nth(4)).toBeVisible();
   const pageFitsViewport = await page.evaluate(
@@ -678,8 +697,7 @@ test("新建题目页说明题目名称待审核后仍可修改，题面题解�
   await page.screenshot({ path: testInfo.outputPath("create-page-title-contract.png"), fullPage: true });
 
   await page.getByLabel("题目名称").fill(`标题契约题-${testInfo.project.name}-${Date.now()}`);
-  await page.locator(".tag-picker-group summary").first().click();
-  await page.locator(".tag-choice").first().click();
+  await selectFirstKnowledgeTag(page);
   await page.locator('section[aria-label="基础题面"] textarea').fill("求 $2+2$ 的值。");
   await page.locator('section[aria-label="基础题解"] textarea').fill("直接计算即可。");
   await page.getByRole("button", { name: "创建草稿" }).click();
