@@ -161,8 +161,8 @@ export function createBuiltinPluginDefinitions(
             description: "网络失败、超时、408、429、502、503、504 最多执行此次数；认证、冲突和契约错误不重试。"
           },
           privateContentAuthorized: {
-            type: "boolean", default: false, title: "允许发送私密题面",
-            description: "仅在确认 Anklang 的存储和嵌入链路全程留在批准的私有边界后启用。"
+            type: "boolean", default: false, title: "允许将题面发送给 Anklang",
+            description: "Anklang 查重和索引必须接收题目名称与基础题面。启用即确认 Anklang 及嵌入提供方属于批准的处理范围；关闭时不会发出题面请求，查重会按“服务不可用时”设置处理。"
           },
           failureBehavior: {
             type: "string",

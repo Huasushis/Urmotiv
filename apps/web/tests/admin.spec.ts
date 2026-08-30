@@ -86,6 +86,12 @@ const plugin = {
         maximum: 120000,
         title: "最长等待时间（毫秒）"
       },
+      privateContentAuthorized: {
+        type: "boolean",
+        default: false,
+        title: "允许将题面发送给 Anklang",
+        description: "Anklang 查重和索引必须接收题目名称与基础题面。"
+      },
       embeddingProvider: {
         type: "object",
         required: ["baseUrl", "model", "dimension"],
@@ -297,6 +303,11 @@ test("系统管理员保存插件设置后密钥输入框恢复为空", async ({
   await expect(providerBaseUrl).toHaveValue("https://emb.example.com/v1");
   await expect(providerModel).toHaveValue("bge-m3");
   await expect(providerDimension).toHaveValue("1024");
+  const privateContentAuthorization = page.getByRole("checkbox", { name: /允许将题面发送给 Anklang/ });
+  await expect(privateContentAuthorization).not.toBeChecked();
+  const privateContentAuthorizationBox = await privateContentAuthorization.boundingBox();
+  expect(privateContentAuthorizationBox?.width ?? 0).toBeLessThanOrEqual(20);
+  expect(privateContentAuthorizationBox?.height ?? 0).toBeLessThanOrEqual(20);
   await timeout.fill("45000");
   await providerBaseUrl.fill("https://emb2.example.com/v1");
   await providerModel.fill("bge-large");
@@ -328,6 +339,145 @@ test("系统管理员保存插件设置后密钥输入框恢复为空", async ({
   });
   await expect(page.getByText(plugin.source)).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("admin-plugin-desktop.png"), fullPage: true });
+});
+
+const generalSettings = {
+  settings: {
+    emailLoginEnabled: true,
+    emailRegistrationEnabled: false,
+    publicRegistrationEnabled: false,
+    publicSiteUrl: "https://urmotiv.example.test",
+    smtpConfigured: true,
+    smtpHost: "smtp.example.test",
+    smtpPort: 587,
+    smtpSecure: false,
+    smtpUsername: "mailer",
+    smtpFromEmail: "noreply@example.test",
+    smtpFromName: "Urmotiv",
+    smtpPasswordConfigured: true,
+    secureCookies: true,
+    loopbackInsecureCookies: false,
+    webOrigins: ["https://urmotiv.example.test"],
+    revision: 3
+  }
+};
+
+test("常规设置按分组排列且复选框保持正常尺寸", async ({ page }, testInfo) => {
+  await page.route("**/api/v1/admin/settings", async (route) => {
+    await fulfillJson(route, generalSettings);
+  });
+  await loginAs(page, /系统管理员/);
+  await page.goto("/admin/settings");
+
+  await expect(page.getByRole("heading", { name: "常规设置" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "账号注册与登录" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "SMTP 发信" })).toBeVisible();
+  const toggles = page.locator(".settings-toggle-row input[type=checkbox]");
+  await expect(toggles).toHaveCount(4);
+  for (const toggle of await toggles.all()) {
+    const box = await toggle.boundingBox();
+    expect(box?.width ?? 0).toBeLessThanOrEqual(20);
+    expect(box?.height ?? 0).toBeLessThanOrEqual(20);
+  }
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
+  if (testInfo.project.name === "mobile-chromium") {
+    await expect(page.locator(".admin-mobile-navigation")).toBeVisible();
+  } else {
+    await expect(page.locator(".admin-sidebar")).toBeVisible();
+  }
+  await page.screenshot({ path: testInfo.outputPath(`admin-settings-${testInfo.project.name}.png`), fullPage: true });
+});
+
+test("服务账号页面可以生成并撤销机器人令牌", async ({ page }, testInfo) => {
+  const tokenId = "77777777-7777-4777-8777-777777777777";
+  const rawToken = `urv_${"A".repeat(43)}`;
+  let items: Array<Record<string, unknown>> = [];
+  let accounts: Array<Record<string, unknown>> = [];
+  let submitted: Record<string, unknown> | undefined;
+  await page.route("**/api/v1/admin/service-accounts", async (route) => {
+    if (route.request().method() === "POST") {
+      const payload = route.request().postDataJSON() as { nickname: string };
+      const item = { id: "901", nickname: payload.nickname, accountType: "robot", enabled: true, tokenConfigured: false };
+      accounts = [item];
+      await fulfillJson(route, { item }, 201);
+      return;
+    }
+    await fulfillJson(route, { items: accounts.map((account) => ({ ...account, tokenConfigured: items.some((item) => item.revokedAt === null) })) });
+  });
+  await page.route("**/api/v1/admin/service-accounts/901", async (route) => {
+    const payload = route.request().postDataJSON() as { enabled: boolean };
+    accounts = accounts.map((account) => ({ ...account, enabled: payload.enabled }));
+    await fulfillJson(route, { item: accounts[0] });
+  });
+  await page.route("**/api/v1/admin/service-accounts/901/tokens**", async (route) => {
+    const method = route.request().method();
+    if (method === "GET") {
+      await fulfillJson(route, { items });
+      return;
+    }
+    if (method === "POST" && route.request().url().endsWith("/tokens")) {
+      submitted = route.request().postDataJSON() as Record<string, unknown>;
+      const item = {
+        id: tokenId,
+        name: submitted.name,
+        displayPrefix: "urv_AAAAAAAA",
+        permissions: submitted.permissions,
+        sourceCidrs: submitted.sourceCidrs,
+        expiresAt: submitted.expiresAt,
+        lastUsedAt: null,
+        revokedAt: null,
+        createdAt: "2026-08-30T12:00:00.000Z"
+      };
+      items = [item];
+      await fulfillJson(route, { item, token: rawToken });
+      return;
+    }
+    if (method === "DELETE") {
+      items = items.map((item) => ({ ...item, revokedAt: "2026-08-30T12:05:00.000Z" }));
+      await fulfillJson(route, { item: items[0] });
+      return;
+    }
+    await fulfillJson(route, { error: { message: "测试请求不匹配。" } }, 500);
+  });
+
+  await loginAs(page, /系统管理员/);
+  await page.goto("/admin/service-accounts");
+  await expect(page.getByText("还没有机器人账号，请先在上方创建。")).toBeVisible();
+  await page.getByLabel("新机器人名称").fill("审题机器人");
+  await page.getByRole("button", { name: "创建", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "审题机器人" })).toBeVisible();
+  await page.getByLabel("用途名称").fill("浏览器审题令牌");
+  await page.getByRole("button", { name: "生成令牌" }).click();
+
+  const secret = page.getByLabel("新机器人令牌");
+  await expect(secret).toHaveValue(rawToken);
+  expect(submitted?.permissions).toEqual([
+    "auth.login",
+    "problem.view.all",
+    "problem.review",
+    "problem.testdata.read"
+  ]);
+  await page.getByRole("button", { name: "我已保存" }).click();
+  await expect(secret).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "轮换" })).toBeVisible();
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "撤销" }).click();
+  await expect(page.getByText("已撤销", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "撤销" })).toHaveCount(0);
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "停用账号" }).click();
+  await expect(page.getByRole("button", { name: "重新启用" })).toBeVisible();
+  await page.getByRole("button", { name: "重新启用" }).click();
+  await expect(page.getByRole("button", { name: "停用账号" })).toBeVisible();
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath(`admin-service-accounts-${testInfo.project.name}.png`), fullPage: true });
 });
 
 test("手机视口中的插件设置没有横向溢出", async ({ page }, testInfo) => {

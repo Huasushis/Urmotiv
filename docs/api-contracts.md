@@ -175,6 +175,8 @@ Accept: application/json
 | `GET /api/v1/admin/settings` | `system.manage` | 读取系统运行设置摘要，不返回密钥 |
 | `GET /api/v1/admin/roles`、`GET /api/v1/admin/permissions` | `user.permission.manage` | 读取内置角色和权限目录 |
 | `GET /api/v1/admin/service-accounts` | `service_account.manage` | 列出机器人账号摘要，不返回令牌 |
+| `POST /api/v1/admin/service-accounts` | `service_account.manage` | 创建使用当前机器人默认角色的机器人账号 |
+| `PATCH /api/v1/admin/service-accounts/:userId` | `service_account.manage` | 启用或停用机器人账号；停用时原子撤销现有令牌 |
 | `GET /api/v1/admin/audit` | `audit.read` | 分页读取安全审计摘要，不返回题面、密钥或原始模型响应 |
 | `GET/PUT /api/v1/admin/oauth/ustc` | 人类管理员且同时具备 `system.manage`、`user.permission.manage` | 读取/更新 USTC OAuth 配置；响应只表示客户端密钥是否已配置 |
 | `GET /api/v1/admin/fermata/health`、`GET/PUT /api/v1/admin/fermata/settings`、`POST /api/v1/admin/fermata/wake` | `plugin.manage` + `system.manage` | 查看和控制 Fermata 内置插件；令牌只在插件内部使用 |

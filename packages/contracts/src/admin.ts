@@ -109,6 +109,15 @@ export const adminServiceAccountSchema = z.object({
 export const adminServiceAccountsResponseSchema = z.object({
   items: z.array(adminServiceAccountSchema)
 }).strict();
+export const createAdminServiceAccountInputSchema = z.object({
+  nickname: z.string().trim().min(1).max(120)
+}).strict();
+export const updateAdminServiceAccountInputSchema = z.object({
+  enabled: z.boolean()
+}).strict();
+export const adminServiceAccountResponseSchema = z.object({
+  item: adminServiceAccountSchema
+}).strict();
 
 export const adminAuditEventSchema = z.object({
   id: z.string(),
@@ -126,6 +135,8 @@ export const adminAuditResponseSchema = z.object({
 export type AdminRole = z.infer<typeof adminRoleSchema>;
 export type AdminPermission = z.infer<typeof adminPermissionSchema>;
 export type AdminServiceAccount = z.infer<typeof adminServiceAccountSchema>;
+export type CreateAdminServiceAccountInput = z.infer<typeof createAdminServiceAccountInputSchema>;
+export type UpdateAdminServiceAccountInput = z.infer<typeof updateAdminServiceAccountInputSchema>;
 export type AdminAuditEvent = z.infer<typeof adminAuditEventSchema>;
 export type AdminRolesResponse = z.infer<typeof adminRolesResponseSchema>;
 export type AdminPermissionsResponse = z.infer<typeof adminPermissionsResponseSchema>;

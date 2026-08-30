@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { createApiToken } from "@urmotiv/auth";
 import {
+  adminServiceAccountSchema,
   createServiceAccountTokenInputSchema,
   createdServiceAccountTokenSchema,
   serviceAccountTokenListSchema,
   serviceAccountTokenSchema,
+  type AdminServiceAccount,
   type CreateServiceAccountTokenInput,
   type CreatedServiceAccountToken,
   type ServiceAccountToken,
@@ -40,6 +42,20 @@ export interface CreateServiceAccountTokenRecordInput {
   readonly token: CreateServiceAccountTokenInput;
 }
 
+export interface CreateServiceAccountRecordInput {
+  readonly actorUserId: string;
+  readonly effectiveUserId?: string;
+  readonly requestId: string;
+  readonly nickname: string;
+}
+
+export interface UpdateServiceAccountRecordInput {
+  readonly actorUserId: string;
+  readonly effectiveUserId?: string;
+  readonly requestId: string;
+  readonly enabled: boolean;
+}
+
 function parseDatabaseId(value: string): bigint | undefined {
   if (value.length === 0 || value.length > 19 || !databaseIdPattern.test(value)) {
     return undefined;
@@ -70,24 +86,45 @@ function readStringArray(value: unknown): string[] {
   return parsed;
 }
 
-async function activeRobotExists(
+async function robotExists(
   executor: DatabaseExecutor,
   userId: bigint,
-  lock: boolean
+  lock: boolean,
+  activeOnly: boolean
 ): Promise<boolean> {
   const rows = await executor.query<{ id: string }>(lock
     ? sql`
         SELECT id::text AS id
         FROM users
-        WHERE id = ${userId} AND account_type = 'robot' AND disabled_at IS NULL
+        WHERE id = ${userId}
+          AND account_type = 'robot'
+          AND (${activeOnly} = false OR disabled_at IS NULL)
         FOR UPDATE
       `
     : sql`
         SELECT id::text AS id
         FROM users
-        WHERE id = ${userId} AND account_type = 'robot' AND disabled_at IS NULL
+        WHERE id = ${userId}
+          AND account_type = 'robot'
+          AND (${activeOnly} = false OR disabled_at IS NULL)
       `);
   return rows.length === 1;
+}
+
+async function activeTokenConfigured(
+  executor: DatabaseExecutor,
+  userId: bigint,
+  now: Date
+): Promise<boolean> {
+  const rows = await executor.query<{ configured: boolean }>(sql`
+    SELECT EXISTS (
+      SELECT 1 FROM api_tokens
+      WHERE user_id = ${userId}
+        AND revoked_at IS NULL
+        AND (expires_at IS NULL OR expires_at > ${now.toISOString()}::timestamptz)
+    ) AS configured
+  `);
+  return rows[0]?.configured === true;
 }
 
 async function readTokens(
@@ -211,13 +248,129 @@ export class DatabaseServiceAccountTokenStore {
     private readonly now: () => Date = () => new Date()
   ) {}
 
-  /** Missing, disabled, and non-robot accounts all return the same result. */
+  /** Missing and non-robot accounts look absent; disabled robots remain manageable. */
   public async listTokens(serviceAccountUserId: string): Promise<ServiceAccountTokenList | undefined> {
     const userId = parseDatabaseId(serviceAccountUserId);
     if (userId === undefined) return undefined;
     return this.database.transaction(async (transaction) => {
-      if (!await activeRobotExists(transaction, userId, false)) return undefined;
+      if (!await robotExists(transaction, userId, false, false)) return undefined;
       return serviceAccountTokenListSchema.parse({ items: await readTokens(transaction, userId) });
+    });
+  }
+
+  public async createAccount(
+    operation: CreateServiceAccountRecordInput
+  ): Promise<AdminServiceAccount> {
+    const actorUserId = requireDatabaseId(operation.actorUserId, "机器人账号创建者编号");
+    const nickname = operation.nickname.trim();
+    if (nickname.length === 0 || nickname.length > 120) {
+      throw new Error("机器人账号名称无效。");
+    }
+    return this.database.transaction(async (transaction) => {
+      const roleRows = await transaction.query<{ id: string }>(sql`
+        SELECT role.id::text AS id
+        FROM role_defaults defaults
+        JOIN roles role ON role.key = defaults.robot_role_key
+        WHERE defaults.id = 'global'
+        LIMIT 1
+      `);
+      const roleId = roleRows[0]?.id;
+      if (roleId === undefined) throw new Error("机器人默认角色尚未初始化。");
+      const inserted = await transaction.query<{ id: string }>(sql`
+        INSERT INTO users (nickname, account_type)
+        VALUES (${nickname}, 'robot')
+        RETURNING id::text AS id
+      `);
+      const userId = inserted[0]?.id;
+      if (userId === undefined) throw new Error("机器人账号创建后无法读取编号。");
+      const databaseUserId = requireDatabaseId(userId, "机器人账号编号");
+      await transaction.execute(sql`
+        INSERT INTO role_memberships (id, user_id, role_id, granted_by_user_id, reason)
+        VALUES (
+          ${randomUUID()}::uuid,
+          ${databaseUserId},
+          ${roleId}::uuid,
+          ${actorUserId},
+          '创建机器人服务账号'
+        )
+      `);
+      await transaction.execute(sql`
+        INSERT INTO audit_events (
+          actor_user_id, subject_user_id, request_id, action, object_type,
+          object_id, result, metadata
+        ) VALUES (
+          ${actorUserId}, ${databaseUserId}, ${operation.requestId}::uuid,
+          'service_account.create', 'user', ${userId}, 'success',
+          ${JSON.stringify(
+            operation.effectiveUserId === undefined || operation.effectiveUserId === operation.actorUserId
+              ? {}
+              : { effectiveUserId: operation.effectiveUserId }
+          )}::jsonb
+        )
+      `);
+      return adminServiceAccountSchema.parse({
+        id: userId,
+        nickname,
+        accountType: "robot",
+        enabled: true,
+        tokenConfigured: false
+      });
+    });
+  }
+
+  public async updateAccount(
+    serviceAccountUserId: string,
+    operation: UpdateServiceAccountRecordInput
+  ): Promise<AdminServiceAccount | undefined> {
+    const userId = parseDatabaseId(serviceAccountUserId);
+    if (userId === undefined) return undefined;
+    const actorUserId = requireDatabaseId(operation.actorUserId, "机器人账号管理者编号");
+    return this.database.transaction(async (transaction) => {
+      const rows = await transaction.query<{ nickname: string }>(sql`
+        SELECT nickname
+        FROM users
+        WHERE id = ${userId} AND account_type = 'robot'
+        FOR UPDATE
+      `);
+      const account = rows[0];
+      if (account === undefined) return undefined;
+      const now = this.now();
+      if (operation.enabled) {
+        await transaction.execute(sql`
+          UPDATE users SET disabled_at = NULL WHERE id = ${userId} AND account_type = 'robot'
+        `);
+      } else {
+        await transaction.execute(sql`
+          UPDATE users SET disabled_at = ${now.toISOString()}::timestamptz
+          WHERE id = ${userId} AND account_type = 'robot'
+        `);
+        await transaction.execute(sql`
+          UPDATE api_tokens SET revoked_at = ${now.toISOString()}::timestamptz
+          WHERE user_id = ${userId} AND revoked_at IS NULL
+        `);
+      }
+      await transaction.execute(sql`
+        INSERT INTO audit_events (
+          actor_user_id, subject_user_id, request_id, action, object_type,
+          object_id, result, metadata
+        ) VALUES (
+          ${actorUserId}, ${userId}, ${operation.requestId}::uuid,
+          'service_account.status.update', 'user', ${serviceAccountUserId}, 'success',
+          ${JSON.stringify({
+            enabled: operation.enabled,
+            ...(operation.effectiveUserId === undefined || operation.effectiveUserId === operation.actorUserId
+              ? {}
+              : { effectiveUserId: operation.effectiveUserId })
+          })}::jsonb
+        )
+      `);
+      return adminServiceAccountSchema.parse({
+        id: serviceAccountUserId,
+        nickname: account.nickname,
+        accountType: "robot",
+        enabled: operation.enabled,
+        tokenConfigured: operation.enabled && await activeTokenConfigured(transaction, userId, now)
+      });
     });
   }
 
@@ -232,7 +385,7 @@ export class DatabaseServiceAccountTokenStore {
     const userId = parseDatabaseId(serviceAccountUserId);
     if (userId === undefined) return undefined;
     return this.database.transaction(async (transaction) => {
-      if (!await activeRobotExists(transaction, userId, true)) return undefined;
+      if (!await robotExists(transaction, userId, true, true)) return undefined;
       return insertToken(transaction, userId, operation, this.now, "service_account.token.create");
     });
   }
@@ -249,7 +402,7 @@ export class DatabaseServiceAccountTokenStore {
     const userId = parseDatabaseId(serviceAccountUserId);
     if (userId === undefined || !uuidPattern.test(tokenId)) return undefined;
     return this.database.transaction(async (transaction) => {
-      if (!await activeRobotExists(transaction, userId, true)) return undefined;
+      if (!await robotExists(transaction, userId, true, true)) return undefined;
       const activeToken = await transaction.query<{ id: string }>(sql`
         SELECT id::text AS id
         FROM api_tokens
@@ -281,7 +434,7 @@ export class DatabaseServiceAccountTokenStore {
     });
   }
 
-  /** Cross-account, missing, malformed, already-revoked, and disabled targets all look absent. */
+  /** Cross-account, missing, malformed, and already-revoked targets all look absent. */
   public async revokeToken(
     serviceAccountUserId: string,
     tokenId: string,
@@ -292,7 +445,7 @@ export class DatabaseServiceAccountTokenStore {
     const userId = parseDatabaseId(serviceAccountUserId);
     if (userId === undefined || !uuidPattern.test(tokenId)) return undefined;
     return this.database.transaction(async (transaction) => {
-      if (!await activeRobotExists(transaction, userId, true)) return undefined;
+      if (!await robotExists(transaction, userId, true, false)) return undefined;
       const revoked = await transaction.query<{ id: string }>(sql`
         UPDATE api_tokens
         SET revoked_at = ${this.now().toISOString()}::timestamptz

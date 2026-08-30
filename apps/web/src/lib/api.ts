@@ -9,7 +9,11 @@ import {
   adminUsersResponseSchema,
   adminRoleManagementResponseSchema,
   adminRoleResponseSchema,
+  adminServiceAccountResponseSchema,
   adminServiceAccountsResponseSchema,
+  createdServiceAccountTokenSchema,
+  serviceAccountTokenListSchema,
+  serviceAccountTokenSchema,
   adminPluginListResponseSchema,
   adminPluginResponseSchema,
   importHistoryResponseSchema,
@@ -59,6 +63,12 @@ import {
   type AdminRoleManagementResponse,
   type AdminRoleResponse,
   type AdminServiceAccountsResponse,
+  type CreateAdminServiceAccountInput,
+  type UpdateAdminServiceAccountInput,
+  type CreateServiceAccountTokenInput,
+  type CreatedServiceAccountToken,
+  type ServiceAccountToken,
+  type ServiceAccountTokenList,
   type UpdateFermataPublicSettingsInput,
   type ImportHistoryQuery,
   type ImportHistoryResponse,
@@ -418,6 +428,69 @@ export function updateAdminRoleDefaults(
 
 export function listAdminServiceAccounts(): Promise<AdminServiceAccountsResponse> {
   return request("/admin/service-accounts", { method: "GET" }, adminServiceAccountsResponseSchema);
+}
+
+export function createAdminServiceAccount(input: CreateAdminServiceAccountInput) {
+  return request(
+    "/admin/service-accounts",
+    json(input),
+    adminServiceAccountResponseSchema
+  );
+}
+
+export function updateAdminServiceAccount(
+  userId: string,
+  input: UpdateAdminServiceAccountInput
+) {
+  return request(
+    `/admin/service-accounts/${encodeURIComponent(userId)}`,
+    json(input, "PATCH"),
+    adminServiceAccountResponseSchema
+  );
+}
+
+export function listServiceAccountTokens(userId: string): Promise<ServiceAccountTokenList> {
+  return request(
+    `/admin/service-accounts/${encodeURIComponent(userId)}/tokens`,
+    { method: "GET" },
+    serviceAccountTokenListSchema
+  );
+}
+
+export function createServiceAccountToken(
+  userId: string,
+  input: CreateServiceAccountTokenInput
+): Promise<CreatedServiceAccountToken> {
+  return request(
+    `/admin/service-accounts/${encodeURIComponent(userId)}/tokens`,
+    json(input),
+    createdServiceAccountTokenSchema
+  );
+}
+
+export function rotateServiceAccountToken(
+  userId: string,
+  tokenId: string,
+  input: CreateServiceAccountTokenInput
+): Promise<CreatedServiceAccountToken> {
+  return request(
+    `/admin/service-accounts/${encodeURIComponent(userId)}/tokens/${encodeURIComponent(tokenId)}/rotate`,
+    json(input),
+    createdServiceAccountTokenSchema
+  );
+}
+
+const revokedServiceAccountTokenSchema = z.object({ item: serviceAccountTokenSchema }).strict();
+
+export function revokeServiceAccountToken(
+  userId: string,
+  tokenId: string
+): Promise<{ item: ServiceAccountToken }> {
+  return request(
+    `/admin/service-accounts/${encodeURIComponent(userId)}/tokens/${encodeURIComponent(tokenId)}`,
+    { method: "DELETE" },
+    revokedServiceAccountTokenSchema
+  );
 }
 
 export function listAdminAudit(page = 1, pageSize = 20): Promise<AdminAuditResponse> {

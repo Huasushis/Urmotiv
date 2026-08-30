@@ -62,7 +62,9 @@ import {
   uploadProblemFileQuerySchema,
   withdrawProblemInputSchema,
   batchAccountCreateInputSchema,
-  createServiceAccountTokenInputSchema
+  createAdminServiceAccountInputSchema,
+  createServiceAccountTokenInputSchema,
+  updateAdminServiceAccountInputSchema
 } from "@urmotiv/contracts";
 import {
   CasAuthenticationError,
@@ -1280,6 +1282,34 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     reply.header("cache-control", "private, no-store");
     await requireServiceAccountManager(request);
     return { items: await dependencies.adminService.listServiceAccounts() };
+  });
+
+  app.post("/api/v1/admin/service-accounts", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const current = await requireServiceAccountManagerContext(request);
+    const input = createAdminServiceAccountInputSchema.parse(request.body);
+    const item = await requireServiceAccountTokenStore().createAccount({
+      actorUserId: current.actor.id,
+      ...(current.actor.id === current.user.id ? {} : { effectiveUserId: current.user.id }),
+      requestId: request.id,
+      nickname: input.nickname
+    });
+    return reply.code(201).send({ item });
+  });
+
+  app.patch("/api/v1/admin/service-accounts/:userId", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const current = await requireServiceAccountManagerContext(request);
+    const userId = parseServiceAccountUserId(request);
+    const input = updateAdminServiceAccountInputSchema.parse(request.body);
+    const item = await requireServiceAccountTokenStore().updateAccount(userId, {
+      actorUserId: current.actor.id,
+      ...(current.actor.id === current.user.id ? {} : { effectiveUserId: current.user.id }),
+      requestId: request.id,
+      enabled: input.enabled
+    });
+    if (item === undefined) throw notFound();
+    return { item };
   });
 
   app.get("/api/v1/admin/audit", async (request, reply) => {

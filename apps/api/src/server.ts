@@ -223,7 +223,11 @@ try {
     roleManagementStore: new DatabaseRoleManagementStore(database),
     serviceAccountTokenConfigured: async (userId) => {
       const tokens = await serviceAccountTokens.listTokens(userId);
-      return tokens !== undefined && tokens.items.length > 0;
+      const now = Date.now();
+      return tokens !== undefined && tokens.items.some((token) =>
+        token.revokedAt === null &&
+        (token.expiresAt === null || Date.parse(token.expiresAt) > now)
+      );
     },
     reviewItems: new DatabaseReviewItemStore(database),
     loginRateLimiter,

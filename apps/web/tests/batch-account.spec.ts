@@ -22,6 +22,13 @@ test.describe("批量创建账号", () => {
     }).click();
     await expect(page).toHaveURL(/\/admin\/accounts$/);
     await expect(page.getByRole("heading", { name: "批量创建账号" })).toBeVisible();
+    if (testInfo.project.name === "mobile-chromium") {
+      await expect(page.locator(".admin-mobile-navigation")).toBeVisible();
+      await expect(page.locator(".admin-mobile-navigation summary")).toContainText("批量创建账号");
+    } else {
+      await expect(page.locator(".admin-sidebar")).toBeVisible();
+      await expect(page.locator('.admin-sidebar a.active')).toHaveText("批量创建账号");
+    }
 
     const unique = mailSuffix();
     const passwordA = "SyntheticBrowserPass-A-123";

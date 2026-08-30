@@ -3059,22 +3059,71 @@ textarea:read-only {
   line-height: 1.55;
 }
 
-.settings-form-section > label,
+.settings-section-controls > label,
+.settings-field-stack label,
 .settings-field-grid label {
   display: grid;
   align-content: start;
   gap: 6px;
 }
 
-.settings-form-section > .checkbox-row {
-  display: flex;
-  align-self: start;
+.settings-section-controls {
+  display: grid;
+  min-width: 0;
+  gap: 14px;
 }
 
 .settings-field-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+}
+
+.settings-field-stack,
+.settings-toggle-list {
+  display: grid;
+  gap: 10px;
+}
+
+.settings-toggle-row {
+  display: flex !important;
+  align-items: flex-start;
+  gap: 10px !important;
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-subtle);
+  cursor: pointer;
+}
+
+.settings-toggle-row input,
+.service-account-permissions input,
+.checkbox-row > input[type="checkbox"] {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  min-height: 0;
+  margin: 2px 0 0;
+  padding: 0;
+  accent-color: var(--teal);
+}
+
+.settings-toggle-row > span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.settings-toggle-row strong {
+  font-size: 14px;
+}
+
+.settings-toggle-row small {
+  color: var(--text-faint);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
 }
 
 .settings-runtime-note {
@@ -3122,6 +3171,317 @@ textarea:read-only {
 .checkbox-row select {
   margin-left: auto;
   width: auto;
+}
+
+.service-account-layout {
+  display: grid;
+  grid-template-columns: minmax(210px, 260px) minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+}
+
+.service-account-list-panel,
+.service-account-detail-panel {
+  min-width: 0;
+}
+
+.service-account-create {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.service-account-create > label {
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.service-account-create > div {
+  display: flex;
+  gap: 7px;
+}
+
+.service-account-create input {
+  min-width: 0;
+  min-height: 38px;
+  padding: 0 9px;
+}
+
+.service-account-status-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.service-account-status-actions button {
+  min-height: 32px;
+  padding-inline: 10px;
+  font-size: 12px;
+}
+
+.service-account-list {
+  display: grid;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.service-account-list > button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  min-height: 58px;
+  padding: 9px 11px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.service-account-list > button:last-child {
+  border-bottom: 0;
+}
+
+.service-account-list > button:hover,
+.service-account-list > button.active {
+  background: var(--teal-soft);
+}
+
+.service-account-list > button > span:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.service-account-list small {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.status-pill {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-subtle);
+  color: var(--text-soft);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.status-pill.success {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.status-pill.danger {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.token-secret-panel {
+  margin-bottom: 18px;
+  padding: 14px;
+  border: 1px solid #e1b15f;
+  border-radius: 5px;
+  background: var(--amber-soft);
+}
+
+.token-secret-panel p {
+  margin: 4px 0 10px;
+  color: var(--text-soft);
+  font-size: 13px;
+}
+
+.token-secret-panel > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.token-secret-panel input {
+  flex: 1 1 280px;
+  min-width: 0;
+  min-height: 38px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--surface);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.token-secret-panel small {
+  display: block;
+  margin-top: 7px;
+  color: var(--text-soft);
+}
+
+.service-token-create {
+  margin-bottom: 20px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.service-token-create > summary {
+  min-height: 44px;
+  padding: 11px 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.service-token-create[open] > summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.service-token-create > form {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.service-token-create > form > label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.service-token-create input:not([type="checkbox"]),
+.service-token-create textarea {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--surface);
+}
+
+.service-token-create label > small,
+.service-account-permissions > p {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+.service-account-permissions {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+}
+
+.service-account-permissions > legend {
+  padding: 0 5px;
+  font-weight: 700;
+}
+
+.service-account-permissions > div {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 14px;
+  margin-top: 9px;
+}
+
+.service-account-permissions .checkbox-row {
+  align-items: flex-start;
+  font-size: 12px;
+}
+
+.service-account-permissions .checkbox-row > span {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.service-account-permissions .checkbox-row small {
+  color: var(--text-faint);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10px;
+}
+
+.service-token-list-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 10px;
+}
+
+.service-token-list-heading h3 {
+  margin: 0;
+}
+
+.service-token-list-heading span {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.service-token-list {
+  display: grid;
+  gap: 10px;
+}
+
+.service-token-list article {
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-subtle);
+}
+
+.service-token-list article > div:first-child,
+.service-token-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.service-token-list dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px 14px;
+  margin: 11px 0;
+}
+
+.service-token-list dl > div {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px;
+  font-size: 12px;
+}
+
+.service-token-list dt {
+  color: var(--text-faint);
+}
+
+.service-token-list dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.service-token-list article > p {
+  margin: 6px 0;
+  color: var(--text-soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.service-token-actions {
+  justify-content: flex-end;
+  margin-top: 11px;
+  padding-top: 11px;
+  border-top: 1px solid var(--border);
 }
 
 .admin-editor,
@@ -3275,7 +3635,9 @@ textarea:read-only {
   flex: none;
   width: 16px;
   height: 16px;
+  min-height: 0;
   margin: 1px 0 0;
+  padding: 0;
   accent-color: var(--teal);
 }
 
@@ -4611,6 +4973,10 @@ textarea:read-only {
   .admin-sidebar {
     display: none;
   }
+
+  .service-account-layout {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 760px) {
@@ -5100,6 +5466,29 @@ textarea:read-only {
 
   .settings-form-section {
     gap: 14px;
+  }
+
+  .service-account-permissions > div,
+  .service-token-list dl {
+    grid-template-columns: 1fr;
+  }
+
+  .token-secret-panel > div,
+  .service-token-actions,
+  .service-account-status-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .token-secret-panel .secondary-button,
+  .service-token-actions button,
+  .service-account-status-actions button {
+    width: 100%;
+  }
+
+  .service-account-create > div {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .admin-actions {

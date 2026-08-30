@@ -47,7 +47,7 @@ jq -n '{
 
 两个插件密钥用途不同，必须分开保存：`serviceToken` 是 Urmotiv 调用 Anklang 服务和提供方管理接口时认证自己的身份；`embeddingApiKey` 是 Anklang 调用嵌入模型提供方时使用的写密钥，只在进程内存中短暂存在，永不回显。`embeddingProvider` 设置（`baseUrl`、`model`、`dimension`）是普通设置，其中 `baseUrl` 允许任一主机名的 HTTPS 地址，或仅供隔离测试的本地/私有 HTTP 地址；不得含账号密码、查询参数或片段。每次启用后的查询或索引同步前，插件都先用 `serviceToken` 认证地 PUT `/api/v1/admin/embedding-provider` 把当前提供方配置（含 `embeddingApiKey`）供给 Anklang；提供方设置或密钥缺失/被清除/非法时，查询按 `failureBehavior` 作为不可用处理（绝不伪装成“没有相似题”），索引同步零请求跳过。没有通用或 Fermata 回退，也不从环境变量读取任何嵌入配置。
 
-`baseUrl` 只允许语法上的本地/私有地址：`localhost`、`host.docker.internal`、回环/RFC1918/链路本地/IPv6 ULA 字面量，或不含点的单标签容器服务名。不得带账号密码、路径、查询参数或片段；公网主机名/IP 会在设置校验阶段拒绝。`privateContentAuthorized` 默认为 `false`，管理员只有在确认 Anklang 的数据库、对象存储和嵌入链路全部留在批准边界内后才能改为 `true`。未授权、缺少非空 `serviceToken`、插件停用或设置无效时，插件在发出任何请求前拒绝继续。
+`baseUrl` 只允许语法上的本地/私有地址：`localhost`、`host.docker.internal`、回环/RFC1918/链路本地/IPv6 ULA 字面量，或不含点的单标签容器服务名。不得带账号密码、路径、查询参数或片段；公网主机名/IP 会在设置校验阶段拒绝。`privateContentAuthorized` 是题面发送的明确授权闸门，默认为 `false`；Anklang 查重与索引都必须接收题目名称和基础题面，因此只有在确认 Anklang 与嵌入提供方属于批准的处理范围后才能改为 `true`。关闭它不会执行“无题面的降级查重”，而是在发出任何题面请求前停止，并按 `failureBehavior` 处理提交检查。缺少非空 `serviceToken`、插件停用或设置无效时同样不会发出请求。
 
 令牌必须在上面的经过认证的管理员请求正文中传输这一次，随后仅以加密形式静态保存，并只在运行时内存中读取；发送到 Anklang 时只出现在 `Authorization`，不会出现在设置/UI 响应、审核条目、错误、日志或缓存键中。
 

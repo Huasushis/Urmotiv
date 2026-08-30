@@ -1,5 +1,6 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
+import { AdminLayout, canOpenAdmin } from "../components/admin-layout";
 import { ApiError, createBatchAccounts, getSession } from "../lib/api";
 
 function lineLabel(field: string): string {
@@ -18,8 +19,22 @@ export function BatchAccountPage() {
   const sessionReady = session.status !== "pending";
   const apiError = create.error instanceof ApiError ? create.error : undefined;
 
-  if (sessionReady && !canCreateAccounts) {
-    return (
+  if (!sessionReady) {
+    return <div className="plain-panel" role="status">正在读取账号权限……</div>;
+  }
+
+  if (!canCreateAccounts || session.data?.user === null || session.data?.user === undefined) {
+    const content = (
+      <div className="plain-panel">
+        <h2>没有访问权限</h2>
+        <p>当前账号没有创建账号的权限。</p>
+      </div>
+    );
+    return session.data?.user !== null && session.data?.user !== undefined && canOpenAdmin(session.data.user) ? (
+      <AdminLayout session={session.data.user} title="批量创建账号">
+        {content}
+      </AdminLayout>
+    ) : (
       <section className="admin-no-access">
         <div className="page-heading">
           <div>
@@ -27,26 +42,19 @@ export function BatchAccountPage() {
             <h1>批量创建账号</h1>
           </div>
         </div>
-        <div className="plain-panel">
-          <h2>没有访问权限</h2>
-          <p>当前账号没有创建账号的权限。</p>
-        </div>
+        {content}
       </section>
     );
   }
 
   return (
-    <section className="batch-account-page">
-      <div className="page-heading">
-        <div>
-          <p className="eyebrow">账号管理</p>
-          <h1>批量创建账号</h1>
-          <p>为已有成员一次创建多个登录账号。服务端会先完整检查整批内容，失败时不会创建任何账号。</p>
-        </div>
-      </div>
-
+    <AdminLayout
+      session={session.data.user}
+      title="批量创建账号"
+      description="为已有成员一次创建多个登录账号。服务端会先完整检查整批内容，失败时不会创建任何账号。"
+    >
       <form
-        className="plain-panel"
+        className="plain-panel batch-account-page"
         onSubmit={(event) => {
           event.preventDefault();
           create.mutate();
@@ -98,6 +106,6 @@ export function BatchAccountPage() {
           </button>
         </div>
       </form>
-    </section>
+    </AdminLayout>
   );
 }

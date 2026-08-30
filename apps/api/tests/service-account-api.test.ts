@@ -66,11 +66,12 @@ async function login(app: FastifyInstance, userId: string): Promise<string> {
 async function provision(
   app: FastifyInstance,
   cookie: string,
-  input: Record<string, unknown> = {}
+  input: Record<string, unknown> = {},
+  userId: string = databaseDemoUserIds.robot
 ): Promise<CreatedServiceAccountToken> {
   const response = await app.inject({
     method: "POST",
-    url: `/api/v1/admin/service-accounts/${databaseDemoUserIds.robot}/tokens`,
+    url: `/api/v1/admin/service-accounts/${userId}/tokens`,
     headers: { cookie, origin: localOrigin },
     payload: {
       name: "Fermata 审核服务",
@@ -134,6 +135,69 @@ afterEach(async () => {
 });
 
 describe("机器人令牌管理接口", () => {
+  it("管理员可以创建机器人账号，停用会撤销令牌且停用账号仍可查看令牌记录", async () => {
+    const { app, database } = await createServiceAccountApp();
+    const admin = await login(app, databaseDemoUserIds.administrator);
+    const createdAccount = await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/service-accounts",
+      headers: { cookie: admin, origin: localOrigin },
+      payload: { nickname: "新建审题机器人" }
+    });
+    expect(createdAccount.statusCode).toBe(201);
+    const account = createdAccount.json() as { item: { id: string; enabled: boolean; tokenConfigured: boolean } };
+    expect(account.item).toEqual(expect.objectContaining({ enabled: true, tokenConfigured: false }));
+
+    const memberships = await database.query<{ role_key: string }>(sql`
+      SELECT role.key AS role_key
+      FROM role_memberships membership
+      JOIN roles role ON role.id = membership.role_id
+      WHERE membership.user_id = ${BigInt(account.item.id)}
+        AND membership.revoked_at IS NULL
+    `);
+    expect(memberships).toEqual([{ role_key: "reviewer" }]);
+
+    const token = await provision(app, admin, {}, account.item.id);
+    expect((await claim(app, token.token)).statusCode).toBe(200);
+    const disabled = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/admin/service-accounts/${account.item.id}`,
+      headers: { cookie: admin, origin: localOrigin },
+      payload: { enabled: false }
+    });
+    expect(disabled.statusCode).toBe(200);
+    expect(disabled.json()).toEqual({
+      item: expect.objectContaining({ id: account.item.id, enabled: false, tokenConfigured: false })
+    });
+    expect((await claim(app, token.token)).statusCode).toBe(401);
+
+    const listedWhileDisabled = await app.inject({
+      method: "GET",
+      url: `/api/v1/admin/service-accounts/${account.item.id}/tokens`,
+      headers: { cookie: admin, origin: localOrigin }
+    });
+    expect(listedWhileDisabled.statusCode).toBe(200);
+    expect(listedWhileDisabled.json()).toEqual({
+      items: [expect.objectContaining({ id: token.item.id, revokedAt: expect.any(String) })]
+    });
+
+    const enabled = await app.inject({
+      method: "PATCH",
+      url: `/api/v1/admin/service-accounts/${account.item.id}`,
+      headers: { cookie: admin, origin: localOrigin },
+      payload: { enabled: true }
+    });
+    expect(enabled.statusCode).toBe(200);
+    expect(enabled.json()).toEqual({
+      item: expect.objectContaining({ id: account.item.id, enabled: true, tokenConfigured: false })
+    });
+    expect(JSON.stringify(await database.query(sql`
+      SELECT action, metadata FROM audit_events
+      WHERE subject_user_id = ${BigInt(account.item.id)}
+      ORDER BY id
+    `))).not.toContain(token.token);
+  });
+
   it("管理员签发的令牌可以领取任务，列表和审计不回显密钥", async () => {
     const { app, database } = await createServiceAccountApp();
     const admin = await login(app, databaseDemoUserIds.administrator);
@@ -234,9 +298,27 @@ describe("机器人令牌管理接口", () => {
     const author = await login(app, databaseDemoUserIds.author);
     expect((await app.inject({ ...request, headers: { cookie: author, origin: localOrigin } })).statusCode)
       .toBe(404);
+    expect((await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/service-accounts",
+      headers: { cookie: author, origin: localOrigin },
+      payload: { nickname: "不应创建的机器人" }
+    })).statusCode).toBe(404);
+    expect((await app.inject({
+      method: "PATCH",
+      url: `/api/v1/admin/service-accounts/${databaseDemoUserIds.robot}`,
+      headers: { cookie: author, origin: localOrigin },
+      payload: { enabled: false }
+    })).statusCode).toBe(404);
     const robot = await login(app, databaseDemoUserIds.robot);
     expect((await app.inject({ ...request, headers: { cookie: robot, origin: localOrigin } })).statusCode)
       .toBe(404);
+    expect((await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/service-accounts",
+      headers: { cookie: robot, origin: localOrigin },
+      payload: { nickname: "机器人不能创建机器人" }
+    })).statusCode).toBe(404);
 
     await database.execute(sql`
       INSERT INTO permission_grants (
@@ -250,6 +332,18 @@ describe("机器人令牌管理接口", () => {
     expect((await app.inject({
       ...request,
       headers: { cookie: deniedAdmin, origin: localOrigin }
+    })).statusCode).toBe(404);
+    expect((await app.inject({
+      method: "POST",
+      url: "/api/v1/admin/service-accounts",
+      headers: { cookie: deniedAdmin, origin: localOrigin },
+      payload: { nickname: "明确拒绝后不能创建" }
+    })).statusCode).toBe(404);
+    expect((await app.inject({
+      method: "PATCH",
+      url: "/api/v1/admin/service-accounts/999999999999999999",
+      headers: { cookie: deniedAdmin, origin: localOrigin },
+      payload: { enabled: false }
     })).statusCode).toBe(404);
 
     const rows = await database.query<{ count: number }>(sql`
