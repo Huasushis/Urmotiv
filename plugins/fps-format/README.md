@@ -8,7 +8,7 @@
 
 按上游 [`fps.current.dtd`](https://github.com/zhblue/freeproblemset/blob/master/fps.current.dtd) 和公开元素约定定义的最小交集：
 
-- `fps` 根元素下的恰好一个 `item`；`generator*` 只作名目信息，不会导入；
+- `fps` 根元素下的一个或多个 `item`；每个 `item` 独立导入为一道题，`generator*` 只作名目信息，不会导入；
 - `title`、`url?`、`time_limit+`、`memory_limit+`、`description`、`input?`、`output?`、`hint?`；
 - `sample_input*` 与 `sample_output*`（按出现顺序配对，数量不一致时拒绝）；
 - `test_input*` 与 `test_output*`（必须有 `name`，按名称配对，生成测试数据文件）；
@@ -34,7 +34,7 @@
 ## 导入拒绝条件
 
 - 根元素不是 `fps`，或包含 `DOCTYPE`/`ENTITY` 声明；
-- `item` 数量不是恰好一道（0 道或多道都被拒绝，不默默取第一道）；
+- `item` 数量为 0；多道题会按 XML 中的顺序全部导入，不会默默只取第一道；
 - `title`/`description`/`time_limit`/`memory_limit` 缺失或重复，或其他元素重复；
 - 未声明的 FPS 元素或属性、不受支持的时间/内存单位、非十进制正数的限制值；
 - `sample_input` 与 `sample_output` 数量不一致；

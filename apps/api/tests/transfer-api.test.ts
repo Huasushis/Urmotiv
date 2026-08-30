@@ -327,6 +327,19 @@ async function hydroZipOf(problem: CanonicalProblem): Promise<Uint8Array> {
   return writeZipArchive(generated.files);
 }
 
+async function hydroMultiZipOf(problems: readonly CanonicalProblem[]): Promise<Uint8Array> {
+  const generated = await Promise.all(problems.map((problem, index) =>
+    hydroProblemFormatAdapter.export(problem, {
+      exportedAt: "2026-07-26T00:00:00.000Z",
+      values: { rootDirectory: `problem-${index + 1}` }
+    })
+  ));
+  return writeZipArchive(generated.flatMap((archive) => {
+    if (archive.kind !== "zip") throw new Error("Hydro 题目包必须导出为 ZIP。");
+    return archive.files;
+  }));
+}
+
 function syntheticGeneratedArchive(
   fileName: string,
   includeNestedArchive: boolean
@@ -426,6 +439,55 @@ async function revokeExportPermissions(
 }
 
 describe("题目包导入", () => {
+  it("Hydro 多题 ZIP 的预览数量会固定为任务项目数并逐题写入", async () => {
+    const pluginStore = new InMemoryPluginStore();
+    const pluginHost = new TrustedPluginHost(createBuiltinPluginDefinitions(), pluginStore);
+    await pluginHost.initialize();
+    await pluginHost.update(
+      hydroFormatPluginId,
+      { expectedRevision: 1, clearSecrets: [], state: "enabled" },
+      databaseDemoUserIds.administrator,
+      "00000000-0000-4000-8000-000000000043"
+    );
+    const adapterCatalog = new TrustedProblemFormatAdapterCatalog(pluginHost);
+    const { app, database, jobs, worker } = await makeTransferApp({ adapterCatalog, pluginHost });
+    const leader = await login(app, databaseDemoUserIds.leader);
+    const first = fixtureProblem();
+    const second = canonicalProblemSchema.parse({ ...fixtureProblem(), title: "导入的第二道演示题目" });
+    const uploaded = await uploadPackage(app, leader, await hydroMultiZipOf([first, second]));
+    expect(uploaded.statusCode).toBe(200);
+    const upload = uploaded.json() as { fileId: string; sha256: string };
+    const preview = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports/preview",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: { fileId: upload.fileId, formatId: "hydro" }
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(preview.json()).toEqual(expect.objectContaining({ problemCount: 2 }));
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/v1/transfer/imports",
+      headers: { cookie: leader, origin: localOrigin },
+      payload: {
+        fileId: upload.fileId,
+        sha256: upload.sha256,
+        formatId: "hydro",
+        idempotencyKey: "hydro-multi-import"
+      }
+    });
+    expect(created.statusCode).toBe(200);
+    const job = created.json() as { id: string; items: unknown[] };
+    expect(job.items).toHaveLength(2);
+    expect(await jobs.getImportJob(job.id)).toEqual(expect.objectContaining({ itemCount: 2 }));
+    expect(await worker.runOnce()).toBe(true);
+    const items = await jobs.getImportItems(job.id);
+    expect(items).toHaveLength(2);
+    expect(items.every((item) => item.state === "succeeded" && item.importedProblemId !== null)).toBe(true);
+    expect(new Set(items.map((item) => item.importedProblemId)).size).toBe(2);
+  });
+
   it("Hydro 格式只随受信任内置插件启用，并在任务执行时复查状态", async () => {
     const pluginStore = new InMemoryPluginStore();
     const pluginHost = new TrustedPluginHost(

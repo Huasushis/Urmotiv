@@ -19,7 +19,7 @@ import { dateTime } from "../lib/presentation";
 import { isAccessBoundaryError } from "../lib/client-security";
 
 type TransferMode = "import" | "export";
-type SourceFormat = "urmotiv" | "hydro";
+type SourceFormat = string;
 
 type ImportJobItem = ImportJobView["items"][number];
 type TransferJobPhase = ImportJobView["phase"];
@@ -27,10 +27,15 @@ type TransferJobState = ImportJobView["state"];
 type ExportPreviewProblem = ExportPreviewResponse["problems"][number];
 type LossSeverity = ExportPreviewProblem["items"][number]["severity"];
 
-const sourceFormatText: Record<SourceFormat, string> = {
+const sourceFormatText: Readonly<Record<string, string>> = {
   urmotiv: "Urmotiv 完整包",
-  hydro: "Hydro 题目包"
+  hydro: "Hydro 题目包",
+  fps: "FPS XML 题目包"
 };
+
+function formatDisplayName(formatId: string): string {
+  return sourceFormatText[formatId] ?? formatId;
+}
 
 const phaseText: Record<TransferJobPhase, string> = {
   queued: "排队中",
@@ -291,7 +296,7 @@ function ImportSection({ currentUserId }: { currentUserId: string }) {
     mutationFn: uploadProblemPackage,
     onSuccess: (result) => {
       const best = [...result.detected].sort((a, b) => b.confidence - a.confidence)[0];
-      setFormatId(best && (best.formatId === "urmotiv" || best.formatId === "hydro") ? best.formatId : "urmotiv");
+      setFormatId(best?.formatId ?? "urmotiv");
     }
   });
   const preview = useMutation({ mutationFn: previewImport });
@@ -345,6 +350,9 @@ function ImportSection({ currentUserId }: { currentUserId: string }) {
   };
 
   const detected = [...(upload.data?.detected ?? [])].sort((a, b) => b.confidence - a.confidence);
+  const importFormatOptions = detected.length > 0
+    ? detected.map((item) => ({ id: item.formatId, label: item.displayName }))
+    : ["urmotiv", "hydro", "fps"].map((id) => ({ id, label: formatDisplayName(id) }));
   const hasBlockingIssue = preview.data?.issues.some((issue) => issue.severity === "error") ?? false;
   const job = importJobQuery.data;
   if (accessDenied || denied) {
@@ -371,7 +379,7 @@ function ImportSection({ currentUserId }: { currentUserId: string }) {
           <label className="drop-field">
             <input
               type="file"
-              accept=".zip,application/zip,application/vnd.urmotiv.problem+zip"
+              accept=".zip,.xml,application/zip,application/xml,text/xml,application/fps+xml,application/vnd.urmotiv.problem+zip"
               disabled={upload.isPending}
               onChange={(event) => {
                 const file = event.target.files?.[0];
@@ -386,8 +394,8 @@ function ImportSection({ currentUserId }: { currentUserId: string }) {
               }}
             />
             <ArrowUpFromLine size={24} aria-hidden="true" />
-            <strong>{fileName || "选择 ZIP 题目包"}</strong>
-            <span>支持 Urmotiv 完整包和 Hydro 导出的题目包</span>
+            <strong>{fileName || "选择 ZIP 或 FPS XML 题目包"}</strong>
+            <span>启用的格式插件会自动识别 Urmotiv、Hydro 或 FPS；一个文件可以包含多道题</span>
           </label>
 
           {upload.isPending ? (
@@ -432,12 +440,13 @@ function ImportSection({ currentUserId }: { currentUserId: string }) {
                 <select
                   value={formatId}
                   onChange={(event) => {
-                    setFormatId(event.target.value as SourceFormat);
+                    setFormatId(event.target.value);
                     resetProgress();
                   }}
                 >
-                  <option value="urmotiv">{sourceFormatText.urmotiv}</option>
-                  <option value="hydro">{sourceFormatText.hydro}</option>
+                  {importFormatOptions.map((format) => (
+                    <option key={format.id} value={format.id}>{format.label}</option>
+                  ))}
                 </select>
               </label>
             </>
@@ -672,12 +681,13 @@ function ExportSection({ currentUserId }: { currentUserId: string }) {
             <select
               value={targetFormat}
               onChange={(event) => {
-                setTargetFormat(event.target.value as SourceFormat);
+                setTargetFormat(event.target.value);
                 resetProgress();
               }}
             >
-              <option value="urmotiv">{sourceFormatText.urmotiv}</option>
-              <option value="hydro">{sourceFormatText.hydro}</option>
+              <option value="urmotiv">{formatDisplayName("urmotiv")}</option>
+              <option value="hydro">{formatDisplayName("hydro")}</option>
+              <option value="fps">{formatDisplayName("fps")}</option>
             </select>
           </label>
           <fieldset className="checkbox-group">

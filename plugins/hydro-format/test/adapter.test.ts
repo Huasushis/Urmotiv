@@ -142,7 +142,7 @@ describe("Hydro 题目包格式适配器", () => {
     ).rejects.toThrow("输出文件 001.out 不存在");
   });
 
-  it("拒绝无法判断用途的 Hydro 目录内容和多题包", async () => {
+  it("拒绝无法判断用途的目录内容，并完整导入一个包中的多道 Hydro 题", async () => {
     const unknownFile = archiveFromText({
       "fixture/problem.yaml": "title: 人工安全测试\n",
       "fixture/problem.md": "# Description\n\n测试。\n",
@@ -160,10 +160,10 @@ describe("Hydro 题目包格式适配器", () => {
     });
     const preview = await hydroProblemFormatAdapter.inspect(multiple);
     expect(preview.problemCount).toBe(2);
-    expect(preview.issues).toContainEqual({
-      severity: "error",
-      message: "这个压缩包包含多道题；当前单题导入接口不能一次导入多道题。"
-    });
+    expect(preview.issues.filter((issue) => issue.severity === "error")).toEqual([]);
+    const imported = await hydroProblemFormatAdapter.import(multiple, { conflictAction: "create" });
+    expect(imported.map((problem) => problem.title)).toEqual(["人工测试一", "人工测试二"]);
+    expect(imported.map((problem) => problem.content.statement)).toEqual(["一。", "二。"]);
   });
 
   it("在适配器接收前拒绝路径跳转、符号链接和嵌套压缩包", () => {

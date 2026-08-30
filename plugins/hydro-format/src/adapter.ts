@@ -45,7 +45,7 @@ import {
 } from "./statement";
 
 export const hydroAdapterId = "hydro";
-export const hydroAdapterVersion = "0.1.0";
+export const hydroAdapterVersion = "0.2.0";
 export const hydroProblemMediaType = "application/zip";
 
 interface HydroLayout {
@@ -55,7 +55,6 @@ interface HydroLayout {
   readonly statementFiles: readonly string[];
   readonly configPath?: string;
   readonly solutionFiles: readonly string[];
-  readonly allFiles: readonly string[];
   readonly files: readonly string[];
 }
 
@@ -121,44 +120,20 @@ export const hydroProblemFormatAdapter: ProblemFormatAdapter = {
         : { confidence: 0.72, reason: "包含 problem.yaml，但没有找到独立 Markdown 题面。" };
     }
     return {
-      confidence: 0.9,
-      reason: "包含多个 Hydro 题目目录；当前单题导入接口需要先选择其中一道题。"
+      confidence: 0.98,
+      reason: `包含 ${manifests.length} 个带 problem.yaml 的 Hydro 题目目录。`
     };
   },
 
   async inspect(input: SafeArchive): Promise<ImportPreview> {
     const files = input.list().map((entry) => entry.path).sort();
-    const manifests = findManifestPaths(files);
-    if (manifests.length !== 1) {
-      return {
-        formatId: hydroAdapterId,
-        problemCount: manifests.length,
-        files,
-        issues: [
-          {
-            severity: "error",
-            message:
-              manifests.length === 0
-                ? "没有找到 Hydro 题目包使用的 problem.yaml。"
-                : "这个压缩包包含多道题；当前单题导入接口不能一次导入多道题。"
-          }
-        ]
-      };
-    }
-
+    let layouts: readonly HydroLayout[];
     try {
-      const loaded = loadHydroPackage(input, undefined, true);
-      return {
-        formatId: hydroAdapterId,
-        problemCount: 1,
-        title: loaded.metadata.title,
-        files,
-        issues: loaded.issues
-      };
+      layouts = locateHydroProblems(input);
     } catch (error) {
       return {
         formatId: hydroAdapterId,
-        problemCount: 0,
+        problemCount: findManifestPaths(files).length,
         files,
         issues: [
           {
@@ -168,62 +143,48 @@ export const hydroProblemFormatAdapter: ProblemFormatAdapter = {
         ]
       };
     }
+
+    const loadedPackages: LoadedHydroPackage[] = [];
+    const issues: ImportIssue[] = [];
+    for (const layout of layouts) {
+      try {
+        const loaded = loadHydroPackage(input, layout.manifestPath, undefined, true);
+        loadedPackages.push(loaded);
+        issues.push(...loaded.issues.map((issue) => scopeHydroIssue(issue, layout)));
+      } catch (error) {
+        issues.push({
+          severity: "error",
+          path: layout.manifestPath,
+          message: error instanceof Error ? error.message : "无法读取这个 Hydro 题目目录。"
+        });
+      }
+    }
+    return {
+      formatId: hydroAdapterId,
+      problemCount: layouts.length,
+      ...(layouts.length === 1 && loadedPackages[0] !== undefined
+        ? { title: loadedPackages[0].metadata.title }
+        : {}),
+      files,
+      issues
+    };
   },
 
   async import(input: SafeArchive, choices: ImportChoices): Promise<readonly CanonicalProblem[]> {
     const parsedChoices = hydroImportChoicesSchema.parse(choices);
-    const loaded = loadHydroPackage(input, parsedChoices.values?.statementFile, false);
-    const problemType = canonicalProblemType(loaded.config.type);
-    const roles = programRoles(loaded.config, problemType);
-    const collected = collectCanonicalFiles(input, loaded.layout, roles);
-    const judge = buildCanonicalJudge(
-      loaded.config,
-      problemType,
-      loaded.layout,
-      input,
-      roles,
-      collected.canonicalPathByHydroName
-    );
-    const statementContent = canonicalContentFromHydroStatement(
-      loaded.statement,
-      loaded.solution
-    );
-    const problemId =
-      loaded.metadata.pid === undefined ? undefined : String(loaded.metadata.pid);
-    const extension = hydroExtensionSchema.parse({
-      revision: hydroSupportedRevision,
-      rootDirectory: loaded.layout.rootDirectory,
-      statementFile: relativeToPrefix(loaded.statementFile, loaded.layout.prefix),
-      sourceStatementMarkdown: loaded.statement,
-      hadSolution: loaded.solution !== undefined,
-      ...(problemId === undefined ? {} : { problemId }),
-      ...(loaded.metadata.difficulty === undefined
-        ? {}
-        : { difficulty: loaded.metadata.difficulty }),
-      ...(Object.keys(loaded.config).length === 0 ? {} : { config: loaded.config })
-    });
-    const tags = (loaded.metadata.tag ?? []).map((tag) => String(tag));
-    if (tags.length > 30) {
-      throw new ProblemPackageError("Hydro 题目包含超过 30 个标签，不能无提示截断。请先减少标签数量。");
+    const layouts = locateHydroProblems(input);
+    if (layouts.length > 1 && parsedChoices.conflictAction === "update") {
+      throw new ProblemPackageError("多题 Hydro 包只能创建新题，不能把多道题更新到同一个题目编号。");
     }
-
-    const problem = canonicalProblemSchema.parse({
-      title: loaded.metadata.title,
-      type: problemType,
-      tags,
-      difficulty: {},
-      content: statementContent.content,
-      samples: statementContent.samples,
-      ...(judge === undefined ? {} : { judge }),
-      files: collected.files,
-      provenance: {
-        sourceSystem: "hydro",
-        ...(problemId === undefined ? {} : { sourceProblemId: problemId }),
-        sourceRevision: hydroSupportedRevision
-      },
-      extensions: { hydro: extension }
-    });
-    return [problem];
+    return layouts.map((layout) => canonicalProblemFromLoadedHydro(
+      input,
+      loadHydroPackage(
+        input,
+        layout.manifestPath,
+        layouts.length === 1 ? parsedChoices.values?.statementFile : undefined,
+        false
+      )
+    ));
   },
 
   async validateExport(problem: CanonicalProblem, options: ExportOptions): Promise<LossReport> {
@@ -328,6 +289,62 @@ export const hydroProblemFormatAdapter: ProblemFormatAdapter = {
   }
 };
 
+function canonicalProblemFromLoadedHydro(
+  input: SafeArchive,
+  loaded: LoadedHydroPackage
+): CanonicalProblem {
+  const problemType = canonicalProblemType(loaded.config.type);
+  const roles = programRoles(loaded.config, problemType);
+  const collected = collectCanonicalFiles(input, loaded.layout, roles);
+  const judge = buildCanonicalJudge(
+    loaded.config,
+    problemType,
+    loaded.layout,
+    input,
+    roles,
+    collected.canonicalPathByHydroName
+  );
+  const statementContent = canonicalContentFromHydroStatement(
+    loaded.statement,
+    loaded.solution
+  );
+  const problemId = loaded.metadata.pid === undefined
+    ? undefined
+    : String(loaded.metadata.pid);
+  const extension = hydroExtensionSchema.parse({
+    revision: hydroSupportedRevision,
+    rootDirectory: loaded.layout.rootDirectory,
+    statementFile: relativeToPrefix(loaded.statementFile, loaded.layout.prefix),
+    sourceStatementMarkdown: loaded.statement,
+    hadSolution: loaded.solution !== undefined,
+    ...(problemId === undefined ? {} : { problemId }),
+    ...(loaded.metadata.difficulty === undefined
+      ? {}
+      : { difficulty: loaded.metadata.difficulty }),
+    ...(Object.keys(loaded.config).length === 0 ? {} : { config: loaded.config })
+  });
+  const tags = (loaded.metadata.tag ?? []).map((tag) => String(tag));
+  if (tags.length > 30) {
+    throw new ProblemPackageError("Hydro 题目包含超过 30 个标签，不能无提示截断。请先减少标签数量。");
+  }
+  return canonicalProblemSchema.parse({
+    title: loaded.metadata.title,
+    type: problemType,
+    tags,
+    difficulty: {},
+    content: statementContent.content,
+    samples: statementContent.samples,
+    ...(judge === undefined ? {} : { judge }),
+    files: collected.files,
+    provenance: {
+      sourceSystem: "hydro",
+      ...(problemId === undefined ? {} : { sourceProblemId: problemId }),
+      sourceRevision: hydroSupportedRevision
+    },
+    extensions: { hydro: extension }
+  });
+}
+
 interface ProgramRoles {
   readonly checker?: string;
   readonly interactor?: string;
@@ -342,11 +359,16 @@ interface ExportFileMapping {
 
 function loadHydroPackage(
   archive: SafeArchive,
+  manifestPath: string,
   requestedStatementFile: string | undefined,
   allowAmbiguousStatement: boolean
 ): LoadedHydroPackage {
-  const layout = locateSingleProblem(archive);
-  assertSupportedPaths(layout);
+  const layout = locateHydroProblems(archive).find(
+    (candidate) => candidate.manifestPath === manifestPath
+  );
+  if (layout === undefined) {
+    throw new ProblemPackageError("选择的 Hydro 题目目录不存在。");
+  }
   const metadata = parseYamlFile(
     readTextFile(archive, layout.manifestPath),
     hydroProblemYamlSchema,
@@ -443,20 +465,26 @@ function findManifestPaths(paths: readonly string[]): string[] {
     .sort();
 }
 
-function locateSingleProblem(archive: SafeArchive): HydroLayout {
+function locateHydroProblems(archive: SafeArchive): readonly HydroLayout[] {
   const files = archive.list().map((entry) => entry.path).sort();
   const manifests = findManifestPaths(files);
-  if (manifests.length !== 1) {
-    throw new ProblemPackageError(
-      manifests.length === 0
-        ? "没有找到 Hydro 题目包使用的 problem.yaml。"
-        : "这个压缩包包含多道题，当前单题适配器不能选择其中一道。"
-    );
+  if (manifests.length === 0) {
+    throw new ProblemPackageError("没有找到 Hydro 题目包使用的 problem.yaml。");
   }
-  const manifestPath = manifests[0];
-  if (manifestPath === undefined) {
-    throw new ProblemPackageError("没有找到 Hydro 题目包清单。");
+  if (manifests.length > 1 && manifests.includes("problem.yaml")) {
+    throw new ProblemPackageError("压缩包同时包含根题目和子目录题目，无法确定导入边界。");
   }
+  const layouts = manifests.map((manifestPath) => createHydroLayout(files, manifestPath));
+  const assignedFiles = new Set(layouts.flatMap((layout) => layout.files));
+  const unassignedFiles = files.filter((path) => !assignedFiles.has(path));
+  if (unassignedFiles.length > 0) {
+    throw new ProblemPackageError("Hydro 多题包根部包含无法归属到具体题目的文件，已停止导入。");
+  }
+  for (const layout of layouts) assertSupportedPaths(layout);
+  return layouts;
+}
+
+function createHydroLayout(files: readonly string[], manifestPath: string): HydroLayout {
   const rootDirectory = manifestPath === "problem.yaml" ? "" : manifestPath.split("/")[0] ?? "";
   const prefix = rootDirectory.length === 0 ? "" : `${rootDirectory}/`;
   const packageFiles = files.filter((path) => path.startsWith(prefix));
@@ -476,18 +504,11 @@ function locateSingleProblem(archive: SafeArchive): HydroLayout {
     statementFiles,
     ...(configPath === undefined ? {} : { configPath }),
     solutionFiles,
-    allFiles: files,
     files: packageFiles
   };
 }
 
 function assertSupportedPaths(layout: HydroLayout): void {
-  const outside = layout.prefix.length === 0
-    ? []
-    : layout.allFiles.filter((path) => !path.startsWith(layout.prefix));
-  if (outside.length > 0) {
-    throw new ProblemPackageError("Hydro 单题目录之外还包含其他文件，不能判断它们属于哪道题。");
-  }
   for (const path of layout.files) {
     const relative = relativeToPrefix(path, layout.prefix);
     if (
@@ -504,6 +525,15 @@ function assertSupportedPaths(layout: HydroLayout): void {
       `当前支持的 Hydro 版本不能确定文件 ${relative} 的用途，已停止导入。`
     );
   }
+}
+
+function scopeHydroIssue(issue: ImportIssue, layout: HydroLayout): ImportIssue {
+  if (layout.prefix.length === 0) return issue;
+  if (issue.path === undefined) return { ...issue, path: layout.manifestPath };
+  return {
+    ...issue,
+    path: issue.path.startsWith(layout.prefix) ? issue.path : `${layout.prefix}${issue.path}`
+  };
 }
 
 function selectStatementFile(

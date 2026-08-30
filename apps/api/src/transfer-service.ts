@@ -321,6 +321,13 @@ export class TransferService {
     const adapter = await this.#requireAdapter(input.formatId);
     const packageInput = await this.#readStoredPackageInput(record);
     this.#requireMatchingInputKind(adapter, packageInput);
+    const preview = await adapter.inspect(packageInput.archive);
+    if (preview.problemCount < 1 || preview.problemCount > 1_000) {
+      throw new ApiError(422, "IMPORT_ITEM_COUNT_INVALID", "题目包没有可导入题目，或题目数量超过上限。");
+    }
+    if (preview.issues.some((issue) => issue.severity === "error")) {
+      throw new ApiError(422, "IMPORT_PREVIEW_BLOCKED", "题目包预览仍有错误，请先按预览提示修正。");
+    }
 
     try {
       const job = await this.#coordinator.createImportJob({
@@ -331,7 +338,7 @@ export class TransferService {
         selectedFormat: input.formatId,
         selectedFormatVersion: adapter.version,
         choices: { conflictAction: "create" },
-        itemCount: 1,
+        itemCount: preview.problemCount,
         idempotencyKey: input.idempotencyKey,
         auditRequestId: requestId
       });
