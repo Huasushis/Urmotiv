@@ -282,6 +282,10 @@ export const withdrawProblemInputSchema = z.object({
   reason: z.string().trim().max(500).default("")
 });
 
+export const deleteProblemInputSchema = z.object({
+  expectedRevision: z.number().int().positive()
+}).strict();
+
 export const problemCapabilitiesSchema = z.object({
   canView: z.boolean(),
   canEdit: z.boolean(),
@@ -294,7 +298,8 @@ export const problemCapabilitiesSchema = z.object({
   canReadTestdata: z.boolean(),
   canWriteTestdata: z.boolean(),
   canExport: z.boolean(),
-  canViewAccessLog: z.boolean()
+  canViewAccessLog: z.boolean(),
+  canDelete: z.boolean().optional()
 });
 
 export type ProblemCapabilities = z.infer<typeof problemCapabilitiesSchema>;

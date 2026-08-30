@@ -78,6 +78,7 @@ Accept: application/json
 | `POST /api/v1/problems` | 用题目草稿创建题目 |
 | `GET /api/v1/problems/:problemId` | 读取当前可见修订和能力字段 |
 | `PATCH /api/v1/problems/:problemId` | 带 `expectedRevision` 更新非冻结内容 |
+| `DELETE /api/v1/problems/:problemId` | JSON `{ "expectedRevision": 1 }` 软删除草稿；作者需有 `problem.delete.own`，管理员需有 `problem.delete.all`，机器人账号固定禁止 |
 | `POST /api/v1/problems/:problemId/frozen-fields` | 带原因修改冻结的基础题面/基础题解；需要专门权限 |
 | `POST /api/v1/problems/:problemId/submit` | JSON `{ "expectedRevision": 1 }` 提交当前修订 |
 | `POST /api/v1/problems/:problemId/withdraw` | 带 `expectedRevision` 和可选 `reason` 撤回 |

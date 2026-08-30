@@ -18,6 +18,8 @@ export function CreateProblemPage() {
   const [type, setType] = useState<ProblemType>("traditional");
   const [tagIds, setTagIds] = useState<string[]>([]);
   const [difficulty, setDifficulty] = useState("");
+  const [thinkingLevel, setThinkingLevel] = useState("");
+  const [codingLevel, setCodingLevel] = useState("");
   const [basicStatement, setBasicStatement] = useState("");
   const [basicSolution, setBasicSolution] = useState("");
 
@@ -35,8 +37,8 @@ export function CreateProblemPage() {
       type,
       tagIds,
       codeforcesDifficulty: difficulty ? Number(difficulty) : null,
-      thinkingLevel: null,
-      codingLevel: null,
+      thinkingLevel: thinkingLevel ? Number(thinkingLevel) as 1 | 2 | 3 | 4 | 5 : null,
+      codingLevel: codingLevel ? Number(codingLevel) as 1 | 2 | 3 | 4 | 5 : null,
       content: {
         basicStatement,
         basicSolution,
@@ -113,6 +115,28 @@ export function CreateProblemPage() {
               step={100}
               placeholder="例如 1600"
             />
+          </label>
+          <label className="field">
+            <span>思维难度（可选）</span>
+            <select value={thinkingLevel} onChange={(event) => setThinkingLevel(event.target.value)}>
+              <option value="">暂不填写</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+            </select>
+          </label>
+          <label className="field">
+            <span>代码难度（可选）</span>
+            <select value={codingLevel} onChange={(event) => setCodingLevel(event.target.value)}>
+              <option value="">暂不填写</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+            </select>
           </label>
           <div className="field wide">
             <span>知识点</span>

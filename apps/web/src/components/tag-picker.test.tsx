@@ -41,6 +41,14 @@ function buttonByText(view: HTMLElement, text: string): HTMLButtonElement {
   return button;
 }
 
+function openPicker(view: HTMLElement): void {
+  const trigger = view.querySelector<HTMLButtonElement>(".tag-picker-trigger");
+  if (trigger === null) throw new Error("找不到知识点下拉按钮。");
+  if (trigger.getAttribute("aria-expanded") !== "true") {
+    act(() => trigger.click());
+  }
+}
+
 function setSearch(view: HTMLElement, value: string): void {
   const input = view.querySelector('input[type="search"]');
   if (!(input instanceof HTMLInputElement)) {
@@ -57,9 +65,20 @@ function setSearch(view: HTMLElement, value: string): void {
 }
 
 describe("知识点选择器", () => {
+  it("默认收起目录，通过一个明确按钮展开下拉树", () => {
+    const view = mount(<TagPicker tags={tags} value={[]} onChange={() => undefined} />);
+    const trigger = view.querySelector<HTMLButtonElement>(".tag-picker-trigger");
+    expect(trigger?.getAttribute("aria-expanded")).toBe("false");
+    expect(view.querySelector(".tag-picker-menu")).toBeNull();
+    openPicker(view);
+    expect(trigger?.getAttribute("aria-expanded")).toBe("true");
+    expect(view.querySelector(".tag-picker-menu")).not.toBeNull();
+  });
+
   it("按分类折叠且只显示一次重复标签，并自动展开含已选项的分类", () => {
     const onChange = vi.fn();
     const view = mount(<TagPicker tags={tags} value={["kmp"]} onChange={onChange} />);
+    openPicker(view);
     const groups = [...view.querySelectorAll("details")];
 
     expect(groups).toHaveLength(2);
@@ -78,6 +97,7 @@ describe("知识点选择器", () => {
 
   it("搜索分类名称或知识点名称时只展示匹配分类并自动展开", () => {
     const view = mount(<TagPicker tags={tags} value={[]} onChange={() => undefined} />);
+    openPicker(view);
 
     setSearch(view, "基础算法");
     expect(view.querySelectorAll("details")).toHaveLength(1);
@@ -105,6 +125,7 @@ describe("知识点选择器", () => {
       aliases: ["Shortest Path", "最短路径"],
     };
     const view = mount(<TagPicker tags={[...tags, searchable]} value={[]} onChange={() => undefined} />);
+    openPicker(view);
 
     setSearch(view, " shortest path ");
     expect(view.textContent).toContain("图论");
@@ -119,6 +140,7 @@ describe("知识点选择器", () => {
 
   it("同步用户折叠状态，并在搜索及搜索变化期间可靠保持匹配分类展开", async () => {
     const view = mount(<TagPicker tags={tags} value={["kmp"]} onChange={() => undefined} />);
+    openPicker(view);
     const initialGroup = [...view.querySelectorAll("details")].find((group) =>
       group.textContent?.includes("字符串"),
     );
@@ -159,6 +181,7 @@ describe("知识点选择器", () => {
     const selected = [...manyTags.slice(0, 30).map((tag) => tag.id), "tag-1"];
     const onChange = vi.fn();
     const view = mount(<TagPicker tags={manyTags} value={selected} onChange={onChange} />);
+    openPicker(view);
     const selectedChoice = buttonByText(view, "知识点 1");
     const unavailableChoice = buttonByText(view, "知识点 31");
 
@@ -178,8 +201,10 @@ describe("知识点选择器", () => {
     const view = mount(<TagPicker tags={tags} value={["sort"]} onChange={onChange} disabled />);
 
     expect(view.querySelector(".tag-picker")?.getAttribute("aria-disabled")).toBe("true");
-    expect([...view.querySelectorAll(".tag-choice, .tag-selected-item")]).not.toHaveLength(0);
-    for (const button of view.querySelectorAll(".tag-choice, .tag-selected-item")) {
+    expect(view.querySelector<HTMLButtonElement>(".tag-picker-trigger")?.disabled).toBe(true);
+    expect(view.querySelectorAll(".tag-choice")).toHaveLength(0);
+    expect([...view.querySelectorAll(".tag-selected-item")]).not.toHaveLength(0);
+    for (const button of view.querySelectorAll(".tag-selected-item")) {
       expect((button as HTMLButtonElement).disabled).toBe(true);
       act(() => (button as HTMLButtonElement).click());
     }
@@ -188,6 +213,7 @@ describe("知识点选择器", () => {
 
   it("受控值变化后自动展开新包含已选项的分类", () => {
     const view = mount(<TagPicker tags={tags} value={[]} onChange={() => undefined} />);
+    openPicker(view);
     expect([...view.querySelectorAll("details")].every((group) => !group.open)).toBe(true);
 
     act(() => root?.render(<TagPicker tags={tags} value={["sort"]} onChange={() => undefined} />));
@@ -210,6 +236,7 @@ describe("知识点选择器", () => {
     const view = mount(
       <TagPicker tags={[...tags, inactive]} value={[inactive.id]} onChange={onChange} />,
     );
+    openPicker(view);
 
     expect(buttonByText(view, "旧知识点（已停用）").classList).toContain("tag-selected-item");
     expect(view.querySelectorAll(".tag-choice")).toHaveLength(3);

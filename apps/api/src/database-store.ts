@@ -2529,8 +2529,10 @@ export class DatabaseDataStore implements DataStore {
           throw new Error("审核意见与当前题目不匹配。");
         },
         replaceProblem: () => false,
+        softDeleteProblem: () => false,
         writeReviewSuggestionAudit: async () => undefined,
         writeFrozenFieldEditAudit: async () => undefined,
+        writeProblemDeleteAudit: async () => undefined,
       });
     }
 
@@ -2565,6 +2567,9 @@ export class DatabaseDataStore implements DataStore {
       const afterReviewWrites: Array<(executor: DatabaseExecutor) => Promise<void>> = [];
       let pendingReplacement:
         | { problem: StoredProblem; expectedRevision: number; changedByUserId?: string }
+        | undefined;
+      let pendingDeletion:
+        | { expectedRevision: number; deletedByUserId: string }
         | undefined;
 
       const transaction: ProblemTransaction = {
@@ -2607,6 +2612,18 @@ export class DatabaseDataStore implements DataStore {
             expectedRevision,
             ...(changedByUserId === undefined ? {} : { changedByUserId }),
           };
+          return true;
+        },
+        softDeleteProblem: (expectedRevision, deletedByUserId) => {
+          if (
+            problem === undefined ||
+            problem.revision !== expectedRevision ||
+            pendingReplacement !== undefined
+          ) {
+            return false;
+          }
+          pendingDeletion = { expectedRevision, deletedByUserId };
+          problem = undefined;
           return true;
         },
         writeReviewSuggestionAudit: async (event) => {
@@ -2659,6 +2676,28 @@ export class DatabaseDataStore implements DataStore {
             )
           `);
         },
+        writeProblemDeleteAudit: async (event) => {
+          if (event.problemId !== problemId) {
+            throw new Error("题目删除审计与当前题目不匹配。");
+          }
+          const actorId = requireDatabaseId(event.actorUserId, "题目删除操作者编号");
+          await executor.execute(sql`
+            INSERT INTO audit_events (
+              actor_user_id, request_id, action, object_type, object_id, result, metadata
+            ) VALUES (
+              ${actorId},
+              ${event.requestId}::uuid,
+              'problem.delete',
+              'problem',
+              ${event.problemId},
+              'success',
+              ${JSON.stringify({
+                revision: event.revision,
+                status: event.status,
+              })}::jsonb
+            )
+          `);
+        },
         afterReviewWrites: (action) => {
           afterReviewWrites.push(action);
         },
@@ -2674,7 +2713,23 @@ export class DatabaseDataStore implements DataStore {
       for (const action of afterReviewWrites) {
         await action(executor);
       }
-      if (pendingReplacement !== undefined) {
+      if (pendingDeletion !== undefined) {
+        const deletedByUserId = requireDatabaseId(
+          pendingDeletion.deletedByUserId,
+          "题目删除操作者编号"
+        );
+        const rows = await executor.query<{ id: string }>(sql`
+          UPDATE problems
+          SET deleted_at = now(), deleted_by_user_id = ${deletedByUserId}, updated_at = now()
+          WHERE id = ${id}
+            AND current_revision = ${pendingDeletion.expectedRevision}
+            AND deleted_at IS NULL
+          RETURNING id::text AS id
+        `);
+        if (rows.length !== 1) {
+          throw new Error("题目修订号在删除事务中发生冲突。");
+        }
+      } else if (pendingReplacement !== undefined) {
         const replaced = await replaceProblemInTransaction(
           executor,
           pendingReplacement.problem,

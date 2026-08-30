@@ -209,7 +209,8 @@ function emptyCapabilities(): ProblemCapabilities {
     canReadTestdata: false,
     canWriteTestdata: false,
     canExport: false,
-    canViewAccessLog: false
+    canViewAccessLog: false,
+    canDelete: false
   };
 }
 
@@ -243,7 +244,8 @@ function permissionsFor(userId: DemoUserId, problem: Problem): ProblemCapabiliti
       canReadTestdata: true,
       canWriteTestdata: true,
       canExport: true,
-      canViewAccessLog: true
+      canViewAccessLog: true,
+      canDelete: true
     };
   }
   if (member) {
@@ -259,7 +261,8 @@ function permissionsFor(userId: DemoUserId, problem: Problem): ProblemCapabiliti
       canReadTestdata: true,
       canWriteTestdata: true,
       canExport: isOwner,
-      canViewAccessLog: true
+      canViewAccessLog: true,
+      canDelete: isOwner && problem.status === "draft"
     };
   }
   if (reviewer || robot) {
@@ -278,7 +281,8 @@ function permissionsFor(userId: DemoUserId, problem: Problem): ProblemCapabiliti
       canEditTitle: true,
       canSubmit: isDraftLike,
       canWithdraw: problem.status === "pending_review" || problem.status === "approved",
-      canExport: true
+      canExport: true,
+      canDelete: problem.status === "draft"
     };
   }
   return emptyCapabilities();
@@ -605,6 +609,17 @@ export async function updateDemoProblem(id: string, input: UpdateProblemInput): 
   all[index] = next;
   saveProblems(all);
   return decorate(next);
+}
+
+export async function deleteDemoProblem(id: string, expectedRevision: number): Promise<{ ok: true }> {
+  const { problem, index, all } = findProblem(id);
+  if (decorate(problem).capabilities.canDelete !== true) {
+    throw new ApiError("当前账号不能删除这道题。", 403);
+  }
+  requireRevision(problem, expectedRevision);
+  all.splice(index, 1);
+  saveProblems(all);
+  return { ok: true };
 }
 
 export async function submitDemoProblem(id: string, expectedRevision: number): Promise<Problem> {

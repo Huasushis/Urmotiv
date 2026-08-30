@@ -314,6 +314,7 @@ describe("题目审核标签页", () => {
     expect(fieldControl(view, "CF 难度")).toHaveProperty("value", "1800");
     expect(fieldControl(view, "原创性（必填）")).toHaveProperty("value", "4");
     expect(fieldControl(view, "公开评论（可选）")).toHaveProperty("value", "公开评论。");
+    act(() => view.querySelector<HTMLButtonElement>(".tag-picker-trigger")?.click());
     expect(
       [...view.querySelectorAll<HTMLButtonElement>(".tag-choice")].find(
         (button) => button.textContent === "动态规划"
@@ -671,6 +672,37 @@ describe("题目审核标签页", () => {
     expect(view.textContent).not.toContain("不应显示的权限判断细节");
     expect(view.textContent).not.toContain("所选字段已经写回题目");
     expect(api.getProblem).not.toHaveBeenCalled();
+  });
+});
+
+describe("题目概要难度编辑", () => {
+  it("有编辑权限时开放思维与代码难度并写回受控题目值", async () => {
+    const base = problem(false);
+    const editable: Problem = {
+      ...base,
+      status: "draft",
+      capabilities: { ...base.capabilities, canEdit: true, canEditTitle: true }
+    };
+    api.listTags.mockResolvedValue({ items: [] });
+    const update = vi.fn();
+    const view = mount(<OverviewTab problem={editable} update={update} />);
+    const selects = view.querySelectorAll<HTMLSelectElement>("select");
+    const thinking = selects[1];
+    const coding = selects[2];
+    expect(thinking).toBeDefined();
+    expect(coding).toBeDefined();
+    expect(thinking!.disabled).toBe(false);
+    expect(coding!.disabled).toBe(false);
+
+    await act(async () => {
+      thinking!.value = "4";
+      thinking!.dispatchEvent(new Event("change", { bubbles: true }));
+      coding!.value = "2";
+      coding!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(update.mock.calls[0]![0](editable).thinkingLevel).toBe(4);
+    expect(update.mock.calls[1]![0](editable).codingLevel).toBe(2);
   });
 });
 

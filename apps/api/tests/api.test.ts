@@ -3,6 +3,9 @@ import type { FastifyInstance } from "fastify";
 import { createApp } from "../src/app";
 import { CasClient } from "@urmotiv/auth";
 import { InMemoryEmailVerificationOutbox } from "../src/email-verification";
+import { createDemoUsers, demoTags } from "../src/demo-data";
+import { InMemoryDataStore } from "../src/repository";
+import type { StoredUser } from "../src/domain";
 
 const fullContent = {
   basicStatement: "给定一个整数，输出它本身。",
@@ -354,6 +357,131 @@ describe("题目 API", () => {
       payload: { expectedRevision: 1, title: "不能看到也不能修改" }
     });
     expect(foreignUpdate.statusCode).toBe(404);
+  });
+
+  it("作者只能按当前修订删除自己的草稿，删除后所有读取统一按不存在处理", async () => {
+    const app = await makeApp();
+    const authorCookie = await login(app, "author");
+    const problem = await createDraft(app, authorCookie);
+    const problemId = problem.id as string;
+    expect(problem).toEqual(expect.objectContaining({
+      status: "draft",
+      capabilities: expect.objectContaining({ canDelete: true })
+    }));
+
+    const stale = await app.inject({
+      method: "DELETE",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: authorCookie, origin: localOrigin },
+      payload: { expectedRevision: 99 }
+    });
+    expect(stale.statusCode).toBe(409);
+    const stillPresent = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: authorCookie }
+    });
+    expect(stillPresent.statusCode).toBe(200);
+
+    const removed = await app.inject({
+      method: "DELETE",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: authorCookie, origin: localOrigin },
+      payload: { expectedRevision: 1 }
+    });
+    expect(removed.statusCode).toBe(200);
+    expect(removed.json()).toEqual({ ok: true });
+    const hidden = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: authorCookie }
+    });
+    expect(hidden.statusCode).toBe(404);
+    const ownList = await app.inject({
+      method: "GET",
+      url: "/api/v1/problems?owner=me",
+      headers: { cookie: authorCookie }
+    });
+    expect(ownList.statusCode).toBe(200);
+    expect(ownList.json()).toMatchObject({ total: 0, items: [] });
+  });
+
+  it("作者不能删除已提交题目，全局删除允许真人管理员并固定拒绝机器人", async () => {
+    const deleteManager: StoredUser = {
+      id: "delete-manager",
+      nickname: "删除管理员",
+      accountType: "human",
+      disabled: false,
+      roles: ["删除管理员"],
+      grants: ["auth.login", "problem.view.all", "problem.delete.all"].map((permission) => ({
+        permission,
+        effect: "allow" as const,
+        scope: "global" as const
+      })),
+      isRoot: false
+    };
+    const deletionRobot: StoredUser = {
+      ...deleteManager,
+      id: "delete-robot",
+      nickname: "删除机器人",
+      accountType: "robot"
+    };
+    const users = [...createDemoUsers(), deleteManager, deletionRobot];
+    const app = await createApp({
+      store: new InMemoryDataStore(users, demoTags),
+      demoAuthEnabled: true,
+      demoUserIds: users.map((user) => user.id)
+    });
+    openApps.push(app);
+    const authorCookie = await login(app, "author");
+    const problem = await createDraft(app, authorCookie);
+    const problemId = problem.id as string;
+    const submitted = await app.inject({
+      method: "POST",
+      url: `/api/v1/problems/${problemId}/submit`,
+      headers: { cookie: authorCookie, origin: localOrigin },
+      payload: { expectedRevision: 1 }
+    });
+    expect(submitted.statusCode).toBe(200);
+    const authorDelete = await app.inject({
+      method: "DELETE",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: authorCookie, origin: localOrigin },
+      payload: { expectedRevision: 2 }
+    });
+    expect(authorDelete.statusCode).toBe(403);
+
+    const robotCookie = await login(app, deletionRobot.id);
+    const robotView = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: robotCookie }
+    });
+    expect(robotView.statusCode).toBe(200);
+    expect(robotView.json().capabilities.canDelete).toBe(false);
+    const robotDelete = await app.inject({
+      method: "DELETE",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: robotCookie, origin: localOrigin },
+      payload: { expectedRevision: 2 }
+    });
+    expect(robotDelete.statusCode).toBe(403);
+
+    const managerCookie = await login(app, deleteManager.id);
+    const managerView = await app.inject({
+      method: "GET",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: managerCookie }
+    });
+    expect(managerView.statusCode).toBe(200);
+    expect(managerView.json().capabilities.canDelete).toBe(true);
+    const managerDelete = await app.inject({
+      method: "DELETE",
+      url: `/api/v1/problems/${problemId}`,
+      headers: { cookie: managerCookie, origin: localOrigin },
+      payload: { expectedRevision: 2 }
+    });
+    expect(managerDelete.statusCode).toBe(200);
   });
 
   it("提交后只冻结基础题面和基础题解，题目名称可继续编辑", async () => {

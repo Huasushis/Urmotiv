@@ -1,6 +1,6 @@
 import { normalizeTagName, type ProblemTag } from "@urmotiv/contracts";
-import { Check, Search, X } from "lucide-react";
-import { useEffect, useId, useMemo, useState } from "react";
+import { Check, ChevronDown, Search, X } from "lucide-react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 type TagPickerProps = {
   tags: ProblemTag[];
@@ -33,7 +33,10 @@ function tagMatchesSearch(tag: ProblemTag, normalizedSearch: string): boolean {
 
 export function TagPicker({ tags, value, onChange, disabled = false }: TagPickerProps) {
   const helpId = useId();
+  const menuId = useId();
+  const pickerRef = useRef<HTMLFieldSetElement>(null);
   const [search, setSearch] = useState("");
+  const [menuOpen, setMenuOpen] = useState(false);
 
   const uniqueTags = useMemo(() => {
     const byId = new Map<string, ProblemTag>();
@@ -106,6 +109,26 @@ export function TagPicker({ tags, value, onChange, disabled = false }: TagPicker
     // groups when the controlled value or asynchronously loaded catalogue really changes.
   }, [selectedAutoOpenKey]);
 
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !pickerRef.current?.contains(event.target)) {
+        setMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [menuOpen]);
+
   const setSelected = (id: string, selected: boolean) => {
     if (disabled) {
       return;
@@ -122,6 +145,7 @@ export function TagPicker({ tags, value, onChange, disabled = false }: TagPicker
 
   return (
     <fieldset
+      ref={pickerRef}
       className="tag-picker"
       aria-label="知识点"
       aria-disabled={disabled || undefined}
@@ -160,95 +184,101 @@ export function TagPicker({ tags, value, onChange, disabled = false }: TagPicker
           </div>
         )}
       </div>
-
-      <label className="tag-picker-search">
-        <span>搜索知识点或分类</span>
-        <span className="tag-picker-search-control">
-          <Search size={15} aria-hidden="true" />
-          <input
-            type="search"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="输入知识点或分类名称"
-          />
-        </span>
-      </label>
-
-      <p
-        id={helpId}
-        className={limitReached ? "tag-picker-help limit-reached" : "tag-picker-help"}
-        aria-live="polite"
+      <button
+        className="tag-picker-trigger"
+        type="button"
+        disabled={disabled}
+        aria-expanded={menuOpen}
+        aria-controls={menuId}
+        onClick={() => setMenuOpen((current) => !current)}
       >
-        {limitReached
-          ? `已达到 ${MAX_SELECTED_TAGS} 项上限，请先移除一个知识点再选择。`
-          : `每道题最多选择 ${MAX_SELECTED_TAGS} 个知识点。`}
-      </p>
+        <span>{selectedIds.length === 0 ? "选择知识点" : "继续选择或调整知识点"}</span>
+        <ChevronDown className={menuOpen ? "open" : ""} size={16} aria-hidden="true" />
+      </button>
 
-      <div className="tag-picker-groups">
-        {visibleGroups.map((group) => {
-          const searchForcesOpen = normalizedSearch.length > 0;
-          const selectedInGroup = group.tags.filter((tag) => selectedIdSet.has(tag.id)).length;
-          return (
-            <details
-              key={group.name}
-              className="tag-picker-group"
-              open={searchForcesOpen || openGroups.has(group.name)}
-              onToggle={(event) => {
-                if (searchForcesOpen) {
-                  if (!event.currentTarget.open) {
-                    event.currentTarget.open = true;
-                  }
-                  return;
-                }
-                const open = event.currentTarget.open;
-                setOpenGroups((current) => {
-                  if (current.has(group.name) === open) {
-                    return current;
-                  }
-                  const next = new Set(current);
-                  if (open) {
-                    next.add(group.name);
-                  } else {
-                    next.delete(group.name);
-                  }
-                  return next;
-                });
-              }}
-            >
-              <summary>
-                <span>{group.name}</span>
-                <small>
-                  已选 {selectedInGroup}，共 {group.tags.length}
-                </small>
-              </summary>
-              <div className="tag-picker-options">
-                {group.tags.map((tag) => {
-                  const selected = selectedIdSet.has(tag.id);
-                  const unavailable = disabled || (limitReached && !selected);
-                  return (
-                    <button
-                      key={tag.id}
-                      type="button"
-                      className={selected ? "tag-choice selected" : "tag-choice"}
-                      onClick={() => setSelected(tag.id, !selected)}
-                      disabled={unavailable}
-                      aria-pressed={selected}
-                      aria-describedby={helpId}
-                      title={limitReached && !selected ? "已达到知识点数量上限" : undefined}
-                    >
-                      {selected ? <Check size={14} aria-hidden="true" /> : null}
-                      {tag.name}
-                    </button>
-                  );
-                })}
-              </div>
-            </details>
-          );
-        })}
-        {visibleGroups.length === 0 ? (
-          <p className="tag-picker-empty">没有匹配的知识点或分类。</p>
-        ) : null}
-      </div>
+      {menuOpen ? (
+        <div className="tag-picker-menu" id={menuId}>
+          <label className="tag-picker-search">
+            <span>搜索知识点或分类</span>
+            <span className="tag-picker-search-control">
+              <Search size={15} aria-hidden="true" />
+              <input
+                type="search"
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="输入知识点或分类名称"
+              />
+            </span>
+          </label>
+
+          <p
+            id={helpId}
+            className={limitReached ? "tag-picker-help limit-reached" : "tag-picker-help"}
+            aria-live="polite"
+          >
+            {limitReached
+              ? `已达到 ${MAX_SELECTED_TAGS} 项上限，请先移除一个知识点再选择。`
+              : `每道题最多选择 ${MAX_SELECTED_TAGS} 个知识点。`}
+          </p>
+
+          <div className="tag-picker-groups">
+            {visibleGroups.map((group) => {
+              const searchForcesOpen = normalizedSearch.length > 0;
+              const selectedInGroup = group.tags.filter((tag) => selectedIdSet.has(tag.id)).length;
+              return (
+                <details
+                  key={group.name}
+                  className="tag-picker-group"
+                  open={searchForcesOpen || openGroups.has(group.name)}
+                  onToggle={(event) => {
+                    if (searchForcesOpen) {
+                      if (!event.currentTarget.open) event.currentTarget.open = true;
+                      return;
+                    }
+                    const open = event.currentTarget.open;
+                    setOpenGroups((current) => {
+                      if (current.has(group.name) === open) return current;
+                      const next = new Set(current);
+                      if (open) next.add(group.name);
+                      else next.delete(group.name);
+                      return next;
+                    });
+                  }}
+                >
+                  <summary>
+                    <span>{group.name}</span>
+                    <small>已选 {selectedInGroup}，共 {group.tags.length}</small>
+                  </summary>
+                  <div className="tag-picker-options">
+                    {group.tags.map((tag) => {
+                      const selected = selectedIdSet.has(tag.id);
+                      const unavailable = disabled || (limitReached && !selected);
+                      return (
+                        <button
+                          key={tag.id}
+                          type="button"
+                          className={selected ? "tag-choice selected" : "tag-choice"}
+                          onClick={() => setSelected(tag.id, !selected)}
+                          disabled={unavailable}
+                          aria-pressed={selected}
+                          aria-describedby={helpId}
+                          title={limitReached && !selected ? "已达到知识点数量上限" : undefined}
+                        >
+                          {selected ? <Check size={14} aria-hidden="true" /> : null}
+                          {tag.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </details>
+              );
+            })}
+            {visibleGroups.length === 0 ? (
+              <p className="tag-picker-empty">没有匹配的知识点或分类。</p>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </fieldset>
   );
 }

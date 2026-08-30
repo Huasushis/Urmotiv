@@ -99,5 +99,11 @@ describe("新建题目页冻结说明", () => {
     expect(text).toContain("题目名称仍可修改");
     expect(text).not.toContain("题目名称会冻结");
     expect(text).not.toContain("名称会冻结");
+    expect(text).toContain("思维难度（可选）");
+    expect(text).toContain("代码难度（可选）");
+    const difficultySelects = [...container!.querySelectorAll<HTMLSelectElement>("select")]
+      .filter((select) => select.parentElement?.textContent?.includes("难度"));
+    expect(difficultySelects).toHaveLength(2);
+    expect(difficultySelects.every((select) => !select.disabled)).toBe(true);
   });
 });

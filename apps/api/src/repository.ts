@@ -51,6 +51,14 @@ export interface FrozenFieldEditAuditEvent {
   readonly reason: string;
 }
 
+export interface ProblemDeleteAuditEvent {
+  readonly actorUserId: string;
+  readonly requestId: string;
+  readonly problemId: string;
+  readonly revision: number;
+  readonly status: StoredProblem["status"];
+}
+
 export interface ProblemTransaction {
   getProblem(): StoredProblem | undefined;
   /** 当前事务已在任何题目行之前取得共享锁的知识点目录版本。 */
@@ -70,8 +78,10 @@ export interface ProblemTransaction {
     expectedRevision: number,
     changedByUserId?: string
   ): boolean;
+  softDeleteProblem(expectedRevision: number, deletedByUserId: string): boolean;
   writeReviewSuggestionAudit(event: ReviewSuggestionAuditEvent): Promise<void>;
   writeFrozenFieldEditAudit(event: FrozenFieldEditAuditEvent): Promise<void>;
+  writeProblemDeleteAudit(event: ProblemDeleteAuditEvent): Promise<void>;
   /** Database-only hook: runs after opinion rows are durable in this transaction and before problem state writes. */
   afterReviewWrites?(action: (executor: DatabaseExecutor) => Promise<void>): void;
   /** Database transactions expose their executor only so related core stores can share it. */
@@ -1022,6 +1032,7 @@ export class InMemoryDataStore implements DataStore {
     return this.withProblemLock(problemId, async () => {
       let problem = this.problems.get(problemId);
       problem = problem === undefined ? undefined : copy(problem);
+      let deleted = false;
       const users = [...this.users.values()].map(copy);
       const reviews = new Map(
         [...this.reviews.entries()]
@@ -1065,12 +1076,23 @@ export class InMemoryDataStore implements DataStore {
           problem = copy(nextProblem);
           return true;
         },
+        softDeleteProblem: (expectedRevision, _deletedByUserId) => {
+          if (problem === undefined || problem.revision !== expectedRevision) {
+            return false;
+          }
+          deleted = true;
+          problem = undefined;
+          return true;
+        },
         writeReviewSuggestionAudit: async () => undefined,
-        writeFrozenFieldEditAudit: async () => undefined
+        writeFrozenFieldEditAudit: async () => undefined,
+        writeProblemDeleteAudit: async () => undefined
       };
 
       const result = await operation(transaction);
-      if (problem !== undefined) {
+      if (deleted) {
+        this.problems.delete(problemId);
+      } else if (problem !== undefined) {
         this.problems.set(problemId, copy(problem));
       }
       for (const [key, review] of this.reviews) {

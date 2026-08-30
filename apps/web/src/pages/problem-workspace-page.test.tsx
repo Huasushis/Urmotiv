@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SimilarityCheckPanel } from "./problem-workspace-page";
 
 const api = vi.hoisted(() => ({
+  deleteProblem: vi.fn(),
   getProblem: vi.fn(),
   listTags: vi.fn(),
   recordProblemActivity: vi.fn(),
@@ -116,9 +117,7 @@ async function waitFor(assertion: () => void): Promise<void> {
       return;
     } catch (error) {
       latestError = error;
-      const { promise, resolve } = Promise.withResolvers<void>();
-      setTimeout(resolve, 50);
-      await promise;
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
     }
   }
   throw latestError;
@@ -269,6 +268,37 @@ describe("ProblemWorkspacePage 名称专用权限自动保存", () => {
     expect(container!.textContent).not.toContain("原标题");
     expect(container!.textContent).not.toContain("不应回显的提交拒绝");
     expect(queryClient!.getQueryData(["problem", "p-title-1", "author"])).toBeUndefined();
+  });
+
+  it("服务端允许删除时显示二次确认并携带当前修订号", async () => {
+    const base = {
+      ...titleOnlyProblem(),
+      status: "draft" as const,
+      capabilities: {
+        ...titleOnlyProblem().capabilities,
+        canDelete: true,
+        canEdit: true,
+        canEditTitle: true,
+        canWithdraw: false
+      }
+    };
+    api.getProblem.mockResolvedValue(base);
+    api.recordProblemActivity.mockResolvedValue(undefined);
+    api.listTags.mockResolvedValue([]);
+    api.deleteProblem.mockResolvedValue({ ok: true });
+
+    mount(<ProblemWorkspacePage currentUserId="author" />);
+    await waitFor(() => expect(container!.textContent).toContain("原标题"));
+    const deleteButton = [...container!.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "删除");
+    expect(deleteButton).toBeDefined();
+    await act(async () => deleteButton?.click());
+    expect(container!.textContent).toContain("确认删除题目");
+    expect(api.deleteProblem).not.toHaveBeenCalled();
+    const confirmButton = [...container!.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.trim() === "确认删除");
+    await act(async () => confirmButton?.click());
+    await waitFor(() => expect(api.deleteProblem).toHaveBeenCalledWith("p-title-1", 3));
   });
 
   it.each([401, 403, 404])(

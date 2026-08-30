@@ -359,6 +359,49 @@ h3 {
   color: var(--teal);
 }
 
+.danger-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid #b42318;
+  border-radius: 5px;
+  background: #fff;
+  color: #b42318;
+  font-size: 14px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.danger-button:hover:not(:disabled) {
+  background: #b42318;
+  color: #fff;
+}
+
+.problem-delete-confirmation {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 14px;
+  padding: 14px 16px;
+  border: 1px solid #f0b4ae;
+  border-radius: 6px;
+  background: #fff7f6;
+}
+
+.problem-delete-confirmation p {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+}
+
+.problem-delete-confirmation > .form-error {
+  flex-basis: 100%;
+}
+
 .compact-button {
   min-height: 32px;
   padding: 0 10px;
@@ -840,12 +883,62 @@ textarea:read-only {
 }
 
 .tag-picker {
+  position: relative;
   display: grid;
   gap: 10px;
   min-width: 0;
   margin: 0;
   padding: 0;
   border: 0;
+}
+
+.tag-picker-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.tag-picker-trigger:hover:not(:disabled),
+.tag-picker-trigger[aria-expanded="true"] {
+  border-color: var(--teal);
+}
+
+.tag-picker-trigger svg {
+  flex: none;
+  transition: transform 140ms ease;
+}
+
+.tag-picker-trigger svg.open {
+  transform: rotate(180deg);
+}
+
+.tag-picker-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  left: 0;
+  z-index: 40;
+  display: grid;
+  gap: 10px;
+  max-height: min(62vh, 520px);
+  margin-top: 6px;
+  padding: 12px;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  box-shadow: 0 12px 28px rgba(27, 45, 43, 0.16);
 }
 
 .tag-picker-selected {
@@ -4866,6 +4959,15 @@ textarea:read-only {
 
   .sticky-form-actions {
     bottom: 8px;
+  }
+
+  .problem-delete-confirmation {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .problem-delete-confirmation .inline-actions > button {
+    width: 100%;
   }
 
   .admin-heading {

@@ -150,7 +150,16 @@ export function OverviewTab({ problem, update }: ProblemTabProps) {
         </div>
         <label className="field">
           <span>思维难度</span>
-          <select value={problem.thinkingLevel ?? ""} disabled>
+          <select
+            value={problem.thinkingLevel ?? ""}
+            disabled={!canEdit}
+            onChange={(event) => {
+              const thinkingLevel = event.target.value
+                ? Number(event.target.value) as 1 | 2 | 3 | 4 | 5
+                : null;
+              update((current) => ({ ...current, thinkingLevel }));
+            }}
+          >
             <option value="">暂不填写</option>
             <option value="1">1</option>
             <option value="2">2</option>
@@ -158,11 +167,19 @@ export function OverviewTab({ problem, update }: ProblemTabProps) {
             <option value="4">4</option>
             <option value="5">5</option>
           </select>
-          <small>评分标准确认后开放填写。</small>
         </label>
         <label className="field">
           <span>代码难度</span>
-          <select value={problem.codingLevel ?? ""} disabled>
+          <select
+            value={problem.codingLevel ?? ""}
+            disabled={!canEdit}
+            onChange={(event) => {
+              const codingLevel = event.target.value
+                ? Number(event.target.value) as 1 | 2 | 3 | 4 | 5
+                : null;
+              update((current) => ({ ...current, codingLevel }));
+            }}
+          >
             <option value="">暂不填写</option>
             <option value="1">1</option>
             <option value="2">2</option>
@@ -170,7 +187,6 @@ export function OverviewTab({ problem, update }: ProblemTabProps) {
             <option value="4">4</option>
             <option value="5">5</option>
           </select>
-          <small>评分标准确认后开放填写。</small>
         </label>
       </div>
 

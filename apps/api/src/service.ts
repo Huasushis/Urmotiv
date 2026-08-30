@@ -529,6 +529,47 @@ export class ProblemService {
     return this.toProblem(next, user);
   }
 
+  public async deleteProblem(
+    user: StoredUser,
+    problemId: string,
+    expectedRevision: number,
+    requestId: string
+  ): Promise<void> {
+    await this.findVisibleProblem(user, problemId);
+    await this.store.runProblemTransaction(problemId, async (transaction) => {
+      const problem = transaction.getProblem();
+      const actor = await transaction.lockUserForAuthorization(user.id);
+      const evaluatedAt = this.now();
+      if (
+        problem === undefined ||
+        actor === undefined ||
+        !canViewProblem(createProblemVisibility(actor, evaluatedAt), problem)
+      ) {
+        throw notFound();
+      }
+      const target = { ownerId: problem.ownerId, objectId: problem.id };
+      const canDeleteAny = hasPermission(actor, "problem.delete.all", target, evaluatedAt);
+      const canDeleteOwnDraft =
+        problem.ownerId === actor.id &&
+        problem.status === "draft" &&
+        hasPermission(actor, "problem.delete.own", target, evaluatedAt);
+      if (!canDeleteAny && !canDeleteOwnDraft) {
+        throw forbidden();
+      }
+      this.assertExpectedRevision(problem, expectedRevision);
+      if (!transaction.softDeleteProblem(expectedRevision, actor.id)) {
+        throw conflict("题目已被其他操作修改，请刷新后重试。");
+      }
+      await transaction.writeProblemDeleteAudit({
+        actorUserId: actor.id,
+        requestId,
+        problemId: problem.id,
+        revision: problem.revision,
+        status: problem.status
+      });
+    });
+  }
+
   /**
    * 管理员专用的冻结字段覆盖路径：只允许修改基础题面/基础题解两个字段，
    * 必须填写原因并写入审计。权限用单独的 problem.frozen.edit 精确判断，
@@ -1782,7 +1823,12 @@ export class ProblemService {
       canReadTestdata: hasPermission(user, "problem.testdata.read", target, this.now()),
       canWriteTestdata: hasPermission(user, "problem.testdata.write", target, this.now()),
       canExport: canExportProblem(user, problem, this.now()),
-      canViewAccessLog: hasPermission(user, "problem.viewers.read", target, this.now())
+      canViewAccessLog: hasPermission(user, "problem.viewers.read", target, this.now()),
+      canDelete:
+        hasPermission(user, "problem.delete.all", target, this.now()) ||
+        (isOwner &&
+          problem.status === "draft" &&
+          hasPermission(user, "problem.delete.own", target, this.now()))
     };
   }
 

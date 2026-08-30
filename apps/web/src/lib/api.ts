@@ -213,7 +213,7 @@ async function request<T>(path: string, init: RequestInit, schema: RuntimeSchema
   return parsed.data;
 }
 
-function json(body: unknown, method: "POST" | "PATCH" = "POST"): RequestInit {
+function json(body: unknown, method: "POST" | "PATCH" | "DELETE" = "POST"): RequestInit {
   return {
     method,
     headers: { "Content-Type": "application/json" },
@@ -643,6 +643,17 @@ export function updateProblem(id: string, input: UpdateProblemInput): Promise<Pr
         problemSchema
       ),
     async () => (await import("./demo-store")).updateDemoProblem(id, input)
+  );
+}
+
+export function deleteProblem(id: string, expectedRevision: number): Promise<{ ok: true }> {
+  return fallback(
+    () => request(
+      `/problems/${encodeURIComponent(id)}`,
+      json({ expectedRevision }, "DELETE"),
+      okResponseSchema
+    ),
+    async () => (await import("./demo-store")).deleteDemoProblem(id, expectedRevision)
   );
 }
 

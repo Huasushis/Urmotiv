@@ -11,12 +11,13 @@ import {
   RotateCcw,
   Search,
   Send,
+  Trash2,
   TriangleAlert,
   X
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import type {
   Problem,
   ProblemJudgeConfig,
@@ -25,6 +26,7 @@ import type {
 } from "@urmotiv/contracts";
 import {
   getProblem,
+  deleteProblem,
   recordProblemActivity,
   runSimilarityCheck,
   submitProblem,
@@ -83,6 +85,7 @@ function updateInput(problem: Problem): UpdateProblemInput {
 }
 
 export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string }) {
+  const navigate = useNavigate();
   const { problemId = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab");
@@ -101,6 +104,7 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
   const [dirty, setDirty] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [fileUploadsInFlight, setFileUploadsInFlight] = useState(0);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const fileUploadPending = fileUploadsInFlight > 0;
   const editNumber = useRef(0);
   const clearPrivateProblemState = useCallback((id: string) => {
@@ -313,6 +317,27 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
     }
   });
 
+  const deleteAction = useMutation({
+    mutationFn: () => {
+      if (!working) {
+        throw new Error("题目尚未加载完成。");
+      }
+      return deleteProblem(working.id, working.revision);
+    },
+    onSuccess: () => {
+      window.sessionStorage.removeItem(localDraftKey(currentUserId, problemId));
+      window.sessionStorage.removeItem(legacyLocalDraftKey(problemId));
+      client.removeQueries({ queryKey: problemQueryKey, exact: true });
+      void client.invalidateQueries({ queryKey: ["problems"] });
+      navigate("/submissions", { replace: true });
+    },
+    onError: (error) => {
+      if (isAccessBoundaryError(error)) {
+        clearPrivateProblemState(problemId);
+      }
+    }
+  });
+
   const similarityCheck = useMutation({
     mutationFn: () => {
       if (!working) {
@@ -439,8 +464,35 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
               {working.status === "approved" ? "撤回修改" : "撤回投稿"}
             </button>
           ) : null}
+          {working.capabilities.canDelete === true ? (
+            <button
+              className="secondary-button danger-button"
+              type="button"
+              disabled={save.isPending || fileUploadPending || statusAction.isPending || deleteAction.isPending}
+              onClick={() => setDeleteConfirmOpen(true)}
+            >
+              <Trash2 size={16} aria-hidden="true" />
+              删除
+            </button>
+          ) : null}
         </div>
       </header>
+
+      {deleteConfirmOpen ? (
+        <section className="problem-delete-confirmation" role="alertdialog" aria-labelledby="problem-delete-title">
+          <div>
+            <strong id="problem-delete-title">确认删除题目？</strong>
+            <p>删除后题目会从题库和“我的投稿”中消失；未保存修改也会丢失。</p>
+          </div>
+          <div className="inline-actions">
+            <button className="secondary-button" type="button" disabled={deleteAction.isPending} onClick={() => setDeleteConfirmOpen(false)}>取消</button>
+            <button className="danger-button" type="button" disabled={deleteAction.isPending} onClick={() => deleteAction.mutate()}>
+              {deleteAction.isPending ? "正在删除…" : "确认删除"}
+            </button>
+          </div>
+          {deleteAction.isError ? <p className="form-error">{deleteAction.error.message}</p> : null}
+        </section>
+      ) : null}
 
       {(save.error || statusAction.error) ? (
         <div className="inline-error workspace-error" role="alert">
