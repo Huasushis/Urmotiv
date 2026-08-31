@@ -606,6 +606,37 @@ export class TrustedPluginHost {
     }
   }
 
+  /**
+   * Read one declared secret for an already-authorized administrator connection test.
+   * Unlike runtime plugin access this does not require the plugin to be enabled; callers
+   * must enforce plugin.manage + system.manage and must never return the value.
+   */
+  public async readSecretForConfigurationTest(
+    pluginId: string,
+    name: string
+  ): Promise<string | undefined> {
+    const registered = this.#plugins.get(pluginId);
+    if (
+      registered === undefined
+      || !registered.secretDefinitions.some((secret) => secret.name === name)
+    ) {
+      return undefined;
+    }
+    const plugin = await this.store.get(pluginId);
+    const secret = plugin?.secrets.find((item) => item.name === name);
+    if (secret === undefined) {
+      return undefined;
+    }
+    if (this.secretBox === undefined) {
+      throw new PluginSecretStorageUnavailableError();
+    }
+    try {
+      return this.secretBox.decrypt(secret.encryptedValue);
+    } catch {
+      throw new PluginSecretStorageUnavailableError();
+    }
+  }
+
   /** 根据钩子编号找出它属于哪个插件；找不到时抛错。 */
   public pluginIdForCheckId(registrationId: string): string {
     return this.pluginIdForRegistration(registrationId);

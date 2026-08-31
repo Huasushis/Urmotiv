@@ -2904,6 +2904,42 @@ textarea:read-only {
   font-size: 13px;
 }
 
+.candidate-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin-top: 6px;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.candidate-statement {
+  margin-top: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.candidate-statement > summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--teal-dark);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.candidate-statement-body {
+  max-height: 28rem;
+  margin-top: 8px;
+  overflow: auto;
+  border-radius: 4px;
+  background: var(--surface);
+  padding: 10px 12px;
+}
+
+.candidate-statement-body .markdown-body {
+  font-size: 13px;
+}
+
 .candidate-item p {
   margin: 6px 0 0;
   color: var(--text-soft);
@@ -3921,6 +3957,100 @@ textarea:read-only {
 .admin-secret-status {
   overflow-wrap: anywhere;
   color: var(--text-soft) !important;
+}
+
+.admin-connection-test {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.75rem 1rem;
+  align-items: center;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-subtle);
+}
+
+.admin-connection-test p {
+  margin: 0.25rem 0 0;
+  color: var(--text-soft);
+}
+
+.admin-connection-test > .admin-save-success,
+.admin-connection-test > .inline-error {
+  grid-column: 1 / -1;
+}
+
+.admin-connection-apply {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.admin-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.admin-status-card {
+  display: grid;
+  gap: 8px;
+}
+
+.admin-status-card .status-badge {
+  justify-self: start;
+}
+
+.admin-status-card small {
+  color: var(--text-soft);
+}
+
+.fermata-settings-panel {
+  display: grid;
+  gap: 18px;
+}
+
+.settings-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.fermata-provider-note {
+  padding: 14px 16px;
+  border-left: 3px solid var(--teal);
+  background: var(--teal-soft);
+}
+
+.fermata-provider-note p {
+  margin: 7px 0 0;
+  color: var(--text-soft);
+  line-height: 1.6;
+}
+
+.fermata-provider-note code {
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+@media (max-width: 640px) {
+  .admin-connection-test {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-status-grid,
+  .settings-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-connection-test .secondary-button {
+    width: 100%;
+  }
+
+  .admin-connection-apply {
+    display: block;
+  }
 }
 
 .admin-clear-secret {

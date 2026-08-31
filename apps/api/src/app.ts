@@ -116,8 +116,10 @@ import {
 import { ProblemService, type SubmitCheckRunner } from "./service";
 import type { TransferService } from "./transfer-service";
 import {
+  AnklangClient,
   anklangCheckId,
   anklangCompletionStatus,
+  anklangSettingsSchema,
   type AnklangCache,
   type AnklangCompletionStatus,
   type AnklangFetch,
@@ -268,6 +270,7 @@ interface AppDependencies {
   trustedProxyCidrs: readonly string[];
   loginRateLimiter?: LoginRateLimiter;
   fetchImpl: typeof fetch;
+  anklangFetch?: AnklangFetch;
 }
 
 
@@ -683,6 +686,7 @@ function createDependencies(options: ApiAppOptions): AppDependencies {
     demoLoginUserIds: new Map(Object.entries(options.demoLoginUserIds ?? {})),
     pluginHost,
     fermataControl,
+    ...(options.anklangFetch === undefined ? {} : { anklangFetch: options.anklangFetch }),
     fetchImpl: options.fetchImpl ?? globalThis.fetch,
     now
   };
@@ -1425,6 +1429,169 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     return { items: await dependencies.pluginHost.list() };
   });
 
+  app.post("/api/v1/admin/anklang/test", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requirePluginManager(request);
+    const input = z.object({
+      settings: z.unknown(),
+      secrets: z.object({
+        serviceToken: z.string().max(16_384).optional(),
+        embeddingApiKey: z.string().max(16_384).optional()
+      }).strict().default({}),
+      clearSecrets: z.array(
+        z.enum([anklangServiceTokenSecretName, anklangEmbeddingApiKeySecretName])
+      ).max(2).default([])
+    }).strict().parse(request.body);
+    const settings = anklangSettingsSchema.parse(input.settings);
+    const searchMode = settings.searchMode ?? "yuantiji";
+    if (!settings.privateContentAuthorized) {
+      throw new ApiError(
+        422,
+        "ANKLANG_CONTENT_NOT_AUTHORIZED",
+        "请先确认 Anklang 与所选外部来源处于批准的题面处理范围。"
+      );
+    }
+    const readSecret = async (name: string): Promise<string | undefined> => {
+      if (input.clearSecrets.includes(name as typeof input.clearSecrets[number])) {
+        return undefined;
+      }
+      const draft = input.secrets[name as keyof typeof input.secrets]?.trim();
+      if (draft !== undefined && draft.length > 0) {
+        return draft;
+      }
+      return dependencies.pluginHost.readSecretForConfigurationTest(anklangPluginId, name);
+    };
+    const token = (await readSecret(anklangServiceTokenSecretName))?.trim();
+    if (!token) {
+      throw new ApiError(422, "ANKLANG_TOKEN_REQUIRED", "请先填写 Anklang 服务认证令牌。");
+    }
+    try {
+      const client = new AnklangClient({
+        baseUrl: settings.baseUrl,
+        apiVersion: settings.apiVersion,
+        token,
+        privateContentAuthorized: settings.privateContentAuthorized,
+        retryAttempts: 1,
+        timeoutMs: settings.timeoutMs,
+        indexTimeoutMs: settings.indexTimeoutMs,
+        ...(dependencies.anklangFetch === undefined ? {} : { fetch: dependencies.anklangFetch })
+      });
+      const search = await client.testSearchSources({
+        mode: searchMode,
+        yuantijiBaseUrl: settings.yuantijiBaseUrl,
+        yuantijiRerank: settings.yuantijiRerank
+      });
+      let embedding: Awaited<ReturnType<AnklangClient["testEmbeddingProvider"]>> | null = null;
+      if (searchMode !== "yuantiji") {
+        const provider = settings.embeddingProvider;
+        const apiKey = (await readSecret(anklangEmbeddingApiKeySecretName))?.trim();
+        if (provider === undefined || !apiKey) {
+          throw new ApiError(
+            422,
+            "ANKLANG_EMBEDDING_REQUIRED",
+            "本地或混合检索需要完整的嵌入提供方设置和 API 密钥。"
+          );
+        }
+        embedding = await client.testEmbeddingProvider({
+          ...(provider.protocol === undefined ? {} : { protocol: provider.protocol }),
+          baseUrl: provider.baseUrl,
+          model: provider.model,
+          dimension: provider.dimension,
+          apiKey
+        });
+      }
+      return { ok: true, search, embedding };
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(
+        502,
+        "ANKLANG_TEST_FAILED",
+        "连接测试失败，请检查服务地址、令牌和所选检索来源。"
+      );
+    }
+  });
+
+  app.post("/api/v1/admin/anklang/apply", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    await requirePluginManager(request);
+    const plugin = (await dependencies.pluginHost.list()).find(
+      (item) => item.id === anklangPluginId
+    );
+    if (plugin === undefined || plugin.state !== "enabled") {
+      throw new ApiError(422, "ANKLANG_NOT_ENABLED", "请先启用并保存 Anklang 插件。");
+    }
+    const settings = anklangSettingsSchema.parse(plugin.settings);
+    const searchMode = settings.searchMode ?? "yuantiji";
+    if (!settings.privateContentAuthorized) {
+      throw new ApiError(
+        422,
+        "ANKLANG_CONTENT_NOT_AUTHORIZED",
+        "请先在插件设置中确认 Anklang 与所选外部来源处于批准的题面处理范围。"
+      );
+    }
+    const token = (
+      await dependencies.pluginHost.readSecretForConfigurationTest(
+        anklangPluginId,
+        anklangServiceTokenSecretName
+      )
+    )?.trim();
+    if (!token) {
+      throw new ApiError(422, "ANKLANG_TOKEN_REQUIRED", "Anklang 服务认证令牌尚未配置。");
+    }
+    try {
+      const client = new AnklangClient({
+        baseUrl: settings.baseUrl,
+        apiVersion: settings.apiVersion,
+        token,
+        privateContentAuthorized: settings.privateContentAuthorized,
+        retryAttempts: 1,
+        timeoutMs: settings.timeoutMs,
+        indexTimeoutMs: settings.indexTimeoutMs,
+        ...(dependencies.anklangFetch === undefined ? {} : { fetch: dependencies.anklangFetch })
+      });
+      const search = await client.putSearchSources({
+        mode: searchMode,
+        yuantijiBaseUrl: settings.yuantijiBaseUrl,
+        yuantijiRerank: settings.yuantijiRerank
+      });
+      if (searchMode === "yuantiji") {
+        const provider = await client.deleteEmbeddingProvider();
+        return { ok: true, search, provider };
+      }
+      const providerSettings = settings.embeddingProvider;
+      const apiKey = (
+        await dependencies.pluginHost.readSecretForConfigurationTest(
+          anklangPluginId,
+          anklangEmbeddingApiKeySecretName
+        )
+      )?.trim();
+      if (providerSettings === undefined || !apiKey) {
+        throw new ApiError(
+          422,
+          "ANKLANG_EMBEDDING_REQUIRED",
+          "本地或混合检索需要完整的嵌入提供方设置和 API 密钥。"
+        );
+      }
+      const provider = await client.putEmbeddingProvider({
+        ...(providerSettings.protocol === undefined
+          ? {}
+          : { protocol: providerSettings.protocol }),
+        baseUrl: providerSettings.baseUrl,
+        model: providerSettings.model,
+        dimension: providerSettings.dimension,
+        apiKey
+      });
+      return { ok: true, search, provider };
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(
+        502,
+        "ANKLANG_APPLY_FAILED",
+        "设置已保存，但暂时无法应用到 Anklang；请检查连接后重试。"
+      );
+    }
+  });
+
 
   app.patch("/api/v1/admin/plugins/:pluginId", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
@@ -1520,7 +1687,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   });
   // ---- Fermata 管理接口 ----
   // 这四个路由实际调用 Fermata 的版本 1 管理端口。权限检查与插件管理一致：
-  // 没有 plugin.manage 权限的请求统一返回 404，不泄露端点存在性。
+  // 没有 plugin.manage 与 system.manage 权限的请求统一返回 404，不泄露端点存在性。
   // 插件未启用、未配置地址或缺少管理令牌时返回 503 FERMATA_NOT_CONFIGURED。
   // Fermata 不可达、超时或返回不符合契约时返回 503/502，不泄露令牌或原始错误体。
 
@@ -1535,7 +1702,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     reply.header("cache-control", "private, no-store");
     await requirePluginManager(request);
     const snapshot = await dependencies.fermataControl.getSettings();
-    return { settings: snapshot };
+    return snapshot;
   });
 
   app.put("/api/v1/admin/fermata/settings", async (request, reply) => {
@@ -1546,14 +1713,14 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       input.expectedRevision,
       input.settings
     );
-    return { settings: snapshot };
+    return snapshot;
   });
 
   app.post("/api/v1/admin/fermata/wake", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
     await requirePluginManager(request);
     await dependencies.fermataControl.wake();
-    reply.code(204);
+    return { ok: true };
   });
 
 

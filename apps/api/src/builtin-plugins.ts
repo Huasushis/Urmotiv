@@ -107,11 +107,11 @@ export function createBuiltinPluginDefinitions(
       secretDefinitions: [{
         name: anklangServiceTokenSecretName,
         label: "服务认证令牌",
-        description: "Anklang 用它确认请求来自 Urmotiv；完整内容只会加密保存，不会在页面重新显示。"
+        description: "在服务器运行 `openssl rand -hex 32` 生成，并把同一个值设置为 Anklang 的 ANKLANG_SERVICE_TOKEN；完整内容只会加密保存，不会在页面重新显示。"
       }, {
         name: anklangEmbeddingApiKeySecretName,
         label: "嵌入提供方 API 密钥",
-        description: "Anklang 用它调用嵌入模型提供方（与 serviceToken 用途不同）；完整内容只会加密保存，不会在页面重新显示。"
+        description: "仅本地或混合检索需要。它是 OpenAI 兼容嵌入接口的 API 密钥（与 serviceToken 用途不同）；完整内容只会加密保存，不会在页面重新显示。"
       }],
       settingsSchema: {
         type: "object", additionalProperties: false, required: ["baseUrl"],
@@ -120,14 +120,40 @@ export function createBuiltinPluginDefinitions(
             type: "string", format: "uri", title: "Anklang 服务地址",
             description: "Urmotiv 调用原题检索服务的本地或私有 HTTP/HTTPS 地址；认证令牌单独保存。"
           },
+          searchMode: {
+            type: "string",
+            oneOf: [
+              { const: "yuantiji", title: "仅 yuantiji 公共题库（推荐）" },
+              { const: "local", title: "仅 Urmotiv 本地题库" },
+              { const: "hybrid", title: "yuantiji 与本地题库" }
+            ],
+            default: "yuantiji",
+            title: "检索来源",
+            description: "仅 yuantiji 时无需填写嵌入模型，也不会把 Urmotiv 题目写入本地相似度索引。"
+          },
+          yuantijiBaseUrl: {
+            type: "string", format: "uri", default: "https://yuantiji.ac",
+            title: "yuantiji 服务地址",
+            description: "公共原题机的 HTTPS 根地址；题面会直接发送到该服务检索。"
+          },
+          yuantijiRerank: {
+            type: "boolean", default: false, title: "请求 yuantiji 重排",
+            description: "重排会增加公共服务开销和等待时间；通常保持关闭。"
+          },
           embeddingProvider: {
             type: "object", additionalProperties: false, required: ["baseUrl", "model", "dimension"],
             title: "嵌入提供方",
             description: "Anklang 生成嵌入所用的模型提供方；API 密钥以 embeddingApiKey 插件密钥单独加密保存，不会在此显示。",
             properties: {
+              protocol: {
+                type: "string", oneOf: [{ const: "openai", title: "OpenAI 兼容接口" }],
+                default: "openai",
+                title: "接口协议",
+                description: "使用 OpenAI 兼容的 POST {地址}/embeddings 接口。"
+              },
               baseUrl: {
                 type: "string", format: "uri", title: "嵌入提供方地址",
-                description: "允许任一主机名的 HTTPS 地址，或仅供隔离测试的本地/私有 HTTP 地址；不得含账号密码、查询参数或片段。"
+                description: "OpenAI 兼容 API 的 v1 根地址，例如 https://…/v1；客户端会请求其 /embeddings。允许 HTTPS，隔离测试可用本地/私有 HTTP。"
               },
               model: {
                 type: "string", minLength: 1, maxLength: 200, title: "嵌入模型名称"
@@ -199,14 +225,14 @@ export function createBuiltinPluginDefinitions(
       secretDefinitions: [{
         name: fermataManagementTokenSecretName,
         label: "管理令牌",
-        description: "Urmotiv 调用 Fermata 的状态、设置和立即检查接口时使用；必须与 Fermata 的管理令牌一致。"
+        description: "在服务器运行 `openssl rand -hex 32` 生成，把同一个值写入 Fermata 的 FERMATA_MANAGEMENT_TOKEN，并在这里保存。它只用于 Urmotiv 管理 Fermata，不是模型 API 密钥，也不是机器人令牌。"
       }],
       settingsSchema: {
         type: "object", additionalProperties: false, required: ["baseUrl"],
         properties: {
           baseUrl: {
             type: "string", format: "uri", title: "Fermata 服务地址",
-            description: "Fermata 在服务器内提供的 HTTP 或 HTTPS 地址。管理令牌单独保存。"
+            description: "Fermata 在服务器内提供的 HTTP 或 HTTPS 地址。此处只连接审核服务；AI 模型档位和服务商密钥在独立的 Fermata 管理页说明和配置。"
           },
           timeoutMs: {
             type: "integer", minimum: 1000, maximum: 30000, default: 5000,
@@ -263,7 +289,8 @@ function createAnklangHookRegistrar(runtime: AnklangHookRuntime): (registry: Plu
           throw new Error("Anklang 服务配置不可用。");
         }
         const settings = parsedSettings.data;
-        if (settings.embeddingProvider === undefined) {
+        const requiresEmbedding = settings.searchMode === "local" || settings.searchMode === "hybrid";
+        if (requiresEmbedding && settings.embeddingProvider === undefined) {
           if (settings.failureBehavior === "continue") {
             return {
               decision: "continue",
@@ -275,7 +302,10 @@ function createAnklangHookRegistrar(runtime: AnklangHookRuntime): (registry: Plu
           throw new Error("Anklang 嵌入提供方未配置。");
         }
         const embeddingApiKey = (await runtime.readEmbeddingApiKey())?.trim();
-        if (embeddingApiKey === undefined || embeddingApiKey.length === 0) {
+        if (
+          requiresEmbedding &&
+          (embeddingApiKey === undefined || embeddingApiKey.length === 0)
+        ) {
           if (settings.failureBehavior === "continue") {
             return {
               decision: "continue",
@@ -292,7 +322,7 @@ function createAnklangHookRegistrar(runtime: AnklangHookRuntime): (registry: Plu
           check = createAnklangCheck({
             settings,
             ...(token === undefined ? {} : { token }),
-            embeddingApiKey,
+            ...(embeddingApiKey === undefined ? {} : { embeddingApiKey }),
             cache: runtime.cache,
             ...(runtime.fetch === undefined ? {} : { fetch: runtime.fetch })
           });

@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { z } from "zod";
 import type {
   Problem,
@@ -37,7 +38,7 @@ import {
   listTags
 } from "../lib/api";
 import { dateTime, duration, isFrozen, reviewVerdictText, statusText, typeText } from "../lib/presentation";
-import { MarkdownEditor } from "./markdown-editor";
+import { MarkdownEditor, MarkdownPreview } from "./markdown-editor";
 import {
   JudgeProgramPanel,
   ProblemFilesPanel,
@@ -910,6 +911,9 @@ const anklangSimilarityDataSchema = z.object({
       title: z.string(),
       url: z.string().optional(),
       similarity: z.number(),
+      statement: z.string().optional(),
+      statementTruncated: z.literal(true).optional(),
+      metadata: z.record(z.string(), z.unknown()).optional(),
       sameProblemSuggestion: z.boolean().optional(),
       explanation: z.string().optional()
     })
@@ -952,7 +956,12 @@ function AnklangCandidates({ data }: { data: AnklangSimilarityData }) {
               key={`${candidate.source}:${candidate.externalId}:${index}`}
             >
               <div className="candidate-heading">
-                {candidate.url ? (
+                {candidate.source === "urmotiv" ? (
+                  <Link to={`/problems/${encodeURIComponent(candidate.externalId)}`}>
+                    {candidate.title}
+                    <ExternalLink size={12} aria-hidden="true" />
+                  </Link>
+                ) : candidate.url ? (
                   <a href={candidate.url} target="_blank" rel="noreferrer noopener">
                     {candidate.title}
                     <ExternalLink size={12} aria-hidden="true" />
@@ -962,7 +971,27 @@ function AnklangCandidates({ data }: { data: AnklangSimilarityData }) {
                 )}
                 <span className="candidate-similarity">{Math.round(candidate.similarity * 100)}%</span>
               </div>
+              <div className="candidate-meta">
+                <span>{candidate.source === "urmotiv" ? "Urmotiv 本地题库" : candidate.source}</span>
+                {candidate.metadata?.search_provider === "yuantiji" ? <span>经 yuantiji 检索</span> : null}
+                <span>题号 {candidate.externalId}</span>
+              </div>
               {candidate.explanation ? <p>{candidate.explanation}</p> : null}
+              {candidate.statement ? (
+                <details className="candidate-statement">
+                  <summary>查看题面{candidate.statementTruncated ? "（节选）" : ""}</summary>
+                  <div className="candidate-statement-body">
+                    <MarkdownPreview
+                      value={candidate.statement}
+                      {...(candidate.source === "urmotiv"
+                        ? { problemId: candidate.externalId }
+                        : {})}
+                    />
+                  </div>
+                </details>
+              ) : (
+                <p className="text-faint">该来源没有返回可展示的题面，请打开来源链接核对。</p>
+              )}
             </li>
           ))}
         </ul>

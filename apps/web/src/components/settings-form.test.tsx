@@ -78,6 +78,30 @@ describe("插件设置表单", () => {
     expect(original).toEqual({});
   });
 
+  it("不会因为可选对象内部的默认值生成半成品配置", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        mode: { type: "string", default: "public" },
+        optionalProvider: {
+          type: "object",
+          properties: {
+            protocol: {
+              type: "string",
+              default: "openai"
+            },
+            baseUrl: { type: "string" }
+          }
+        }
+      }
+    } as const satisfies PluginSettingsFormSchema;
+
+    expect(applySettingsFormDefaults(schema, {})).toEqual({ mode: "public" });
+    expect(
+      applySettingsFormDefaults(schema, { optionalProvider: { baseUrl: "https://example" } })
+    ).toEqual({ optionalProvider: { protocol: "openai", baseUrl: "https://example" }, mode: "public" });
+  });
+
   it("显示分组、说明、必填标记、默认值和输入限制", () => {
     const html = renderToStaticMarkup(
       <SettingsForm

@@ -184,7 +184,7 @@ describe("Fermata 管理 HTTP 接口", () => {
       headers: { cookie }
     });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ settings: fakeSettings() });
+    expect(response.json()).toEqual(fakeSettings());
   });
 
   it("有权限的管理员能更新 Fermata 公开设置", async () => {
@@ -215,7 +215,7 @@ describe("Fermata 管理 HTTP 接口", () => {
       payload: { expectedRevision: 4, settings: fakeSettings().settings }
     });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ settings: updatedSnapshot });
+    expect(response.json()).toEqual(updatedSnapshot);
   });
 
   it("有权限的管理员能触发 Fermata 立即检查", async () => {
@@ -241,7 +241,8 @@ describe("Fermata 管理 HTTP 接口", () => {
       url: "/api/v1/admin/fermata/wake",
       headers: { cookie, origin }
     });
-    expect(response.statusCode).toBe(204);
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ ok: true });
     expect(fetch).toHaveBeenCalledTimes(1);
     const [calledUrl] = fetch.mock.calls[0]!;
     expect(String(calledUrl)).toContain("/api/v1/actions/wake");

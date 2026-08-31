@@ -4,15 +4,13 @@
 
 ## 管理员配置与隐私闸门
 
-插件管理端点需要核心 `plugin.manage` 和 `system.manage` 权限。先在 `/api/v1/admin/plugins` 读取当前 `revision`，再用带 `expectedRevision` 的 PATCH 保存设置。两个密钥只从环境变量通过声明的插件密钥 `serviceToken`（Anklang 服务认证）与 `embeddingApiKey`（嵌入提供方认证）提交；建议使用权限为 `0600` 的 curl cookie-jar（保存登录 Cookie 的文件）：
+插件管理端点需要核心 `plugin.manage` 和 `system.manage` 权限。先在 `/api/v1/admin/plugins` 读取当前 `revision`，再用带 `expectedRevision` 的 PATCH 保存设置。密钥通过声明的插件密钥提交：`serviceToken`（Anklang 服务认证）始终需要，`embeddingApiKey`（嵌入提供方认证）只在 local/hybrid 模式需要；建议使用权限为 `0600` 的 curl cookie-jar（保存登录 Cookie 的文件）：
 
 ```bash
 export URMOTIV_COOKIE_JAR=/secure/path/urmotiv.cookies
 read -rsp 'Anklang service token: ' ANKLANG_SERVICE_TOKEN
 printf '\n'
-read -rsp 'Embedding provider api key: ' ANKLANG_EMBEDDING_API_KEY
-printf '\n'
-export ANKLANG_SERVICE_TOKEN ANKLANG_EMBEDDING_API_KEY
+export ANKLANG_SERVICE_TOKEN
 jq -n '{
   expectedRevision: 1,
   state: "enabled",
@@ -26,15 +24,12 @@ jq -n '{
     failureBehavior: "continue",
     minimumSimilarityToShow: 0.3,
     cacheMinutes: 1440,
-    embeddingProvider: {
-      baseUrl: "https://emb.example.com/v1",
-      model: "bge-m3",
-      dimension: 1024
-    }
+    searchMode: "yuantiji",
+    yuantijiBaseUrl: "https://yuantiji.ac",
+    yuantijiRerank: false
   },
   secrets: {
-    serviceToken: env.ANKLANG_SERVICE_TOKEN,
-    embeddingApiKey: env.ANKLANG_EMBEDDING_API_KEY
+    serviceToken: env.ANKLANG_SERVICE_TOKEN
   },
   clearSecrets: []
 }' | curl -X PATCH "$URMOTIV_URL/api/v1/admin/plugins/org.ustc.urmotiv.anklang" \
@@ -45,15 +40,19 @@ jq -n '{
 
 `URMOTIV_COOKIE_JAR` 应指向一个权限为 `0600` 的保存登录 Cookie 的文件；不要把令牌写进 JSON 字面量、shell 历史或日志。管理响应只显示 `configured` 标记，绝不返回原文、掩码后缀、长度或哈希。
 
-两个插件密钥用途不同，必须分开保存：`serviceToken` 是 Urmotiv 调用 Anklang 服务和提供方管理接口时认证自己的身份；`embeddingApiKey` 是 Anklang 调用嵌入模型提供方时使用的写密钥，只在进程内存中短暂存在，永不回显。`embeddingProvider` 设置（`baseUrl`、`model`、`dimension`）是普通设置，其中 `baseUrl` 允许任一主机名的 HTTPS 地址，或仅供隔离测试的本地/私有 HTTP 地址；不得含账号密码、查询参数或片段。每次启用后的查询或索引同步前，插件都先用 `serviceToken` 认证地 PUT `/api/v1/admin/embedding-provider` 把当前提供方配置（含 `embeddingApiKey`）供给 Anklang；提供方设置或密钥缺失/被清除/非法时，查询按 `failureBehavior` 作为不可用处理（绝不伪装成“没有相似题”），索引同步零请求跳过。没有通用或 Fermata 回退，也不从环境变量读取任何嵌入配置。
+上面的示例选择 `yuantiji`，因此不需要填写 `embeddingProvider` 或 `embeddingApiKey`。如果要让 Anklang 自己保存本地索引，把 `searchMode` 改为 `local` 或 `hybrid`，再填写 `embeddingProvider` 的 `protocol: "openai"`、`baseUrl`、`model`、`dimension`，并保存 `embeddingApiKey`。客户端会向 `POST {baseUrl}/embeddings` 发送 OpenAI 兼容请求；更换模型、维度或地址后 Anklang 会分批重建全部本地向量。
+
+两个插件密钥用途不同，必须分开保存：`serviceToken` 是 Urmotiv 调用 Anklang 服务和提供方管理接口时认证自己的身份；`embeddingApiKey` 是 Anklang 调用嵌入模型提供方时使用的写密钥，只在进程内存中短暂存在，永不回显。检索来源可选 `yuantiji`（默认，不需要填写嵌入配置）、`local` 或 `hybrid`；只有后两种模式才需要 `embeddingProvider`（`protocol: openai`、`baseUrl`、`model`、`dimension`）和 `embeddingApiKey`。`baseUrl` 允许任一主机名的 HTTPS 地址，或仅供隔离测试的本地/私有 HTTP 地址；不得含账号密码、查询参数或片段。每次启用后的查询或索引同步前，插件都先用 `serviceToken` 认证地 PUT `/api/v1/admin/search-sources`；local/hybrid 还会 PUT `/api/v1/admin/embedding-provider` 把当前提供方配置（含 `embeddingApiKey`）供给 Anklang；提供方设置或密钥缺失/被清除/非法时，查询按 `failureBehavior` 作为不可用处理（绝不伪装成“没有相似题”），索引同步零请求跳过。没有通用或 Fermata 回退，也不从环境变量读取任何嵌入配置。
 
 `baseUrl` 只允许语法上的本地/私有地址：`localhost`、`host.docker.internal`、回环/RFC1918/链路本地/IPv6 ULA 字面量，或不含点的单标签容器服务名。不得带账号密码、路径、查询参数或片段；公网主机名/IP 会在设置校验阶段拒绝。`privateContentAuthorized` 是题面发送的明确授权闸门，默认为 `false`；Anklang 查重与索引都必须接收题目名称和基础题面，因此只有在确认 Anklang 与嵌入提供方属于批准的处理范围后才能改为 `true`。关闭它不会执行“无题面的降级查重”，而是在发出任何题面请求前停止，并按 `failureBehavior` 处理提交检查。缺少非空 `serviceToken`、插件停用或设置无效时同样不会发出请求。
 
 令牌必须在上面的经过认证的管理员请求正文中传输这一次，随后仅以加密形式静态保存，并只在运行时内存中读取；发送到 Anklang 时只出现在 `Authorization`，不会出现在设置/UI 响应、审核条目、错误、日志或缓存键中。
 
+插件卡片的“测试当前输入”只发送固定合成文本，分别验证 Anklang 服务、所选 yuantiji 来源和（local/hybrid 时）embedding 接口，不保存任何设置；“应用已保存设置 / 刷新状态”会把已保存的来源和提供方配置重新同步到 Anklang，并显示向量重建进度。
+
 ## 查询边界
 
-默认查询 `POST /api/v2/checks/similarity`；明确选择旧版时才查询 `/api/v1/checks/similarity`。查询只发送 `title`、`type`、`tagIds`、`basicStatement` 和 `contentHash`，不发送基础题解、完整题解、测试数据、附件、作者/用户、权限、审核意见或 Fermata 数据。HTTP 请求禁止重定向，响应必须是严格 JSON，正文上限 2 MB，并使用 `Cache-Control: no-store`。
+默认查询 `POST /api/v2/checks/similarity`；明确选择旧版时才查询 `/api/v1/checks/similarity`。`yuantiji` 模式直接使用公开原题搜索；`local`/`hybrid` 模式使用 Anklang 自己的向量索引。查询只发送 `title`、`type`、`tagIds`、`basicStatement` 和 `contentHash`，不发送基础题解、完整题解、测试数据、附件、作者/用户、权限、审核意见或 Fermata 数据。HTTP 请求禁止重定向，响应必须是严格 JSON，正文上限 2 MB，并使用 `Cache-Control: no-store`。
 
 Anklang 的 `recommendation`、`sameProblemSuggestion`、`explanation` 等判断字段会在插件边界被丢弃。Urmotiv 保存的条目只能包含候选、完成/复用状态和必要来源数据；接受候选永远产生 `continue`，不会因为相似度或远端建议拦截提交。`failureBehavior` 只控制无法取得配置检查时的 `block`/`continue`：
 
@@ -66,7 +65,7 @@ Anklang 的 `recommendation`、`sameProblemSuggestion`、`explanation` 等判断
 
 ## 索引同步边界
 
-每次索引同步前先认证地配置嵌入提供方（见上），提供方可用后，成功的 Urmotiv 本地提交才会尽力调用 Anklang 冻结接口 `PUT /api/v1/index/problems`。请求严格是：
+在 local/hybrid 模式下，每次索引同步前先认证地配置嵌入提供方（见上）；提供方可用后，成功的 Urmotiv 本地提交才会尽力调用 Anklang 冻结接口 `PUT /api/v1/index/problems`。yuantiji 模式不进行本地索引同步。请求严格是：
 
 ```json
 {
@@ -83,7 +82,7 @@ Anklang 的 `recommendation`、`sameProblemSuggestion`、`explanation` 等判断
 
 响应严格包含 `apiVersion`、同一 `requestId`/`externalId`、`source: "urmotiv"`、`contentHash` 和 `outcome`；`outcome` 只能是 `"inserted"`、`"updated"` 或 `"unchanged"`。索引同步只包含 `pending_review` 或 `approved` 题目：每次成功 submit 都同步；这些状态允许的标题变化同步；管理员冻结字段路径只有 `basicStatement` 变化同步，solution-only 变化不同步。draft/rejected 的普通编辑、无变化和其他字段变化不发请求，也没有删除同步。
 
-本地数据库提交先完成，适配器随后等待有界的尽力请求。失败、超时、401、409 或 503 都不能回滚本地成功，也不能把提交报告为失败；停用或错误配置时不会发 HTTP 请求。
+本地数据库提交先完成，适配器随后等待有界的尽力请求。`yuantiji` 模式不会把题目写入 Anklang 本地索引；切换到 local/hybrid 后才启用增量同步。失败、超时、401、409 或 503 都不能回滚本地成功，也不能把提交报告为失败；停用或错误配置时不会发 HTTP 请求。
 
 ## 候选权限过滤
 

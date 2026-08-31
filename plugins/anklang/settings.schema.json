@@ -10,6 +10,29 @@
       "title": "Anklang 服务地址",
       "description": "只能填写本地或私有 HTTP/HTTPS 地址，不含账号密码、路径、查询参数或片段。认证令牌单独保存在插件密钥中。"
     },
+    "searchMode": {
+      "type": "string",
+      "oneOf": [
+        { "const": "yuantiji", "title": "仅 yuantiji 公共题库（推荐）" },
+        { "const": "local", "title": "仅 Urmotiv 本地题库" },
+        { "const": "hybrid", "title": "yuantiji 与本地题库" }
+      ],
+      "default": "yuantiji",
+      "title": "检索来源",
+      "description": "仅 yuantiji 时不需要嵌入配置，也不会把 Urmotiv 题目写入本地相似度索引。"
+    },
+    "yuantijiBaseUrl": {
+      "type": "string",
+      "format": "uri",
+      "default": "https://yuantiji.ac",
+      "title": "yuantiji 服务地址"
+    },
+    "yuantijiRerank": {
+      "type": "boolean",
+      "default": false,
+      "title": "请求 yuantiji 重排",
+      "description": "通常保持关闭，以减少公共服务开销和等待时间。"
+    },
     "embeddingProvider": {
       "type": "object",
       "additionalProperties": false,
@@ -17,11 +40,18 @@
       "title": "Anklang 嵌入提供方",
       "description": "Anklang 生成嵌入所用的模型提供方；API 密钥以 embeddingApiKey 插件密钥单独加密保存，不会在此显示。",
       "properties": {
+        "protocol": {
+          "type": "string",
+          "oneOf": [{ "const": "openai", "title": "OpenAI 兼容接口" }],
+          "default": "openai",
+          "title": "接口协议",
+          "description": "OpenAI 兼容的 POST {地址}/embeddings 接口。"
+        },
         "baseUrl": {
           "type": "string",
           "format": "uri",
           "title": "嵌入提供方地址",
-          "description": "允许任一主机名的 HTTPS 地址，或仅供隔离测试的本地/私有 HTTP 地址；不得含账号密码、查询参数或片段。"
+          "description": "OpenAI 兼容 API 的 v1 根地址，例如 https://…/v1；客户端会请求 /embeddings。"
         },
         "model": {
           "type": "string",

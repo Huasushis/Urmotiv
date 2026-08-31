@@ -1,4 +1,4 @@
-import { NavLink, useLocation } from "react-router-dom";
+import { NavLink, useInRouterContext } from "react-router-dom";
 import type { ReactNode } from "react";
 import type { SessionUser } from "@urmotiv/contracts";
 
@@ -11,6 +11,32 @@ export type AdminNavigationGroup = {
   readonly label: string;
   readonly items: readonly AdminNavigationItem[];
 };
+
+function AdminNavigationLink({
+  item,
+  inRouter,
+  sidebar = false
+}: {
+  item: AdminNavigationItem;
+  inRouter: boolean;
+  sidebar?: boolean;
+}) {
+  const baseClassName = sidebar ? "admin-section-link" : "";
+  if (!inRouter) {
+    return <a href={item.to} className={baseClassName}>{item.label}</a>;
+  }
+  return (
+    <NavLink
+      end
+      to={item.to}
+      className={({ isActive }) =>
+        `${baseClassName}${isActive ? `${baseClassName ? " " : ""}active` : ""}`
+      }
+    >
+      {item.label}
+    </NavLink>
+  );
+}
 
 export function canOpenAdmin(session: SessionUser): boolean {
   return session.accountType === "human" && (
@@ -76,7 +102,12 @@ export function adminNavigationGroups(session: SessionUser): AdminNavigationGrou
     },
     {
       label: "扩展",
-      items: canManagePlugins ? [{ to: "/admin/plugins", label: "插件" }] : []
+      items: [
+        ...(canManagePlugins ? [{ to: "/admin/plugins", label: "插件" }] : []),
+        ...(canManagePlugins && canManageSystem
+          ? [{ to: "/admin/fermata", label: "Fermata 审核服务" }]
+          : [])
+      ]
     }
   ].filter((group) => group.items.length > 0);
 }
@@ -95,14 +126,15 @@ export function AdminLayout({
   actions?: ReactNode;
 }) {
   const groups = adminNavigationGroups(session);
-  const location = useLocation();
+  const inRouter = useInRouterContext();
+  const pathname = typeof window === "undefined" ? "" : window.location.pathname;
   const currentLabel = groups
     .flatMap((group) => group.items)
-    .find((item) => item.to === location.pathname)?.label ?? title;
+    .find((item) => item.to === pathname)?.label ?? title;
   return (
     <section className="admin-page">
       <div className="admin-layout">
-        <details className="admin-mobile-navigation" key={location.pathname}>
+        <details className="admin-mobile-navigation" key={pathname}>
           <summary>
             <span>管理栏目</span>
             <strong>{currentLabel}</strong>
@@ -113,14 +145,11 @@ export function AdminLayout({
                 <h2>{group.label}</h2>
                 <div>
                   {group.items.map((item) => (
-                    <NavLink
-                      end
+                    <AdminNavigationLink
                       key={item.to}
-                      to={item.to}
-                      className={({ isActive }) => isActive ? "active" : ""}
-                    >
-                      {item.label}
-                    </NavLink>
+                      item={item}
+                      inRouter={inRouter}
+                    />
                   ))}
                 </div>
               </section>
@@ -145,14 +174,12 @@ export function AdminLayout({
                 <h2>{group.label}</h2>
                 <div>
                   {group.items.map((item) => (
-                    <NavLink
-                      end
+                    <AdminNavigationLink
                       key={item.to}
-                      to={item.to}
-                      className={({ isActive }) => `admin-section-link${isActive ? " active" : ""}`}
-                    >
-                      {item.label}
-                    </NavLink>
+                      item={item}
+                      inRouter={inRouter}
+                      sidebar
+                    />
                   ))}
                 </div>
               </section>

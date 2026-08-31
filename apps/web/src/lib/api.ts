@@ -347,6 +347,72 @@ export function listAdminPlugins(): Promise<AdminPluginListResponse> {
   return request("/admin/plugins", { method: "GET" }, adminPluginListResponseSchema);
 }
 
+const anklangConfigurationTestResponseSchema = z.object({
+  ok: z.literal(true),
+  search: z.object({
+    ok: z.boolean(),
+    yuantijiReady: z.boolean().nullable(),
+    yuantijiProblemCount: z.number().int().nonnegative().optional()
+  }).strict(),
+  embedding: z.object({
+    ok: z.literal(true),
+    protocol: z.literal("openai"),
+    model: z.string(),
+    dimension: z.number().int().positive()
+  }).strict().nullable()
+}).strict();
+
+const anklangRebuildStatusSchema = z.object({
+  state: z.enum(["idle", "running", "failed"]),
+  processed: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative(),
+  reasonCode: z.string().optional()
+}).strict();
+
+const anklangProviderStatusSchema = z.union([
+  z.object({
+    configured: z.literal(true),
+    baseUrl: z.string().url(),
+    model: z.string(),
+    dimension: z.number().int().positive(),
+    rebuild: anklangRebuildStatusSchema.optional()
+  }).strict(),
+  z.object({
+    configured: z.literal(false),
+    rebuild: anklangRebuildStatusSchema.optional()
+  }).strict()
+]);
+
+export function testAdminAnklangConfiguration(input: {
+  settings: Record<string, unknown>;
+  secrets: Record<string, string>;
+  clearSecrets: string[];
+}): Promise<z.infer<typeof anklangConfigurationTestResponseSchema>> {
+  return request(
+    "/admin/anklang/test",
+    { ...json(input), method: "POST" },
+    anklangConfigurationTestResponseSchema
+  );
+}
+
+const anklangApplyResponseSchema = z.object({
+  ok: z.literal(true),
+  search: z.object({
+    mode: z.enum(["yuantiji", "local", "hybrid"]),
+    yuantijiBaseUrl: z.string().url(),
+    yuantijiRerank: z.boolean()
+  }).strict(),
+  provider: anklangProviderStatusSchema
+}).strict();
+
+export function applyAdminAnklangConfiguration(): Promise<z.infer<typeof anklangApplyResponseSchema>> {
+  return request(
+    "/admin/anklang/apply",
+    { method: "POST" },
+    anklangApplyResponseSchema
+  );
+}
+
 export function getAdminGeneralSettings(): Promise<{ settings: AdminGeneralSettings }> {
   return request(
     "/admin/settings",
@@ -562,6 +628,14 @@ export function updateFermataSettings(input: UpdateFermataPublicSettingsInput): 
     { ...json(input), method: "PUT" },
     fermataPublicSettingsResponseSchema
   );
+}
+
+export function wakeFermata(): Promise<void> {
+  return request(
+    "/admin/fermata/wake",
+    { method: "POST" },
+    z.object({ ok: z.literal(true) }).strict()
+  ).then(() => undefined);
 }
 
 export function listManagedTagCatalog(): Promise<ManagedTagCatalogResponse> {

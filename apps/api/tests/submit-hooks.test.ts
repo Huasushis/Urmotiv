@@ -61,6 +61,18 @@ interface FakeAnklang {
 }
 function fakeAnklangFetch(state: FakeAnklang): AnklangFetch {
   return async (input, init) => {
+    if (String(input).endsWith("/api/v1/admin/search-sources")) {
+      const source = JSON.parse(String(init?.body ?? "{}")) as {
+        mode?: string;
+        yuantijiBaseUrl?: string;
+        yuantijiRerank?: boolean;
+      };
+      return new Response(JSON.stringify({
+        mode: source.mode ?? "local",
+        yuantijiBaseUrl: source.yuantijiBaseUrl ?? "https://yuantiji.ac",
+        yuantijiRerank: source.yuantijiRerank ?? false
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
     if (String(input).endsWith("/api/v1/admin/embedding-provider")) {
       const method = init?.method ?? "GET";
       if (method === "DELETE") {
@@ -292,6 +304,7 @@ async function enableAnklang(host: TrustedPluginHost, settings: Record<string, u
       state: "enabled",
       settings: {
         baseUrl: "http://127.0.0.1:8730",
+        searchMode: "local",
         privateContentAuthorized: true,
         embeddingProvider: { baseUrl: "https://emb.example.com/v1", model: "bge-m3", dimension: 1024 },
         ...settings
@@ -778,7 +791,12 @@ describe("提交前查重链路", () => {
       items: Array<{ summary: string; data: { candidates: Array<Record<string, unknown>> } }>;
     };
     expect(body.items[0]?.data.candidates).toEqual([
-      expect.objectContaining({ source: "urmotiv", externalId: visible.id, title: "查重链路演示题" })
+      expect.objectContaining({
+        source: "urmotiv",
+        externalId: visible.id,
+        title: "查重链路演示题",
+        statement: statementText
+      })
     ]);
     expect(body.items[0]?.summary).toContain("1 道候选");
   });

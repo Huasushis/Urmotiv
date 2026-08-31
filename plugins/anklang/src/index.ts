@@ -121,6 +121,7 @@ export function isValidEmbeddingProviderBaseUrl(value: string): boolean {
 
 const embeddingProviderSettingsSchema = z
   .object({
+    protocol: z.literal("openai").optional(),
     baseUrl: embeddingProviderUrlSchema,
     model: z
       .string()
@@ -137,6 +138,7 @@ const embeddingProviderSettingsSchema = z
 /** 提交给 Anklang 的嵌入提供方配置（含一次性写密钥）。 */
 export const embeddingProviderProvisionSchema = z
   .object({
+    protocol: z.literal("openai").optional(),
     baseUrl: embeddingProviderUrlSchema,
     apiKey: z.string().min(1).max(4_096),
     model: z.string().min(1).max(200),
@@ -145,12 +147,20 @@ export const embeddingProviderProvisionSchema = z
   .strict();
 
 /** Anklang 只会返回 configured 与非密钥设置；永不回显 apiKey。 */
+const embeddingRebuildStatusSchema = z.object({
+  state: z.enum(["idle", "running", "failed"]),
+  processed: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative(),
+  reasonCode: z.string().regex(/^[a-z0-9_]+$/u).max(80).optional()
+}).strict().refine((value) => value.processed <= value.total, "重建进度不能超过总数。");
+
 export const embeddingProviderStatusSchema = z
   .object({
     configured: z.boolean(),
     baseUrl: embeddingProviderUrlSchema.optional(),
     model: z.string().min(1).max(200).optional(),
-    dimension: z.number().int().min(1).max(embeddingProviderMaxDimension).optional()
+    dimension: z.number().int().min(1).max(embeddingProviderMaxDimension).optional(),
+    rebuild: embeddingRebuildStatusSchema.optional()
   })
   .strict()
   .refine(
@@ -171,6 +181,7 @@ export const embeddingProviderStatusSchema = z
   );
 
 export interface EmbeddingProviderConfig {
+  readonly protocol?: "openai";
   readonly baseUrl: string;
   readonly model: string;
   readonly dimension: number;
@@ -183,10 +194,30 @@ export interface EmbeddingProviderProvisionInput extends EmbeddingProviderConfig
 export type EmbeddingProviderStatus = z.infer<typeof embeddingProviderStatusSchema>;
 
 const apiVersionSchema = z.enum(["2", "1"]);
+const searchModeSchema = z.enum(["yuantiji", "local", "hybrid"]);
+
+const yuantijiBaseUrlSchema = embeddingProviderUrlSchema.refine((value) => {
+  const url = new URL(value);
+  return url.pathname === "/" || url.pathname === "";
+}, "yuantiji 地址不能包含路径。");
+
+export const anklangSearchSourceConfigSchema = z
+  .object({
+    mode: searchModeSchema,
+    yuantijiBaseUrl: yuantijiBaseUrlSchema,
+    yuantijiRerank: z.boolean()
+  })
+  .strict();
+export type AnklangSearchSourceConfig = z.infer<typeof anklangSearchSourceConfigSchema>;
 
 export const anklangSettingsSchema = z
   .object({
     baseUrl: serviceUrlSchema,
+    // 旧版配置没有这个字段。缺省时保留 Anklang 服务端现有来源，避免升级时
+    // 静默改写检索语义；管理页保存的新配置会明确写入所选模式。
+    searchMode: searchModeSchema.optional(),
+    yuantijiBaseUrl: yuantijiBaseUrlSchema.default("https://yuantiji.ac"),
+    yuantijiRerank: z.boolean().default(false),
     apiVersion: apiVersionSchema.default("2"),
     timeoutMs: z.number().int().min(1_000).max(120_000).default(120_000),
     indexTimeoutMs: z.number().int().min(1_000).max(30_000).default(defaultIndexTimeoutMs),
@@ -314,9 +345,18 @@ function canonicalMetadataJson(metadata: Record<string, unknown>): string {
 }
 
 /** v2 专用候选题：v1 候选保持原有字节形状，携带 metadata 的 v1 候选被拒绝。 */
+const candidateStatementShape = {
+  statement: z.string().min(1).max(32_000).optional(),
+  statementTruncated: z.literal(true).optional()
+} as const;
+
 export const anklangV2CandidateSchema = anklangCandidateSchema
-  .extend({ metadata: anklangCandidateMetadataSchema.optional() })
+  .extend({ metadata: anklangCandidateMetadataSchema.optional(), ...candidateStatementShape })
   .strict()
+  .refine(
+    (candidate) => candidate.statementTruncated !== true || candidate.statement !== undefined,
+    { path: ["statementTruncated"], message: "截断标记必须与题面同时出现。" }
+  )
   .transform((candidate) => {
     if (candidate.metadata !== undefined && Object.keys(candidate.metadata).length !== 0) {
       return candidate;
@@ -475,8 +515,12 @@ export const anklangSearchCandidateSchema = anklangCandidateSchema
   .strict();
 
 export const anklangV2SearchCandidateSchema = anklangSearchCandidateSchema
-  .extend({ metadata: anklangCandidateMetadataSchema.optional() })
+  .extend({ metadata: anklangCandidateMetadataSchema.optional(), ...candidateStatementShape })
   .strict()
+  .refine(
+    (candidate) => candidate.statementTruncated !== true || candidate.statement !== undefined,
+    { path: ["statementTruncated"], message: "截断标记必须与题面同时出现。" }
+  )
   .transform((candidate) => {
     if (candidate.metadata !== undefined && Object.keys(candidate.metadata).length !== 0) {
       return candidate;
@@ -696,6 +740,9 @@ export class AnklangClient {
   readonly #endpoint: URL;
   readonly #indexEndpoint: URL;
   readonly #providerEndpoint: URL;
+  readonly #providerTestEndpoint: URL;
+  readonly #searchSourcesEndpoint: URL;
+  readonly #searchSourcesTestEndpoint: URL;
   readonly #token: string;
   readonly #retryAttempts: number;
   readonly #timeoutMs: number;
@@ -725,6 +772,18 @@ export class AnklangClient {
     this.#indexEndpoint = new URL("/api/v1/index/problems", ensureTrailingSlash(baseUrl));
     this.#providerEndpoint = new URL(
       "/api/v1/admin/embedding-provider",
+      ensureTrailingSlash(baseUrl)
+    );
+    this.#providerTestEndpoint = new URL(
+      "/api/v1/admin/embedding-provider/test",
+      ensureTrailingSlash(baseUrl)
+    );
+    this.#searchSourcesEndpoint = new URL(
+      "/api/v1/admin/search-sources",
+      ensureTrailingSlash(baseUrl)
+    );
+    this.#searchSourcesTestEndpoint = new URL(
+      "/api/v1/admin/search-sources/test",
       ensureTrailingSlash(baseUrl)
     );
     this.#token = token;
@@ -846,6 +905,64 @@ export class AnklangClient {
       signal,
       this.#timeoutMs,
       parseEmbeddingProviderStatus
+    );
+  }
+
+  /** Configure which independent corpora participate in each similarity query. */
+  public async putSearchSources(
+    input: AnklangSearchSourceConfig,
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<AnklangSearchSourceConfig> {
+    const parsed = anklangSearchSourceConfigSchema.safeParse(input);
+    if (!parsed.success) {
+      throw new AnklangInvalidResponseError("Anklang 检索来源配置不符合契约。");
+    }
+    return this.#requestJson(
+      this.#searchSourcesEndpoint,
+      { method: "PUT" },
+      parsed.data,
+      signal,
+      this.#timeoutMs,
+      (raw) => anklangSearchSourceConfigSchema.parse(raw)
+    );
+  }
+
+  public async testSearchSources(
+    input: AnklangSearchSourceConfig,
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<{ ok: boolean; yuantijiReady: boolean | null; yuantijiProblemCount?: number | undefined }> {
+    const parsed = anklangSearchSourceConfigSchema.parse(input);
+    return this.#requestJson(
+      this.#searchSourcesTestEndpoint,
+      { method: "POST" },
+      parsed,
+      signal,
+      this.#timeoutMs,
+      (raw) => z.object({
+        ok: z.boolean(),
+        yuantijiReady: z.boolean().nullable(),
+        yuantijiProblemCount: z.number().int().nonnegative().optional()
+      }).strict().parse(raw)
+    );
+  }
+
+  public async testEmbeddingProvider(
+    input: EmbeddingProviderProvisionInput,
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<{ ok: true; protocol: "openai"; model: string; dimension: number }> {
+    const parsed = embeddingProviderProvisionSchema.parse(input);
+    return this.#requestJson(
+      this.#providerTestEndpoint,
+      { method: "POST" },
+      parsed,
+      signal,
+      this.#timeoutMs,
+      (raw) => z.object({
+        ok: z.literal(true),
+        protocol: z.literal("openai"),
+        model: z.string().min(1).max(200),
+        dimension: z.number().int().min(1).max(embeddingProviderMaxDimension)
+      }).strict().parse(raw)
     );
   }
 
@@ -1029,21 +1146,42 @@ async function provisionEmbeddingProvider(
   ) {
     throw new AnklangUnavailableError("Anklang 嵌入提供方未配置。");
   }
-  await client.putEmbeddingProvider({ ...provider, apiKey: normalizedApiKey }, signal);
+  await client.putEmbeddingProvider({
+    ...(provider.protocol === undefined ? {} : { protocol: provider.protocol }),
+    baseUrl: provider.baseUrl,
+    model: provider.model,
+    dimension: provider.dimension,
+    apiKey: normalizedApiKey
+  }, signal);
+}
+
+async function provisionSearchSources(
+  client: AnklangClient,
+  settings: AnklangSettings,
+  signal: AbortSignal = new AbortController().signal
+): Promise<void> {
+  if (settings.searchMode === undefined) {
+    return;
+  }
+  await client.putSearchSources({
+    mode: settings.searchMode,
+    yuantijiBaseUrl: settings.yuantijiBaseUrl,
+    yuantijiRerank: settings.yuantijiRerank
+  }, signal);
+}
+
+function shouldProvisionEmbeddingProvider(settings: AnklangSettings): boolean {
+  return (
+    settings.searchMode === "local" ||
+    settings.searchMode === "hybrid" ||
+    (settings.searchMode === undefined && settings.embeddingProvider !== undefined)
+  );
 }
 
 export interface CreateAnklangCheckOptions {
   readonly settings: AnklangSettings;
   readonly token?: string;
   readonly embeddingApiKey?: string;
-  readonly cache?: AnklangCache;
-  readonly fetch?: AnklangFetch;
-  readonly now?: () => Date;
-}
-
-export interface CreateAnklangCheckOptions {
-  readonly settings: AnklangSettings;
-  readonly token?: string;
   readonly cache?: AnklangCache;
   readonly fetch?: AnklangFetch;
   readonly now?: () => Date;
@@ -1070,7 +1208,8 @@ export function createAnklangCheck(options: CreateAnklangCheckOptions): BeforeSu
     async run(input, context): Promise<BeforeSubmitResult> {
       let result: AnklangSearchResult;
       try {
-        if (settings.embeddingProvider !== undefined) {
+        await provisionSearchSources(client, settings, context.signal);
+        if (shouldProvisionEmbeddingProvider(settings)) {
           await provisionEmbeddingProvider(client, settings, options.embeddingApiKey, context.signal);
         }
         result = await readOrCheck(input, context.signal, client, settings, options.cache, now);
@@ -1173,6 +1312,9 @@ export function createAnklangIndexAdapter(runtime: AnklangIndexRuntime): Anklang
           return undefined;
         }
         const settings = parsedSettings.data;
+        if (settings.searchMode === "yuantiji") {
+          return undefined;
+        }
         const apiKey = await runtime.readEmbeddingApiKey();
         const normalizedApiKey = apiKey?.trim();
         if (
@@ -1192,6 +1334,7 @@ export function createAnklangIndexAdapter(runtime: AnklangIndexRuntime): Anklang
           indexTimeoutMs: settings.indexTimeoutMs,
           ...(runtime.fetch === undefined ? {} : { fetch: runtime.fetch })
         });
+        await provisionSearchSources(client, settings);
         await provisionEmbeddingProvider(client, settings, normalizedApiKey);
         return await client.upsert({
           apiVersion: "1",
@@ -1240,7 +1383,15 @@ async function readOrCheck(
   cache: AnklangCache | undefined,
   now: () => Date
 ): Promise<AnklangSearchResult> {
-  const cacheKey = `${settings.apiVersion}:${new URL(settings.baseUrl).href}:${settings.cacheMinutes}:${input.contentHash}`;
+  const sourceIdentity = settings.searchMode === undefined
+    ? "server-default"
+    : `${settings.searchMode}:${settings.yuantijiBaseUrl}:${settings.yuantijiRerank}`;
+  const providerIdentity = !shouldProvisionEmbeddingProvider(settings)
+    ? "none"
+    : `${settings.embeddingProvider?.protocol ?? "missing"}:${settings.embeddingProvider?.baseUrl ?? "missing"}:${settings.embeddingProvider?.model ?? "missing"}:${settings.embeddingProvider?.dimension ?? "missing"}`;
+  const cacheKey = settings.searchMode === undefined && settings.embeddingProvider === undefined
+    ? `${settings.apiVersion}:${new URL(settings.baseUrl).href}:${settings.cacheMinutes}:${input.contentHash}`
+    : `${settings.apiVersion}:${new URL(settings.baseUrl).href}:${sourceIdentity}:${providerIdentity}:${settings.cacheMinutes}:${input.contentHash}`;
   let cached: unknown | undefined;
   try {
     cached = await cache?.get(cacheKey);

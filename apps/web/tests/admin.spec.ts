@@ -59,12 +59,16 @@ const plugin = {
   failureCode: null,
   settings: {
     baseUrl: "http://127.0.0.1:8730",
+    searchMode: "hybrid",
+    yuantijiBaseUrl: "https://yuantiji.ac",
+    yuantijiRerank: false,
     timeoutMs: 30000,
     privateContentAuthorized: false,
     failureBehavior: "block",
     minimumSimilarityToShow: 0.3,
     cacheMinutes: 1440,
     embeddingProvider: {
+      protocol: "openai",
       baseUrl: "https://emb.example.com/v1",
       model: "bge-m3",
       dimension: 1024
@@ -79,6 +83,24 @@ const plugin = {
         type: "string",
         format: "uri",
         title: "Anklang 服务地址"
+      },
+      searchMode: {
+        type: "string",
+        oneOf: [
+          { const: "yuantiji", title: "仅 yuantiji 公共题库（推荐）" },
+          { const: "local", title: "仅 Urmotiv 本地题库" },
+          { const: "hybrid", title: "yuantiji 与本地题库" }
+        ],
+        title: "检索来源"
+      },
+      yuantijiBaseUrl: {
+        type: "string",
+        format: "uri",
+        title: "yuantiji 服务地址"
+      },
+      yuantijiRerank: {
+        type: "boolean",
+        title: "请求 yuantiji 重排"
       },
       timeoutMs: {
         type: "integer",
@@ -97,6 +119,11 @@ const plugin = {
         required: ["baseUrl", "model", "dimension"],
         title: "嵌入提供方",
         properties: {
+          protocol: {
+            type: "string",
+            oneOf: [{ const: "openai", title: "OpenAI 兼容接口" }],
+            title: "接口协议"
+          },
           baseUrl: {
             type: "string",
             format: "uri",
@@ -280,6 +307,7 @@ test("系统管理员保存插件设置后密钥输入框恢复为空", async ({
           ...plugin.settings,
           timeoutMs: 45000,
           embeddingProvider: {
+            protocol: "openai",
             baseUrl: "https://emb2.example.com/v1",
             model: "bge-large",
             dimension: 2048
@@ -298,6 +326,10 @@ test("系统管理员保存插件设置后密钥输入框恢复为空", async ({
   const providerBaseUrl = page.getByLabel(/嵌入提供方地址/);
   const providerModel = page.getByLabel(/嵌入模型名称/);
   const providerDimension = page.getByLabel(/嵌入向量维度/);
+  await expect(page.getByLabel("检索来源").locator("option:checked"))
+    .toHaveText("yuantiji 与本地题库");
+  await expect(page.getByLabel("接口协议").locator("option:checked"))
+    .toHaveText("OpenAI 兼容接口");
   const secret = page.getByLabel(/^访问令牌/);
   const embeddingKey = page.getByLabel(/^嵌入提供方 API 密钥/);
   await expect(providerBaseUrl).toHaveValue("https://emb.example.com/v1");
@@ -327,6 +359,7 @@ test("系统管理员保存插件设置后密钥输入框恢复为空", async ({
       ...plugin.settings,
       timeoutMs: 45000,
       embeddingProvider: {
+        protocol: "openai",
         baseUrl: "https://emb2.example.com/v1",
         model: "bge-large",
         dimension: 2048
@@ -338,6 +371,7 @@ test("系统管理员保存插件设置后密钥输入框恢复为空", async ({
     }
   });
   await expect(page.getByText(plugin.source)).toHaveCount(0);
+  await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({ path: testInfo.outputPath("admin-plugin-desktop.png"), fullPage: true });
 });
 
@@ -520,6 +554,48 @@ test("手机视口中的审核规则没有横向溢出", async ({ page }, testIn
   );
   expect(overflow).toBeLessThanOrEqual(1);
   await page.screenshot({ path: testInfo.outputPath("admin-review-mobile.png"), fullPage: true });
+});
+
+test("Fermata 独立管理页展示运行状态、模型配置说明且没有横向溢出", async ({ page }, testInfo) => {
+  const settings = {
+    enabled: true,
+    pollingIntervalSeconds: 30,
+    maximumConcurrentTasks: 16,
+    modelProfileName: "deepseek-v4-flash-max",
+    experimentVersion: "prompt-v5"
+  };
+  await page.route("**/api/v1/admin/fermata/settings", async (route) => {
+    await fulfillJson(route, { settings, revision: 7, secretsConfigured: true });
+  });
+  await page.route("**/api/v1/admin/fermata/health", async (route) => {
+    await fulfillJson(route, {
+      health: {
+        status: "ok",
+        service: "fermata",
+        apiVersion: "1",
+        workerRunning: true,
+        activeTasks: 12,
+        checkedAt: "2026-08-31T13:00:00.000Z"
+      }
+    });
+  });
+
+  await loginAs(page, /系统管理员/);
+  await page.goto("/admin/fermata");
+  await expect(page.getByRole("heading", { name: "Fermata 审核服务", level: 1 })).toBeVisible();
+  await expect(page.getByText("审核 Worker 正在运行")).toBeVisible();
+  await expect(page.getByLabel("最多并发审核任务")).toHaveValue("16");
+  await expect(page.getByLabel("模型档位名称")).toHaveValue("deepseek-v4-flash-max");
+  await expect(page.getByText("AI 服务地址和密钥在哪里配置？")).toBeVisible();
+  await expect(page.getByText("FERMATA_MANAGEMENT_TOKEN")).toBeVisible();
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
+  await page.screenshot({
+    path: testInfo.outputPath(`admin-fermata-${testInfo.project.name}.png`),
+    fullPage: true
+  });
 });
 
 test("知识点管理员可以展开分类并查看安全的停用影响汇总", async ({ page }, testInfo) => {

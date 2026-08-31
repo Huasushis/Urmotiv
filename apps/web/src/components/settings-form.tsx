@@ -46,9 +46,10 @@ function cloneSettingValue(value: unknown): unknown {
  * Fills defaults without changing the object supplied by the caller.
  * The server performs the same validation again before saving.
  */
-export function applySettingsFormDefaults(
+function applySettingsFormDefaultsInternal(
   schema: PluginSettingsFormSchema,
-  value: unknown
+  value: unknown,
+  forceObject: boolean
 ): unknown {
   const effectiveValue =
     value === undefined && schema.default !== undefined
@@ -57,11 +58,22 @@ export function applySettingsFormDefaults(
 
   if (schema.type === "object") {
     const hadObjectValue = isRecord(effectiveValue);
+    // An optional object must stay absent when its parent did not provide it. This
+    // prevents a default on one nested field (for example protocol) from creating
+    // an invalid half-filled configuration that the server then rejects.
+    if (!hadObjectValue && effectiveValue === undefined && schema.default === undefined && !forceObject) {
+      return undefined;
+    }
     const source = hadObjectValue ? effectiveValue : {};
     const result: Record<string, unknown> = { ...source };
+    const requiredNames = new Set(schema.required ?? []);
 
     for (const [name, childSchema] of Object.entries(schema.properties ?? {})) {
-      const childValue = applySettingsFormDefaults(childSchema, source[name]);
+      const childValue = applySettingsFormDefaultsInternal(
+        childSchema,
+        source[name],
+        requiredNames.has(name)
+      );
       if (childValue === undefined) {
         delete result[name];
       } else {
@@ -81,12 +93,19 @@ export function applySettingsFormDefaults(
       return cloneSettingValue(effectiveValue);
     }
     return effectiveValue.map((item) => {
-      const childValue = applySettingsFormDefaults(itemSchema, item);
+      const childValue = applySettingsFormDefaultsInternal(itemSchema, item, false);
       return childValue === undefined ? cloneSettingValue(item) : childValue;
     });
   }
 
   return cloneSettingValue(effectiveValue);
+}
+
+export function applySettingsFormDefaults(
+  schema: PluginSettingsFormSchema,
+  value: unknown
+): unknown {
+  return applySettingsFormDefaultsInternal(schema, value, true);
 }
 
 function displayValue(value: PluginSettingsFormValue): string {

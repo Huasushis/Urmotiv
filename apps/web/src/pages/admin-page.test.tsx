@@ -464,10 +464,11 @@ describe("管理页面", () => {
       expect.objectContaining({ href: "/admin/audit", text: expect.stringContaining("审计") }),
       expect.objectContaining({ href: "/admin/oauth", text: expect.stringContaining("统一身份认证") }),
       expect.objectContaining({ href: "/admin/plugins", text: expect.stringContaining("插件") }),
+      expect.objectContaining({ href: "/admin/fermata", text: expect.stringContaining("Fermata") }),
       expect.objectContaining({ href: "/admin/knowledge", text: expect.stringContaining("知识点") }),
       expect.objectContaining({ href: "/problems", text: expect.stringContaining("题库") })
     ]));
-    expect(links.some((link) => link.href === "/admin/fermata")).toBe(false);
+    expect(links.some((link) => link.href === "/admin/fermata")).toBe(true);
     const sectionLinks = [...view.querySelectorAll<HTMLAnchorElement>(".admin-section-nav a")];
     expect(new Set(sectionLinks.map((link) => link.getAttribute("href"))).size).toBe(sectionLinks.length);
   });

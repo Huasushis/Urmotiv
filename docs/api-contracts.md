@@ -205,9 +205,9 @@ Accept: application/json
 
 ## Anklang 内置适配器 API
 
-Anklang 查询和索引是插件到独立服务的内部 API，不是公开的 Urmotiv `/api/v1` 路由。插件只接受语法上的本地/私有 `baseUrl`（无凭据、路径、查询或片段），并要求管理员显式设置 `privateContentAuthorized: true`；默认 `false`，且运行时必须有非空 `serviceToken` 插件密钥。密钥永远不会出现在管理设置响应、审核条目或日志中。
+Anklang 查询和索引是插件到独立服务的内部 API，不是公开的 Urmotiv `/api/v1` 路由。插件只接受语法上的本地/私有 `baseUrl`（无凭据、路径、查询或片段），并要求管理员显式设置 `privateContentAuthorized: true`；默认 `false`，且运行时必须有非空 `serviceToken` 插件密钥。检索来源可选 `yuantiji`、`local` 或 `hybrid`；前者不需要本地 embedding，后两者使用 `protocol: openai` 的 `/embeddings` 提供方。密钥永远不会出现在管理设置响应、审核条目或日志中。
 
-查询使用现有 Anklang `POST /api/v2/checks/similarity`（仅显式 v1 迁移配置使用 `/api/v1/checks/similarity`），只发送标题、题型、标签、基础题面和内容摘要。响应必须是严格 JSON，最多 2 MB、禁止重定向并按 `Cache-Control: no-store` 处理。插件投影为仅检索结果：候选与完成/复用状态可保存，`recommendation`、`sameProblemSuggestion`、`explanation` 等判断字段会被删除；相似候选不会产生 Urmotiv 裁决或阻止提交。`failureBehavior` 只处理无法取得配置检查的情况。`retryAttempts` 范围 1–3（默认 2），只对网络/超时/408/429/502/503/504 重试；401、409 和数据结构约束错误不重试，最终都保持 unavailable 语义而不是空成功。
+查询使用现有 Anklang `POST /api/v2/checks/similarity`（仅显式 v1 迁移配置使用 `/api/v1/checks/similarity`），只发送标题、题型、标签、基础题面和内容摘要。响应必须是严格 JSON，最多 2 MB、禁止重定向并按 `Cache-Control: no-store` 处理；候选可带有界 `url`、`statement` 和 `metadata` 供页面展开核对。插件投影为仅检索结果：候选与完成/复用状态可保存，`recommendation`、`sameProblemSuggestion`、`explanation` 等判断字段会被删除；相似候选不会产生 Urmotiv 裁决或阻止提交。`failureBehavior` 只处理无法取得配置检查的情况。`retryAttempts` 范围 1–3（默认 2），只对网络/超时/408/429/502/503/504 重试；401、409 和数据结构约束错误不重试，最终都保持 unavailable 语义而不是空成功。
 成功 submit、`pending_review`/`approved` 题目的标题变更、冻结 `basicStatement` 变更，才通过注入 `ProblemService` 的窄适配器执行 `PUT /api/v1/index/problems`。索引超时 `indexTimeoutMs` 范围 1–30 秒（默认 10 秒），请求严格为：
 
 ```http

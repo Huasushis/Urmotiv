@@ -926,7 +926,8 @@ export class ProblemService {
           source: "urmotiv",
           externalId: candidate.externalId,
           title: visible.title,
-          similarity: candidate.similarity
+          similarity: candidate.similarity,
+          statement: visible.content.basicStatement
         });
       }
       const reviewItemInput: ReviewItemInput = {

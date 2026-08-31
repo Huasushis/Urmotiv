@@ -249,3 +249,66 @@ test("题目工作台提供原题检索按钮，未形成可信结果时不会�
   await expect(page.getByText(/原题检索未能形成可信结果/)).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText(/未发现需要关注的相似题目/)).toHaveCount(0);
 });
+
+test("原题检索候选展示来源链接、题号和可展开题面", async ({ page }, testInfo) => {
+  await page.route("**/api/v1/problems/*/similarity-check", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "completed",
+        blockedAdvice: null,
+        items: [{
+          id: "synthetic-anklang-result",
+          type: "org.ustc.urmotiv.anklang.similarity",
+          source: "anklang",
+          visibility: "author",
+          summary: "发现 1 道候选题，需人工核对。",
+          createdAt: "2026-08-31T13:00:00.000Z",
+          data: {
+            apiVersion: "2",
+            checkedAt: "2026-08-31T13:00:00.000Z",
+            completion: { status: "complete" },
+            candidates: [{
+              source: "yuantiji",
+              externalId: "CF-1000A",
+              title: "公开合成相似题",
+              url: "https://example.test/problems/CF-1000A",
+              similarity: 0.91,
+              statement: "# 公开合成题面\n\n给定一个整数，输出它本身。",
+              metadata: { search_provider: "yuantiji" }
+            }]
+          }
+        }]
+      })
+    });
+  });
+
+  await loginAsLeader(page);
+  await page.goto("/problems/new");
+  await page.getByLabel("题目名称").fill(`候选展示联调题-${testInfo.project.name}`);
+  await page.getByRole("button", { name: "选择知识点" }).click();
+  await page.locator(".tag-picker-group summary").first().click();
+  await page.locator(".tag-choice").first().click();
+  await page.locator('section[aria-label="基础题面"] textarea').fill("给定 x，输出 x。");
+  await page.locator('section[aria-label="基础题解"] textarea').fill("直接输出。");
+  await page.getByRole("button", { name: "创建草稿" }).click();
+  await page.getByRole("button", { name: /原题检索/ }).click();
+
+  const candidate = page.locator(".candidate-item").filter({ hasText: "公开合成相似题" });
+  await expect(candidate.getByRole("link", { name: /公开合成相似题/ }))
+    .toHaveAttribute("href", "https://example.test/problems/CF-1000A");
+  await expect(candidate.getByText("题号 CF-1000A")).toBeVisible();
+  await expect(candidate.getByText("经 yuantiji 检索")).toBeVisible();
+  await candidate.getByText("查看题面").click();
+  await expect(candidate.getByRole("heading", { name: "公开合成题面" })).toBeVisible();
+  await expect(candidate.getByText("给定一个整数，输出它本身。")).toBeVisible();
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth
+  );
+  expect(overflow).toBeLessThanOrEqual(1);
+  await page.screenshot({
+    path: testInfo.outputPath(`anklang-candidate-${testInfo.project.name}.png`),
+    fullPage: true
+  });
+});

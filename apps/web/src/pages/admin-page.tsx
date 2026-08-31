@@ -23,8 +23,10 @@ import { TagCatalogAdmin } from "../components/tag-catalog-admin";
 import { AdminLayout, adminNavigationGroups, canOpenAdmin } from "../components/admin-layout";
 import {
   ApiError,
+  applyAdminAnklangConfiguration,
   getReviewPolicy,
   listAdminPlugins,
+  testAdminAnklangConfiguration,
   updateAdminPlugin,
   updateReviewPolicy
 } from "../lib/api";
@@ -606,11 +608,23 @@ function PluginEditor({
     setConflict(false);
   };
 
+  const applyMutation = useMutation({
+    mutationFn: applyAdminAnklangConfiguration,
+    onError: (error) => {
+      if (isAccessBoundaryError(error)) {
+        onAccessDenied();
+      }
+    }
+  });
+
   const mutation = useMutation({
     mutationFn: (input: UpdatePluginRequest) => updateAdminPlugin(saved.id, input),
     onSuccess: (result) => {
       onSaved(result);
       resetFrom(result);
+      if (result.id === "org.ustc.urmotiv.anklang" && result.state === "enabled") {
+        applyMutation.mutate();
+      }
     },
     onError: (error) => {
       if (isAccessBoundaryError(error)) {
@@ -624,7 +638,6 @@ function PluginEditor({
       }
     }
   });
-
   const stateChanged =
     stateTouched && (saved.state === "failed" || enabled !== (saved.state === "enabled"));
   const settingsChanged =
@@ -632,6 +645,20 @@ function PluginEditor({
   const enteredSecrets = Object.fromEntries(
     Object.entries(secretValues).filter(([, value]) => value.length > 0)
   );
+  const testMutation = useMutation({
+    mutationFn: () => testAdminAnklangConfiguration({
+      settings,
+      secrets: enteredSecrets,
+      clearSecrets
+    }),
+    onError: (error) => {
+      if (isAccessBoundaryError(error)) {
+        setSecretValues({});
+        setClearSecrets([]);
+        onAccessDenied();
+      }
+    }
+  });
   const hasChanges =
     stateChanged ||
     settingsChanged ||
@@ -693,6 +720,8 @@ function PluginEditor({
               setStateTouched(true);
               setConflict(false);
               mutation.reset();
+              testMutation.reset();
+              applyMutation.reset();
             }}
           />
           <span>启用这个插件</span>
@@ -725,6 +754,8 @@ function PluginEditor({
             setSettings(value);
             setConflict(false);
             mutation.reset();
+            testMutation.reset();
+            applyMutation.reset();
           }}
         />
       ) : (
@@ -761,6 +792,8 @@ function PluginEditor({
                         }
                         setConflict(false);
                         mutation.reset();
+                        testMutation.reset();
+                        applyMutation.reset();
                       }}
                     />
                     <small id={`secret-${secret.name}-description`}>{secret.description}</small>
@@ -784,6 +817,8 @@ function PluginEditor({
                         }
                         setConflict(false);
                         mutation.reset();
+                        testMutation.reset();
+                        applyMutation.reset();
                       }}
                     />
                     明确清除已保存内容
@@ -800,6 +835,67 @@ function PluginEditor({
           <RefreshCw size={16} aria-hidden="true" />
           保存后需要重启服务，新的设置才会用于插件运行。
         </p>
+      ) : null}
+
+      {saved.id === "org.ustc.urmotiv.anklang" ? (
+        <section className="admin-connection-test" aria-label="Anklang 连接测试">
+          <div>
+            <strong>连接测试</strong>
+            <p>使用当前输入发送固定测试文本，不保存设置，也不会发送题库中的题面。</p>
+          </div>
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={mutation.isPending || testMutation.isPending}
+            onClick={() => testMutation.mutate()}
+          >
+            <RefreshCw className={testMutation.isPending ? "spin" : ""} size={15} aria-hidden="true" />
+            测试当前输入
+          </button>
+          {testMutation.isSuccess ? (
+            <p className="admin-save-success" role="status">
+              <CheckCircle2 size={16} aria-hidden="true" />
+              {testMutation.data.embedding === null
+                ? "Anklang 与 yuantiji 连接正常；当前模式不需要嵌入模型。"
+                : `Anklang、检索来源和 ${testMutation.data.embedding.model} 嵌入接口均正常。`}
+            </p>
+          ) : null}
+          {testMutation.isError ? (
+            <p className="inline-error" role="alert">
+              <AlertTriangle size={16} aria-hidden="true" />
+              {errorMessage(testMutation.error)}
+            </p>
+          ) : null}
+          <div className="admin-connection-apply">
+            <button
+              type="button"
+              className="secondary-button"
+              disabled={hasChanges || mutation.isPending || applyMutation.isPending || saved.state !== "enabled"}
+              onClick={() => applyMutation.mutate()}
+            >
+              <RefreshCw className={applyMutation.isPending ? "spin" : ""} size={15} aria-hidden="true" />
+              应用已保存设置 / 刷新状态
+            </button>
+          </div>
+          {applyMutation.isSuccess ? (
+            <p className="admin-save-success" role="status">
+              <CheckCircle2 size={16} aria-hidden="true" />
+              {applyMutation.data.provider.rebuild?.state === "running"
+                ? `设置已应用，正在后台重建向量：${applyMutation.data.provider.rebuild.processed}/${applyMutation.data.provider.rebuild.total}。`
+                : applyMutation.data.search.mode === "yuantiji"
+                  ? "设置已应用：仅使用 yuantiji，不需要本地嵌入模型。"
+                  : applyMutation.data.provider.rebuild?.state === "failed"
+                    ? "设置已应用，但上一次向量重建失败；请检查嵌入接口后重试。"
+                    : "设置已应用，本地向量索引可用。"}
+            </p>
+          ) : null}
+          {applyMutation.isError ? (
+            <p className="inline-error" role="alert">
+              <AlertTriangle size={16} aria-hidden="true" />
+              {errorMessage(applyMutation.error)}
+            </p>
+          ) : null}
+        </section>
       ) : null}
 
       {conflict ? (
@@ -829,7 +925,11 @@ function PluginEditor({
       {mutation.isSuccess && !hasChanges ? (
         <p className="admin-save-success" role="status">
           <CheckCircle2 size={16} aria-hidden="true" />
-          插件设置已保存。这里表示配置已经写入，不代表外部服务已经连通。
+          {saved.id === "org.ustc.urmotiv.anklang"
+            ? applyMutation.isPending
+              ? "插件设置已保存，正在应用到 Anklang。"
+              : "插件设置已保存。"
+            : "插件设置已保存。这里表示配置已经写入，不代表外部服务已经连通。"}
         </p>
       ) : null}
 

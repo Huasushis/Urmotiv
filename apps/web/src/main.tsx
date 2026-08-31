@@ -16,6 +16,7 @@ import { ProfilePage } from "./pages/profile-page";
 import { BatchAccountPage } from "./pages/batch-account-page";
 import { TransferPage } from "./pages/transfer-page";
 import { VerifyEmailPage } from "./pages/verify-email-page";
+import { FermataAdminPage } from "./pages/fermata-admin-page";
 
 import { AdminSectionPage } from "./pages/admin-section-page";
 import { AdminPermissionsPage } from "./pages/admin-permissions-page";
@@ -94,6 +95,7 @@ function App() {
         <Route path="/admin/oauth" element={<AdminSectionPage section="oauth" session={sessionData.user} />} />
         <Route path="/admin/review" element={<AdminPage section="review" session={sessionData.user} />} />
         <Route path="/admin/plugins" element={<AdminPage section="plugins" session={sessionData.user} />} />
+        <Route path="/admin/fermata" element={<FermataAdminPage session={sessionData.user} />} />
         <Route path="/admin/knowledge" element={<AdminPage section="knowledge" session={sessionData.user} />} />
         <Route path="/admin/imports" element={<AdminSectionPage section="imports" session={sessionData.user} />} />
         <Route path="/admin" element={<AdminPage session={sessionData.user} />} />

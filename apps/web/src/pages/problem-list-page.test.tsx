@@ -111,12 +111,13 @@ function mount(session: SessionUser = manager): HTMLDivElement {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
-  client = new QueryClient({
+  const mountedClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } }
   });
+  client = mountedClient;
   act(() => {
     root?.render(
-      <QueryClientProvider client={client}>
+      <QueryClientProvider client={mountedClient}>
         <MemoryRouter initialEntries={["/admin/problems"]}>
           <ProblemListPage managementSession={session} />
         </MemoryRouter>
