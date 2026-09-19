@@ -303,6 +303,7 @@ export class DatabaseRobotStore {
         ON problem.id = round.problem_id
        AND problem.deleted_at IS NULL
        AND problem.status = 'pending_review'
+       AND problem.external_review_enabled = true
        AND problem.current_review_round = round.round
       JOIN problem_revisions revision
         ON revision.problem_id = problem.id

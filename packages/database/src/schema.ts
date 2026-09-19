@@ -718,6 +718,8 @@ export const problems = pgTable(
     status: problemStatus("status").notNull().default("draft"),
     currentRevision: integer("current_revision").notNull().default(1),
     currentReviewRound: integer("current_review_round").notNull().default(0),
+    /** Whether newly opened review rounds may be claimed by external review robots. */
+    externalReviewEnabled: boolean("external_review_enabled").notNull().default(true),
     origin: varchar("origin", { length: 100 }).notNull().default("native"),
     importBatch: varchar("import_batch", { length: 200 }),
     importSource: varchar("import_source", { length: 200 }),

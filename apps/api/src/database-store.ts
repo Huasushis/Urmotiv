@@ -78,6 +78,7 @@ interface ProblemRow extends Record<string, unknown> {
   origin: string | null;
   import_batch: string | null;
   import_source: string | null;
+  external_review_enabled: boolean;
   revision_id: string;
   title: string;
   type: StoredProblem["type"];
@@ -468,6 +469,7 @@ async function loadProblemRows(
       problem.origin,
       problem.import_batch,
       problem.import_source,
+      problem.external_review_enabled,
       revision.id::text AS revision_id,
       revision.title,
       revision.type,
@@ -612,7 +614,8 @@ async function hydrateProblems(
     updatedAt: toIso(row.updated_at),
     origin: row.origin ?? "native",
     importBatch: row.import_batch,
-    importSource: row.import_source
+    importSource: row.import_source,
+    externalReviewEnabled: row.external_review_enabled
   }));
 }
 
@@ -2278,6 +2281,7 @@ export class DatabaseDataStore implements DataStore {
           origin,
           import_batch,
           import_source,
+          external_review_enabled,
           created_at,
           updated_at
         ) VALUES (
@@ -2288,6 +2292,7 @@ export class DatabaseDataStore implements DataStore {
           ${problem.origin ?? "native"},
           ${problem.importBatch ?? null},
           ${problem.importSource ?? null},
+          ${problem.externalReviewEnabled ?? true},
           ${problem.createdAt}::timestamptz,
           ${problem.updatedAt}::timestamptz
         )

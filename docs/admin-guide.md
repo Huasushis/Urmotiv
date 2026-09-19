@@ -108,6 +108,16 @@ docker compose --env-file /secure/path/urmotiv.env exec -T api pnpm --filter @ur
 
 机器人令牌在创建或轮换时只显示一次原文；数据库只保存不可还原的校验摘要。使用独立的保密通道交给机器人，不能放在题目、插件设置明文、日志或 Git。令牌丢失时轮换而不是尝试恢复原文。
 
+历史验题记录迁移使用仓库内的安全脚本。题面、题解和工作簿必须留在 Git 之外的私有目录；脚本只按题号写入审核轮次和意见，不打印题名或正文：
+
+```bash
+python3 scripts/migrate-hist/sync-review-records.py /secure/private/USTC新生赛_59-156验题与组卷.xlsx \
+  | docker compose --env-file /secure/private/urmotiv.env exec -T postgres sh -c \
+      'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
+该迁移会关闭 156 道既有题目的外部自动验题；59–156 的 A/B/C/D 记录分别保存为通过、要求修改、要求修改和不通过意见。新增题目默认开启外部验题，不会因为历史迁移自动再次排队。
+
 管理页“服务账号”可以创建机器人账号，账号会自动使用“默认角色”里配置的机器人角色。停用机器人账号会在同一事务中撤销它当前未撤销的全部令牌；重新启用后需要生成新令牌，旧令牌不会复活。
 
 机器人审核接口的主要路由为：

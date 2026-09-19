@@ -48,6 +48,8 @@ export interface StoredProblem {
   origin?: string;
   importBatch?: string | null;
   importSource?: string | null;
+  /** External Fermata/API review is enabled for this problem. Defaults to true. */
+  externalReviewEnabled?: boolean;
 }
 
 export interface StoredReviewRule {

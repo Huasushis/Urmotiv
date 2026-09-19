@@ -76,3 +76,16 @@ OAuth 登录状态有效期为 10 分钟，并绑定发起登录的浏览器 Coo
 ## 与邮箱登录并行
 
 邮箱登录由 `URMOTIV_EMAIL_LOGIN_ENABLED` 控制，默认开启；OAuth 由 `URMOTIV_USTC_OAUTH_ENABLED` 控制，默认关闭。两者可以同时显示在 `/login`：OAuth 账号仍使用外部身份会话，邮箱凭据不会因 OAuth 开关而自动生成或重置。关闭 OAuth 后，既有外部绑定不会删除，但 OAuth 登录入口不可用。
+
+## 使用 LUG 代理的统一身份认证
+
+`https://sso-proxy.lug.ustc.edu.cn/login/` 当前是 LUG 的登录说明页，不是 OIDC discovery 地址。它展示的 CAS 登录入口会把浏览器送到 USTC Passport；因此 Urmotiv 应使用经典 CAS 配置，而不是把该页面填写成 OAuth 的令牌或资料端点。生产回调仍必须使用自己的公网来源，例如：
+
+```dotenv
+URMOTIV_CAS_ENABLED=true
+URMOTIV_CAS_LOGIN_URL=https://passport.ustc.edu.cn/login
+URMOTIV_CAS_VALIDATE_URL=https://id.ustc.edu.cn/cas/serviceValidate
+URMOTIV_CAS_CALLBACK_URL=https://ti.kruskal.top/api/v1/auth/cas/callback
+```
+
+`subjectAttribute`、邮箱和姓名属性以实际 CAS XML 的属性名为准；不要把一次登录返回的票据、个人资料或 Cookie 写入日志。若组织仍使用 OAuth 客户端，则继续使用 OAuth 配置，LUG 页面本身不会提供 `/.well-known/openid-configuration`。
