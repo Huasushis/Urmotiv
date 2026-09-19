@@ -8,6 +8,11 @@ node_modules
 **/node_modules
 .pnpm-store
 .data
+.tmp
+.tools
+.cache
+**/test-results
+**/playwright-report
 storage
 private_data
 problem_data
