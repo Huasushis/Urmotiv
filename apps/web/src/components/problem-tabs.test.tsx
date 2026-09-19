@@ -18,7 +18,8 @@ const api = vi.hoisted(() => ({
   listProblemAccess: vi.fn(),
   listReviewItems: vi.fn(),
   listReviews: vi.fn(),
-  listTags: vi.fn()
+  listTags: vi.fn(),
+  updateExternalReview: vi.fn()
 }));
 
 vi.mock("../lib/api", async (importOriginal) => {
@@ -725,6 +726,31 @@ describe("题目审核标签页", () => {
 });
 
 describe("题目概要难度编辑", () => {
+  it("AI 审题保存失败保持原值，不把普通编辑当成已保存", async () => {
+    api.listTags.mockResolvedValue({ items: [] });
+    api.updateExternalReview.mockRejectedValue(new ApiError("题目版本已变化，请刷新后重试。", 409));
+    const editable = problem();
+    editable.externalReviewEnabled = false;
+    editable.capabilities.canConfigureExternalReview = true;
+    const changed = vi.fn();
+    const view = mount(<OverviewTab problem={editable} update={vi.fn()} onExternalReviewChange={changed} />);
+    const checkbox = view.querySelector<HTMLInputElement>('section[aria-label="AI 审题设置"] input')!;
+    expect(checkbox.checked).toBe(false);
+    await act(async () => checkbox.click());
+    await waitFor(() => expect(view.textContent).toContain("题目版本已变化"));
+    expect(checkbox.checked).toBe(false);
+    expect(changed).not.toHaveBeenCalled();
+    expect(api.updateExternalReview).toHaveBeenCalledWith(editable.id, { enabled: true, expectedRevision: editable.revision });
+  });
+
+  it("尚有未保存编辑时不允许并发修改 AI 审题设置", async () => {
+    api.listTags.mockResolvedValue({ items: [] });
+    const editable = problem();
+    editable.capabilities.canConfigureExternalReview = true;
+    const view = mount(<OverviewTab problem={editable} update={vi.fn()} fileUploadsDisabled />);
+    expect(view.querySelector<HTMLInputElement>('section[aria-label="AI 审题设置"] input')!.disabled).toBe(true);
+    expect(view.textContent).toContain("请先保存其他修改");
+  });
   it("有编辑权限时开放思维与代码难度并写回受控题目值", async () => {
     const base = problem(false);
     const editable: Problem = {

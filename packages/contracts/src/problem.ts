@@ -238,6 +238,7 @@ export const createProblemInputSchema = problemDraftSchema.partial({
   judgeConfig: true
 }).extend({
   title: z.string().trim().min(1, "请填写题目名称").max(200),
+  externalReviewEnabled: z.boolean().optional(),
   type: problemTypeSchema.default("traditional")
 });
 
@@ -300,6 +301,7 @@ export const problemCapabilitiesSchema = z.object({
   canWithdraw: z.boolean(),
   canReview: z.boolean(),
   canChangeStatus: z.boolean(),
+  canConfigureExternalReview: z.boolean().optional(),
   canReadTestdata: z.boolean(),
   canWriteTestdata: z.boolean(),
   canExport: z.boolean(),

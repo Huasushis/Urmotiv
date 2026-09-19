@@ -252,6 +252,31 @@ async function claimOne(app: FastifyInstance): Promise<ClaimedTask> {
 }
 
 describe("机器人审题接口", () => {
+  it("新建时可关闭 AI 审题，普通编辑和投稿保持关闭且机器人不能领取", async () => {
+    const { app } = await makeRobotApp();
+    const author = await login(app, databaseDemoUserIds.author);
+    const created = await app.inject({ method: "POST", url: "/api/v1/problems", headers: { cookie: author, origin: localOrigin },
+      payload: { title: "关闭 AI 的合成题", type: "traditional", tagIds: ["catalog.tag.02.09"], externalReviewEnabled: false,
+        content: { basicStatement: "输出输入的整数。", basicSolution: "读取并输出。" } } });
+    expect(created.statusCode).toBe(200);
+    expect(created.json().externalReviewEnabled).toBe(false);
+    const edited = await app.inject({ method: "PATCH", url: `/api/v1/problems/${created.json().id}`,
+      headers: { cookie: author, origin: localOrigin }, payload: { title: "修改名称后仍关闭", expectedRevision: created.json().revision } });
+    expect(edited.statusCode).toBe(200);
+    expect(edited.json().externalReviewEnabled).toBe(false);
+    const submitted = await app.inject({ method: "POST", url: `/api/v1/problems/${created.json().id}/submit`,
+      headers: { cookie: author, origin: localOrigin }, payload: { expectedRevision: edited.json().revision } });
+    expect(submitted.statusCode).toBe(200);
+    expect(submitted.json().externalReviewEnabled).toBe(false);
+    const robotCookie = await login(app, databaseDemoUserIds.robot);
+    const forbiddenToggle = await app.inject({ method: "PUT", url: `/api/v1/problems/${created.json().id}/external-review`,
+      headers: { cookie: robotCookie, origin: localOrigin }, payload: { enabled: true, expectedRevision: submitted.json().revision } });
+    expect(forbiddenToggle.statusCode).toBe(403);
+    const claim = await app.inject({ method: "POST", url: "/api/v1/robot/review-tasks/claim", headers: robotHeaders(), payload: { maximumTasks: 1 } });
+    expect(claim.statusCode).toBe(200);
+    expect(claim.json().items).toEqual([]);
+  });
+
   it("管理员关闭外部验题后不再领取，重新开启可以领取", async () => {
     const { app, database } = await makeRobotApp();
     const problem = await createPendingProblem(app);
@@ -286,12 +311,26 @@ describe("机器人审题接口", () => {
     expect((await claimOne(app)).problem.id).toBe(problem.id);
   });
 
-  it("普通作者不能开关外部验题，隐藏题目和不存在题目返回一致", async () => {
+  it("作者可开关本题 AI 审核，编辑拒绝及不可见题目仍受保护", async () => {
     const { app, database } = await makeRobotApp();
     const problem = await createPendingProblem(app);
     const author = await login(app, databaseDemoUserIds.author);
-    const denied = await app.inject({ method: "PUT", url: `/api/v1/problems/${problem.id}/external-review`,
+    const reader = await login(app, databaseDemoUserIds.reviewer);
+    const outsider = await app.inject({ method: "PUT", url: `/api/v1/problems/${problem.id}/external-review`,
+      headers: { cookie: reader, origin: localOrigin }, payload: { enabled: false, expectedRevision: 2 } });
+    expect(outsider.statusCode).toBe(403);
+    const closed = await app.inject({ method: "PUT", url: `/api/v1/problems/${problem.id}/external-review`,
       headers: { cookie: author, origin: localOrigin }, payload: { enabled: false, expectedRevision: 2 } });
+    expect(closed.statusCode).toBe(200);
+    expect(closed.json().externalReviewEnabled).toBe(false);
+    expect(closed.json().capabilities.canConfigureExternalReview).toBe(true);
+    await database.execute(sql`
+      INSERT INTO permission_grants (id, subject_user_id, permission_name, effect, scope, granted_by_user_id, reason)
+      VALUES (${randomUUID()}::uuid, ${BigInt(databaseDemoUserIds.author)}, 'problem.edit.own', 'deny', 'global',
+        ${BigInt(databaseDemoUserIds.leader)}, '验证作者编辑拒绝')
+    `);
+    const denied = await app.inject({ method: "PUT", url: `/api/v1/problems/${problem.id}/external-review`,
+      headers: { cookie: author, origin: localOrigin }, payload: { enabled: true, expectedRevision: closed.json().revision } });
     expect(denied.statusCode).toBe(403);
     await database.execute(sql`
       INSERT INTO permission_grants (id, subject_user_id, permission_name, effect, scope, granted_by_user_id, reason)

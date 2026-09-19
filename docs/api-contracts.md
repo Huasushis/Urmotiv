@@ -85,7 +85,7 @@ Accept: application/json
 | `GET /api/v1/problems/:problemId/reviews` | 当前审核轮次的意见和统计 |
 | `POST /api/v1/problems/:problemId/reviews` | 提交一份当前轮次人工/机器人审核意见 |
 | `POST /api/v1/problems/:problemId/review-decision` | 有 `problem.status.change` 时确认最终状态 |
-| `PUT /api/v1/problems/:problemId/external-review` | 真人账号有本题 `problem.status.change` 时设置外部验题；请求为 `{ "enabled": false, "expectedRevision": 3 }`，返回更新后的题目；版本冲突返回 409，不可见题目返回 404 |
+| `PUT /api/v1/problems/:problemId/external-review` | 真人作者有本题编辑权，或真人管理员有本题 `problem.status.change` 时设置 AI/外部验题；请求为 `{ "enabled": false, "expectedRevision": 3 }`，返回更新后的题目；版本冲突返回 409，不可见题目返回 404；机器人不能更改此开关 |
 | `POST /api/v1/admin/problems/status` | 真人账号同时有全局 `problem.view.all` 与 `problem.status.change` 时，批量提交、终审或撤回；最多 200 题，逐题返回成功或失败 |
 | `GET /api/v1/problems/:problemId/review-items` | 读取调用者有权看到的插件/机器人审核条目 |
 | `GET /api/v1/problems/:problemId/review-suggestions` | 读取可应用的审核建议 |

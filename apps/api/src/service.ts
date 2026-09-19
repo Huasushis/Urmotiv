@@ -478,6 +478,7 @@ export class ProblemService {
     if (!hasPermission(user, "problem.create", {}, this.now())) {
       throw forbidden();
     }
+    if (input.externalReviewEnabled !== undefined && user.accountType !== "human") throw forbidden();
     if (
       input.judgeConfig !== undefined &&
       input.judgeConfig !== null &&
@@ -510,7 +511,8 @@ export class ProblemService {
       updatedAt: now,
       origin: "native",
       importBatch: null,
-      importSource: null
+      importSource: null,
+      externalReviewEnabled: input.externalReviewEnabled ?? true
     };
 
     const created = await this.store.createProblem(problem);
@@ -623,8 +625,7 @@ export class ProblemService {
           !canViewProblem(createProblemVisibility(actor, this.now()), problem)) {
         throw notFound();
       }
-      if (actor.accountType !== "human" || !hasPermission(actor, "problem.status.change",
-        { ownerId: problem.ownerId, objectId: problem.id }, this.now())) {
+      if (!this.canConfigureExternalReview(actor, problem)) {
         throw forbidden();
       }
       this.assertExpectedRevision(problem, input.expectedRevision);
@@ -1917,6 +1918,13 @@ export class ProblemService {
     };
   }
 
+  private canConfigureExternalReview(user: StoredUser, problem: StoredProblem): boolean {
+    return user.accountType === "human" && (
+      (user.id === problem.ownerId && canEditProblem(user, problem, this.now())) ||
+      hasPermission(user, "problem.status.change", { ownerId: problem.ownerId, objectId: problem.id }, this.now())
+    );
+  }
+
   private capabilitiesFor(problem: StoredProblem, user: StoredUser): ProblemCapabilities {
     const target = { ownerId: problem.ownerId, objectId: problem.id };
     const isOwner = problem.ownerId === user.id;
@@ -1944,6 +1952,7 @@ export class ProblemService {
         problem.status === "pending_review" &&
         hasPermission(user, "problem.review", target, this.now()),
       canChangeStatus,
+      canConfigureExternalReview: this.canConfigureExternalReview(user, problem),
       canReadTestdata: hasPermission(user, "problem.testdata.read", target, this.now()),
       canWriteTestdata: hasPermission(user, "problem.testdata.write", target, this.now()),
       canExport: canExportProblem(user, problem, this.now()),

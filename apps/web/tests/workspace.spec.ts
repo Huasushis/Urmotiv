@@ -121,6 +121,8 @@ test("历史审核可以展开完整意见，未填写的评分不补默认值",
 test("投稿人可以创建带 Markdown 内容的草稿并看到六个工作区标签", async ({ page }, testInfo) => {
   await loginAsAuthor(page);
   await page.getByRole("link", { name: "新建题目" }).click();
+  await expect(page.getByRole("checkbox", { name: "允许 AI 审题", exact: true })).toBeChecked();
+  await page.getByRole("checkbox", { name: "允许 AI 审题", exact: true }).uncheck();
   await page.getByLabel("题目名称").fill("页面联调示例题");
   await page.getByLabel("思维难度（可选）").selectOption("3");
   await page.getByLabel("代码难度（可选）").selectOption("4");
@@ -130,6 +132,17 @@ test("投稿人可以创建带 Markdown 内容的草稿并看到六个工作区�
   await page.getByRole("button", { name: "创建草稿" }).click();
 
   await expect(page.getByRole("heading", { name: "页面联调示例题" })).toBeVisible();
+  const aiReview = page.getByRole("checkbox", { name: "允许 AI 审题", exact: true });
+  await expect(aiReview).not.toBeChecked();
+  await expect(aiReview).toBeEnabled();
+  await aiReview.check();
+  await expect(aiReview).toBeEnabled();
+  await page.reload();
+  await expect(aiReview).toBeChecked();
+  await aiReview.uncheck();
+  await expect(aiReview).toBeEnabled();
+  await page.reload();
+  await expect(aiReview).not.toBeChecked();
   for (const label of ["概要", "题面", "样例与约束", "数据与评测", "题解与资料", "审核记录"]) {
     await expect(page.getByRole("tab", { name: label })).toBeVisible();
   }

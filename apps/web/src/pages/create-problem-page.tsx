@@ -20,6 +20,7 @@ export function CreateProblemPage() {
   const [difficulty, setDifficulty] = useState("");
   const [thinkingLevel, setThinkingLevel] = useState("");
   const [codingLevel, setCodingLevel] = useState("");
+  const [externalReviewEnabled, setExternalReviewEnabled] = useState(true);
   const [basicStatement, setBasicStatement] = useState("");
   const [basicSolution, setBasicSolution] = useState("");
 
@@ -36,6 +37,7 @@ export function CreateProblemPage() {
       title,
       type,
       tagIds,
+      externalReviewEnabled,
       codeforcesDifficulty: difficulty ? Number(difficulty) : null,
       thinkingLevel: thinkingLevel ? Number(thinkingLevel) as 1 | 2 | 3 | 4 | 5 : null,
       codingLevel: codingLevel ? Number(codingLevel) as 1 | 2 | 3 | 4 | 5 : null,
@@ -146,6 +148,14 @@ export function CreateProblemPage() {
           </div>
         </div>
       </div>
+
+      <section className="form-section" aria-label="AI 审题设置">
+        <label className="checkbox-row">
+          <input type="checkbox" checked={externalReviewEnabled} onChange={event => setExternalReviewEnabled(event.currentTarget.checked)} />
+          允许 AI 审题
+        </label>
+        <p className="field-help">提交审核后，允许已授权的外部审核服务读取本题的题面和题解并提供意见。关闭不影响人工审核，之后可在题目概要中更改。</p>
+      </section>
 
       <div className="form-section">
         <div className="section-heading">

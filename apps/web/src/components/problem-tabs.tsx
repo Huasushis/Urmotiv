@@ -47,6 +47,7 @@ import {
   useStatementImageUploader
 } from "./problem-files";
 import { TagPicker } from "./tag-picker";
+import { ExternalReviewSwitch } from "./external-review-switch";
 
 export type ProblemUpdater = (updater: (problem: Problem) => Problem) => void;
 
@@ -57,6 +58,7 @@ type ProblemTabProps = {
   onFileRevisionChange?: ((revision: number) => void) | undefined;
   onFileUploadPendingChange?: ((pending: boolean) => void) | undefined;
   onJudgeProgramBound?: ((revision: number, judgeConfig: ProblemJudgeConfig) => void) | undefined;
+  onExternalReviewChange?: ((problem: Problem) => void) | undefined;
 };
 
 function setContent(problem: Problem, key: keyof Problem["content"], value: string): Problem {
@@ -79,7 +81,7 @@ function judgeConfigForType(
     : withoutProgram;
 }
 
-export function OverviewTab({ problem, update }: ProblemTabProps) {
+export function OverviewTab({ problem, update, fileUploadsDisabled, onExternalReviewChange }: ProblemTabProps) {
   const tags = useQuery({ queryKey: ["tags"], queryFn: listTags, staleTime: 5 * 60_000 });
   const canEdit = problem.capabilities.canEdit;
   const canEditTitle = problem.capabilities.canEditTitle;
@@ -202,6 +204,7 @@ export function OverviewTab({ problem, update }: ProblemTabProps) {
         <div><dt>题目类型</dt><dd>{typeText[problem.type]}</dd></div>
         <div><dt>最近更新</dt><dd>{dateTime(problem.updatedAt)}</dd></div>
       </dl>
+      <ExternalReviewSwitch problem={problem} disabled={fileUploadsDisabled} onChange={onExternalReviewChange} />
 
       {problem.capabilities.canViewAccessLog ? <ProblemAccessPanel problemId={problem.id} /> : null}
     </div>
@@ -1243,7 +1246,7 @@ export function ReviewTab({
     <section className="plain-panel" aria-label="外部 API 验题">
       <h2>外部 API 验题</h2>
       <p>当前{problem.externalReviewEnabled === false ? "关闭" : "开启"}。开启后，有权限的 Fermata 或其他审核程序可以领取本题的新审核任务。关闭不影响人工审核，已有记录继续保留。</p>
-      {problem.capabilities.canChangeStatus ? (
+      {problem.capabilities.canConfigureExternalReview ?? problem.capabilities.canChangeStatus ? (
         <button className="secondary-button" type="button"
           disabled={submissionBlocked || externalReview.isPending}
           onClick={() => externalReview.mutate(problem.externalReviewEnabled === false)}>

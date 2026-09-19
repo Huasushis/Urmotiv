@@ -563,7 +563,13 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
         role="tabpanel"
         aria-labelledby={`workspace-tab-${activeTab}`}
       >
-        {activeTab === "overview" ? <OverviewTab problem={working} update={update} /> : null}
+        {activeTab === "overview" ? <OverviewTab problem={working} update={update}
+          fileUploadsDisabled={dirty || save.isPending || fileUploadPending}
+          onExternalReviewChange={updated => {
+            setWorking(current => current === null || current.revision > updated.revision ? current : {
+              ...current, revision: updated.revision, externalReviewEnabled: updated.externalReviewEnabled
+            });
+          }} /> : null}
         {activeTab === "statement" ? (
           <StatementTab
             problem={working}
