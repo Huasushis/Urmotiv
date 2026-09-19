@@ -583,7 +583,10 @@ function UserPanel({
                 {visibleUsers.map((user) => (
                   <tr key={user.id} className={selectedUserId === user.id ? "selected" : ""}>
                     <td>
-                      <button type="button" className="permission-user-select" onClick={() => { setSelectedUserId(user.id); setDraft(null); setEffective(null); setRefreshError(null); mutation.reset(); }}>
+                      <button type="button" className="permission-user-select" onClick={() => {
+                        if (user.id === selectedUserId) return;
+                        setSelectedUserId(user.id); setDraft(null); setEffective(null); setRefreshError(null); mutation.reset();
+                      }}>
                         <strong>{user.nickname}</strong>
                         <small>{user.username ?? user.id}</small>
                       </button>

@@ -296,6 +296,22 @@ describe("权限管理页", () => {
     expect(view.textContent).not.toContain("服务端状态未确认");
   });
 
+  it("再次点击当前账号不会卡在读取权限，也不会丢失未保存修改", async () => {
+    api.listAdminPermissionCatalog.mockResolvedValue(catalog);
+    api.listAdminUsers.mockResolvedValue(users);
+    api.getAdminUserPermissions.mockResolvedValue(permissionDelta);
+    const view = mount(<AdminPermissionsPage session={session} section="users" />);
+    await waitFor(() => expect(view.querySelector('input[name="user-deny-problem.review"]')).not.toBeNull());
+    const deny = view.querySelector<HTMLInputElement>('input[name="user-deny-problem.review"]')!;
+    await act(async () => { deny.click(); });
+    expect(deny.checked).toBe(true);
+    const current = view.querySelector<HTMLButtonElement>(".permission-user-table tr.selected button")!;
+    await act(async () => { current.click(); });
+    expect(view.textContent).not.toContain("正在读取账号权限");
+    expect(view.querySelector<HTMLInputElement>('input[name="user-deny-problem.review"]')?.checked).toBe(true);
+    expect(api.updateAdminUserPermissions).not.toHaveBeenCalled();
+  });
+
   it("角色保存使用响应中的新修订号并在失败时保持真实状态", async () => {
     const contributor = roles.roles[1]!;
     api.listAdminPermissionCatalog.mockResolvedValue(catalog);
