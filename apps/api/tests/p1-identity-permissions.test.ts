@@ -60,6 +60,29 @@ afterEach(async () => {
 });
 
 describe("P1 root identity and permission model", () => {
+  it("paginates only manageable human accounts and keeps protected root out of administrator search", async () => {
+    const app = await makeApp();
+    const cookie = await login(app, "administrator");
+    const expected = createDemoUsers().filter(user => user.accountType === "human").map(user => user.id).sort();
+    const actual: string[] = [];
+    for (let page = 1; page <= expected.length; page++) {
+      const response = await app.inject({ method: "GET", url: `/api/v1/admin/users?page=${page}&pageSize=1`, headers: { cookie, origin } });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().total).toBe(expected.length);
+      expect(response.json().items).toHaveLength(1);
+      actual.push(response.json().items[0].id);
+    }
+    expect(actual.sort()).toEqual(expected);
+    const hidden = await app.inject({ method: "GET", url: "/api/v1/admin/users?search=root", headers: { cookie, origin } });
+    expect(hidden.json()).toMatchObject({ items: [], total: 0 });
+    const rootCookie = await login(app, "0");
+    const rootList = await app.inject({ method: "GET", url: "/api/v1/admin/users?search=root", headers: { cookie: rootCookie, origin } });
+    expect(rootList.json().items.map((user: { id: string }) => user.id)).toEqual(["0"]);
+    const anonymous = await app.inject({ method: "GET", url: "/api/v1/admin/users" });
+    expect(anonymous.statusCode).toBe(401);
+    expect(anonymous.json()).not.toHaveProperty("items");
+  });
+
   it("root can switch once, see actor/effective identity, and exit", async () => {
     const app = await makeApp();
     const rootCookie = await login(app, "0");

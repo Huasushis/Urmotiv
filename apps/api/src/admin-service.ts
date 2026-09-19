@@ -658,9 +658,15 @@ export class AdminService {
     });
   }
 
-  public async listManagedUsers(search = "", page = 1, pageSize = 30): Promise<AdminUsersResponse> {
+  public async listManagedUsers(actor: StoredUser, search = "", page = 1, pageSize = 30): Promise<AdminUsersResponse> {
+    if (actor.accountType !== "human" || !hasPermission(actor, "user.permission.manage", {}, this.now())) {
+      throw notFound();
+    }
+    const canViewRoot = actor.isRoot === true && actor.id === "0";
     const normalizedSearch = search.trim().toLocaleLowerCase();
-    const users = (await this.options.store.listUsers()).filter((user) =>
+    const users = (await this.options.store.listUsers()).filter((user) => user.accountType === "human" && (
+      canViewRoot || (!user.isRoot && user.id !== "0" && !user.roles.includes("root"))
+    )).filter((user) =>
       normalizedSearch.length === 0 ||
       user.id.toLocaleLowerCase().includes(normalizedSearch) ||
       user.nickname.toLocaleLowerCase().includes(normalizedSearch) ||
