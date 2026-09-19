@@ -24,6 +24,7 @@ import {
   updateAdminUstcOAuthSettings
 } from "../lib/api";
 import { AdminLayout } from "../components/admin-layout";
+import { UserRoleEditor } from "../components/user-role-editor";
 
 export type AdminSection =
   | "settings"
@@ -320,7 +321,7 @@ function tokenStatus(token: ServiceAccountToken): string {
   return "可用";
 }
 
-function ServiceAccountsSection() {
+function ServiceAccountsSection({ canManagePermissions }: { canManagePermissions: boolean }) {
   const client = useQueryClient();
   const accounts = useQuery({ queryKey: ["admin-service-accounts"], queryFn: listAdminServiceAccounts });
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -490,6 +491,10 @@ function ServiceAccountsSection() {
               </div>
             </div>
             {accountUpdated.isError ? <p className="inline-error" role="alert">{accountUpdated.error.message}</p> : null}
+            {canManagePermissions ? <>
+              <UserRoleEditor key={selected.id} userId={selected.id} />
+              <p className="muted-note">权限组决定服务账号可以做什么，令牌只能进一步限制权限。机器人禁止管理系统、管理权限和切换用户等固定限制始终生效。</p>
+            </> : null}
 
             {revealedToken !== null ? (
               <div className="token-secret-panel" role="status">
@@ -746,7 +751,7 @@ export function AdminSectionPage({ section, session }: { section: AdminSection; 
   const content = useMemo(() => {
     switch (section) {
       case "settings": return <SettingsSection />;
-      case "service-accounts": return <ServiceAccountsSection />;
+      case "service-accounts": return <ServiceAccountsSection canManagePermissions={session.canManagePermissions === true} />;
       case "audit": return <AuditSection />;
       case "oauth": return <OAuthSection />;
       case "imports": return <ImportHistorySection />;
