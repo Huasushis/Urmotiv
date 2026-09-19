@@ -92,6 +92,15 @@ describe("题目 API", () => {
     });
     expect(incorrectPassword.statusCode).toBe(401);
 
+    const unverifiedLogin = await app.inject({
+      method: "POST",
+      url: "/api/v1/auth/email-login",
+      headers: { origin: localOrigin },
+      payload: { email: "new.user@example.test", password: "safe-password-123" }
+    });
+    expect(unverifiedLogin.statusCode).toBe(401);
+    expect(unverifiedLogin.headers["set-cookie"]).toBeUndefined();
+
     const verify = await app.inject({
       method: "POST",
       url: "/api/v1/auth/email-verification/verify",
@@ -142,6 +151,46 @@ describe("题目 API", () => {
     await expect(createApp({ emailRegistrationEnabled: true })).rejects.toThrow(
       "启用邮箱注册前必须配置服务端邮件投递和验证页面地址"
     );
+  });
+
+  it("邮箱验证链接过期后不能激活账号，注册关闭时所有注册接口拒绝请求", async () => {
+    const outbox = new InMemoryEmailVerificationOutbox();
+    let now = new Date("2026-09-19T00:00:00.000Z");
+    const app = await createApp({
+      emailRegistrationEnabled: true,
+      emailVerificationDelivery: outbox,
+      emailVerificationWebUrl: localOrigin,
+      now: () => now
+    });
+    openApps.push(app);
+    const registration = await app.inject({
+      method: "POST", url: "/api/v1/auth/email-register", headers: { origin: localOrigin },
+      payload: { email: "expired@example.test", password: "safe-password-123", nickname: "过期验证" }
+    });
+    expect(registration.statusCode).toBe(202);
+    const message = outbox.messages[0]!;
+    const token = new URLSearchParams(new URL(message.verificationUrl).hash.split("?", 2)[1]).get("token");
+    now = new Date(Date.parse(message.expiresAt) + 1);
+    const expired = await app.inject({
+      method: "POST", url: "/api/v1/auth/email-verification/verify",
+      headers: { origin: localOrigin }, payload: { token }
+    });
+    expect(expired.statusCode).toBe(400);
+    expect(expired.json().error.code).toBe("INVALID_VERIFICATION");
+    const signedIn = await app.inject({
+      method: "POST", url: "/api/v1/auth/email-login", headers: { origin: localOrigin },
+      payload: { email: "expired@example.test", password: "safe-password-123" }
+    });
+    expect(signedIn.statusCode).toBe(401);
+
+    const closed = await createApp();
+    openApps.push(closed);
+    for (const path of ["email-register", "email-verification/resend", "email-verification/verify"]) {
+      const result = await closed.inject({
+        method: "POST", url: `/api/v1/auth/${path}`, headers: { origin: localOrigin }, payload: {}
+      });
+      expect(result.statusCode).toBe(404);
+    }
   });
 
   it("resending a verification email invalidates the older link", async () => {

@@ -184,7 +184,7 @@ function SettingsSection() {
           />
           <SettingsToggle
             label="允许访客通过邮箱注册账号"
-            description="需要先完整配置下方 SMTP 发信服务。"
+            description="注册后发送验证链接，确认邮箱后才能登录。需要先完整配置下方 SMTP 发信服务。"
             checked={draft.publicRegistrationEnabled}
             onChange={(checked) => update("publicRegistrationEnabled", checked)}
           />
@@ -193,7 +193,7 @@ function SettingsSection() {
       <section className="settings-form-section">
         <div>
           <h2>SMTP 发信</h2>
-          <p>SMTP 是向邮箱发送验证码的标准服务。当前状态：{query.data.settings.smtpConfigured ? "已可用" : "未完整配置"}。</p>
+          <p>SMTP 是发送邮件的服务，用于投递邮箱验证链接。当前状态：{query.data.settings.smtpConfigured ? "配置完整，实际送达需通过注册验证" : "未完整配置"}。</p>
         </div>
         <div className="settings-section-controls">
           <div className="settings-field-grid">

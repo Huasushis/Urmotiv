@@ -79,13 +79,4 @@ OAuth 登录状态有效期为 10 分钟，并绑定发起登录的浏览器 Coo
 
 ## 使用 LUG 代理的统一身份认证
 
-`https://sso-proxy.lug.ustc.edu.cn/login/` 当前是 LUG 的登录说明页，不是 OIDC discovery 地址。它展示的 CAS 登录入口会把浏览器送到 USTC Passport；因此 Urmotiv 应使用经典 CAS 配置，而不是把该页面填写成 OAuth 的令牌或资料端点。生产回调仍必须使用自己的公网来源，例如：
-
-```dotenv
-URMOTIV_CAS_ENABLED=true
-URMOTIV_CAS_LOGIN_URL=https://passport.ustc.edu.cn/login
-URMOTIV_CAS_VALIDATE_URL=https://id.ustc.edu.cn/cas/serviceValidate
-URMOTIV_CAS_CALLBACK_URL=https://ti.kruskal.top/api/v1/auth/cas/callback
-```
-
-`subjectAttribute`、邮箱和姓名属性以实际 CAS XML 的属性名为准；不要把一次登录返回的票据、个人资料或 Cookie 写入日志。若组织仍使用 OAuth 客户端，则继续使用 OAuth 配置，LUG 页面本身不会提供 `/.well-known/openid-configuration`。
+LUG 的登录页位于 `https://sso-proxy.lug.ustc.edu.cn/login/`。登录页使用 CAS 登录 LUG 本身，并不能证明下游应用也应直接连接学校 CAS。本站接入前仍需核实 LUG 对下游提供的协议、应用登记、回调地址和身份字段；不能把该页面当作 OAuth 令牌端点，也不能根据上游跳转猜测票据校验地址。当前尚未完成 LUG 登录验收。
