@@ -80,6 +80,10 @@ URMOTIV_TRUSTED_PROXY_CIDRS=精确的反向代理IPv4或IPv6 CIDR
 - 对上传设置足够的请求体上限。内置 nginx 示例为 `128m`；API 的单文件路由上限为 `512 MiB`，若业务需要更大文件，必须在每一层代理明确调整并重新评估风险。
 - 不要把 API、PostgreSQL、Redis、MinIO 或可选 Anklang/Fermata 端口直接暴露到公网；Compose 默认只发布 Web、Anklang 和 Fermata 的回环端口。
 
+如果 API 直接运行在主机上，或容器使用 `network_mode: host`，请在 API 进程环境中设置
+`URMOTIV_API_HOST=127.0.0.1`，再由同机 Web 代理访问。默认桥接部署保持 `0.0.0.0`，
+这个地址只位于容器自己的网络中。修改监听地址不替代 HTTPS、登录或服务端权限检查。
+
 生产 HTTPS 下 OAuth/CAS 回调和 Cookie 都使用安全来源。不要通过设置回环例外来“修复”证书、代理头或来源配置问题。
 
 ## 端口和可选服务

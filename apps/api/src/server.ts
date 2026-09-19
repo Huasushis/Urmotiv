@@ -248,7 +248,10 @@ try {
 
   const configuredPort = process.env.URMOTIV_API_PORT ?? process.env.PORT ?? "3000";
   const port = Number.parseInt(configuredPort, 10);
-  await app.listen({ port: Number.isFinite(port) ? port : 3000, host: "0.0.0.0" });
+  await app.listen({
+    port: Number.isFinite(port) ? port : 3000,
+    host: process.env.URMOTIV_API_HOST ?? "0.0.0.0"
+  });
 } catch (error) {
   await database.close().catch(() => undefined);
   throw error;
