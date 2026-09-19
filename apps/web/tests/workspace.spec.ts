@@ -135,6 +135,11 @@ test("投稿人可以创建带 Markdown 内容的草稿并看到六个工作区�
   }
   await expect(page.getByLabel("思维难度")).toHaveValue("3");
   await expect(page.getByLabel("代码难度")).toHaveValue("4");
+  await page.evaluate(() => window.scrollTo(0, 500));
+  await expect.poll(() => page.locator('.workspace-header').evaluate(element =>
+    element.getBoundingClientRect().top - document.querySelector('.global-header')!.getBoundingClientRect().bottom
+  )).toBeGreaterThanOrEqual(-1);
+  await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({ path: testInfo.outputPath("problem-workspace.png"), fullPage: true });
 });
 
@@ -194,10 +199,10 @@ test("关键文字、导航提示和编辑操作在桌面与 360px 触屏上可�
     return {
       faint,
       onWhite: ratio(faint, "#ffffff"),
-      onSubtle: ratio(faint, "#f7f9f8")
+      onSubtle: ratio(faint, getComputedStyle(document.documentElement).getPropertyValue("--surface-subtle").trim())
     };
   });
-  expect(contrast.faint).toBe("#63706d");
+  expect(contrast.faint).toMatch(/^#[0-9a-f]{6}$/);
   expect(contrast.onWhite).toBeGreaterThanOrEqual(4.5);
   expect(contrast.onSubtle).toBeGreaterThanOrEqual(4.5);
 

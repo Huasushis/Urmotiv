@@ -13,7 +13,8 @@
   --border-strong: #bccfd7;
   --text: #172b35;
   --text-soft: #506975;
-  --text-faint: #607784;
+  --text-faint: #5a707c;
+  --header-height: 69px;
   --teal: #087e94;
   --teal-dark: #075d70;
   --teal-soft: #e4f5f9;
@@ -1451,7 +1452,7 @@ textarea:read-only {
 
 .workspace-header {
   position: sticky;
-  top: 60px;
+  top: var(--header-height);
   z-index: 20;
   display: flex;
   align-items: center;
@@ -5055,10 +5056,6 @@ textarea:read-only {
     padding: 0 10px;
   }
 
-  .workspace-header {
-    top: 59px;
-  }
-
   .filter-bar {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -5098,6 +5095,7 @@ textarea:read-only {
 }
 
 @media (max-width: 900px) {
+  :root { --header-height: 59px; }
   .global-header-inner {
     grid-template-columns: auto minmax(0, 1fr) auto;
     align-items: center;
@@ -5480,7 +5478,6 @@ textarea:read-only {
   }
 
   .workspace-header {
-    top: 0;
     align-items: flex-start;
     margin: -20px -16px 0;
     padding: 10px 16px;
