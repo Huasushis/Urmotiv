@@ -283,6 +283,19 @@ describe("管理页面", () => {
     expect(view.textContent).not.toContain(plugin.source);
   });
 
+  it("连续勾选和取消清除密钥不会让插件页面崩溃或直接修改密钥", async () => {
+    api.listAdminPlugins.mockResolvedValue({ items: [plugin] });
+    const view = mount(<AdminPage session={session({ canManagePlugins: true })} />);
+    await waitFor(() => expect(view.querySelector('.admin-clear-secret input')).not.toBeNull());
+    const checkbox = view.querySelector<HTMLInputElement>('.admin-clear-secret input')!;
+    for (let count = 0; count < 4; count++) {
+      await act(async () => { checkbox.click(); });
+      expect(checkbox.checked).toBe(count % 2 === 0);
+      expect(view.querySelector('input[type="password"]')).not.toBeNull();
+    }
+    expect(api.updateAdminPlugin).not.toHaveBeenCalled();
+  });
+
   it("只有知识点管理权限时直接打开目录且不读取其他管理设置", async () => {
     api.listManagedTagCatalog.mockResolvedValue({ version: 1, items: [], aliases: [] });
     const view = mount(<AdminPage session={session({ canManageTags: true })} />);

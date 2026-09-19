@@ -140,6 +140,33 @@ afterEach(() => {
 });
 
 describe("权限管理页", () => {
+  it("在用户管理移除权限组时保留同组其他账号，取消确认不提交", async () => {
+    const contributor = { ...roles.roles[1]!, members: [
+      ...roles.roles[1]!.members,
+      { id: "another", nickname: "另一投稿人", accountType: "human" as const, enabled: true }
+    ] };
+    api.listAdminPermissionCatalog.mockResolvedValue(catalog);
+    api.listAdminRoles.mockResolvedValue({ ...roles, roles: [roles.roles[0], contributor] });
+    api.listAdminUsers.mockResolvedValue(users);
+    api.getAdminUserPermissions.mockResolvedValue(permissionDelta);
+    api.updateAdminRole.mockResolvedValue({ role: { ...contributor, revision: 3, members: contributor.members.slice(1) } });
+    const confirmation = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      const view = mount(<AdminPermissionsPage session={session} section="users" />);
+      await waitFor(() => expect(view.querySelector('[aria-label="移除投稿人权限组"]')).not.toBeNull());
+      const remove = view.querySelector<HTMLButtonElement>('[aria-label="移除投稿人权限组"]')!;
+      await act(async () => remove.click());
+      expect(api.updateAdminRole).not.toHaveBeenCalled();
+      confirmation.mockReturnValue(true);
+      await act(async () => remove.click());
+      await waitFor(() => expect(api.updateAdminRole).toHaveBeenCalledWith(contributor.id, {
+        key: contributor.key, displayName: contributor.displayName, description: contributor.description,
+        permissions: contributor.permissions, expectedRevision: 2, userIds: ["another"]
+      }));
+      expect([...view.querySelectorAll('select[aria-label="选择要添加的权限组"] option')].map(option => option.textContent)).not.toContain("root");
+    } finally { confirmation.mockRestore(); }
+  });
+
   it("显示完整分组矩阵并保护 root 角色", async () => {
     api.listAdminPermissionCatalog.mockResolvedValue(catalog);
     api.listAdminRoles.mockResolvedValue(roles);
@@ -150,6 +177,7 @@ describe("权限管理页", () => {
     await waitFor(() => expect(view.textContent).toContain("题目与附件"));
     expect(view.textContent).toContain("root（受保护）");
     expect(view.textContent).toContain("角色基线");
+    expect(view.querySelector(".permission-member-list")).toBeNull();
     expect(view.querySelector('input[name="role-root-problem.review"]')?.hasAttribute("disabled")).toBe(true);
   });
 
@@ -186,7 +214,7 @@ describe("权限管理页", () => {
     await waitFor(() => expect(view.querySelector(".permission-user-panel")).not.toBeNull());
     expect(view.querySelector(".admin-permissions-roles")).toBeNull();
     expect(view.querySelector(".permission-defaults")).toBeNull();
-    expect(api.listAdminRoles).not.toHaveBeenCalled();
+    await waitFor(() => expect(api.listAdminRoles).toHaveBeenCalled());
     expect(api.getAdminRoleDefaults).not.toHaveBeenCalled();
   });
 

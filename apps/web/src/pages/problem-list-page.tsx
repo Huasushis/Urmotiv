@@ -19,6 +19,7 @@ import type {
   SessionUser
 } from "@urmotiv/contracts";
 import { AdminLayout } from "../components/admin-layout";
+import { SearchInput } from "../components/search-input";
 import { batchChangeProblemStatus, getSession, listProblems, listTags } from "../lib/api";
 import { dateTime, difficultyText, statusText, statusTone, typeText } from "../lib/presentation";
 
@@ -200,9 +201,9 @@ export function ProblemListPage({
     <div className="filter-bar" aria-label="题目筛选">
       <label className="search-field">
         <Search size={16} aria-hidden="true" />
-        <input
+        <SearchInput
           value={search}
-          onChange={(event) => updateQuery("search", event.target.value)}
+          onSearch={(value) => updateQuery("search", value)}
           placeholder="搜索题号或名称"
         />
       </label>

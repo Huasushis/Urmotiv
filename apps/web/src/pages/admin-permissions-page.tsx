@@ -18,9 +18,12 @@ import {
   listAdminUsers,
   updateAdminRole,
   updateAdminRoleDefaults,
+  switchAccount,
   updateAdminUserPermissions
 } from "../lib/api";
 import { AdminLayout } from "../components/admin-layout";
+import { UserRoleEditor } from "../components/user-role-editor";
+import { clearProblemDrafts } from "../lib/client-security";
 
 type AdminPermissionSection = "users" | "roles" | "defaults";
 
@@ -210,19 +213,6 @@ function RoleMatrix({
   );
 }
 
-type RoleMemberView = {
-  id: string;
-  nickname: string;
-  accountType: "human" | "robot";
-  enabled: boolean;
-  roles?: string[];
-};
-
-function roleMembers(rolesQuery: AdminRoleManagementResponse | undefined): RoleMemberView[] {
-  if (rolesQuery === undefined) return [];
-  return rolesQuery.users ?? [];
-}
-
 function RolesPanel({
   catalogGroups,
   rolesQuery
@@ -304,7 +294,6 @@ function RolesPanel({
       permissions: draft.permissions.map((permission) => permission.name === name ? { ...permission, effect } : permission)
     });
   };
-  const members = roleMembers(rolesQuery);
 
   return (
     <div className="admin-permissions-roles">
@@ -363,26 +352,12 @@ function RolesPanel({
         </div>
         <h3>权限目录</h3>
         <RoleMatrix key={draft.id ?? "new"} groups={catalogGroups} draft={draft} disabled={rootRole} onToggle={togglePermission} onEffectChange={changePermissionEffect} />
-        <fieldset className="permission-member-list" disabled={rootRole}>
-          <legend>角色成员</legend>
-          {members.length === 0 ? <p>暂无可显示的成员。</p> : members.map((user) => (
-            <label key={user.id} className="checkbox-row">
-              <input
-                type="checkbox"
-                checked={draft.userIds.includes(user.id)}
-                disabled={user.id === "0" || user.roles?.includes("root") === true}
-                onChange={(event) => updateDraft({ userIds: event.target.checked ? [...draft.userIds, user.id] : draft.userIds.filter((id) => id !== user.id) })}
-              />
-              {user.nickname}（{user.accountType === "robot" ? "机器人" : "普通账号"}）
-            </label>
-          ))}
-          <p>机器人即使拥有角色，也不能绕过服务端硬拒绝；root 账号和 root 身份不能通过此处授予。</p>
-        </fieldset>
+        <p className="muted-note">在「用户管理」中选择账号，设置其所属权限组。</p>
         <div className="admin-actions">
           <span>修订号：{draft.expectedRevision}</span>
           <button type="submit" className="primary-button" disabled={rootRole || mutation.isPending || mutation.isError || refreshing}>{draft.id === null ? "创建角色" : "保存角色"}</button>
         </div>
-        {rootRole ? <p className="notice-line">root（受保护）：只读展示完整权限宇宙，不能修改或删除。</p> : null}
+        {rootRole ? <p className="notice-line">root 拥有全部核心权限，包括只操作本人题目的权限。此权限组不可修改或转授。</p> : null}
         {mutation.isError ? (
           <SaveUncertainNotice
             message={mutation.error instanceof Error ? mutation.error.message : "请求失败。"}
@@ -473,6 +448,14 @@ function UserPanel({
   session: SessionUser;
 }) {
   const client = useQueryClient();
+  const switchAction = useMutation({
+    mutationFn: switchAccount,
+    onSuccess: () => {
+      clearProblemDrafts();
+      client.clear();
+      window.location.assign("/problems");
+    }
+  });
   const [search, setSearch] = useState("");
   const [querySearch, setQuerySearch] = useState("");
   const [page, setPage] = useState(1);
@@ -621,6 +604,13 @@ function UserPanel({
                 <div><h3>{selectedVisibleUser.nickname}</h3><p>{selectedVisibleUser.id} · 角色基线：{permissionQuery.data?.delta.roles.join("、") || "无"}</p></div>
                 {protectedUser ? <span className="status-badge">root（受保护）</span> : null}
               </div>
+              <UserRoleEditor key={selectedVisibleUser.id} userId={selectedVisibleUser.id} protectedUser={protectedUser} />
+              {!protectedUser && selectedVisibleUser.id !== session.id && selectedVisibleUser.enabled && session.permissions.includes("user.impersonate") ? <div className="admin-actions">
+                <button type="button" className="secondary-button" disabled={switchAction.isPending} onClick={() => {
+                  if (window.confirm("切换后将仅拥有此用户的权限。返回管理员身份需要重新登录，是否继续？")) switchAction.mutate(selectedVisibleUser.id);
+                }}>切换到此用户</button>
+                {switchAction.error ? <p role="alert">{switchAction.error.message}</p> : null}
+              </div> : null}
               <p className="notice-line">生效来源：角色基线、用户 allow、用户 deny；用户拒绝（优先）覆盖同名允许，机器人还会受硬拒绝规则约束。</p>
               <div className="permission-delta-columns">
                 <PermissionDeltaMatrix
@@ -770,7 +760,7 @@ export function AdminPermissionsPage({
     },
     roles: {
       title: "角色与权限",
-      description: "维护角色权限基线、允许或明确拒绝的效果以及角色成员。"
+      description: "定义可重复使用的权限组；账号所属权限组在用户管理中设置。"
     },
     defaults: {
       title: "默认角色",

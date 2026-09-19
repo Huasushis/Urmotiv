@@ -306,6 +306,10 @@ export function logout(): Promise<{ ok: true }> {
   return request("/auth/logout", json({}), okResponseSchema);
 }
 
+export function switchAccount(targetUserId: string): Promise<SessionResponse> {
+  return request("/auth/switch-account", json({ targetUserId }), sessionResponseSchema);
+}
+
 export function getMyProfile(): Promise<ProfileView> {
   return request("/me", { method: "GET" }, profileViewSchema);
 }

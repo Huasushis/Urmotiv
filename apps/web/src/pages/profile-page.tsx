@@ -257,7 +257,7 @@ export function ProfilePage() {
             <small>QQ 号码只对你自己可见，不会展示给其他用户。</small>
           </div>
           <div className="field">
-            <label>用户名（学工号）</label>
+            <label>用户名（建议使用学号，字母全部大写）</label>
             <input
               data-testid="profile-username"
               type="text"

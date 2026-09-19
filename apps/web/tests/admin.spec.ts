@@ -1,4 +1,5 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
+import { corePermissions } from "@urmotiv/contracts";
 
 async function loginAs(page: Page, accountName: RegExp): Promise<void> {
   await page.goto("/demo-login");
@@ -221,6 +222,24 @@ async function fulfillJson(route: Route, body: unknown, status = 200): Promise<v
   });
 }
 
+test("角色页展示 root 全部权限，成员操作位于用户管理", async ({ page }, testInfo) => {
+  await loginAs(page, /系统管理员/);
+  await page.goto("/admin/roles");
+  await page.getByRole("listitem").filter({ hasText: /^root（受保护）/ }).click();
+  const permissions = page.locator('input[name^="role-root-"]');
+  await expect(permissions).toHaveCount(corePermissions.length);
+  expect(await permissions.evaluateAll(inputs => inputs.every(input => (input as HTMLInputElement).checked))).toBe(true);
+  expect(await permissions.evaluateAll(inputs => inputs.every(input => (input as HTMLInputElement).disabled))).toBe(true);
+  await expect(page.locator(".permission-member-list")).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath(`roles-${testInfo.project.name}.png`), fullPage: true });
+  await page.goto("/admin/users");
+  await expect(page.getByRole("heading", { name: "所属权限组" })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "选择要添加的权限组" })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath(`users-${testInfo.project.name}.png`), fullPage: true });
+});
+
 test("无管理权限的账号直接访问管理页时不会读取管理接口", async ({ page }) => {
   let managementRequestCount = 0;
   await page.route("**/api/v1/admin/plugins", async (route) => {
@@ -331,6 +350,12 @@ test("系统管理员保存插件设置后密钥输入框恢复为空", async ({
   await expect(page.getByLabel("接口协议").locator("option:checked"))
     .toHaveText("OpenAI 兼容接口");
   const secret = page.getByLabel(/^访问令牌/);
+  const clearSavedSecret = page.getByRole("checkbox", { name: "明确清除已保存内容" }).first();
+  await clearSavedSecret.check();
+  await clearSavedSecret.uncheck();
+  await clearSavedSecret.check();
+  await clearSavedSecret.uncheck();
+  await expect(page.getByRole("heading", { name: "原题检索" })).toBeVisible();
   const embeddingKey = page.getByLabel(/^嵌入提供方 API 密钥/);
   await expect(providerBaseUrl).toHaveValue("https://emb.example.com/v1");
   await expect(providerModel).toHaveValue("bge-m3");
@@ -498,10 +523,20 @@ test("服务账号页面可以生成并撤销机器人令牌", async ({ page }, 
   ]);
   await page.getByRole("button", { name: "我已保存" }).click();
   await expect(secret).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "轮换" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "轮换令牌" })).toBeVisible();
+  let unexpectedRotations = 0;
+  await page.route("**/tokens/*/rotate", async route => {
+    unexpectedRotations++;
+    await fulfillJson(route, { error: { code: "UNEXPECTED", message: "不应发送" } }, 500);
+  });
+  page.once("dialog", dialog => dialog.dismiss());
+  await page.getByRole("button", { name: "轮换令牌" }).click();
+  expect(unexpectedRotations).toBe(0);
 
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "撤销" }).click();
+  await expect(page.getByText("已撤销", { exact: true })).toHaveCount(0);
+  await page.getByRole("checkbox", { name: /显示已撤销和已过期的历史记录/ }).check();
   await expect(page.getByText("已撤销", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "撤销" })).toHaveCount(0);
   page.once("dialog", (dialog) => dialog.accept());

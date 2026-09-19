@@ -1,22 +1,25 @@
 :root {
-  color: #182321;
-  background: #f3f6f5;
+  color: #172b35;
+  background: #f4f9fb;
   font-family:
-    Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, "PingFang SC", "Noto Sans SC", "Microsoft YaHei", system-ui, "Segoe UI",
     sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   letter-spacing: 0;
   --surface: #ffffff;
-  --surface-subtle: #f7f9f8;
-  --border: #d9e1df;
-  --border-strong: #becbc8;
-  --text: #182321;
-  --text-soft: #596764;
-  --text-faint: #63706d;
-  --teal: #0d766e;
-  --teal-dark: #095e58;
-  --teal-soft: #e5f3f1;
+  --surface-subtle: #f3f8fa;
+  --border: #dce7eb;
+  --border-strong: #bccfd7;
+  --text: #172b35;
+  --text-soft: #506975;
+  --text-faint: #607784;
+  --teal: #087e94;
+  --teal-dark: #075d70;
+  --teal-soft: #e4f5f9;
+  --glass: rgba(255, 255, 255, 0.82);
+  --panel-radius: 20px;
+  --panel-shadow: 0 8px 32px -20px rgba(20, 77, 96, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.95);
   --green: #277a4d;
   --green-soft: #eaf5ee;
   --amber: #9a6410;
@@ -31,14 +34,15 @@
 
 html {
   min-width: 320px;
-  background: #f3f6f5;
+  background: #f4f9fb;
 }
 
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: #f3f6f5;
+  background: radial-gradient(ellipse at 5% 0%, #dff5fa 0, transparent 48%),
+    radial-gradient(ellipse at 100% 24%, #e9effd 0, transparent 42%), #f4f9fb;
   color: var(--text);
 }
 
@@ -128,8 +132,10 @@ h3 {
   top: 0;
   z-index: 30;
   border-bottom: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.97);
-  box-shadow: 0 1px 5px rgba(21, 45, 40, 0.06);
+  background: var(--glass);
+  backdrop-filter: blur(24px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.8);
 }
 
 .global-header-inner {
@@ -137,7 +143,7 @@ h3 {
   grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: stretch;
   width: min(100%, 1280px);
-  min-height: 58px;
+  min-height: 68px;
   margin: 0 auto;
   padding: 0 24px;
 }
@@ -161,8 +167,8 @@ h3 {
   place-items: center;
   width: 30px;
   height: 30px;
-  border-radius: 5px;
-  background: var(--teal);
+  border-radius: 10px;
+  background: linear-gradient(145deg, #26b3c9, var(--teal));
   color: white;
   font-weight: 800;
 }
@@ -179,9 +185,10 @@ h3 {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  height: 58px;
+  height: 40px;
   padding: 0 16px;
-  border-top: 3px solid transparent;
+  border: 1px solid transparent;
+  border-radius: 999px;
   color: var(--text-soft);
   font-size: 14px;
   font-weight: 650;
@@ -191,8 +198,8 @@ h3 {
 .global-nav a:hover,
 .global-nav a.active {
   color: var(--teal);
-  border-top-color: var(--teal);
-  background: var(--surface-subtle);
+  border-color: rgba(8, 126, 148, 0.10);
+  background: var(--teal-soft);
 }
 
 .mobile-nav-toggle {
@@ -330,7 +337,7 @@ h3 {
   gap: 7px;
   min-height: 38px;
   padding: 0 14px;
-  border-radius: 5px;
+  border-radius: 12px;
   font-size: 14px;
   font-weight: 650;
   cursor: pointer;
@@ -339,7 +346,8 @@ h3 {
 
 .primary-button {
   border: 1px solid var(--teal);
-  background: var(--teal);
+  background: linear-gradient(180deg, #0c8ca4, var(--teal));
+  box-shadow: 0 3px 8px -4px rgba(8, 126, 148, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.18);
   color: #fff;
 }
 
@@ -517,7 +525,7 @@ h3 {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(360px, 520px);
   min-height: 100vh;
-  background: var(--surface);
+  background: transparent;
 }
 
 .login-intro {
@@ -525,8 +533,7 @@ h3 {
   flex-direction: column;
   justify-content: center;
   padding: clamp(32px, 7vw, 112px);
-  border-right: 1px solid var(--border);
-  background: #eef4f2;
+  background: radial-gradient(ellipse at 20% 30%, rgba(83, 215, 226, 0.16), transparent 70%);
 }
 
  .login-intro h1 {
@@ -548,7 +555,9 @@ h3 {
   margin: 28px;
   padding: 28px;
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: 28px;
+  background: var(--glass);
+  box-shadow: var(--panel-shadow);
 }
 
 .login-form {
@@ -568,7 +577,7 @@ h3 {
   min-height: 39px;
   padding: 0 10px;
   border: 1px solid var(--border-strong);
-  border-radius: 5px;
+  border-radius: 10px;
   background: var(--surface);
   color: var(--text);
 }
@@ -2073,8 +2082,9 @@ textarea:read-only {
 .plain-panel {
   padding: 18px;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface);
+  border-radius: var(--panel-radius);
+  background: var(--glass);
+  box-shadow: var(--panel-shadow);
 }
 
 .review-form {
@@ -2994,8 +3004,7 @@ textarea:read-only {
   justify-content: space-between;
   gap: 24px;
   margin-bottom: 22px;
-  padding-bottom: 18px;
-  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
 }
 
 .admin-page-header h1 {
@@ -3020,8 +3029,11 @@ textarea:read-only {
   top: 80px;
   overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface);
+  border-radius: var(--panel-radius);
+  background: var(--glass);
+  box-shadow: var(--panel-shadow);
+  backdrop-filter: blur(20px);
+  padding: 8px;
 }
 
 .admin-sidebar .admin-section-nav {
@@ -3033,7 +3045,7 @@ textarea:read-only {
 }
 
 .admin-sidebar-group + .admin-sidebar-group {
-  border-top: 1px solid var(--border);
+  margin-top: 8px;
 }
 
 .admin-sidebar-group h2 {
@@ -3051,12 +3063,14 @@ textarea:read-only {
 }
 
 .admin-sidebar-group a {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 9px;
   min-width: 0;
   min-height: 0;
   padding: 8px 9px;
   border: 0;
-  border-radius: 4px;
+  border-radius: 10px;
   color: var(--text-soft);
   font-size: 13px;
   font-weight: 600;
@@ -3192,8 +3206,8 @@ textarea:read-only {
   min-width: 0;
   padding: 20px;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--surface);
+  border-radius: var(--panel-radius);
+  background: var(--glass);
 }
 
 .admin-form {
@@ -4167,11 +4181,9 @@ textarea:read-only {
 
 .permission-role-buttons {
   display: grid;
-  gap: 1px;
+  gap: 6px;
   overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  background: var(--border);
+  border-radius: 12px;
 }
 
 .permission-role-buttons > button {
@@ -4181,7 +4193,8 @@ textarea:read-only {
   min-height: 58px;
   padding: 10px 12px;
   border: 0;
-  background: var(--surface);
+  border-radius: 12px;
+  background: transparent;
   color: var(--text);
   text-align: left;
   cursor: pointer;
@@ -4190,7 +4203,7 @@ textarea:read-only {
 .permission-role-buttons > button:hover,
 .permission-role-buttons > button.selected {
   background: var(--teal-soft);
-  box-shadow: inset 3px 0 0 var(--teal);
+  box-shadow: inset 0 0 0 1px rgba(8, 126, 148, 0.16);
 }
 
 .permission-role-buttons small {
@@ -4225,7 +4238,7 @@ textarea:read-only {
   min-height: 38px;
   padding: 7px 10px;
   border: 1px solid var(--border-strong);
-  border-radius: 4px;
+  border-radius: 10px;
   background: var(--surface);
   color: var(--text);
 }
@@ -4611,6 +4624,23 @@ textarea:read-only {
 
 .permission-defaults {
   width: min(100%, 760px);
+}
+
+.user-role-editor {
+  margin-block: 20px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.user-role-editor h4 { margin: 0 0 12px; }
+.user-role-memberships, .user-role-add { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.user-role-membership { display: flex; align-items: center; gap: 12px; padding: 5px 12px; border-radius: 10px; background: var(--teal-soft); }
+.user-role-add { margin-top: 12px; }
+.user-role-add select { min-width: 0; max-width: 100%; min-height: 40px; padding: 6px 12px; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface); color: var(--text); }
+
+@media (prefers-reduced-transparency: reduce) {
+  :root { --glass: #ffffff; }
+  .global-header, .admin-sidebar { backdrop-filter: none; -webkit-backdrop-filter: none; }
 }
 
 .sr-only {
@@ -5212,10 +5242,13 @@ textarea:read-only {
   }
 
   .admin-mobile-navigation a {
+    display: flex;
+    align-items: center;
+    gap: 9px;
     min-width: 0;
     min-height: 42px;
     padding: 11px 9px;
-    border-radius: 4px;
+    border-radius: 10px;
     color: var(--text-soft);
     font-size: 13px;
     font-weight: 600;

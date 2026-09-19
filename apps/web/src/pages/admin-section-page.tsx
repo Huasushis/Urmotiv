@@ -328,6 +328,8 @@ function ServiceAccountsSection() {
   const [newAccountName, setNewAccountName] = useState("");
   const [revealedToken, setRevealedToken] = useState<string | null>(null);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const [showTokenHistory, setShowTokenHistory] = useState(false);
+  const [tokenPage, setTokenPage] = useState(1);
   useEffect(() => {
     if (accounts.data === undefined) return;
     if (accounts.data.items.some((item) => item.id === selectedId)) return;
@@ -392,6 +394,8 @@ function ServiceAccountsSection() {
   });
   const selectAccount = (id: string) => {
     setSelectedId(id);
+    setTokenPage(1);
+    setShowTokenHistory(false);
     setRevealedToken(null);
     setCopyState("idle");
     created.reset();
@@ -401,6 +405,10 @@ function ServiceAccountsSection() {
   if (accounts.isPending) return <LoadingState />;
   if (accounts.isError) return <ErrorState message={accounts.error.message} />;
   const selected = accounts.data.items.find((item) => item.id === selectedId);
+  const allTokens = tokens.data?.items ?? [];
+  const visibleTokens = allTokens.filter(token => showTokenHistory || tokenStatus(token) === "可用");
+  const tokenPages = Math.max(1, Math.ceil(visibleTokens.length / 10));
+  const currentTokenPage = Math.min(tokenPage, tokenPages);
   return (
     <div className="service-account-layout">
       <section className="plain-panel service-account-list-panel">
@@ -546,11 +554,15 @@ function ServiceAccountsSection() {
               </form>
             </details>
 
-            <div className="service-token-list-heading"><h3>已有令牌</h3><span>{tokens.data?.items.length ?? 0} 个</span></div>
+            <div className="service-token-list-heading"><h3>{showTokenHistory ? "全部令牌" : "可用令牌"}</h3><span>{visibleTokens.length} 个</span></div>
+            <label className="settings-form-toggle">
+              <input type="checkbox" checked={showTokenHistory} onChange={event => {setShowTokenHistory(event.currentTarget.checked); setTokenPage(1);}} />
+              显示已撤销和已过期的历史记录
+            </label>
             {tokens.isPending ? <p role="status">正在读取令牌……</p> : null}
             {tokens.isError ? <p className="inline-error" role="alert">{tokens.error.message}</p> : null}
             <div className="service-token-list">
-              {tokens.data?.items.map((token) => {
+              {visibleTokens.slice((currentTokenPage - 1) * 10, currentTokenPage * 10).map((token) => {
                 const active = tokenStatus(token) === "可用";
                 return (
                   <article key={token.id}>
@@ -568,7 +580,9 @@ function ServiceAccountsSection() {
                     {token.sourceCidrs.length > 0 ? <p>来源限制：{token.sourceCidrs.join("、")}</p> : <p>来源限制：无</p>}
                     {active ? (
                       <div className="service-token-actions">
-                        <button type="button" className="secondary-button" disabled={rotated.isPending} onClick={() => rotated.mutate(token)}>轮换</button>
+                        <button type="button" className="secondary-button" disabled={rotated.isPending || revoked.isPending} onClick={() => {
+                          if (window.confirm("轮换后旧令牌会立即失效。需要把新令牌更新到 Fermata 或其他使用它的服务，否则服务会停止认证。确认继续？")) rotated.mutate(token);
+                        }}>轮换令牌</button>
                         <button
                           type="button"
                           className="danger-button"
@@ -583,6 +597,11 @@ function ServiceAccountsSection() {
                 );
               })}
             </div>
+            {tokenPages > 1 ? <div className="pagination">
+              <button type="button" className="secondary-button" disabled={currentTokenPage === 1} onClick={() => setTokenPage(currentTokenPage - 1)}>上一页</button>
+              <span>{currentTokenPage} / {tokenPages}</span>
+              <button type="button" className="secondary-button" disabled={currentTokenPage === tokenPages} onClick={() => setTokenPage(currentTokenPage + 1)}>下一页</button>
+            </div> : null}
             {rotated.isError ? <p className="inline-error" role="alert">{rotated.error.message}</p> : null}
             {revoked.isError ? <p className="inline-error" role="alert">{revoked.error.message}</p> : null}
           </>

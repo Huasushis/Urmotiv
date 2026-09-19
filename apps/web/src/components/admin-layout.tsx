@@ -1,6 +1,16 @@
 import { NavLink, useInRouterContext } from "react-router-dom";
 import type { ReactNode } from "react";
 import type { SessionUser } from "@urmotiv/contracts";
+import { BookOpen, Boxes, ClipboardCheck, FileClock, FolderInput, House, KeyRound, ListTree, Plug, Settings2, ShieldCheck, UserPlus, Users, type LucideIcon } from "lucide-react";
+
+const navigationIcons: Record<string, LucideIcon> = {
+  "/admin": House, "/admin/problems": BookOpen, "/admin/review": ClipboardCheck,
+  "/admin/knowledge": ListTree, "/problems": BookOpen, "/admin/imports": FolderInput,
+  "/admin/users": Users, "/admin/roles": ShieldCheck, "/admin/roles/defaults": KeyRound,
+  "/admin/accounts": UserPlus, "/admin/service-accounts": Boxes,
+  "/admin/settings": Settings2, "/admin/oauth": KeyRound, "/admin/audit": FileClock,
+  "/admin/plugins": Plug
+};
 
 export type AdminNavigationItem = {
   readonly to: string;
@@ -22,8 +32,10 @@ function AdminNavigationLink({
   sidebar?: boolean;
 }) {
   const baseClassName = sidebar ? "admin-section-link" : "";
+  const Icon = navigationIcons[item.to] ?? Settings2;
+  const label = <><Icon size={16} aria-hidden="true" /><span>{item.label}</span></>;
   if (!inRouter) {
-    return <a href={item.to} className={baseClassName}>{item.label}</a>;
+    return <a href={item.to} className={baseClassName}>{label}</a>;
   }
   return (
     <NavLink
@@ -33,7 +45,7 @@ function AdminNavigationLink({
         `${baseClassName}${isActive ? `${baseClassName ? " " : ""}active` : ""}`
       }
     >
-      {item.label}
+      {label}
     </NavLink>
   );
 }

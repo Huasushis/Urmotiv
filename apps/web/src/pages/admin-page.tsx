@@ -820,12 +820,13 @@ function PluginEditor({
                       checked={clearing}
                       disabled={!secret.configured || mutation.isPending}
                       onChange={(event) => {
+                        const checked = event.currentTarget.checked;
                         setClearSecrets((current) =>
-                          event.currentTarget.checked
+                          checked
                             ? [...current.filter((name) => name !== secret.name), secret.name]
                             : current.filter((name) => name !== secret.name)
                         );
-                        if (event.currentTarget.checked) {
+                        if (checked) {
                           setSecretValues((current) => ({ ...current, [secret.name]: "" }));
                         }
                         setConflict(false);
