@@ -66,6 +66,31 @@ test("邮箱验证链接在桌面和手机上显示可操作的确认页", async
   await expect(page.getByRole("button", { name: "确认邮箱" })).toBeVisible();
 });
 
+test("管理员可以在草稿审核页开关外部验题并保存", async ({ page }, testInfo) => {
+  await loginAs(page, /组长/);
+  const tags = await (await page.request.get("/api/v1/tags")).json();
+  const tag = tags.items.find((item: { itemKind: string }) => item.itemKind === "tag");
+  const problem = await postJson(page, "/api/v1/problems", {
+    title: "外部验题开关测试", type: "traditional", tagIds: [tag.id],
+    content: { basicStatement: "输出输入的整数。", basicSolution: "读取并输出。" }
+  });
+  await page.goto(`/problems/${problem.id}`);
+  await page.getByRole("tab", { name: "审核记录" }).click();
+  await expect(page.getByRole("heading", { name: "尚未进入审核" })).toBeVisible();
+  const control = page.getByRole("region", { name: "外部 API 验题" });
+  await control.getByRole("button", { name: "关闭外部验题" }).click();
+  await expect(control.getByRole("button", { name: "开启外部验题" })).toBeVisible();
+  await page.reload();
+  await page.getByRole("tab", { name: "审核记录" }).click();
+  await expect(control.getByRole("button", { name: "开启外部验题" })).toBeVisible();
+  const stored = await (await page.request.get(`/api/v1/problems/${problem.id}`)).json();
+  expect(stored.externalReviewEnabled).toBe(false);
+  await control.getByRole("button", { name: "开启外部验题" }).click();
+  await expect(control.getByRole("button", { name: "关闭外部验题" })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("external-review.png"), fullPage: true });
+});
+
 test("投稿人可以创建带 Markdown 内容的草稿并看到六个工作区标签", async ({ page }, testInfo) => {
   await loginAsAuthor(page);
   await page.getByRole("link", { name: "新建题目" }).click();

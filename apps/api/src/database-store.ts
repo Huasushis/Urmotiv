@@ -1005,8 +1005,9 @@ async function replaceProblemInTransaction(
     current_revision: number;
     current_review_round: number;
     status: StoredProblem["status"];
+    external_review_enabled: boolean;
   }>(sql`
-    SELECT current_revision, current_review_round, status
+    SELECT current_revision, current_review_round, status, external_review_enabled
     FROM problems
     WHERE id = ${problemId} AND deleted_at IS NULL
     FOR UPDATE
@@ -1064,6 +1065,7 @@ async function replaceProblemInTransaction(
     SET status = ${problem.status}::problem_status,
         current_revision = ${problem.revision},
         current_review_round = ${problem.reviewRound},
+        external_review_enabled = ${problem.externalReviewEnabled ?? true},
         status_changed_by_user_id = CASE
           WHEN status <> ${problem.status}::problem_status THEN ${actorId}
           ELSE status_changed_by_user_id
@@ -1074,6 +1076,13 @@ async function replaceProblemInTransaction(
   `);
   if (updated.length !== 1) {
     throw new Error("保存题目修订时数据库状态发生变化。");
+  }
+  if (current.external_review_enabled !== (problem.externalReviewEnabled ?? true)) {
+    await executor.execute(sql`
+      INSERT INTO audit_events (actor_user_id, request_id, action, object_type, object_id, result, metadata)
+      VALUES (${actorId}, ${randomUUID()}::uuid, 'problem.external_review.update', 'problem', ${problem.id}, 'success',
+        ${JSON.stringify({ enabled: problem.externalReviewEnabled ?? true, revision: problem.revision })}::jsonb)
+    `);
   }
 
   if (problem.reviewRound === Number(current.current_review_round) + 1) {

@@ -878,6 +878,14 @@ export function withdrawProblem(id: string, expectedRevision: number, reason = "
   );
 }
 
+export function updateExternalReview(
+  id: string,
+  input: { enabled: boolean; expectedRevision: number }
+): Promise<Problem> {
+  return request(`/problems/${encodeURIComponent(id)}/external-review`,
+    { ...json(input), method: "PUT" }, problemSchema);
+}
+
 export function listReviews(id: string): Promise<ReviewRoundSummary> {
   return fallback(
     () => request(`/problems/${encodeURIComponent(id)}/reviews`, { method: "GET" }, reviewRoundSummarySchema),

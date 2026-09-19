@@ -389,6 +389,7 @@ export class DatabaseRobotStore {
       round === undefined
       || round.status !== "open"
       || problem.status !== "pending_review"
+      || problem.externalReviewEnabled === false
     ) {
       return undefined;
     }
@@ -1154,7 +1155,7 @@ function canRobotReviewProblem(
   problem: StoredProblem,
   evaluatedAt: Date,
 ): user is StoredUser {
-  if (user === undefined || user.accountType !== "robot") return false;
+  if (user === undefined || user.accountType !== "robot" || problem.externalReviewEnabled === false) return false;
   const target = { ownerId: problem.ownerId, objectId: problem.id };
   return canViewProblem(createProblemVisibility(user, evaluatedAt), problem)
     && hasPermission(user, "problem.review", target, evaluatedAt);

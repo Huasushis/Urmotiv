@@ -611,6 +611,38 @@ export class ProblemService {
     return this.toProblem(next, user);
   }
 
+  public async updateExternalReview(
+    user: StoredUser,
+    problemId: string,
+    input: { enabled: boolean; expectedRevision: number }
+  ): Promise<Problem> {
+    const updated = await this.store.runProblemTransaction(problemId, async (transaction) => {
+      const problem = transaction.getProblem();
+      const actor = await transaction.lockUserForAuthorization(user.id);
+      if (problem === undefined || actor === undefined ||
+          !canViewProblem(createProblemVisibility(actor, this.now()), problem)) {
+        throw notFound();
+      }
+      if (actor.accountType !== "human" || !hasPermission(actor, "problem.status.change",
+        { ownerId: problem.ownerId, objectId: problem.id }, this.now())) {
+        throw forbidden();
+      }
+      this.assertExpectedRevision(problem, input.expectedRevision);
+      if ((problem.externalReviewEnabled ?? true) === input.enabled) return problem;
+      const next: StoredProblem = {
+        ...problem,
+        externalReviewEnabled: input.enabled,
+        revision: problem.revision + 1,
+        updatedAt: asIso(this.now())
+      };
+      if (!transaction.replaceProblem(next, problem.revision, actor.id)) {
+        throw conflict("题目已被其他操作修改，请刷新后重试。");
+      }
+      return next;
+    });
+    return this.toProblem(updated, user);
+  }
+
   public async deleteProblem(
     user: StoredUser,
     problemId: string,
@@ -1857,6 +1889,7 @@ export class ProblemService {
       origin: problem.origin ?? "native",
       importBatch: problem.importBatch ?? null,
       importSource: problem.importSource ?? null,
+      externalReviewEnabled: problem.externalReviewEnabled ?? true,
       capabilities
     };
   }
@@ -1879,7 +1912,8 @@ export class ProblemService {
       capabilities: full.capabilities,
       origin: full.origin,
       importBatch: full.importBatch,
-      importSource: full.importSource
+      importSource: full.importSource,
+      externalReviewEnabled: full.externalReviewEnabled
     };
   }
 

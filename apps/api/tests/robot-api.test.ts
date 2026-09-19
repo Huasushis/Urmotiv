@@ -252,6 +252,75 @@ async function claimOne(app: FastifyInstance): Promise<ClaimedTask> {
 }
 
 describe("机器人审题接口", () => {
+  it("管理员关闭外部验题后不再领取，重新开启可以领取", async () => {
+    const { app, database } = await makeRobotApp();
+    const problem = await createPendingProblem(app);
+    const admin = await login(app, databaseDemoUserIds.leader);
+    const read = await app.inject({ method: "GET", url: `/api/v1/problems/${problem.id}`,
+      headers: { cookie: admin } });
+    expect(read.json().externalReviewEnabled).toBe(true);
+    const closed = await app.inject({ method: "PUT", url: `/api/v1/problems/${problem.id}/external-review`,
+      headers: { cookie: admin, origin: localOrigin },
+      payload: { enabled: false, expectedRevision: read.json().revision } });
+    expect(closed.statusCode).toBe(200);
+    expect(closed.json().externalReviewEnabled).toBe(false);
+    expect((await database.query<{ enabled: boolean }>(sql`
+      SELECT external_review_enabled AS enabled FROM problems WHERE id = ${BigInt(problem.id)}
+    `))[0]?.enabled).toBe(false);
+    expect((await database.query<{ metadata: unknown }>(sql`
+      SELECT metadata FROM audit_events WHERE action = 'problem.external_review.update'
+        AND object_id = ${problem.id}
+    `))[0]?.metadata).toEqual({ enabled: false, revision: closed.json().revision });
+    const claim = await app.inject({ method: "POST", url: "/api/v1/robot/review-tasks/claim",
+      headers: robotHeaders(), payload: { maximumTasks: 1 } });
+    expect(claim.statusCode).toBe(200);
+    expect(claim.json().items).toEqual([]);
+    const stale = await app.inject({ method: "PUT", url: `/api/v1/problems/${problem.id}/external-review`,
+      headers: { cookie: admin, origin: localOrigin },
+      payload: { enabled: true, expectedRevision: read.json().revision } });
+    expect(stale.statusCode).toBe(409);
+    const reopened = await app.inject({ method: "PUT", url: `/api/v1/problems/${problem.id}/external-review`,
+      headers: { cookie: admin, origin: localOrigin },
+      payload: { enabled: true, expectedRevision: closed.json().revision } });
+    expect(reopened.statusCode).toBe(200);
+    expect((await claimOne(app)).problem.id).toBe(problem.id);
+  });
+
+  it("普通作者不能开关外部验题，隐藏题目和不存在题目返回一致", async () => {
+    const { app, database } = await makeRobotApp();
+    const problem = await createPendingProblem(app);
+    const author = await login(app, databaseDemoUserIds.author);
+    const denied = await app.inject({ method: "PUT", url: `/api/v1/problems/${problem.id}/external-review`,
+      headers: { cookie: author, origin: localOrigin }, payload: { enabled: false, expectedRevision: 2 } });
+    expect(denied.statusCode).toBe(403);
+    await database.execute(sql`
+      INSERT INTO permission_grants (id, subject_user_id, permission_name, effect, scope, granted_by_user_id, reason)
+      VALUES (${randomUUID()}::uuid, ${BigInt(databaseDemoUserIds.author)}, 'problem.view.own', 'deny', 'global',
+        ${BigInt(databaseDemoUserIds.leader)}, '验证不可见题目')
+    `);
+    for (const id of [problem.id, "999999"]) {
+      const hidden = await app.inject({ method: "PUT", url: `/api/v1/problems/${id}/external-review`,
+        headers: { cookie: author, origin: localOrigin }, payload: { enabled: false, expectedRevision: 2 } });
+      expect(hidden.statusCode).toBe(404);
+    }
+  });
+
+  it("已领取任务在题目关闭外部验题后不能续租或提交意见", async () => {
+    const { app, database } = await makeRobotApp();
+    const problem = await createPendingProblem(app);
+    const task = await claimOne(app);
+    await database.execute(sql`UPDATE problems SET external_review_enabled = false WHERE id = ${BigInt(problem.id)}`);
+    const completed = await app.inject({ method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/complete`,
+      headers: robotHeaders(), payload: completionPayload(task) });
+    expect(completed.statusCode).toBe(404);
+    expect((await database.query<{ n: number }>(sql`SELECT count(*)::int AS n FROM review_opinions`))[0]?.n).toBe(0);
+    const renewed = await app.inject({ method: "POST",
+      url: `/api/v1/robot/review-tasks/${task.assignmentId}/renew`, headers: robotHeaders(),
+      payload: { requestId: randomUUID(), expectedLeaseExpiresAt: task.leaseExpiresAt, leaseSeconds: 300 } });
+    expect(renewed.statusCode).toBe(404);
+  });
+
   it("领取任务完整保留审核条目的认证来源、可见范围和有效期", async () => {
     const { app, database, reviewItems } = await makeRobotApp();
     const problem = await createPendingProblem(app);

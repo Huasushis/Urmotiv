@@ -54,6 +54,7 @@ import {
   updateContestInputSchema,
   updateFermataPublicSettingsInputSchema,
   updateProblemInputSchema,
+  updateExternalReviewInputSchema,
   updateReviewPolicyInputSchema,
   switchAccountInputSchema,
   updateProfileInputSchema,
@@ -2424,6 +2425,13 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     return dependencies.service.updateProblem(user, parseProblemId(request), input);
   });
 
+  app.put("/api/v1/problems/:problemId/external-review", async (request) => {
+    const user = await requireUser(request);
+    return dependencies.service.updateExternalReview(
+      user, parseProblemId(request), updateExternalReviewInputSchema.parse(request.body)
+    );
+  });
+
   app.delete("/api/v1/problems/:problemId", async (request) => {
     const user = await requireUser(request);
     const input = deleteProblemInputSchema.parse(request.body);
@@ -2552,6 +2560,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
               || executor === undefined
               || transaction.getTagCatalogVersion() !== tagCatalog.version
               || problem.status !== "pending_review"
+              || problem.externalReviewEnabled === false
               || problem.reviewRound !== candidate.round
               || problem.tagIds.some((tagId) => !activeTagIds.has(tagId))
               || (

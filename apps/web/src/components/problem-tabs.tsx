@@ -35,7 +35,8 @@ import {
   listProblemAccess,
   listReviewItems,
   listReviews,
-  listTags
+  listTags,
+  updateExternalReview
 } from "../lib/api";
 import { dateTime, duration, isFrozen, reviewVerdictText, statusText, typeText } from "../lib/presentation";
 import { MarkdownEditor, MarkdownPreview } from "./markdown-editor";
@@ -1046,6 +1047,16 @@ export function ReviewTab({
   onProblemChange?: (problem: Problem) => void;
 }) {
   const client = useQueryClient();
+  const externalReview = useMutation({
+    mutationFn: (enabled: boolean) => updateExternalReview(problem.id, {
+      enabled, expectedRevision: problem.revision
+    }),
+    onSuccess: async (updated) => {
+      onProblemChange?.(updated);
+      client.setQueryData(["problem", problem.id], updated);
+      await client.invalidateQueries({ queryKey: ["problems"] });
+    }
+  });
   const reviews = useQuery({
     queryKey: ["reviews", problem.id, problem.reviewRound, currentUserId],
     queryFn: () => listReviews(problem.id),
@@ -1213,12 +1224,30 @@ export function ReviewTab({
     }
   });
 
+  const externalReviewControl = (
+    <section className="plain-panel" aria-label="外部 API 验题">
+      <h2>外部 API 验题</h2>
+      <p>当前{problem.externalReviewEnabled === false ? "关闭" : "开启"}。开启后，有权限的 Fermata 或其他审核程序可以领取本题的新审核任务。关闭不影响人工审核，已有记录继续保留。</p>
+      {problem.capabilities.canChangeStatus ? (
+        <button className="secondary-button" type="button"
+          disabled={submissionBlocked || externalReview.isPending}
+          onClick={() => externalReview.mutate(problem.externalReviewEnabled === false)}>
+          {externalReview.isPending ? "正在保存…" : problem.externalReviewEnabled === false ? "开启外部验题" : "关闭外部验题"}
+        </button>
+      ) : null}
+      {externalReview.error ? <p role="alert">{externalReview.error.message}</p> : null}
+    </section>
+  );
+
   if (problem.reviewRound === 0) {
     return (
-      <div className="workspace-section permission-empty">
-        <ClipboardListIcon />
-        <h2>尚未进入审核</h2>
-        <p>题目第一次提交后会新建审核轮次，后续重新提交会保留旧轮次记录。</p>
+      <div className="workspace-section review-tab">
+        {externalReviewControl}
+        <div className="permission-empty">
+          <ClipboardListIcon />
+          <h2>尚未进入审核</h2>
+          <p>题目第一次提交后会新建审核轮次，后续重新提交会保留旧轮次记录。</p>
+        </div>
       </div>
     );
   }
@@ -1287,6 +1316,7 @@ export function ReviewTab({
 
   return (
     <div className="workspace-section review-tab">
+      {externalReviewControl}
       <div className="review-summary">
         <div><span>当前轮次</span><strong>第 {summary?.round ?? problem.reviewRound} 轮</strong></div>
         <div><span>通过意见</span><strong>{summary?.approvals ?? 0}{summary?.requiredApprovals === null ? "" : ` / ${summary?.requiredApprovals ?? 2}`}</strong></div>

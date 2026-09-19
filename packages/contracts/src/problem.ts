@@ -249,6 +249,11 @@ export const updateProblemInputSchema = problemDraftSchema.partial().extend({
 
 export type UpdateProblemInput = z.infer<typeof updateProblemInputSchema>;
 
+export const updateExternalReviewInputSchema = z.object({
+  enabled: z.boolean(),
+  expectedRevision: z.number().int().positive()
+}).strict();
+
 /**
  * 强制修改冻结字段的专用接口：只能携带基础题面/基础题解两个冻结字段，
  * 必须填写原因。题目名称不在其中——名称永远走普通编辑接口。
@@ -313,6 +318,7 @@ export const userSummarySchema = z.object({
 export type UserSummary = z.infer<typeof userSummarySchema>;
 
 export const problemMetadataSchema = z.object({
+  externalReviewEnabled: z.boolean().optional(),
   origin: z.string().trim().min(1).max(100).optional(),
   importBatch: z.string().trim().max(200).nullable().optional(),
   importSource: z.string().trim().max(200).nullable().optional()
@@ -348,7 +354,8 @@ export const problemListItemSchema = problemSchema.pick({
   capabilities: true,
   origin: true,
   importBatch: true,
-  importSource: true
+  importSource: true,
+  externalReviewEnabled: true
 });
 
 export type ProblemListItem = z.infer<typeof problemListItemSchema>;
