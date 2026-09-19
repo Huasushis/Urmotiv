@@ -2038,9 +2038,12 @@ describePostgres("problem package outbox on real PostgreSQL", () => {
         is_called AS sequence_called
       FROM drizzle.__drizzle_migrations_id_seq
     `);
+    const migrationCount = (JSON.parse(readFileSync(
+      new URL("../migrations/meta/_journal.json", import.meta.url), "utf8"
+    )) as { entries: unknown[] }).entries.length;
     expect(migrationState).toEqual([{
-      migration_count: 19,
-      sequence_value: "19",
+      migration_count: migrationCount,
+      sequence_value: String(migrationCount),
       sequence_called: true
     }]);
     const indexes = await database.query<{ indexname: string }>(sql`

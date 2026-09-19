@@ -144,20 +144,21 @@ describe("机器人令牌事务存储", () => {
     expect(serializedAudit).not.toContain("127.0.0.1");
   });
 
-  it("错误编号、不存在、普通用户和已停用机器人统一返回未找到且没有副作用", async () => {
+  it("错误编号、不存在和普通用户统一返回未找到；停用机器人可查看记录但不能创建令牌", async () => {
     const { database, store } = await createStore();
     const targets = [
       "not-an-id",
       "999999",
       "9223372036854775808",
       "9".repeat(10_000),
-      humanId,
-      disabledRobotId
+      humanId
     ];
     for (const target of targets) {
       await expect(store.listTokens(target)).resolves.toBeUndefined();
       await expect(store.createToken(target, createOperation())).resolves.toBeUndefined();
     }
+    await expect(store.listTokens(disabledRobotId)).resolves.toEqual({ items: [] });
+    await expect(store.createToken(disabledRobotId, createOperation())).resolves.toBeUndefined();
     expect(await counts(database)).toEqual({ tokens: 0, permissions: 0, audits: 0 });
   });
 
@@ -169,7 +170,7 @@ describe("机器人令牌事务存储", () => {
     expect(await counts(database)).toEqual({ tokens: 0, permissions: 0, audits: 0 });
   });
 
-  it("跨账号、错误编号和已停用账号不能撤销令牌，也不留下失败状态", async () => {
+  it("跨账号和错误编号不能撤销令牌；管理员仍可撤销停用机器人的遗留令牌", async () => {
     const { database, store } = await createStore();
     const created = await store.createToken(activeRobotId, createOperation());
     expect(created).toBeDefined();
@@ -195,6 +196,9 @@ describe("机器人令牌事务存储", () => {
       )).resolves.toBeUndefined();
     }
 
+    expect(await counts(database)).toEqual({ tokens: 1, permissions: 3, audits: 1 });
+    const beforeDisable = await store.listTokens(activeRobotId);
+    expect(beforeDisable?.items[0]?.revokedAt).toBeNull();
     await database.execute(sql`
       UPDATE users SET disabled_at = now(), disabled_reason = '测试停用'
       WHERE id = ${BigInt(activeRobotId)}
@@ -204,13 +208,16 @@ describe("机器人令牌事务存储", () => {
       created!.item.id,
       "0",
       randomUUID()
-    )).resolves.toBeUndefined();
+    )).resolves.toEqual(expect.objectContaining({
+      id: created!.item.id,
+      revokedAt: expect.any(String)
+    }));
 
     const state = await database.query<{ revoked_at: string | null }>(sql`
       SELECT revoked_at FROM api_tokens WHERE id = ${created!.item.id}::uuid
     `);
-    expect(state).toEqual([{ revoked_at: null }]);
-    expect(await counts(database)).toEqual({ tokens: 1, permissions: 3, audits: 1 });
+    expect(state[0]?.revoked_at).not.toBeNull();
+    expect(await counts(database)).toEqual({ tokens: 1, permissions: 3, audits: 2 });
   });
 
   it("撤销只改变所属账号的活动令牌，并与成功审计一起提交", async () => {

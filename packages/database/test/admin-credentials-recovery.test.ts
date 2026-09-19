@@ -150,7 +150,7 @@ describe("administrator credential recovery", () => {
       SET password_hash = ${replacementHash}
       WHERE id = 0
     `);
-    await database.execute(sql`
+    await expect(database.execute(sql`
       INSERT INTO role_memberships (
         id, user_id, role_id, granted_by_user_id, reason
       ) VALUES (
@@ -160,7 +160,7 @@ describe("administrator credential recovery", () => {
         0,
         '合成 root 拒绝'
       )
-    `);
+    `)).rejects.toMatchObject({ cause: { code: "23514" } });
     for (const [accountType, nickname, membershipId] of [
       ["robot", "合成机器人", "a0000000-0000-4000-8000-000000000004"],
       ["service", "合成服务", "a0000000-0000-4000-8000-000000000005"],

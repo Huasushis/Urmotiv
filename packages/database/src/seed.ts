@@ -185,6 +185,7 @@ const roleDefinitions = [
       "contest.create",
       "contest.edit.own",
       "problem.status.change",
+      "contest.risk.read",
       "review.policy.manage",
       "problem.access.grant",
       "problem.import",
@@ -226,16 +227,17 @@ export interface CoreSeedResult {
 
 export async function seedCoreDatabase(handle: DatabaseHandle): Promise<CoreSeedResult> {
   await handle.transaction(async (transaction) => {
-    const usernameColumns = await transaction.query<{ present: boolean }>(sql`
+    const schemaSupport = await transaction.query<{ username_present: boolean; role_defaults_present: boolean }>(sql`
       SELECT EXISTS (
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema = 'public'
           AND table_name = 'users'
           AND column_name = 'username'
-      ) AS present
+      ) AS username_present,
+      to_regclass('public.role_defaults') IS NOT NULL AS role_defaults_present
     `);
-    if (usernameColumns[0]?.present === true) {
+    if (schemaSupport[0]?.username_present === true) {
       await transaction.execute(sql`
         INSERT INTO users (id, nickname, username, account_type, password_hash)
         VALUES (0, 'root', 'root', 'human', NULL)
@@ -309,11 +311,14 @@ export async function seedCoreDatabase(handle: DatabaseHandle): Promise<CoreSeed
       VALUES (${rootMembershipId}::uuid, 0, ${rootRoleId}::uuid, 0, '首次初始化 root 账号')
       ON CONFLICT (id) DO NOTHING
     `);
-    await transaction.execute(sql`
-      INSERT INTO role_defaults (id, human_role_key, robot_role_key, revision, updated_by_user_id)
-      VALUES ('global', 'contributor', 'reviewer', 1, 0)
-      ON CONFLICT (id) DO NOTHING
-    `);
+    // Older migration fixtures do not have the role-defaults table yet.
+    if (schemaSupport[0]?.role_defaults_present === true) {
+      await transaction.execute(sql`
+        INSERT INTO role_defaults (id, human_role_key, robot_role_key, revision, updated_by_user_id)
+        VALUES ('global', 'contributor', 'reviewer', 1, 0)
+        ON CONFLICT (id) DO NOTHING
+      `);
+    }
   });
 
   return {

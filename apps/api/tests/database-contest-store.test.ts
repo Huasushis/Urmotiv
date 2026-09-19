@@ -9,6 +9,7 @@ import {
   seedCoreDatabase
 } from "@urmotiv/database";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { sql } from "drizzle-orm";
 import { createApp } from "../src/app";
 import { ContestService } from "../src/contest-service";
 import { DatabaseContestStore } from "../src/database-contest-store";
@@ -138,6 +139,19 @@ describe("数据库组题与访问记录仓库", () => {
         expect.objectContaining({ user: expect.objectContaining({ id: leader.id }), role: "manager" })
       ])
     );
+    await reopened.execute(sql`
+      INSERT INTO permission_grants (
+        id, subject_user_id, permission_name, effect, scope, granted_by_user_id, reason
+      ) VALUES (
+        ${randomUUID()}::uuid, ${BigInt(leader.id)}, 'contest.risk.read', 'deny', 'global', 0,
+        '验证明确拒绝覆盖组长内置权限'
+      )
+    `);
+    await seedCoreDatabase(reopened);
+    const deniedLeader = requireUser(await reopenedProblemStore.getUser(leader.id));
+    const withoutRisk = await reopenedService.getContest(deniedLeader, created.id);
+    expect(withoutRisk.capabilities.canReadRisk).toBe(false);
+    expect(withoutRisk.problems[0]).toMatchObject({ leakRiskCount: 0, leakRiskEntries: [] });
   });
 
   it("HTTP 路由重新检查登录、来源和对象权限", async () => {
