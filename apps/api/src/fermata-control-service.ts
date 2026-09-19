@@ -18,7 +18,7 @@ import {
   type FermataSettingsSnapshot,
   type FermataFetch
 } from "@urmotiv/plugin-fermata-control";
-import type { FermataHealth, FermataPublicSettings } from "@urmotiv/contracts";
+import type { FermataHealth, FermataPublicSettings, FermataSecretUpdate } from "@urmotiv/contracts";
 import { fermataPluginId, fermataManagementTokenSecretName } from "./builtin-plugins";
 import type { TrustedPluginHost } from "./plugin-host";
 
@@ -51,6 +51,7 @@ export type FermataControlErrorCode =
   | "FERMATA_NOT_CONFIGURED"
   | "FERMATA_UNAVAILABLE"
   | "FERMATA_REQUEST_FAILED"
+  | "FERMATA_SETTINGS_CONFLICT"
   | "FERMATA_RESPONSE_INVALID";
 
 function fermataControlErrorStatus(code: FermataControlErrorCode): number {
@@ -61,6 +62,8 @@ function fermataControlErrorStatus(code: FermataControlErrorCode): number {
       return 503;
     case "FERMATA_REQUEST_FAILED":
       return 502;
+    case "FERMATA_SETTINGS_CONFLICT":
+      return 409;
     case "FERMATA_RESPONSE_INVALID":
       return 502;
   }
@@ -104,11 +107,12 @@ export class FermataControlService {
   public async updateSettings(
     expectedRevision: number,
     settings: FermataPublicSettings,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    secrets?: FermataSecretUpdate
   ): Promise<FermataSettingsSnapshot> {
     const client = await this.#createClient();
     try {
-      return await client.updateSettings(expectedRevision, settings, signal);
+      return await client.updateSettings(expectedRevision, settings, signal, secrets);
     } catch (error) {
       throw translateFermataError(error);
     }
@@ -204,6 +208,9 @@ function translateFermataError(error: unknown): FermataControlError {
   // FermataControlClient.request() 在 !response.ok 时抛的 Error 里包含状态码。
   // 这些信息不泄露令牌，但可能间接暴露 Fermata 内部状态；统一收窄为一条消息。
   const statusMatch = /状态码为\s*(\d+)/.exec(errorMessage);
+  if (statusMatch?.[1] === "409") {
+    return new FermataControlError("FERMATA_SETTINGS_CONFLICT", "设置已被其他管理员修改，请重新读取后再保存。");
+  }
   if (statusMatch !== null) {
     return new FermataControlError(
       "FERMATA_REQUEST_FAILED",

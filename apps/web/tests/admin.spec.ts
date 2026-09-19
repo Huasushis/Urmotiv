@@ -619,16 +619,25 @@ test("插件管理入口随插件启用显示，不进入通用导航", async ({
   await expect(link).toHaveCount(0);
 });
 
-test("Fermata 独立管理页展示运行状态、模型配置说明且没有横向溢出", async ({ page }, testInfo) => {
-  const settings = {
+test("Fermata 管理页可以保存实际模型、连接和密钥，且没有横向溢出", async ({ page }, testInfo) => {
+  let settings = {
     enabled: true,
     pollingIntervalSeconds: 30,
     maximumConcurrentTasks: 16,
     modelProfileName: "deepseek-v4-flash-max",
-    experimentVersion: "prompt-v5"
+    experimentVersion: "prompt-v5",
+    model: { baseUrl: "https://model.example.test/v1", model: "deepseek-v4-flash", temperature: 0.2, thinking: true },
+    urmotivBaseUrl: "https://urmotiv.example.test"
   };
+  let revision = 7;
+  let submitted: Record<string, unknown> | undefined;
   await page.route("**/api/v1/admin/fermata/settings", async (route) => {
-    await fulfillJson(route, { settings, revision: 7, secretsConfigured: true });
+    if (route.request().method() === "PUT") {
+      submitted = route.request().postDataJSON();
+      settings = submitted!.settings as typeof settings;
+      revision++;
+    }
+    await fulfillJson(route, { settings, revision, secretsConfigured: true, credentialStatus: { modelApiKey: true, robotToken: true } });
   });
   await page.route("**/api/v1/admin/fermata/health", async (route) => {
     await fulfillJson(route, {
@@ -646,15 +655,25 @@ test("Fermata 独立管理页展示运行状态、模型配置说明且没有横
   await loginAs(page, /系统管理员/);
   await page.goto("/admin/fermata");
   await expect(page.getByRole("heading", { name: "Fermata 审核服务", level: 1 })).toBeVisible();
-  await expect(page.getByText("审核 Worker 正在运行")).toBeVisible();
+  await expect(page.getByText("自动审题已启动")).toBeVisible();
   await expect(page.getByLabel("最多并发审核任务")).toHaveValue("16");
-  await expect(page.getByLabel("模型档位名称")).toHaveValue("deepseek-v4-flash-max");
-  await expect(page.getByText("AI 服务地址和密钥在哪里配置？")).toBeVisible();
-  await expect(page.getByText("FERMATA_MANAGEMENT_TOKEN")).toBeVisible();
+  await expect(page.getByLabel(/^审题模型/)).toHaveValue("deepseek-v4-flash");
+  await page.getByLabel("模型接口地址（OpenAI 兼容）").fill("https://new-model.example.test/v1");
+  await page.getByLabel(/^模型 API 密钥/).fill("synthetic-new-model-key");
+  await page.getByLabel(/^题库机器人令牌/).fill("urv_synthetic_new_robot");
+  await page.getByRole("button", { name: "保存 Fermata 设置", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("Fermata 运行设置已保存");
+  expect(submitted).toMatchObject({ expectedRevision: 7, settings: { model: { baseUrl: "https://new-model.example.test/v1" } },
+    secrets: { modelApiKey: "synthetic-new-model-key", robotToken: "urv_synthetic_new_robot" } });
+  await expect(page.getByLabel(/^模型 API 密钥/)).toHaveValue("");
+  await expect(page.getByLabel(/^题库机器人令牌/)).toHaveValue("");
+  const clear = page.getByRole("checkbox", { name: "清除模型 API 密钥", exact: true });
+  await clear.check(); await clear.uncheck();
   const overflow = await page.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth
   );
   expect(overflow).toBeLessThanOrEqual(1);
+  await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({
     path: testInfo.outputPath(`admin-fermata-${testInfo.project.name}.png`),
     fullPage: true

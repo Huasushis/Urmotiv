@@ -58,7 +58,7 @@ afterEach(() => {
 });
 
 describe("Fermata 管理页面", () => {
-  it("展示真实 AI 档位、运行状态和三类凭据的配置位置", async () => {
+  it("展示可编辑的模型连接与三类凭据的用途，密钥输入保持为空", async () => {
     api.getFermataHealth.mockResolvedValue({
       health: {
         status: "ok",
@@ -75,7 +75,9 @@ describe("Fermata 管理页面", () => {
         pollingIntervalSeconds: 15,
         maximumConcurrentTasks: 16,
         modelProfileName: "review-balanced",
-        experimentVersion: "review-flow-v1"
+        experimentVersion: "review-flow-v1",
+        model: { baseUrl: "https://models.example.test/v1", model: "deepseek-v4-flash", temperature: 0.2, thinking: true },
+        urmotivBaseUrl: "https://urmotiv.example.test"
       },
       revision: 4,
       secretsConfigured: true
@@ -95,14 +97,14 @@ describe("Fermata 管理页面", () => {
     });
 
     await waitFor(() => {
-      expect(container?.textContent).toContain("review-balanced");
+      expect(container?.textContent).toContain("deepseek-v4-flash");
     });
-    expect(container.textContent).toContain("审核 Worker 正在运行");
+    expect(container.textContent).toContain("自动审题已启动");
     expect(container.textContent).toContain("当前处理任务：2");
-    expect(container.textContent).toContain("config/models.yaml");
-    expect(container.textContent).toContain("*_BASE_URL");
-    expect(container.textContent).toContain("*_API_KEY");
-    expect(container.textContent).toContain("FERMATA_MANAGEMENT_TOKEN");
+    expect(container.textContent).toContain("模型 API 密钥");
+    expect(container.textContent).toContain("题库机器人令牌");
+    expect(container.textContent).toContain("管理令牌用于连接 Fermata 管理端口");
+    for (const input of container.querySelectorAll<HTMLInputElement>('input[type="password"]')) expect(input.value).toBe("");
     expect(container.querySelector('.admin-section-nav a[href="/admin/fermata"]')).toBeNull();
   });
 });

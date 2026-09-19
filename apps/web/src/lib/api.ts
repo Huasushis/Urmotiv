@@ -615,7 +615,7 @@ export function getFermataHealth(): Promise<{ health: FermataHealth }> {
   );
 }
 
-export function getFermataSettings(): Promise<{ settings: FermataPublicSettings; revision: number; secretsConfigured: boolean }> {
+export function getFermataSettings(): Promise<{ settings: FermataPublicSettings; revision: number; secretsConfigured: boolean; credentialStatus?: { modelApiKey: boolean; robotToken: boolean } | undefined }> {
   return request(
     "/admin/fermata/settings",
     { method: "GET" },
@@ -627,6 +627,7 @@ export function updateFermataSettings(input: UpdateFermataPublicSettingsInput): 
   settings: FermataPublicSettings;
   revision: number;
   secretsConfigured: boolean;
+  credentialStatus?: { modelApiKey: boolean; robotToken: boolean } | undefined;
 }> {
   return request(
     "/admin/fermata/settings",

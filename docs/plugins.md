@@ -64,3 +64,5 @@ Anklang 只做原题相似性检索和受控索引写入。`org.ustc.urmotiv.ank
 成功 submit、`pending_review`/`approved` 题目的标题变化，以及冻结 `basicStatement` 变化才通过窄 `AnklangIndexAdapter` 调用 `PUT /api/v1/index/problems`；`yuantiji` 模式不写本地索引，切换回 local/hybrid 后再由后续同步逐步建立。draft/rejected、solution-only、无变化和删除不会同步；未启用、未授权或缺少密钥时不会发 HTTP 请求。候选 v2 可带有界 `statement` 和 `url`，页面可展开题面并打开来源；Urmotiv 自有候选仍先按当前请求用户权限过滤，当前题目自身、未知、隐藏、明确拒绝都静默移除，授权候选用当前标题替换并移除远端 URL、`metadata`（附加信息）；外部来源仅保留非判断参考数据。过滤失败时拒绝返回/保存，不会伪造空结果。
 
 Fermata 只能读取 Urmotiv 自己保存的检查属性；Anklang 不拥有 Urmotiv 的流程、审核状态、权限或最终审核决定。插件宿主没有通用事件总线，索引适配器只注入 `ProblemService` 的上述本地修改边界。
+
+`fermata-control` 的管理页面通过版本 1 HTTP 接口配置独立服务，宿主不直接读取其配置文件。`PUT /api/v1/admin/fermata/settings` 接收 `expectedRevision`、`settings` 和可选的只写 `secrets`。`settings.model` 包含 `baseUrl`、`model`、`temperature`、`thinking`，`settings.urmotivBaseUrl` 指定题库地址；`secrets` 支持 `modelApiKey`、`robotToken` 和对应的 `clearModelApiKey`、`clearRobotToken`。响应只含 `credentialStatus` 布尔标记，密钥原文不返回。旧服务省略新增字段仍可读取；保存冲突返回 409，权限检查仍要求人工账号同时拥有 `plugin.manage` 和 `system.manage`。

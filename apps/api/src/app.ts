@@ -1715,7 +1715,9 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     const input = updateFermataPublicSettingsInputSchema.parse(request.body);
     const snapshot = await dependencies.fermataControl.updateSettings(
       input.expectedRevision,
-      input.settings
+      input.settings,
+      undefined,
+      input.secrets
     );
     return snapshot;
   });

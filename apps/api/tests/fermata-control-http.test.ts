@@ -192,10 +192,14 @@ describe("Fermata 管理 HTTP 接口", () => {
   grant("plugin.manage"),
   grant("system.manage")
 ]);
-    const updatedSnapshot = { ...fakeSettings(), revision: 5 };
+    const settings = { ...fakeSettings().settings,
+      model: { baseUrl: "https://model.example.test/v1", model: "deepseek-v4-flash", temperature: 0.2, thinking: true },
+      urmotivBaseUrl: "https://urmotiv.example.test" };
+    const secrets = { modelApiKey: "synthetic-model-key", robotToken: "urv_synthetic_robot_key" };
+    const updatedSnapshot = { ...fakeSettings(), settings, revision: 5, credentialStatus: { modelApiKey: true, robotToken: true } };
     const fetch = vi.fn<FermataFetch>(async (_url, init) => {
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      expect(body).toEqual({ expectedRevision: 4, settings: fakeSettings().settings });
+      expect(body).toEqual({ expectedRevision: 4, settings, secrets });
       return new Response(JSON.stringify(updatedSnapshot), { status: 200 });
     });
     const app = await createApp({
@@ -212,10 +216,28 @@ describe("Fermata 管理 HTTP 接口", () => {
       method: "PUT",
       url: "/api/v1/admin/fermata/settings",
       headers: { cookie, origin },
-      payload: { expectedRevision: 4, settings: fakeSettings().settings }
+      payload: { expectedRevision: 4, settings, secrets }
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual(updatedSnapshot);
+    expect(response.body).not.toContain(secrets.modelApiKey);
+    expect(response.body).not.toContain(secrets.robotToken);
+  });
+
+  it("过期设置版本返回 409 且不回显上游内容或提交的密钥", async () => {
+    const manager = createUser("fermata-manager", "human", [grant("plugin.manage"), grant("system.manage")]);
+    const fetch = vi.fn<FermataFetch>(async () => new Response("private-upstream-detail", { status: 409 }));
+    const app = await createApp({ store: new InMemoryDataStore([manager], demoTags),
+      demoAuthEnabled: true, demoUserIds: [manager.id], pluginHost: makeConfiguredHost(), fermataFetch: fetch });
+    openApps.push(app);
+    const cookie = await setupFermataPlugin(app, manager);
+    const response = await app.inject({ method: "PUT", url: "/api/v1/admin/fermata/settings",
+      headers: { cookie, origin }, payload: { expectedRevision: 4, settings: fakeSettings().settings,
+        secrets: { modelApiKey: "synthetic-model-key" } } });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe("FERMATA_SETTINGS_CONFLICT");
+    expect(response.body).not.toContain("private-upstream-detail");
+    expect(response.body).not.toContain("synthetic-model-key");
   });
 
   it("有权限的管理员能触发 Fermata 立即检查", async () => {

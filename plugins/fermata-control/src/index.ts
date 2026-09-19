@@ -3,6 +3,7 @@ import {
   fermataPublicSettingsResponseSchema,
   updateFermataPublicSettingsInputSchema,
   type FermataHealth,
+  type FermataSecretUpdate,
   type FermataPublicSettings
 } from "@urmotiv/contracts";
 import { z } from "zod";
@@ -45,6 +46,7 @@ export interface FermataSettingsSnapshot {
   readonly settings: FermataPublicSettings;
   readonly revision: number;
   readonly secretsConfigured: boolean;
+  readonly credentialStatus?: { modelApiKey: boolean; robotToken: boolean } | undefined;
 }
 
 export class FermataControlClient {
@@ -76,9 +78,10 @@ export class FermataControlClient {
   public updateSettings(
     expectedRevision: number,
     settings: FermataPublicSettings,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    secrets?: FermataSecretUpdate
   ): Promise<FermataSettingsSnapshot> {
-    const body = updateFermataPublicSettingsInputSchema.parse({ expectedRevision, settings });
+    const body = updateFermataPublicSettingsInputSchema.parse({ expectedRevision, settings, secrets });
     return this.request(
       "settings/public",
       { method: "PUT", body: JSON.stringify(body) },

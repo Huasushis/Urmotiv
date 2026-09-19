@@ -155,13 +155,39 @@ export const fermataHealthSchema = z
 
 export type FermataHealth = z.infer<typeof fermataHealthSchema>;
 
+const fermataConnectionUrlSchema = z.string().trim().url().max(2_000).refine(value => {
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash;
+  } catch { return false; }
+}, "请填写不含账号、密码或查询参数的 HTTP/HTTPS 地址。");
+
+export const fermataModelSettingsSchema = z.object({
+  baseUrl: fermataConnectionUrlSchema,
+  model: z.string().trim().min(1).max(200),
+  temperature: z.number().min(0).max(2),
+  thinking: z.boolean()
+}).strict();
+export type FermataModelSettings = z.infer<typeof fermataModelSettingsSchema>;
+
+export const fermataSecretUpdateSchema = z.object({
+  modelApiKey: z.string().trim().max(4_096).refine(value => !/[\x00-\x20\x7f]/u.test(value), "密钥不能包含空白或控制字符。").optional(),
+  robotToken: z.string().trim().max(4_096).refine(value => !/[\x00-\x20\x7f]/u.test(value), "令牌不能包含空白或控制字符。").optional(),
+  clearModelApiKey: z.boolean().optional(),
+  clearRobotToken: z.boolean().optional()
+}).strict().refine(value => !(value.clearModelApiKey && value.modelApiKey) && !(value.clearRobotToken && value.robotToken),
+  "不能同时填写新密钥并要求清除它。");
+export type FermataSecretUpdate = z.infer<typeof fermataSecretUpdateSchema>;
+
 export const fermataPublicSettingsSchema = z
   .object({
     enabled: z.boolean(),
     pollingIntervalSeconds: z.number().int().min(5).max(3_600),
     maximumConcurrentTasks: z.number().int().min(1).max(32),
     modelProfileName: z.string().trim().min(1).max(120),
-    experimentVersion: z.string().trim().min(1).max(120)
+    experimentVersion: z.string().trim().min(1).max(120),
+    model: fermataModelSettingsSchema.optional(),
+    urmotivBaseUrl: fermataConnectionUrlSchema.optional()
   })
   .strict();
 
@@ -171,14 +197,16 @@ export const fermataPublicSettingsResponseSchema = z
   .object({
     settings: fermataPublicSettingsSchema,
     revision: z.number().int().positive(),
-    secretsConfigured: z.boolean()
+    secretsConfigured: z.boolean(),
+    credentialStatus: z.object({ modelApiKey: z.boolean(), robotToken: z.boolean() }).strict().optional()
   })
   .strict();
 
 export const updateFermataPublicSettingsInputSchema = z
   .object({
     expectedRevision: z.number().int().positive(),
-    settings: fermataPublicSettingsSchema
+    settings: fermataPublicSettingsSchema,
+    secrets: fermataSecretUpdateSchema.optional()
   })
   .strict();
 
