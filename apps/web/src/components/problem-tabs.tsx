@@ -17,6 +17,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { z } from "zod";
+import { importedReviewDataSchema, importedReviewItemType } from "@urmotiv/contracts";
 import type {
   Problem,
   ProblemJudgeConfig,
@@ -1012,6 +1013,7 @@ export function ReviewItemCard({
   const [expanded, setExpanded] = useState(defaultExpanded);
   const parsedAnklang =
     item.type === anklangSimilarityType ? anklangSimilarityDataSchema.safeParse(item.data) : null;
+  const imported = item.type === importedReviewItemType ? importedReviewDataSchema.safeParse(item.data) : null;
 
   return (
     <article className="analysis-item">
@@ -1028,6 +1030,19 @@ export function ReviewItemCard({
           </button>
           {expanded ? <AnklangCandidates data={parsedAnklang.data} /> : null}
         </>
+      ) : null}
+      {imported?.success ? (
+        <details className="candidate-statement">
+          <summary>查看完整历史审核（原题号 {imported.data.sourceNumber}）</summary>
+          <div className="candidate-statement-body">
+            {imported.data.sections.map((section, index) => (
+              <section key={index}>
+                <h3>{section.label}</h3>
+                {section.content ? <MarkdownPreview value={section.content} /> : <p className="text-faint">原记录未填写</p>}
+              </section>
+            ))}
+          </div>
+        </details>
       ) : null}
     </article>
   );

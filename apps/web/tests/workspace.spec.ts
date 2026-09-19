@@ -91,6 +91,33 @@ test("管理员可以在草稿审核页开关外部验题并保存", async ({ pa
   await page.screenshot({ path: testInfo.outputPath("external-review.png"), fullPage: true });
 });
 
+test("历史审核可以展开完整意见，未填写的评分不补默认值", async ({ page }, testInfo) => {
+  await loginAs(page, /组长/);
+  const tags = await (await page.request.get("/api/v1/tags")).json();
+  const tag = tags.items.find((item: { itemKind: string }) => item.itemKind === "tag");
+  const problem = await postJson(page, "/api/v1/problems", {
+    title: "历史审核展示测试", type: "traditional", tagIds: [tag.id],
+    content: { basicStatement: "输出一个整数。", basicSolution: "直接输出。" }
+  });
+  await postJson(page, `/api/v1/problems/${problem.id}/submit`, { expectedRevision: problem.revision });
+  await page.route(`**/api/v1/problems/${problem.id}/review-items`, (route) => route.fulfill({
+    json: { round: 1, items: [{ id: "history-fixture", type: "org.ustc.urmotiv.review.imported", source: "human",
+      visibility: "author", summary: "历史审核：大修后复验", createdAt: "2026-09-19T00:00:00Z",
+      data: { version: 1, sourceSha256: "a".repeat(64), sourceNumber: 59, conclusion: "C",
+        sections: [{ label: "正确性核验", content: "合成记录：需要补充边界情况。" },
+          { label: "建议难度", content: "" }, { label: "必须修改", content: "说明 **零值** 的处理。" }] }
+    }] }
+  }));
+  await page.goto(`/problems/${problem.id}`);
+  await page.getByRole("tab", { name: "审核记录" }).click();
+  await page.getByText("查看完整历史审核（原题号 59）").click();
+  await expect(page.getByText("合成记录：需要补充边界情况。")).toBeVisible();
+  await expect(page.getByText("原记录未填写")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "必须修改" })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("historical-review.png"), fullPage: true });
+});
+
 test("投稿人可以创建带 Markdown 内容的草稿并看到六个工作区标签", async ({ page }, testInfo) => {
   await loginAsAuthor(page);
   await page.getByRole("link", { name: "新建题目" }).click();

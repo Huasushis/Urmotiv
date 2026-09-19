@@ -9,6 +9,18 @@ export const reviewItemSourceSchema = z.enum(["human", "anklang", "fermata", "pl
 
 export const reviewItemVisibilitySchema = z.enum(["author", "reviewer", "administrator"]);
 
+export const importedReviewItemType = "org.ustc.urmotiv.review.imported";
+export const importedReviewDataSchema = z.object({
+  version: z.literal(1),
+  sourceSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  sourceNumber: z.number().int().positive(),
+  conclusion: z.enum(["A", "B", "C", "D"]),
+  sections: z.array(z.object({
+    label: z.string().min(1).max(100),
+    content: z.string().max(100_000)
+  }).strict()).min(1).max(32)
+}).strict();
+
 export const reviewItemViewSchema = z
   .object({
     id: z.string().min(1).max(200),
