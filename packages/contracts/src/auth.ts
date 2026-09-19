@@ -70,6 +70,10 @@ export const demoLoginInputSchema = z.object({
   userId: z.string().min(1)
 });
 export const emailRegistrationInputSchema = z.object({
+  username: z.string().trim().min(1).max(255).refine(
+    value => !/[\s@]/u.test(value) && !["root", "0"].includes(value.toLowerCase()),
+    "用户名不能包含空白或 @，也不能使用系统保留名称。"
+  ).optional(),
   email: z.string().trim().email().max(320),
   password: z.string().min(12).max(1024),
   nickname: z.string().trim().min(1).max(120)

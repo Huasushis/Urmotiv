@@ -23,6 +23,7 @@ import { DatabaseBatchAccountAuditWriter, type BatchAccountAuditWriter } from ".
 import { BatchAccountConflictError, normalizeUsernameKey } from "./batch-account";
 import {
   ExternalIdentityCollisionError,
+  UsernameUnavailableError,
   type BatchAccountCreationInput,
   type BatchAccountCreationResult,
   type DataStore,
@@ -1578,6 +1579,8 @@ export class DatabaseDataStore implements DataStore {
         AND lower(btrim(user_record.username)) = lower(btrim(${username}))
         AND user_record.account_type = 'human'
         AND user_record.disabled_at IS NULL
+        AND (NOT EXISTS (SELECT 1 FROM user_emails email WHERE email.user_id = user_record.id)
+          OR EXISTS (SELECT 1 FROM user_emails email WHERE email.user_id = user_record.id AND email.verified_at IS NOT NULL))
       LIMIT 1
     `);
     const row = rows[0];
@@ -1706,8 +1709,8 @@ export class DatabaseDataStore implements DataStore {
     try {
       return await this.handle.transaction(async (transaction) => {
         const inserted = await transaction.query<{ id: string }>(sql`
-          INSERT INTO users (nickname, account_type, password_hash)
-          VALUES (${input.nickname}, 'human', ${input.passwordHash})
+          INSERT INTO users (nickname, username, account_type, password_hash)
+          VALUES (${input.nickname}, ${input.username ?? null}, 'human', ${input.passwordHash})
           RETURNING id::text AS id
         `);
         const userId = inserted[0]?.id;
@@ -1742,6 +1745,12 @@ export class DatabaseDataStore implements DataStore {
       });
     } catch (error) {
       if (isUniqueViolation(error)) {
+        if (input.username !== undefined) {
+          const usernames = await this.handle.query<{ id: string }>(sql`
+            SELECT id::text AS id FROM users WHERE lower(btrim(username)) = lower(btrim(${input.username})) LIMIT 1
+          `);
+          if (usernames.length > 0) throw new UsernameUnavailableError();
+        }
         return undefined;
       }
       throw error;

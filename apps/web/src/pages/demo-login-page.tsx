@@ -29,6 +29,7 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
   const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [nickname, setNickname] = useState("");
+  const [username, setUsername] = useState("");
   const [registering, setRegistering] = useState(false);
   const [verificationPending, setVerificationPending] = useState(false);
   const auth = existingSession?.auth;
@@ -44,7 +45,7 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
     onSuccess: complete
   });
   const emailRegistrationAction = useMutation({
-    mutationFn: () => emailRegister({ email: identifier, password, nickname }),
+    mutationFn: () => emailRegister({ username, email: identifier, password, nickname }),
     onSuccess: () => setVerificationPending(true)
   });
   const resendAction = useMutation({
@@ -73,7 +74,11 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
             }
             accountLoginAction.mutate();
           }}>
-            {registering ? <label>昵称<input value={nickname} onChange={(event) => setNickname(event.target.value)} required maxLength={120} /></label> : null}
+            {registering ? <>
+              <label>用户名<input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required maxLength={255} pattern={"[^\\s@]+"} aria-describedby="registration-username-help" /></label>
+              <small id="registration-username-help">用户名可自由选择，不区分大小写。推荐使用学号时将字母全部大写；日后可在个人资料中另行绑定学校身份。</small>
+              <label>昵称<input value={nickname} onChange={(event) => setNickname(event.target.value)} required maxLength={120} /></label>
+            </> : null}
             <label>{registering ? "邮箱" : "用户名或邮箱"}<input type={registering ? "email" : "text"} autoComplete={registering ? "email" : "username"} value={identifier} onChange={(event) => setIdentifier(event.target.value)} required /></label>
             <label>密码<input type="password" autoComplete={registering ? "new-password" : "current-password"} value={password} onChange={(event) => setPassword(event.target.value)} required minLength={registering ? 12 : 8} /></label>
             <button type="submit" className="primary-button" disabled={accountLoginAction.isPending || emailRegistrationAction.isPending}>{registering ? "发送验证邮件" : "登录"}</button>

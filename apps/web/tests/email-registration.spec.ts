@@ -9,7 +9,7 @@ test("邮箱注册入口、发送提示和链接确认在桌面与手机可用",
   let registrations = 0;
   await page.route("**/api/v1/auth/email-register", async (route) => {
     expect(route.request().postDataJSON()).toEqual({
-      email: "registration@example.test", password: "synthetic-password-123", nickname: "注册测试"
+      username: "自由Alias", email: "registration@example.test", password: "synthetic-password-123", nickname: "注册测试"
     });
     registrations += 1;
     await route.fulfill({ status: 202, json: { ok: true, verificationPending: true } });
@@ -17,6 +17,7 @@ test("邮箱注册入口、发送提示和链接确认在桌面与手机可用",
   await page.goto("/login");
   await expect(page.getByRole("button", { name: /统一身份/ })).toHaveCount(0);
   await page.getByRole("button", { name: "注册新账号" }).click();
+  await page.getByLabel("用户名", { exact: true }).fill("自由Alias");
   await page.getByLabel("昵称", { exact: true }).fill("注册测试");
   await page.getByLabel("邮箱", { exact: true }).fill("registration@example.test");
   await page.getByLabel("密码", { exact: true }).fill("synthetic-password-123");

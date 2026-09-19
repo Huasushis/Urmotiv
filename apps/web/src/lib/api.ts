@@ -287,6 +287,7 @@ export function accountLogin(input: { identifier: string; password: string }): P
 }
 
 export function emailRegister(input: {
+  username?: string;
   email: string;
   password: string;
   nickname: string;

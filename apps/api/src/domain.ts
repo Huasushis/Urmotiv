@@ -14,7 +14,7 @@ export interface StoredUser extends UserSummary {
   roles: string[];
   grants: PermissionGrant[];
   isRoot: boolean;
-  /** 由 USTC OAuth2 学工号映射来的用户名；仅本人可见。 */
+  /** 本地唯一用户名，与第三方身份编号分离。 */
   username?: string | null;
   /** 由 USTC OAuth2 姓名映射来的真实姓名；仅本人可见。 */
   realName?: string | null;

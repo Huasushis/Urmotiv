@@ -16,7 +16,7 @@ export const profileViewSchema = z.object({
   id: z.string(),
   nickname: z.string(),
   accountType: profileAccountTypeSchema,
-  /** 由统一身份认证学工号映射来的用户名；仅本人可见，其他用户永远看不到。 */
+  /** 本地唯一用户名，可在注册时选择，与第三方身份编号分离。 */
   username: z.string().nullable(),
   /** 由统一身份认证姓名映射来的真实姓名；仅本人可见。 */
   realName: z.string().nullable(),

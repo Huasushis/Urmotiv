@@ -75,7 +75,7 @@ describe("题目 API", () => {
       method: "POST",
       url: "/api/v1/auth/email-register",
       headers: { origin: localOrigin },
-      payload: { email: "new.user@example.test", password: "safe-password-123", nickname: "新用户" }
+      payload: { username: "自由Alias", email: "new.user@example.test", password: "safe-password-123", nickname: "新用户" }
     });
     expect(registration.statusCode).toBe(202);
     expect(registration.json()).toEqual({ ok: true, verificationPending: true });
@@ -100,6 +100,9 @@ describe("题目 API", () => {
     });
     expect(unverifiedLogin.statusCode).toBe(401);
     expect(unverifiedLogin.headers["set-cookie"]).toBeUndefined();
+    const unverifiedUsername = await app.inject({ method: "POST", url: "/api/v1/auth/username-login",
+      headers: { origin: localOrigin }, payload: { username: "自由alias", password: "safe-password-123" } });
+    expect(unverifiedUsername.statusCode).toBe(401);
 
     const verify = await app.inject({
       method: "POST",
@@ -108,6 +111,14 @@ describe("题目 API", () => {
       payload: { token }
     });
     expect(verify.statusCode).toBe(200);
+    const usernameLogin = await app.inject({ method: "POST", url: "/api/v1/auth/username-login",
+      headers: { origin: localOrigin }, payload: { username: "自由alias", password: "safe-password-123" } });
+    expect(usernameLogin.statusCode).toBe(200);
+    const collision = await app.inject({ method: "POST", url: "/api/v1/auth/email-register",
+      headers: { origin: localOrigin }, payload: { username: "自由ALIAS", email: "other@example.test", password: "safe-password-456", nickname: "重复用户名" } });
+    expect(collision.statusCode).toBe(409);
+    expect(collision.json().error.code).toBe("USERNAME_UNAVAILABLE");
+    expect(outbox.messages).toHaveLength(1);
     const replay = await app.inject({
       method: "POST",
       url: "/api/v1/auth/email-verification/verify",

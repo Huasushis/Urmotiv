@@ -202,10 +202,15 @@ export interface RootCredential {
 export type EmailCredential = RootCredential;
 
 export interface EmailRegistration {
+  readonly username?: string;
   readonly normalizedEmail: string;
   readonly displayEmail: string;
   readonly passwordHash: string;
   readonly nickname: string;
+}
+
+export class UsernameUnavailableError extends Error {
+  public constructor() { super("用户名不可用，请换一个。"); }
 }
 
 export interface BatchAccountCreationInput {
@@ -577,14 +582,18 @@ export class InMemoryDataStore implements DataStore {
 
 
   public async registerEmailUser(input: EmailRegistration): Promise<StoredUser | undefined> {
-    if (this.emailCredentials.has(input.normalizedEmail)) {
-      return undefined;
+    if (input.username !== undefined && [...this.users.values()].some(
+      user => user.username !== null && user.username !== undefined && normalizeUsernameKey(user.username) === normalizeUsernameKey(input.username!)
+    )) {
+      throw new UsernameUnavailableError();
     }
+    if (this.emailCredentials.has(input.normalizedEmail)) return undefined;
     const defaultRoleKey = this.defaultRoleKey("human");
     const defaultRole = this.defaultRoleDefinition("human");
     const user: StoredUser = {
       id: String(this.nextUserId++),
       nickname: input.nickname,
+      username: input.username ?? null,
       accountType: "human",
       disabled: false,
       roles: [defaultRole?.displayName ?? defaultRoleKey],

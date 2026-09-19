@@ -103,7 +103,7 @@ import {
   createProblemVisibility,
   hasPermission,
 } from "./permissions";
-import { InMemoryDataStore, type DataStore } from "./repository";
+import { InMemoryDataStore, UsernameUnavailableError, type DataStore } from "./repository";
 import {
   createEmailVerificationUrl,
   SmtpEmailVerificationDelivery,
@@ -756,6 +756,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     }
     if (error instanceof ApiError) {
       sendError(reply, request.id, error);
+      return;
+    }
+    if (error instanceof UsernameUnavailableError) {
+      sendError(reply, request.id, new ApiError(409, "USERNAME_UNAVAILABLE", "用户名不可用，请换一个。"));
       return;
     }
 
@@ -1745,6 +1749,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     const input = emailRegistrationInputSchema.strict().parse(request.body);
     const normalizedEmail = normalizeEmail(input.email);
     const user = await dependencies.store.registerEmailUser({
+      ...(input.username === undefined ? {} : { username: input.username }),
       normalizedEmail,
       displayEmail: input.email.trim(),
       passwordHash: await hashPassword(input.password),
