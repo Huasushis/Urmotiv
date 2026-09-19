@@ -755,6 +755,7 @@ async function insertProblemRevision(
       solution,
       hints,
       judge_config,
+      format_extensions,
       changed_fields,
       content_hash,
       change_reason,
@@ -780,6 +781,10 @@ async function insertProblemRevision(
       ${problem.content.solution},
       ${problem.content.hints},
       ${JSON.stringify(problem.judgeConfig ?? {})}::jsonb,
+      COALESCE((
+        SELECT format_extensions FROM problem_revisions
+        WHERE id = ${previousRevisionId ?? null}::uuid AND problem_id = ${problemId}
+      ), '{}'::jsonb),
       '[]'::jsonb,
       ${contentHash(problem)},
       ${changeReason},
@@ -911,16 +916,10 @@ export async function createTagCatalogProblemRevision(
     "知识点目录停用管理修订",
     problem.revisionId,
   );
-  // Package format extensions belong to the immutable revision as well. They
-  // are not part of StoredProblem, so copy them explicitly instead of silently
-  // resetting them on this administrative metadata-only revision.
   await executor.execute(sql`
-    UPDATE problem_revisions next_revision
-    SET format_extensions = previous_revision.format_extensions,
-        changed_fields = '["tagIds"]'::jsonb
-    FROM problem_revisions previous_revision
-    WHERE next_revision.id = ${revisionId}::uuid
-      AND previous_revision.id = ${problem.revisionId}::uuid
+    UPDATE problem_revisions
+    SET changed_fields = '["tagIds"]'::jsonb
+    WHERE id = ${revisionId}::uuid
   `);
   const updated = await executor.query<{ id: string }>(sql`
     UPDATE problems

@@ -125,6 +125,39 @@ describe("数据库用户加载", () => {
 });
 
 describe("数据库题目仓库", () => {
+  it("编辑导入题目时保留格式扩展，越权和过期保存不产生新修订", async () => {
+    const database = await openDatabase(true);
+    const store = new DatabaseDataStore(database);
+    const service = new ProblemService(store);
+    const author = requireUser(await store.getUser(databaseDemoUserIds.author));
+    const denied = requireUser(await store.getUser(databaseDemoUserIds.denied));
+    const extensions = { "synthetic.format": { sourceId: "example-source", extra: [1, 2] } };
+    const created = await store.createProblemWithRevisionAction(problem(), async (revisionId, transaction) => {
+      await transaction.execute(sql`
+        UPDATE problem_revisions SET format_extensions = ${JSON.stringify(extensions)}::jsonb
+        WHERE id = ${revisionId}::uuid
+      `);
+    });
+    await expect(service.updateProblem(denied, created.id, {
+      expectedRevision: 1, title: "不能保存的名称"
+    })).rejects.toMatchObject({ statusCode: 404 });
+    const updated = await service.updateProblem(author, created.id, {
+      expectedRevision: 1, title: "修改后的合成题名"
+    });
+    expect(updated.revision).toBe(2);
+    await expect(service.updateProblem(author, created.id, {
+      expectedRevision: 1, title: "过期保存"
+    })).rejects.toMatchObject({ statusCode: 409 });
+    const revisions = await database.query<{ revision: number; format_extensions: unknown }>(sql`
+      SELECT revision, format_extensions FROM problem_revisions
+      WHERE problem_id = ${BigInt(created.id)} ORDER BY revision
+    `);
+    expect(revisions).toEqual([
+      { revision: 1, format_extensions: extensions },
+      { revision: 2, format_extensions: extensions }
+    ]);
+  });
+
   it("只把启用叶子作为可选知识点，并返回所属分类", async () => {
     const database = await openDatabase(true);
     const store = new DatabaseDataStore(database);
