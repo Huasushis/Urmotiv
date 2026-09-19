@@ -133,7 +133,7 @@ export function AdminPage({
   if (resolvedSection === "plugins") {
     return (
       <AdminLayout session={session} title="插件" description="管理已安装插件及各插件相互隔离的设置和密钥。">
-        {canManagePlugins ? <PluginSection key={session.id} currentUserId={session.id} /> : <AdminNotFound />}
+        {canManagePlugins ? <PluginSection key={session.id} currentUserId={session.id} permissions={session.permissions} /> : <AdminNotFound />}
       </AdminLayout>
     );
   }
@@ -437,9 +437,11 @@ function ReviewPolicySection({ currentUserId }: { currentUserId: string }) {
 
 function PluginSection({
   currentUserId,
+  permissions,
   onOpenReviewPolicy
 }: {
   currentUserId: string;
+  permissions: readonly string[];
   onOpenReviewPolicy?: (() => void) | undefined;
 }) {
   const client = useQueryClient();
@@ -562,6 +564,7 @@ function PluginSection({
         <PluginEditor
           key={selected.id}
           plugin={selected}
+          permissions={permissions}
           onSaved={replacePlugin}
           onReload={reloadPlugin}
           onAccessDenied={() => {
@@ -578,12 +581,14 @@ function PluginSection({
 
 function PluginEditor({
   plugin,
+  permissions,
   onSaved,
   onReload,
   onAccessDenied,
   onOpenReviewPolicy,
 }: {
   plugin: AdminPlugin;
+  permissions: readonly string[];
   onSaved: (plugin: AdminPlugin) => void;
   onReload: (pluginId: string) => Promise<AdminPlugin | undefined>;
   onAccessDenied: () => void;
@@ -728,6 +733,14 @@ function PluginEditor({
         </label>
         <small>停用后，插件提供的检查或外部服务连接不会继续运行。</small>
       </div>
+
+      {saved.state === "enabled" ? (
+        <div className="button-row">
+          {(saved.managementLinks ?? []).filter((link) => link.requiredPermissions.every((permission) => permissions.includes(permission))).map((link) => (
+            <Link key={link.href} to={link.href} className="secondary-button compact-button">{link.label}</Link>
+          ))}
+        </div>
+      ) : null}
 
       {saved.settingsManagedBy === "review_policy" ? (
         <div className="admin-managed-elsewhere">

@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import {
   pluginSettingsFormSchema,
+  pluginManagementLinkSchema,
   type AdminPlugin,
   type ParsedUpdatePluginInput,
   type PluginSettingsFormSchema
@@ -187,6 +188,8 @@ export interface TrustedPluginDefinition {
   /** A local build path or package name. It is shown to administrators, not fetched. */
   readonly source: string;
   readonly settingsSchema?: unknown;
+  /** 插件声明已编译的站内管理入口；不加载远程代码。 */
+  readonly managementLinks?: NonNullable<AdminPlugin["managementLinks"]>;
   /** Settings descriptions for review rules registered by this plugin. */
   readonly reviewRuleSettingsSchemas?: Readonly<Record<string, unknown>>;
   /** Names of encrypted credentials the plugin is allowed to request. */
@@ -201,6 +204,7 @@ export interface TrustedPluginDefinition {
 }
 
 interface RegisteredPlugin {
+  readonly managementLinks: NonNullable<AdminPlugin["managementLinks"]>;
   readonly manifest: PluginManifest;
   readonly source: string;
   readonly settingsSchema: PluginSettingsFormSchema | undefined;
@@ -270,6 +274,7 @@ export class TrustedPluginHost {
         this.#registry.registerPluginHooks(manifest.id, () => definition.registerHooks!(this.#registry));
       }
       this.#plugins.set(manifest.id, {
+        managementLinks: z.array(pluginManagementLinkSchema).max(10).parse(definition.managementLinks ?? []),
         manifest,
         source: definition.source,
         settingsSchema,
@@ -701,7 +706,8 @@ function toAdminPlugin(
       ...definition,
       configured: storedSecrets.has(definition.name)
     })),
-    requiresRestart: registered.requiresRestart
+    requiresRestart: registered.requiresRestart,
+    managementLinks: stored?.state === "enabled" ? [...registered.managementLinks] : []
   };
 }
 

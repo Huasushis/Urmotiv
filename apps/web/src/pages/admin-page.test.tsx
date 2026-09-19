@@ -254,6 +254,18 @@ describe("管理页面", () => {
     expect(view.textContent).not.toContain("正在读取审核规则");
   });
 
+  it.each([
+    ["enabled", ["plugin.manage", "system.manage"], true],
+    ["enabled", ["plugin.manage"], false],
+    ["disabled", ["plugin.manage", "system.manage"], false]
+  ] as const)("插件自己的管理入口按启用状态和权限显示 %s %j", async (state, permissions, visible) => {
+    api.listAdminPlugins.mockResolvedValue({ items: [{ ...plugin, state, managementLinks: [{ label: "打开测试服务", href: "/admin/example", requiredPermissions: ["system.manage"] }] }] });
+    const view = mount(<AdminPage session={session({ canManagePlugins: true, permissions: [...permissions] })} />);
+    await waitFor(() => expect(view.textContent).toContain("服务地址"));
+    expect(view.querySelector('a[href="/admin/example"]') !== null).toBe(visible);
+    expect(view.querySelector('.admin-section-nav a[href="/admin/example"]')).toBeNull();
+  });
+
   it("只有插件权限时不读取审核规则且不回显完整密钥", async () => {
     api.listAdminPlugins.mockResolvedValue({ items: [plugin] });
     const view = mount(<AdminPage session={session({ canManagePlugins: true })} />);
@@ -464,11 +476,10 @@ describe("管理页面", () => {
       expect.objectContaining({ href: "/admin/audit", text: expect.stringContaining("审计") }),
       expect.objectContaining({ href: "/admin/oauth", text: expect.stringContaining("统一身份认证") }),
       expect.objectContaining({ href: "/admin/plugins", text: expect.stringContaining("插件") }),
-      expect.objectContaining({ href: "/admin/fermata", text: expect.stringContaining("Fermata") }),
       expect.objectContaining({ href: "/admin/knowledge", text: expect.stringContaining("知识点") }),
       expect.objectContaining({ href: "/problems", text: expect.stringContaining("题库") })
     ]));
-    expect(links.some((link) => link.href === "/admin/fermata")).toBe(true);
+    expect(links.some((link) => link.href === "/admin/fermata")).toBe(false);
     const sectionLinks = [...view.querySelectorAll<HTMLAnchorElement>(".admin-section-nav a")];
     expect(new Set(sectionLinks.map((link) => link.getAttribute("href"))).size).toBe(sectionLinks.length);
   });

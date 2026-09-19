@@ -556,6 +556,34 @@ test("手机视口中的审核规则没有横向溢出", async ({ page }, testIn
   await page.screenshot({ path: testInfo.outputPath("admin-review-mobile.png"), fullPage: true });
 });
 
+test("插件管理入口随插件启用显示，不进入通用导航", async ({ page }, testInfo) => {
+  let enabled = true;
+  await page.route("**/api/v1/admin/plugins", async (route) => {
+    await fulfillJson(route, { items: [{
+      ...plugin,
+      id: "org.ustc.urmotiv.fermata-control",
+      name: "Fermata 审核服务管理",
+      state: enabled ? "enabled" : "disabled",
+      settings: { baseUrl: "http://fermata.internal:8720" },
+      settingsSchema: { type: "object", properties: { baseUrl: { type: "string", title: "服务地址" } } },
+      secrets: [],
+      managementLinks: enabled ? [{ label: "管理审核服务", href: "/admin/fermata", requiredPermissions: ["plugin.manage", "system.manage"] }] : []
+    }] });
+  });
+  await loginAs(page, /系统管理员/);
+  await page.goto("/admin/plugins");
+  const link = page.getByRole("link", { name: "管理审核服务", exact: true });
+  await expect(link).toBeVisible();
+  await expect(link).toHaveAttribute("href", "/admin/fermata");
+  await expect(page.locator('.admin-section-nav a[href="/admin/fermata"]')).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath(`plugin-management-${testInfo.project.name}.png`), fullPage: true });
+  enabled = false;
+  await page.reload();
+  await expect(page.getByLabel("启用这个插件")).not.toBeChecked();
+  await expect(link).toHaveCount(0);
+});
+
 test("Fermata 独立管理页展示运行状态、模型配置说明且没有横向溢出", async ({ page }, testInfo) => {
   const settings = {
     enabled: true,

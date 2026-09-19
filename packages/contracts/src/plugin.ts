@@ -300,6 +300,12 @@ export const pluginSecretStatusSchema = z
   })
   .strict();
 
+export const pluginManagementLinkSchema = z.object({
+  label: z.string().trim().min(1).max(120),
+  href: z.string().regex(/^\/admin\/[a-z0-9/-]+$/),
+  requiredPermissions: z.array(z.string().min(1).max(160)).max(20)
+}).strict();
+
 export const adminPluginSchema = z
   .object({
     id: pluginIdSchema,
@@ -315,7 +321,8 @@ export const adminPluginSchema = z
     reviewRuleIds: z.array(z.string().min(1).max(160)).max(100),
     settingsRevision: z.number().int().positive(),
     secrets: z.array(pluginSecretStatusSchema),
-    requiresRestart: z.boolean()
+    requiresRestart: z.boolean(),
+    managementLinks: z.array(pluginManagementLinkSchema).max(10).optional()
   })
   .strict();
 

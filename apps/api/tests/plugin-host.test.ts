@@ -61,6 +61,19 @@ function createHost() {
 }
 
 describe("插件宿主", () => {
+  it("管理入口由插件声明，只对已启用插件返回", async () => {
+    const managementLinks = [{ label: "打开管理页", href: "/admin/example", requiredPermissions: ["system.manage"] }];
+    const host = new TrustedPluginHost([{ source: "builtin:test", manifest, managementLinks }], new InMemoryPluginStore());
+    await host.initialize();
+    expect((await host.list())[0]?.managementLinks).toEqual([]);
+    const enabled = await host.update(manifest.id, { expectedRevision: 1, state: "enabled", clearSecrets: [] }, "9", "00000000-0000-4000-8000-000000000031");
+    expect(enabled?.managementLinks).toEqual(managementLinks);
+    const disabled = await host.update(manifest.id, { expectedRevision: enabled!.settingsRevision, state: "disabled", clearSecrets: [] }, "9", "00000000-0000-4000-8000-000000000032");
+    expect(disabled?.managementLinks).toEqual([]);
+  });
+  it.each(["https://example.test/admin", "//example.test/admin", "javascript:alert(1)", "/admin/../secrets"])("拒绝非站内管理路径 %s", (href) => {
+    expect(() => new TrustedPluginHost([{ source: "builtin:test", manifest, managementLinks: [{ label: "无效入口", href, requiredPermissions: [] }] }], new InMemoryPluginStore())).toThrow();
+  });
   it("只发现已启用且安装身份未改变的内置题目格式", async () => {
     const formatAdapter = {
       id: "fixture-format",

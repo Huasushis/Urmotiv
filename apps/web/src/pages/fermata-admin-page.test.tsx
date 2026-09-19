@@ -103,6 +103,6 @@ describe("Fermata 管理页面", () => {
     expect(container.textContent).toContain("*_BASE_URL");
     expect(container.textContent).toContain("*_API_KEY");
     expect(container.textContent).toContain("FERMATA_MANAGEMENT_TOKEN");
-    expect(container.querySelector('a[href="/admin/fermata"]')?.classList.contains("active")).toBe(true);
+    expect(container.querySelector('.admin-section-nav a[href="/admin/fermata"]')).toBeNull();
   });
 });

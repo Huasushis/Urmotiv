@@ -4,6 +4,11 @@
 
 ## 1. 版本和清单
 
+需要独立管理页时，可以在服务端 `TrustedPluginDefinition` 中声明 `managementLinks`：
+`[{ label: "管理服务", href: "/admin/example", requiredPermissions: ["system.manage"] }]`。
+入口只支持已编译的站内 `/admin/` 页面，插件启用且当前用户具备所需权限时才显示在该插件的设置卡片中；通用管理导航不内置具体服务名称。
+这只是页面入口声明，不会自动创建路由或授予权限；目标页面和服务端接口仍须独立检查权限，机器人固定禁止及明确拒绝规则不变。
+
 当前插件 SDK API 版本为字符串 `"1"`。清单由 `@urmotiv/plugin-sdk` 的 `pluginManifestSchema` 严格校验：
 
 | 字段 | 规则 |

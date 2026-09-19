@@ -218,6 +218,7 @@ export function createBuiltinPluginDefinitions(
     },
     {
       source: "builtin:fermata-control",
+      managementLinks: [{ label: "管理审核服务", href: "/admin/fermata", requiredPermissions: ["plugin.manage", "system.manage"] }],
       manifest: {
         id: fermataPluginId, name: "Fermata 审核服务管理", version: "0.1.0", apiVersion: "1",
         serverEntry: "dist/index.js", permissions: ["org.ustc.urmotiv.fermata-control.status.read", "org.ustc.urmotiv.fermata-control.configure"], settingsSchema: "settings.schema.json"

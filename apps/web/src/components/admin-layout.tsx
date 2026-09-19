@@ -103,10 +103,7 @@ export function adminNavigationGroups(session: SessionUser): AdminNavigationGrou
     {
       label: "扩展",
       items: [
-        ...(canManagePlugins ? [{ to: "/admin/plugins", label: "插件" }] : []),
-        ...(canManagePlugins && canManageSystem
-          ? [{ to: "/admin/fermata", label: "Fermata 审核服务" }]
-          : [])
+        ...(canManagePlugins ? [{ to: "/admin/plugins", label: "插件" }] : [])
       ]
     }
   ].filter((group) => group.items.length > 0);
