@@ -14,6 +14,10 @@ import {
   type StoredUstcOAuthSettings
 } from "../src/admin-service";
 import { AesGcmPluginSecretBox } from "../src/plugin-host";
+import { corePermissions } from "@urmotiv/contracts";
+import { DatabaseRoleManagementStore } from "../src/admin-role-service";
+import { loadUsers } from "../src/database-store";
+import { hasPermission } from "../src/permissions";
 
 let database: LocalDatabaseHandle;
 let temporaryDirectory = "";
@@ -31,6 +35,21 @@ afterEach(async () => {
 });
 
 describe("管理员设置修订号隔离", () => {
+  it("角色目录保留 own 权限，root 展示和实际授权包含完整核心目录", async () => {
+    const roles = await new DatabaseRoleManagementStore(database).listRoles();
+    const root = roles.find(role => role.key === "root")!;
+    expect(root.permissions.map(permission => permission.name).sort()).toEqual([...corePermissions].sort());
+    expect(roles.find(role => role.key === "contributor")!.permissions).toEqual(expect.arrayContaining([
+      { name: "problem.view.own", effect: "allow" },
+      { name: "problem.edit.own", effect: "allow" },
+      { name: "problem.delete.own", effect: "allow" }
+    ]));
+    const user = (await loadUsers(database, [0n]))[0]!;
+    for (const permission of corePermissions) {
+      expect(hasPermission(user, permission, { ownerId: user.id }), permission).toBe(true);
+    }
+  });
+
   it("数据库尚未保存公开地址时使用当前部署的 Web origin", async () => {
     const store = new DatabaseAdminSettingsStore(
       database,

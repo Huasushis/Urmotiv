@@ -94,7 +94,7 @@ afterEach(async () => {
 });
 
 describe("管理员权限提升攻击红测", () => {
-  it("拒绝超出调用者 allow ceiling 的权限授予", async () => {
+  it("权限管理员可定义超出自身业务权限的权限组", async () => {
     const manager = restrictedManager();
     const app = await makeApp([manager]);
     openApps.push(app);
@@ -111,8 +111,8 @@ describe("管理员权限提升攻击红测", () => {
         userIds: []
       }
     });
-    expect(response.statusCode).toBe(403);
-    expect(response.json().error.code).toBe("ROLE_PERMISSION_CEILING");
+    expect(response.statusCode).toBe(201);
+    expect(response.json().role.permissions).toEqual([{ name: "problem.view.all", effect: "allow" }]);
   });
 
   it("忽略 own/object 作用域的 allow，不能扩大为全局角色权限", async () => {
@@ -135,11 +135,11 @@ describe("管理员权限提升攻击红测", () => {
           displayName: "作用域权限",
           description: "",
           permissions: [{ name: "problem.view.all", effect: "allow" }],
-          userIds: []
+          userIds: [manager.id]
         }
       });
       expect(response.statusCode).toBe(403);
-      expect(response.json().error.code).toBe("ROLE_PERMISSION_CEILING");
+      expect(response.json().error.code).toBe("ROLE_SELF_ESCALATION");
     }
   });
 
@@ -165,11 +165,11 @@ describe("管理员权限提升攻击红测", () => {
         displayName: "过期权限",
         description: "",
         permissions: [{ name: "problem.view.all", effect: "allow" }],
-        userIds: []
+        userIds: [manager.id]
       }
     });
     expect(response.statusCode).toBe(403);
-    expect(response.json().error.code).toBe("ROLE_PERMISSION_CEILING");
+    expect(response.json().error.code).toBe("ROLE_SELF_ESCALATION");
   });
 
   it("拒绝绕过调用者对权限的明确 deny", async () => {
@@ -192,7 +192,7 @@ describe("管理员权限提升攻击红测", () => {
         displayName: "绕过拒绝",
         description: "",
         permissions: [{ name: "problem.view.all", effect: "allow" }],
-        userIds: []
+        userIds: [manager.id]
       }
     });
     expect(response.statusCode).toBe(403);
@@ -220,7 +220,7 @@ describe("管理员权限提升攻击红测", () => {
         displayName: "明确拒绝",
         description: "",
         permissions: [{ name: "problem.view.all", effect: "allow" }],
-        userIds: []
+        userIds: [manager.id]
       }
     });
     expect(response.statusCode).toBe(403);
@@ -248,7 +248,7 @@ describe("管理员权限提升攻击红测", () => {
       }
     });
     expect(response.statusCode).toBe(403);
-    expect(response.json().error.code).toBe("ROLE_PERMISSION_CEILING");
+    expect(response.json().error.code).toBe("ROLE_SELF_ESCALATION");
   });
 
   it("拒绝把高权限内置角色分配给调用者", async () => {
@@ -277,7 +277,7 @@ describe("管理员权限提升攻击红测", () => {
       }
     });
     expect(response.statusCode).toBe(403);
-    expect(response.json().error.code).toBe("ROLE_PERMISSION_CEILING");
+    expect(response.json().error.code).toBe("ROLE_SELF_ESCALATION");
   });
 
   it("root 成员固定为 bootstrap root，root 账号不能进入其他角色", async () => {

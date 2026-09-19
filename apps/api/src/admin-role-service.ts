@@ -74,7 +74,7 @@ export function createAdminRoleMutationContext(
   auditActorUserId?: string
 ): AdminRoleMutationContext {
   const actorAllowCeiling = corePermissions.filter((permission) =>
-    hasPermission(user, permission, {}, now)
+    hasPermission(user, permission, permission.endsWith(".own") ? { ownerId: user.id } : {}, now)
   );
   const actorDeniedPermissions = [
     ...new Set(
@@ -118,21 +118,18 @@ export function assertRoleMutationSafety(
   )) {
     throw new ApiError(403, "ROLE_ROOT_MEMBERSHIP", "root 角色成员固定为 bootstrap root 账号。");
   }
-  if (!actorIsRoot && (
-    role?.key === "root" ||
-    input.permissions.some((permission) => permission.name === "user.impersonate")
-  )) {
+  if (!actorIsRoot && role?.key === "root") {
     throw new ApiError(403, "ROLE_ROOT_PRIVILEGE", "只有 root 可以管理 root 等价权限。");
   }
   const allowCeiling = new Set(context.actorAllowCeiling);
   const explicitDenies = new Set(context.actorDeniedPermissions);
   for (const permission of input.permissions) {
     if (permission.effect !== "allow") continue;
-    if (explicitDenies.has(permission.name)) {
+    if (memberIds.includes(context.actorUserId) && explicitDenies.has(permission.name)) {
       throw new ApiError(403, "ROLE_PERMISSION_DENIED", "不能通过角色绕过调用者已有的明确拒绝。");
     }
-    if (!allowCeiling.has(permission.name)) {
-      throw new ApiError(403, "ROLE_PERMISSION_CEILING", "角色权限不能超出调用者当前的允许权限上限。");
+    if (memberIds.includes(context.actorUserId) && !allowCeiling.has(permission.name)) {
+      throw new ApiError(403, "ROLE_SELF_ESCALATION", "不能通过编辑自己的权限组提升自身权限，请由另一位管理员授权。");
     }
   }
 }
@@ -340,7 +337,7 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
         FROM permission_grants
         WHERE subject_role_id IS NOT NULL AND revoked_at IS NULL
           AND (expires_at IS NULL OR expires_at > now())
-          AND scope = 'global'
+          AND scope IN ('global', 'own')
         ORDER BY subject_role_id, permission_name, effect
       `),
       this.database.query<MemberRow>(sql`
@@ -558,7 +555,7 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
           id, subject_role_id, permission_name, effect, scope, granted_by_user_id, reason
         ) VALUES (
           ${randomUUID()}::uuid, ${roleId}::uuid, ${permission.name}, ${permission.effect}::permission_effect,
-          'global'::permission_scope, ${actorId}, ${`管理员角色设置（${requestId}）`}
+          ${permission.name.endsWith(".own") ? "own" : "global"}::permission_scope, ${actorId}, ${`管理员角色设置（${requestId}）`}
         )
       `);
     }
@@ -600,7 +597,7 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
         SELECT subject_role_id::text AS role_id, permission_name, effect
         FROM permission_grants
         WHERE subject_role_id = ${roleId}::uuid AND revoked_at IS NULL
-          AND (expires_at IS NULL OR expires_at > now()) AND scope = 'global'
+          AND (expires_at IS NULL OR expires_at > now()) AND scope IN ('global', 'own')
         ORDER BY permission_name, effect
       `),
       executor.query<MemberRow>(sql`

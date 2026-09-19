@@ -83,7 +83,7 @@ describe("P1 root identity and permission model", () => {
     expect(anonymous.json()).not.toHaveProperty("items");
   });
 
-  it("root can switch once, see actor/effective identity, and exit", async () => {
+  it("switching uses only target permissions and exiting requires a fresh login", async () => {
     const app = await makeApp();
     const rootCookie = await login(app, "0");
     const switched = await app.inject({
@@ -108,6 +108,9 @@ describe("P1 root identity and permission model", () => {
     });
     expect(switchedSession.statusCode).toBe(200);
     expect(switchedSession.json().identity).toEqual(switched.json().identity);
+    expect(switchedSession.json().user.permissions).not.toContain("system.manage");
+    expect((await app.inject({ method: "GET", url: "/api/v1/admin/settings", headers: { cookie: switchedCookie } })).statusCode).toBe(404);
+    expect((await app.inject({ method: "GET", url: "/api/v1/session", headers: { cookie: rootCookie } })).json().user).toBeNull();
     const nested = await app.inject({
       method: "POST",
       url: "/api/v1/auth/switch-account",
@@ -123,8 +126,9 @@ describe("P1 root identity and permission model", () => {
       headers: { cookie: switchedCookie, origin }
     });
     expect(exited.statusCode).toBe(200);
-    expect(exited.json().identity.effective.id).toBe("0");
-    const exitedCookie = (exited.headers["set-cookie"] as string).split(";", 1)[0]!;
+    expect(exited.json().user).toBeNull();
+    expect((await app.inject({ method: "GET", url: "/api/v1/session", headers: { cookie: switchedCookie } })).json().user).toBeNull();
+    const exitedCookie = await login(app, "0");
     const audit = await app.inject({
       method: "GET",
       url: "/api/v1/admin/audit?page=1&pageSize=20",
@@ -152,6 +156,28 @@ describe("P1 root identity and permission model", () => {
       });
       expect(deniedTarget.statusCode).toBe(404);
       expect(deniedTarget.json().error.code).toBe("NOT_FOUND");
+    }
+  });
+
+  it("an explicitly authorized administrator can switch, while an explicit deny still wins", async () => {
+    for (const denied of [false, true]) {
+      const users = createDemoUsers();
+      const admin = users.find(user => user.id === "administrator")!;
+      admin.grants = [...admin.grants, { permission: "user.impersonate", effect: "allow", scope: "global" },
+        ...(denied ? [{ permission: "user.impersonate", effect: "deny" as const, scope: "global" as const }] : [])];
+      const app = await createApp({ store: new InMemoryDataStore(users, demoTags), demoAuthEnabled: true,
+        demoUserIds: users.map(user => user.id), allowedOrigins: [origin], secureCookies: true });
+      openApps.push(app);
+      const cookie = await login(app, "administrator");
+      const switched = await app.inject({ method: "POST", url: "/api/v1/auth/switch-account",
+        headers: { cookie, origin }, payload: { targetUserId: "author" } });
+      expect(switched.statusCode).toBe(denied ? 404 : 200);
+      if (!denied) {
+        const targetCookie = (switched.headers["set-cookie"] as string).split(";", 1)[0]!;
+        const session = await app.inject({ method: "GET", url: "/api/v1/session", headers: { cookie: targetCookie } });
+        expect(session.json().user.id).toBe("author");
+        expect(session.json().user.permissions).not.toContain("system.manage");
+      }
     }
   });
 

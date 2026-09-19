@@ -828,8 +828,6 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     if (session.impersonatorUserId !== undefined && session.impersonatorUserId !== null) {
       actor = (await dependencies.store.getUser(session.impersonatorUserId)) ?? user;
       if (
-        actor.id !== "0" ||
-        !actor.isRoot ||
         actor.accountType !== "human" ||
         actor.id === user.id ||
         user.accountType !== "human" ||
@@ -1111,8 +1109,6 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       throw new ApiError(409, "IMPERSONATION_NESTED", "不能在已切换的账号下再次切换账号。");
     }
     if (
-      current.actor.id !== "0" ||
-      !current.actor.isRoot ||
       current.actor.accountType !== "human" ||
       !hasPermission(current.actor, "user.impersonate", {}, dependencies.now())
     ) {
@@ -1123,6 +1119,8 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     if (
       target === undefined ||
       target.id === "0" ||
+      target.isRoot ||
+      target.id === current.actor.id ||
       target.accountType !== "human" ||
       target.disabled ||
       !hasPermission(target, "auth.login", {}, dependencies.now())
@@ -1159,10 +1157,6 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     if (current.session.impersonatorUserId === undefined || current.session.impersonatorUserId === null) {
       throw notFound();
     }
-    const expiresAt = new Date(
-      dependencies.now().getTime() + sessionLifetimeSeconds * 1000
-    ).toISOString();
-    const restoredSession = await dependencies.store.createSession(current.actor.id, expiresAt);
     await dependencies.store.deleteSession(current.session.id);
     await dependencies.adminService.recordAuditEvent({
       actorUserId: current.actor.id,
@@ -1171,10 +1165,15 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       objectType: "user",
       objectId: current.user.id,
       result: "success",
-      metadata: { effectiveUserId: current.actor.id }
+      metadata: { effectiveUserId: current.user.id }
     });
-    setSessionCookie(restoredSession, reply);
-    return authSummary(current.actor, restoredSession);
+    reply.clearCookie(sessionCookieName, {
+      httpOnly: true,
+      secure: dependencies.secureCookies,
+      sameSite: "lax",
+      path: "/"
+    });
+    return authSummary(undefined);
   });
 
   app.get("/api/v1/admin/settings", async (request, reply) => {
