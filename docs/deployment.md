@@ -174,7 +174,9 @@ docker compose --env-file /secure/path/urmotiv.env logs --tail=100 api worker we
 
 ### 能看到登录页但不能登录
 
-先确认管理员 bootstrap 已成功并重启 `api web worker`。邮箱登录由 `URMOTIV_EMAIL_LOGIN_ENABLED` 控制，默认开启；邮箱注册由 `URMOTIV_EMAIL_REGISTRATION_ENABLED` 控制，默认关闭。注册若开启，还需要正式的邮件投递实现，不能在生产使用测试投递模式。
+先确认管理员 bootstrap 已成功并重启 `api web worker`。在「管理 → 常规设置」中配置通用 SMTP，并开启邮箱登录、公开注册；保存后立即生效。验证链接使用同页的公开站点地址，该地址必须与部署的 `URMOTIV_WEB_ORIGIN` 一致。QQ 邮箱可使用 `smtp.qq.com`、端口 `465`、直接 TLS，密码填写邮箱服务提供的 SMTP 授权码。
+
+正式环境将 `URMOTIV_EMAIL_DELIVERY_MODE` 留空，服务会读取管理设置中的 SMTP，发送失败不会自动通过验证。`test` 只允许在自动化测试中使用。旧的 `URMOTIV_EMAIL_LOGIN_ENABLED`、`URMOTIV_EMAIL_REGISTRATION_ENABLED` 是启动默认值；已有数据库的开关以管理界面保存值为准。
 
 ### OAuth 回调失败
 

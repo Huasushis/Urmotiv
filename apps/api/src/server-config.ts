@@ -465,10 +465,14 @@ function readEmailVerificationOptions(
   if (!emailRegistrationEnabled) {
     return undefined;
   }
-  if (environment.NODE_ENV !== "test" || environment.URMOTIV_EMAIL_DELIVERY_MODE !== "test") {
-    throw new Error(
-      "邮箱注册只能在测试环境使用内存投递；生产环境必须先接入并审查真实邮件投递服务。"
-    );
+  const deliveryMode = environment.URMOTIV_EMAIL_DELIVERY_MODE?.trim() ?? "";
+  // 正式服务从管理设置读取 SMTP；只有显式 test 模式才使用内存投递。
+  if (deliveryMode === "") return undefined;
+  if (deliveryMode !== "test") {
+    throw new Error("URMOTIV_EMAIL_DELIVERY_MODE 只能留空使用 SMTP，或在自动化测试中设为 test。");
+  }
+  if (environment.NODE_ENV !== "test") {
+    throw new Error("内存邮件投递只能用于自动化测试；生产环境请在管理设置中配置 SMTP。");
   }
   const webUrl = environment.URMOTIV_EMAIL_VERIFICATION_WEB_URL?.trim() ?? "";
   try {

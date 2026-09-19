@@ -402,9 +402,17 @@ describe("认证启动配置", () => {
   });
 
   it("only allows the in-memory delivery sink in automated tests", () => {
-    expect(() => readServerAuthenticationOptions({ URMOTIV_EMAIL_REGISTRATION_ENABLED: "true" })).toThrow(
-      "邮箱注册只能在测试环境使用内存投递"
-    );
+    const production = readServerAuthenticationOptions({
+      NODE_ENV: "production", URMOTIV_EMAIL_REGISTRATION_ENABLED: "true"
+    });
+    expect(production.emailRegistrationEnabled).toBe(true);
+    expect(production.emailVerification).toBeUndefined();
+    expect(() => readServerAuthenticationOptions({
+      NODE_ENV: "production", URMOTIV_EMAIL_REGISTRATION_ENABLED: "true", URMOTIV_EMAIL_DELIVERY_MODE: "test"
+    })).toThrow("内存邮件投递只能用于自动化测试");
+    expect(() => readServerAuthenticationOptions({
+      NODE_ENV: "production", URMOTIV_EMAIL_REGISTRATION_ENABLED: "true", URMOTIV_EMAIL_DELIVERY_MODE: "unknown"
+    })).toThrow("URMOTIV_EMAIL_DELIVERY_MODE 只能留空");
     expect(
       readServerAuthenticationOptions({
         NODE_ENV: "test",
