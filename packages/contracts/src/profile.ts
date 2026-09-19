@@ -18,20 +18,44 @@ export const profileViewSchema = z.object({
   accountType: profileAccountTypeSchema,
   /** 本地唯一用户名，可在注册时选择，与第三方身份编号分离。 */
   username: z.string().nullable(),
-  /** 由统一身份认证姓名映射来的真实姓名；仅本人可见。 */
+  /** 由统一身份认证姓名映射来的真实姓名；不公开。 */
   realName: z.string().nullable(),
   email: z.string().nullable(),
   emailVerified: z.boolean(),
-  /** 仅本人可见；其他用户永远看不到。 */
+  /** 本人和有用户管理权限的人工管理员可见，不公开。 */
   qq: qqSchema.nullable(),
   avatarSource: profileAvatarSourceSchema,
   /** 站内头像地址；无头像时为 null，客户端用默认头像兜底。 */
   avatarUrl: z.string().nullable(),
-  /** 学号/用户名等由外部身份映射来的标识，仅本人可见。 */
+  /** 学号/用户名等由外部身份映射来的标识，不公开。 */
   studentIds: z.array(z.object({ attribute: z.string(), value: z.string() })),
 });
 
 export type ProfileView = z.infer<typeof profileViewSchema>;
+
+/** 仅本人或经服务端授权的人工管理员可读取的联系资料。 */
+export const userContactSchema = profileViewSchema.pick({
+  id: true, nickname: true, username: true, realName: true, email: true,
+  emailVerified: true, qq: true, studentIds: true
+}).strict();
+export type UserContact = z.infer<typeof userContactSchema>;
+
+export const leaderboardQuerySchema = z.object({
+  sort: z.enum(["submitted", "approved", "rejected"]).default("submitted"),
+  page: z.coerce.number().int().min(1).max(100_000).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(30)
+}).strict();
+export type LeaderboardQuery = z.infer<typeof leaderboardQuerySchema>;
+export const leaderboardResponseSchema = z.object({
+  items: z.array(z.object({
+    id: z.string(), nickname: z.string(),
+    submitted: z.number().int().nonnegative(),
+    approved: z.number().int().nonnegative(),
+    rejected: z.number().int().nonnegative()
+  }).strict()),
+  total: z.number().int().nonnegative(), page: z.number().int().positive(), pageSize: z.number().int().positive()
+}).strict();
+export type LeaderboardResponse = z.infer<typeof leaderboardResponseSchema>;
 
 /** 更新个人资料：空字符串的 qq 表示清除。
  * avatarSource 的切换规则由服务端校验（qq 需要已填写 qq，uploaded 需要已有上传头像）。

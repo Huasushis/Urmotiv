@@ -1891,7 +1891,8 @@ export class ProblemService {
       importBatch: problem.importBatch ?? null,
       importSource: problem.importSource ?? null,
       externalReviewEnabled: problem.externalReviewEnabled ?? true,
-      capabilities
+      capabilities: { ...capabilities, canReadOwnerContact: user.accountType === "human" && owner.accountType === "human"
+        && (!owner.isRoot || user.isRoot) && hasPermission(user, "user.permission.manage", {}, this.now()) }
     };
   }
 

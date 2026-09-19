@@ -1,4 +1,9 @@
 import {
+  leaderboardResponseSchema,
+  userContactSchema,
+  type LeaderboardQuery,
+  type LeaderboardResponse,
+  type UserContact,
   adminAuditResponseSchema,
   adminGeneralSettingsSchema,
   updateAdminGeneralSettingsInputSchema,
@@ -784,6 +789,15 @@ export function batchChangeProblemStatus(
     () => request("/admin/problems/status", json(input), batchProblemStatusResponseSchema),
     async () => (await import("./demo-store")).batchChangeDemoProblemStatus(input)
   );
+}
+
+export function getUserContact(userId: string): Promise<UserContact> {
+  return request(`/admin/users/${encodeURIComponent(userId)}/contact`, { method: "GET" }, userContactSchema);
+}
+
+export function getLeaderboard(query: LeaderboardQuery): Promise<LeaderboardResponse> {
+  const params = new URLSearchParams({ sort: query.sort, page: String(query.page), pageSize: String(query.pageSize) });
+  return request(`/leaderboard?${params}`, { method: "GET" }, leaderboardResponseSchema);
 }
 
 export function getProblem(id: string): Promise<Problem> {

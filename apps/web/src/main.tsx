@@ -17,6 +17,7 @@ import { BatchAccountPage } from "./pages/batch-account-page";
 import { TransferPage } from "./pages/transfer-page";
 import { VerifyEmailPage } from "./pages/verify-email-page";
 import { FermataAdminPage } from "./pages/fermata-admin-page";
+import { LeaderboardPage } from "./pages/leaderboard-page";
 
 import { AdminSectionPage } from "./pages/admin-section-page";
 import { AdminPermissionsPage } from "./pages/admin-permissions-page";
@@ -37,6 +38,10 @@ function App() {
 
   if (location.pathname === "/login" || location.pathname === "/demo-login") {
     return <DemoLoginPage existingSession={session.data} />;
+  }
+
+  if (location.pathname === "/leaderboard" && !session.data?.user) {
+    return <LeaderboardPage publicView />;
   }
 
   if (session.isLoading) {
@@ -84,6 +89,7 @@ function App() {
         <Route path="/contests" element={<ContestPage />} />
         <Route path="/transfer" element={<TransferPage />} />
         <Route path="/profile" element={<ProfilePage />} />
+        <Route path="/leaderboard" element={<LeaderboardPage />} />
         <Route path="/admin/accounts" element={<BatchAccountPage />} />
         <Route path="/admin/problems" element={<ProblemListPage managementSession={sessionData.user} />} />
         <Route path="/admin/settings" element={<AdminSectionPage section="settings" session={sessionData.user} />} />

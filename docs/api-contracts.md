@@ -1,6 +1,12 @@
 # 版本化 API 与契约
 
-Urmotiv 的 HTTP API 当前版本是 `/api/v1`。请求和响应由 `@urmotiv/contracts` 中的 Zod（运行时数据校验器）模式校验；新增字段不会让客户端可以跳过既有必填字段，未知字段在严格模式下会被拒绝。除健康检查、登录入口和 OAuth 回调外，业务接口都需要浏览器会话 Cookie；机器人接口使用 `Authorization: Bearer` 令牌。
+Urmotiv 的 HTTP API 当前版本是 `/api/v1`。请求和响应由 `@urmotiv/contracts` 中的 Zod（运行时数据校验器）模式校验；新增字段不会让客户端可以跳过既有必填字段，未知字段在严格模式下会被拒绝。除健康检查、登录入口、OAuth 回调和公开投稿榜单外，业务接口都需要浏览器会话 Cookie；机器人接口使用 `Authorization: Bearer` 令牌。
+
+## 投稿榜单与联系资料
+
+`GET /api/v1/leaderboard` 不要求登录。查询参数 `sort` 支持 `submitted`（默认）、`approved`、`rejected`；`page` 从 1 开始，`pageSize` 默认 30、最多 100。返回 `{ items, total, page, pageSize }`，每项仅有账号 `id`、公开 `nickname` 和三个计数。投稿总数按题目去重，重复送审不重复累计；统计当前未删除、曾提交过或非草稿状态的站内/题目包投稿，排除迁移资料、机器人、root 和停用账号。通过/拒绝按当前状态计数。此接口有意公开汇总贡献，不提供题号、标题、内容、用户名或联系信息，也不接受题目关键词、来源等筛选。
+
+`GET /api/v1/admin/users/:userId/contact` 要求人工账号具有 `user.permission.manage`，明确拒绝优先；机器人固定不可用，模拟登录按当前目标权限检查。返回用户名、姓名、邮箱及验证标记、QQ 和外部身份标识，响应使用 `private, no-store`。无权读取、目标不存在或目标为机器人统一返回 404；非 root 管理员不能读取 root 联系资料。题目内容接口只提供 `capabilities.canReadOwnerContact`，不会顺带返回联系方式。
 
 ## 地址、会话和错误
 

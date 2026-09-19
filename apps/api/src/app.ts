@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
+import { leaderboardQuerySchema, leaderboardResponseSchema, userContactSchema } from "@urmotiv/contracts";
 import {
   adminSettingsQuerySchema,
   importHistoryQuerySchema,
@@ -1246,6 +1247,22 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     }).strict().parse(request.query);
     return dependencies.adminService.listManagedUsers(actor, query.search, query.page, query.pageSize);
   });
+  app.get("/api/v1/admin/users/:userId/contact", async (request, reply) => {
+    reply.header("cache-control", "private, no-store");
+    const actor = await requireAdminPermission(request, "user.permission.manage");
+    const { userId } = z.object({ userId: z.string().trim().min(1).max(80) }).strict().parse(request.params);
+    const target = await dependencies.store.getUser(userId);
+    if (!target || target.accountType !== "human" || (target.isRoot && !actor.isRoot)) throw notFound();
+    const { id, nickname, username, realName, email, emailVerified, qq, studentIds } = await profile.readProfileView(target, dependencies.store);
+    return userContactSchema.parse({ id, nickname, username, realName, email, emailVerified, qq, studentIds });
+  });
+
+  app.get("/api/v1/leaderboard", async (request, reply) => {
+    reply.header("cache-control", "no-store");
+    const query = leaderboardQuerySchema.parse(request.query);
+    return leaderboardResponseSchema.parse(await dependencies.store.listLeaderboard(query));
+  });
+
   app.get("/api/v1/admin/users/:userId/permissions", async (request, reply) => {
     reply.header("cache-control", "private, no-store");
     const actor = await requireAdminPermission(request, "user.permission.manage");

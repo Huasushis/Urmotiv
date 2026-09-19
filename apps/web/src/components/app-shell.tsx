@@ -8,6 +8,7 @@ import {
   LogOut,
   Menu,
   Settings,
+  Trophy,
   UserRound,
   X
 } from "lucide-react";
@@ -44,7 +45,8 @@ const transferPermissions = [
 const baseNavItems = [
   { to: "/problems", label: "题目", icon: BookOpen },
   { to: "/submissions", label: "我的投稿", icon: FilePenLine },
-  { to: "/reviews", label: "待审", icon: ClipboardCheck }
+  { to: "/reviews", label: "待审", icon: ClipboardCheck },
+  { to: "/leaderboard", label: "榜单", icon: Trophy }
 ];
 
 function buildNavItems(session: NonNullable<SessionResponse["user"]>) {

@@ -1,6 +1,6 @@
 import { LogIn, ShieldCheck } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { useState } from "react";
 import type { SessionResponse } from "@urmotiv/contracts";
 import {
@@ -59,6 +59,7 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
         <div className="brand compact"><span className="brand-mark">U</span><span>Urmotiv</span></div>
         <h1>题库协作，从一份可审阅的草稿开始</h1>
         <p>登录后可按已授予的权限投题、审题和整理题目资料。系统会在服务端再次核对权限。</p>
+        <Link to="/leaderboard" className="secondary-button">查看公开投稿榜单</Link>
         {existingSession?.user ? <p className="notice-line">当前已作为“{existingSession.user.nickname}”登录。</p> : null}
       </section>
       <section className="login-panel" aria-labelledby="login-title">

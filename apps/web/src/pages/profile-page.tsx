@@ -254,7 +254,7 @@ export function ProfilePage() {
                 {qqError[0]}
               </span>
             ) : null}
-            <small>QQ 号码只对你自己可见，不会展示给其他用户。</small>
+            <small>仅本人和有用户管理权限的管理员可见，用于头像及投稿联系，不会公开展示。</small>
           </div>
           <div className="field">
             <label>用户名（建议使用学号，字母全部大写）</label>

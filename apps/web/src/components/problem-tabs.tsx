@@ -48,6 +48,7 @@ import {
 } from "./problem-files";
 import { TagPicker } from "./tag-picker";
 import { ExternalReviewSwitch } from "./external-review-switch";
+import { UserContact } from "./user-contact";
 
 export type ProblemUpdater = (updater: (problem: Problem) => Problem) => void;
 
@@ -197,7 +198,7 @@ export function OverviewTab({ problem, update, fileUploadsDisabled, onExternalRe
       </div>
 
       <dl className="metadata-list">
-        <div><dt>作者</dt><dd>{problem.owner.nickname}</dd></div>
+        <div><dt>作者</dt><dd>{problem.owner.nickname}{problem.capabilities.canReadOwnerContact && <UserContact key={problem.owner.id} userId={problem.owner.id} />}</dd></div>
         <div><dt>当前状态</dt><dd>{statusText[problem.status]}</dd></div>
         <div><dt>当前修订</dt><dd>第 {problem.revision} 版</dd></div>
         <div><dt>审核轮次</dt><dd>{problem.reviewRound ? `第 ${problem.reviewRound} 轮` : "尚未提交"}</dd></div>

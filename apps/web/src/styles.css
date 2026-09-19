@@ -6141,3 +6141,37 @@ textarea:read-only {
     font-size: 14px;
   }
 }
+
+/* 投稿与联系信息沿用全站青色表单，不公开私人联系方式。 */
+.user-contact { margin-top: 8px; min-width: 0; }
+.contact-card { margin-top: 10px; padding: 14px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); }
+.contact-card dl { margin: 0; display: grid; gap: 10px; }
+.contact-card dl > div { display: grid; grid-template-columns: minmax(60px, 1fr) minmax(0, 3fr); gap: 12px; }
+.contact-card dt { color: var(--text-soft); font-size: 13px; }
+.contact-card dd { margin: 0; overflow-wrap: anywhere; }
+.leaderboard-page { max-width: 1000px; margin: 0 auto; }
+.public-header .global-header-inner { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.public-header .secondary-button { width: auto; min-height: 36px; }
+.leaderboard-page h1 { display: flex; align-items: center; gap: 12px; }
+.leaderboard-page h1 svg { color: var(--teal); }
+.leaderboard-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
+.leaderboard-toolbar label { display: flex; align-items: center; gap: 10px; }
+.leaderboard-toolbar select { width: auto; min-width: 120px; }
+.leaderboard-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-variant-numeric: tabular-nums; }
+.leaderboard-table th, .leaderboard-table td { padding: 16px 12px; border-bottom: 1px solid var(--border); text-align: right; }
+.leaderboard-table th:first-child { width: 55%; text-align: left; }
+.leaderboard-table thead th { color: var(--text-soft); font-size: 13px; font-weight: 500; }
+.leaderboard-table tbody th { font-weight: 500; }
+.leaderboard-person { display: flex; align-items: center; gap: 14px; overflow-wrap: anywhere; }
+.leaderboard-rank { display: inline-grid; place-items: center; flex-shrink: 0; min-width: 34px; height: 34px; border-radius: 11px; color: var(--text-soft); }
+.leaderboard-rank.podium { background: #d9f2f4; color: #086c7b; font-weight: 700; }
+.leaderboard-pagination { display: flex; align-items: center; justify-content: center; gap: 16px; margin-top: 22px; }
+.leaderboard-explanation { font-size: 13px; line-height: 1.8; margin-top: 20px; }
+@media (max-width: 600px) {
+  .leaderboard-panel { padding: 16px; }
+  .leaderboard-table th, .leaderboard-table td { padding: 12px 5px; font-size: 13px; }
+  .leaderboard-table th:first-child { width: 49%; }
+  .leaderboard-person { gap: 6px; }
+  .leaderboard-rank { min-width: 24px; height: 28px; }
+  .contact-card dl > div { grid-template-columns: minmax(60px, 1fr) minmax(0, 2fr); }
+}

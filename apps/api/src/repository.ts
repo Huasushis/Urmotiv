@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { builtinRoleDefinitions, type DatabaseExecutor } from "@urmotiv/database";
-import type { CorePermission, PermissionGrant, ProblemTag, ReviewSuggestionField } from "@urmotiv/contracts";
+import type { CorePermission, PermissionGrant, ProblemTag, ReviewSuggestionField, LeaderboardQuery, LeaderboardResponse } from "@urmotiv/contracts";
 import type {
   ProblemListFilters,
   StoredProblem,
@@ -89,6 +89,7 @@ export interface ProblemTransaction {
 }
 
 export interface DataStore {
+  listLeaderboard(query: LeaderboardQuery): Promise<LeaderboardResponse>;
   getUser(userId: string): Promise<StoredUser | undefined>;
   listUsers(): Promise<StoredUser[]>;
   getPrimaryEmail(userId: string): Promise<{ readonly address: string; readonly verified: boolean } | undefined>;
@@ -935,6 +936,26 @@ export class InMemoryDataStore implements DataStore {
   public async createProblem(problem: StoredProblem): Promise<StoredProblem> {
     this.problems.set(problem.id, copy(problem));
     return copy(problem);
+  }
+
+  public async listLeaderboard(query: LeaderboardQuery): Promise<LeaderboardResponse> {
+    const counts = new Map<string, LeaderboardResponse["items"][number]>();
+    for (const problem of this.problems.values()) {
+      const user = this.users.get(problem.ownerId);
+      // 常规题目包导入写入此来源标记；历史搬运保留其原始来源，不计作个人投稿。
+      const personalSubmission = (problem.origin ?? "native") === "native"
+        || (problem.origin === "problem-package" && problem.importSource === "problem-package");
+      if (!user || user.disabled || user.accountType !== "human" || user.isRoot
+        || !personalSubmission
+        || (problem.reviewRound === 0 && problem.status === "draft")) continue;
+      const row = counts.get(user.id) ?? { id: user.id, nickname: user.nickname, submitted: 0, approved: 0, rejected: 0 };
+      row.submitted++;
+      if (problem.status === "approved") row.approved++;
+      if (problem.status === "rejected") row.rejected++;
+      counts.set(user.id, row);
+    }
+    const sorted = [...counts.values()].sort((a,b) => b[query.sort]-a[query.sort] || b.submitted-a.submitted || a.id.localeCompare(b.id, "en", { numeric: true }));
+    return { items: sorted.slice((query.page-1)*query.pageSize, query.page*query.pageSize), total: sorted.length, page: query.page, pageSize: query.pageSize };
   }
 
   public async findVisibleProblem(

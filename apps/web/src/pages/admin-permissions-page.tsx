@@ -23,6 +23,7 @@ import {
 } from "../lib/api";
 import { AdminLayout } from "../components/admin-layout";
 import { UserRoleEditor } from "../components/user-role-editor";
+import { UserContact } from "../components/user-contact";
 import { clearProblemDrafts } from "../lib/client-security";
 
 type AdminPermissionSection = "users" | "roles" | "defaults";
@@ -604,6 +605,7 @@ function UserPanel({
                 <div><h3>{selectedVisibleUser.nickname}</h3><p>{selectedVisibleUser.id} · 角色基线：{permissionQuery.data?.delta.roles.join("、") || "无"}</p></div>
                 {protectedUser ? <span className="status-badge">root（受保护）</span> : null}
               </div>
+              <UserContact key={`contact-${selectedVisibleUser.id}`} userId={selectedVisibleUser.id} />
               <UserRoleEditor key={selectedVisibleUser.id} userId={selectedVisibleUser.id} protectedUser={protectedUser} />
               {!protectedUser && selectedVisibleUser.id !== session.id && selectedVisibleUser.enabled && session.permissions.includes("user.impersonate") ? <div className="admin-actions">
                 <button type="button" className="secondary-button" disabled={switchAction.isPending} onClick={() => {

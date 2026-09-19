@@ -6,6 +6,7 @@ import {
   type ProblemSample,
   type ProblemTag
 } from "@urmotiv/contracts";
+import type { LeaderboardQuery, LeaderboardResponse } from "@urmotiv/contracts";
 import type { DatabaseExecutor, DatabaseHandle } from "@urmotiv/database";
 import { type SQL, sql } from "drizzle-orm";
 import type {
@@ -1373,6 +1374,29 @@ async function defaultRoleId(
 }
 
 export class DatabaseDataStore implements DataStore {
+  public async listLeaderboard(query: LeaderboardQuery): Promise<LeaderboardResponse> {
+    const order = query.sort === "approved" ? sql`approved` : query.sort === "rejected" ? sql`rejected` : sql`submitted`;
+    const rows = await this.handle.query<{ total: number; items: LeaderboardResponse["items"] }>(sql`
+      with totals as (
+        select account.id, account.nickname, count(*)::integer as submitted,
+          count(*) filter (where problem.status = 'approved')::integer as approved,
+          count(*) filter (where problem.status = 'rejected')::integer as rejected
+        from problems problem join users account on account.id = problem.owner_id
+        where problem.deleted_at is null and account.disabled_at is null and account.account_type = 'human' and account.id <> 0
+          and (problem.origin = 'native' or (problem.origin = 'problem-package' and problem.import_source = 'problem-package'))
+          and (problem.current_review_round > 0 or problem.status <> 'draft')
+        group by account.id, account.nickname
+      ), page_items as (
+        select id::text, nickname, submitted, approved, rejected from totals
+        order by ${order} desc, submitted desc, totals.id asc
+        limit ${query.pageSize} offset ${(query.page-1)*query.pageSize}
+      )
+      select (select count(*)::integer from totals) as total,
+        coalesce((select jsonb_agg(page_items) from page_items), '[]'::jsonb) as items
+    `);
+    const row = rows[0]!;
+    return { items: row.items, total: row.total, page: query.page, pageSize: query.pageSize };
+  }
   public constructor(private readonly handle: DatabaseHandle) {}
 
   /** 就绪检查：执行一次最廉价的查询确认连接可用。 */

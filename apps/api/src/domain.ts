@@ -16,9 +16,9 @@ export interface StoredUser extends UserSummary {
   isRoot: boolean;
   /** 本地唯一用户名，与第三方身份编号分离。 */
   username?: string | null;
-  /** 由 USTC OAuth2 姓名映射来的真实姓名；仅本人可见。 */
+  /** 由 USTC OAuth2 姓名映射来的真实姓名；本人及人工账号管理员可读，不公开。 */
   realName?: string | null;
-  /** 可选 QQ 号码；仅本人可读写，不进入公开接口。 */
+  /** 可选 QQ 号码；本人可维护，人工账号管理员可读取，不进入公开接口。 */
   qq?: string | null;
   /** 头像来源，默认 none。 */
   avatarSource?: "none" | "qq" | "uploaded";
