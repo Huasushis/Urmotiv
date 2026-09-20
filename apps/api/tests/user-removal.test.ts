@@ -27,6 +27,7 @@ it("删除账号转移题目比赛，保留版本和审计，撤销登录并从�
   const author=await login(ids.author);const admin=await login(ids.administrator);
   await db.execute(sql`INSERT INTO audit_events(actor_user_id,request_id,action,object_type,object_id,result,metadata) VALUES(${BigInt(ids.author)},${randomUUID()}::uuid,'synthetic.history','problem',${problem.id},'success','{}'::jsonb)`);
   const before=await db.query(sql`SELECT * FROM audit_events WHERE action='synthetic.history'`);
+  const beforeRank=await store.listLeaderboard({sort:"submitted",page:1,pageSize:30});
   const response=await remove(ids.author,admin);expect(response.statusCode).toBe(200);
   expect(await store.getUser(ids.author)).toBeUndefined();
   expect((await app.inject({method:"GET",url:"/api/v1/me",headers:{cookie:author}})).statusCode).toBe(401);
@@ -37,6 +38,8 @@ it("删除账号转移题目比赛，保留版本和审计，撤销登录并从�
   expect((await contests.getContest(contest.id))?.problems[0]?.revisionId).toBe(contest.problems[0]?.revisionId);
   expect(await db.query(sql`SELECT * FROM audit_events WHERE action='synthetic.history'`)).toEqual(before);
   expect(await db.query(sql`SELECT count(*)::int AS n FROM audit_events WHERE action='admin.user.delete'`)).toEqual([{n:1}]);
+  const afterRank=await store.listLeaderboard({sort:"submitted",page:1,pageSize:30});
+  expect(afterRank.items.find(user=>user.id===ids.administrator)?.submitted??0).toBe(beforeRank.items.find(user=>user.id===ids.administrator)?.submitted??0);
   expect((await remove(ids.author,admin)).statusCode).toBe(404);
 });
 it("拒绝普通账号、机器人、模拟登录、自删和删除 root",async()=>{

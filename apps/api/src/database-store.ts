@@ -1388,7 +1388,9 @@ export class DatabaseDataStore implements DataStore {
         select account.id, account.nickname, count(*)::integer as submitted,
           count(*) filter (where problem.status = 'approved')::integer as approved,
           count(*) filter (where problem.status = 'rejected')::integer as rejected
-        from problems problem join users account on account.id = problem.owner_id
+        from problems problem
+        join lateral (select created_by_user_id from problem_revisions where problem_id=problem.id order by revision limit 1) original on true
+        join users account on account.id = original.created_by_user_id
         where problem.deleted_at is null and account.disabled_at is null and account.account_type = 'human' and account.id <> 0
           and (problem.origin = 'native' or (problem.origin = 'problem-package' and problem.import_source = 'problem-package'))
           and (problem.current_review_round > 0 or problem.status <> 'draft')
