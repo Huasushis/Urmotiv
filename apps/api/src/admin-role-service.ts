@@ -1,9 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
-  corePermissions,
   type AdminRoleDefaults,
   type CreateAdminRoleInput,
-  type PermissionGrant,
   type UpdateAdminRoleDefaultsInput,
   type UpdateAdminRoleInput
 } from "@urmotiv/contracts";
@@ -35,8 +33,6 @@ export interface AdminRoleMutationContext {
   readonly requestId: string;
   readonly actorIsRoot?: boolean;
   readonly auditActorUserId?: string;
-  readonly actorAllowCeiling: readonly string[];
-  readonly actorDeniedPermissions: readonly string[];
 }
 
 export interface RoleManagementStore {
@@ -62,37 +58,15 @@ function cloneRole(role: StoredAdminRole): StoredAdminRole {
   };
 }
 
-function isActiveGrant(grant: PermissionGrant, now: Date): boolean {
-  if (grant.expiresAt === undefined) return true;
-  const expiresAt = Date.parse(grant.expiresAt);
-  return Number.isFinite(expiresAt) && expiresAt > now.getTime();
-}
 export function createAdminRoleMutationContext(
   user: StoredUser,
   requestId: string,
-  now = new Date(),
   auditActorUserId?: string
 ): AdminRoleMutationContext {
-  const actorAllowCeiling = corePermissions.filter((permission) =>
-    hasPermission(user, permission, permission.endsWith(".own") ? { ownerId: user.id } : {}, now)
-  );
-  const actorDeniedPermissions = [
-    ...new Set(
-      user.grants
-        .filter((grant) =>
-          grant.effect === "deny" &&
-          grant.scope === "global" &&
-          isActiveGrant(grant, now)
-        )
-        .map((grant) => grant.permission)
-    )
-  ];
   return {
     actorUserId: user.id,
     requestId,
     actorIsRoot: user.isRoot && user.id === "0",
-    actorAllowCeiling,
-    actorDeniedPermissions,
     ...(auditActorUserId === undefined ? {} : { auditActorUserId })
   };
 }
@@ -120,17 +94,6 @@ export function assertRoleMutationSafety(
   }
   if (!actorIsRoot && role?.key === "root") {
     throw new ApiError(403, "ROLE_ROOT_PRIVILEGE", "只有 root 可以管理 root 等价权限。");
-  }
-  const allowCeiling = new Set(context.actorAllowCeiling);
-  const explicitDenies = new Set(context.actorDeniedPermissions);
-  for (const permission of input.permissions) {
-    if (permission.effect !== "allow") continue;
-    if (memberIds.includes(context.actorUserId) && explicitDenies.has(permission.name)) {
-      throw new ApiError(403, "ROLE_PERMISSION_DENIED", "不能通过角色绕过调用者已有的明确拒绝。");
-    }
-    if (memberIds.includes(context.actorUserId) && !allowCeiling.has(permission.name)) {
-      throw new ApiError(403, "ROLE_SELF_ESCALATION", "不能通过编辑自己的权限组提升自身权限，请由另一位管理员授权。");
-    }
   }
 }
 
@@ -518,7 +481,7 @@ export class DatabaseRoleManagementStore implements RoleManagementStore {
     if (!hasPermission(actor, "user.permission.manage", {}, new Date())) {
       throw notFound();
     }
-    return createAdminRoleMutationContext(actor, context.requestId, new Date(), context.auditActorUserId);
+    return createAdminRoleMutationContext(actor, context.requestId, context.auditActorUserId);
   }
   private async lockRoleState(executor: RoleExecutor, roleId: string): Promise<StoredAdminRole> {
     const rows = await executor.query<{ id: string }>(sql`

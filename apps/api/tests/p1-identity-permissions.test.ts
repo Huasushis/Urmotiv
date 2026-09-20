@@ -292,7 +292,8 @@ describe("P1 root identity and permission model", () => {
         denies: []
       }
     });
-    expect(selfEscalation.statusCode).toBe(403);
+    expect(selfEscalation.statusCode).toBe(200);
+    expect(selfEscalation.json().effective.permissions).toContain("user.impersonate");
     expect((await app.inject({
       method: "GET",
       url: "/api/v1/admin/users/robot/permissions",

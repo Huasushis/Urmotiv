@@ -1272,6 +1272,18 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     return userContactSchema.parse({ id, nickname, username, realName, email, emailVerified, qq, studentIds });
   });
 
+  app.delete("/api/v1/admin/users/:userId", async (request) => {
+    const current = await currentSession(request);
+    if (!current) throw unauthorized();
+    if (current.session.impersonatorUserId != null || current.user.accountType !== "human" || !hasPermission(current.user,"user.delete",{},dependencies.now())) throw notFound();
+    const {userId}=z.object({userId:z.string().regex(/^(0|[1-9]\d*)$/)}).parse(request.params);
+    z.object({confirm:z.literal(true)}).strict().parse(request.body);
+    if (!dependencies.store.removeManagedUser) throw new ApiError(503,"SERVICE_UNAVAILABLE","当前存储不支持账号删除。");
+    try { await dependencies.store.removeManagedUser({actorUserId:current.user.id,userId,requestId:request.id}); }
+    catch(error) { if(error instanceof Error && error.message==="USER_REMOVAL_DENIED") throw notFound(); throw error; }
+    return {ok:true};
+  });
+
   app.get("/api/v1/leaderboard", async (request, reply) => {
     reply.header("cache-control", "no-store");
     const query = leaderboardQuerySchema.parse(request.query);

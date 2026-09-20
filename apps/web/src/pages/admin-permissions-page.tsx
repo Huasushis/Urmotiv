@@ -19,7 +19,8 @@ import {
   updateAdminRole,
   updateAdminRoleDefaults,
   switchAccount,
-  updateAdminUserPermissions
+  updateAdminUserPermissions,
+  deleteManagedUser
 } from "../lib/api";
 import { AdminLayout } from "../components/admin-layout";
 import { UserRoleEditor } from "../components/user-role-editor";
@@ -343,7 +344,7 @@ function RolesPanel({
         <div className="admin-section-heading">
           <div>
             <h2>{draft.id === null ? "新建自定义角色" : `编辑角色：${draft.displayName}`}</h2>
-            <p>{rootRole ? "root 角色包含完整权限目录，仅供查看；服务端仍会强制 root、机器人和自我升级边界。" : "非 root 角色可以编辑完整权限目录，不受当前管理员有效权限的二次截断。"}</p>
+            <p>{rootRole ? "root 角色包含完整权限目录，仅供查看，不能授予其他账号。" : "可编辑完整权限目录，不受管理员自身业务权限限制；明确拒绝和机器人固定禁止项仍然有效。"}</p>
           </div>
         </div>
         <div className="permission-role-fields">
@@ -461,6 +462,14 @@ function UserPanel({
   const [querySearch, setQuerySearch] = useState("");
   const [page, setPage] = useState(1);
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const deleteAction = useMutation({
+    mutationFn: deleteManagedUser,
+    onSuccess: () => {
+      setSelectedUserId(null);
+      void client.invalidateQueries({queryKey:["admin-users"]});
+      void client.invalidateQueries({queryKey:["admin-roles"]});
+    }
+  });
   const [draft, setDraft] = useState<UserPermissionDraft | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
@@ -607,6 +616,12 @@ function UserPanel({
               </div>
               <UserContact key={`contact-${selectedVisibleUser.id}`} userId={selectedVisibleUser.id} />
               <UserRoleEditor key={selectedVisibleUser.id} userId={selectedVisibleUser.id} protectedUser={protectedUser} />
+              {!protectedUser && selectedVisibleUser.id !== session.id && ["user.delete","problem.edit.all","contest.edit.all"].every(permission=>session.permissions.includes(permission as typeof session.permissions[number])) ? <div className="admin-actions">
+                <button type="button" className="danger-button" disabled={deleteAction.isPending} onClick={()=>{
+                  if(window.confirm("删除此账号并使其退出登录？题目和比赛会转到你名下，历史审核和审计仍保留。")) deleteAction.mutate(selectedVisibleUser.id);
+                }}>{deleteAction.isPending?"正在删除…":"删除账号"}</button>
+                {deleteAction.error?<p role="alert">{deleteAction.error.message}</p>:null}
+              </div>:null}
               {!protectedUser && selectedVisibleUser.id !== session.id && selectedVisibleUser.enabled && session.permissions.includes("user.impersonate") ? <div className="admin-actions">
                 <button type="button" className="secondary-button" disabled={switchAction.isPending} onClick={() => {
                   if (window.confirm("切换后将仅拥有此用户的权限。返回管理员身份需要重新登录，是否继续？")) switchAction.mutate(selectedVisibleUser.id);

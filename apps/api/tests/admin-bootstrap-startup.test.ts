@@ -15,6 +15,7 @@ import {
   adminBootstrapStartupErrors,
   assertAdminBootstrapReadyForServer,
 } from "../src/bootstrap-admin";
+import {DatabaseDataStore} from "../src/database-store";
 
 const openDatabases: LocalDatabaseHandle[] = [];
 
@@ -46,6 +47,17 @@ describe("API administrator bootstrap startup gate", () => {
     });
 
     await expect(assertAdminBootstrapReadyForServer(database)).resolves.toBeUndefined();
+  });
+
+  it("完成初始化后删除普通管理员，只保留 root 仍可正常启动", async () => {
+    const database=await createOpenBootstrapDatabase();
+    await completeAdminBootstrap(database,{normalizedEmail:"retired-admin@example.test",passwordHash:await hashPassword("synthetic-long-password")});
+    const store=new DatabaseDataStore(database);
+    const target=(await store.listUsers()).find(user=>user.id!=="0")!;
+    await store.removeManagedUser({actorUserId:"0",userId:target.id,requestId:"00000000-0000-4000-8000-000000000088"});
+    await expect(assertAdminBootstrapReadyForServer(database)).resolves.toBeUndefined();
+    await seedCoreDatabase(database);
+    expect((await store.listUsers()).map(user=>user.id)).toEqual(["0"]);
   });
 
   it("rejects non-seed system settings during fresh bootstrap", async () => {

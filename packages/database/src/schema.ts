@@ -169,6 +169,7 @@ export const users = pgTable(
     passwordChangedAt: timestamp("password_changed_at", { withTimezone: true }),
     disabledAt: timestamp("disabled_at", { withTimezone: true }),
     disabledReason: varchar("disabled_reason", { length: 500 }),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
     qq: varchar("qq", { length: 20 }),
     avatarSource: varchar("avatar_source", { length: 10 })
       .notNull()
@@ -194,6 +195,7 @@ export const users = pgTable(
       sql`${table.realName} IS NULL OR length(btrim(${table.realName})) > 0`
     ),
     check("users_auth_revision_ck", sql`${table.authRevision} > 0`),
+    check("users_deleted_state_ck", sql`${table.deletedAt} IS NULL OR (${table.id} <> 0 AND ${table.disabledAt} IS NOT NULL)`),
     check(
       "users_root_is_human_ck",
       sql`${table.id} <> 0 OR ${table.accountType} = 'human'`

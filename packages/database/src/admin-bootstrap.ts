@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { readMigrationFiles } from "drizzle-orm/migrator";
 import { getTableName, isTable, sql } from "drizzle-orm";
 import type { DatabaseExecutor, DatabaseHandle } from "./client";
 import * as databaseSchema from "./schema";
@@ -29,14 +31,14 @@ const formalPublicTableNames = Object.values(databaseSchema)
   .flatMap((value) => isTable(value) ? [getTableName(value)] : [])
   .sort(compareText);
 
+const expectedMigrationCount = readMigrationFiles({ migrationsFolder: fileURLToPath(new URL("../migrations", import.meta.url)) }).length;
 const expectedSequenceStates = [
-  { schema: "drizzle", name: "__drizzle_migrations_id_seq", last_value: "28", is_called: true },
+  { schema: "drizzle", name: "__drizzle_migrations_id_seq", last_value: String(expectedMigrationCount), is_called: true },
   { schema: "public", name: "audit_events_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "contests_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "problems_id_seq", last_value: "1", is_called: false },
   { schema: "public", name: "users_id_seq", last_value: "1", is_called: false }
 ] as const;
-const expectedMigrationCount = 28;
 
 export type AdminBootstrapStatus = "blocked" | "open" | "completed";
 

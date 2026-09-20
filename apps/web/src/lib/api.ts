@@ -883,6 +883,10 @@ export function listProblemFiles(problemId: string): Promise<ProblemFileListResp
   );
 }
 
+export function deleteManagedUser(userId: string): Promise<{ok:true}> {
+  return request(`/admin/users/${encodeURIComponent(userId)}`, json({confirm:true}, "DELETE"), okResponseSchema);
+}
+
 export function uploadProblemFile(
   problemId: string,
   input: ProblemFileUploadRequest

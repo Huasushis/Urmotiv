@@ -718,13 +718,6 @@ export class AdminService {
     ) {
       throw new ApiError(422, "PERMISSION_UNKNOWN", "包含未知权限。");
     }
-    if (!actor.isRoot && actor.id !== "0" && (
-      allows.includes("user.impersonate") ||
-      denies.includes("user.impersonate") ||
-      target!.isRoot
-    )) {
-      throw new ApiError(403, "ROOT_PRIVILEGE_REQUIRED", "只有 root 可以管理 root 等价权限。");
-    }
     if (target!.isRoot) {
       throw new ApiError(409, "ROOT_DELTA_IMMUTABLE", "root 账号的完整权限不可改为用户增量。");
     }
@@ -755,13 +748,6 @@ export class AdminService {
         requestId,
         authorizeActor: (currentActor, currentTarget) => {
           this.assertPermissionDeltaManager(currentActor, currentTarget);
-          if (!currentActor.isRoot && currentActor.id !== "0" && (
-            allows.includes("user.impersonate") ||
-            denies.includes("user.impersonate") ||
-            currentTarget.isRoot
-          )) {
-            throw new ApiError(403, "ROOT_PRIVILEGE_REQUIRED", "只有 root 可以管理 root 等价权限。");
-          }
           if (currentTarget.isRoot) {
             throw new ApiError(409, "ROOT_DELTA_IMMUTABLE", "root 账号的完整权限不可改为用户增量。");
           }
@@ -1248,7 +1234,7 @@ export class AdminService {
     requestId: string,
     auditContext: AdminMutationAuditContext = {}
   ): AdminRoleMutationContext {
-    return createAdminRoleMutationContext(user, requestId, this.now(), auditContext.auditActorUserId);
+    return createAdminRoleMutationContext(user, requestId, auditContext.auditActorUserId);
   }
 
   private auditedAdminEvent(

@@ -297,8 +297,8 @@ export async function loadUsers(
   }
 
   const userFilter = requestedIds === undefined
-    ? sql`WHERE u.account_type IN ('human', 'robot')`
-    : sql`WHERE u.account_type IN ('human', 'robot') AND u.id IN (${sqlList(requestedIds)})`;
+    ? sql`WHERE u.account_type IN ('human', 'robot') AND u.deleted_at IS NULL`
+    : sql`WHERE u.account_type IN ('human', 'robot') AND u.deleted_at IS NULL AND u.id IN (${sqlList(requestedIds)})`;
   const membershipFilter =
     requestedIds === undefined ? sql`` : sql`AND membership.user_id IN (${sqlList(requestedIds)})`;
   const directGrantFilter =
@@ -1421,6 +1421,33 @@ export class DatabaseDataStore implements DataStore {
 
   public async listUsers(): Promise<StoredUser[]> {
     return loadUsers(this.handle);
+  }
+
+  public async removeManagedUser(input: { actorUserId: string; userId: string; requestId: string }): Promise<void> {
+    const actorId = parseDatabaseId(input.actorUserId);
+    const targetId = parseDatabaseId(input.userId);
+    if (actorId === undefined || targetId === undefined || actorId === targetId || targetId === 0n) throw new Error("USER_REMOVAL_DENIED");
+    await this.handle.transaction(async (transaction) => {
+      await transaction.query(sql`SELECT id FROM users WHERE id IN (${actorId},${targetId}) ORDER BY id FOR UPDATE`);
+      const actor = await lockUserPolicyForAuthorization(transaction, actorId);
+      const target = (await loadUsers(transaction, [targetId]))[0];
+      if (!actor || actor.accountType !== "human" || !target || target.accountType !== "human" || target.isRoot ||
+        !hasPermission(actor, "user.delete") || !hasPermission(actor, "problem.edit.all") || !hasPermission(actor, "contest.edit.all")) throw new Error("USER_REMOVAL_DENIED");
+      const ownedProblems = await transaction.query<{id:string}>(sql`SELECT id::text FROM problems WHERE owner_id=${targetId} ORDER BY id FOR UPDATE`);
+      const ownedContests = await transaction.query<{id:string}>(sql`SELECT id::text FROM contests WHERE created_by_user_id=${targetId} ORDER BY id FOR UPDATE`);
+      if (ownedProblems.some(({id}) => !hasPermission(actor,"problem.edit.all",{ownerId:input.userId,objectId:id})) ||
+        ownedContests.some(({id}) => !hasPermission(actor,"contest.edit.all",{ownerId:input.userId,objectId:id}))) throw new Error("USER_REMOVAL_DENIED");
+      await transaction.execute(sql`UPDATE problems SET owner_id=${actorId} WHERE owner_id=${targetId}`);
+      await transaction.execute(sql`UPDATE contests SET created_by_user_id=${actorId},updated_at=now() WHERE created_by_user_id=${targetId}`);
+      await transaction.execute(sql`UPDATE users SET deleted_at=now(),disabled_at=coalesce(disabled_at,now()),disabled_reason='账号已删除',password_hash=NULL,auth_revision=auth_revision+1,updated_at=now() WHERE id=${targetId}`);
+      await transaction.execute(sql`DELETE FROM sessions WHERE user_id=${targetId} OR impersonator_user_id=${targetId}`);
+      await transaction.execute(sql`DELETE FROM account_action_tokens WHERE user_id=${targetId}`);
+      await transaction.execute(sql`UPDATE api_tokens SET revoked_at=now() WHERE user_id=${targetId} AND revoked_at IS NULL`);
+      await transaction.execute(sql`UPDATE role_memberships SET revoked_at=now(),revoked_by_user_id=${actorId} WHERE user_id=${targetId} AND revoked_at IS NULL`);
+      await transaction.execute(sql`INSERT INTO audit_events(actor_user_id,subject_user_id,request_id,action,object_type,object_id,result,metadata)
+        VALUES (${actorId},${targetId},${input.requestId}::uuid,'admin.user.delete','user',${input.userId},'success',
+          ${JSON.stringify({transferredToUserId:input.actorUserId,problemCount:ownedProblems.length,contestCount:ownedContests.length})}::jsonb)`);
+    });
   }
 
   public async getPrimaryEmail(

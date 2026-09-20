@@ -29,15 +29,10 @@ function databaseConnectionString(connectionString: string, databaseName: string
   return `${endpoint.slice(0, separator + 1)}${databaseName}${query}`;
 }
 
-function roleContext(
-  requestId: string,
-  actorAllowCeiling: readonly string[] = ["auth.login", "user.permission.manage", "system.manage"]
-) {
+function roleContext(requestId: string) {
   return {
     actorUserId: "0",
-    requestId,
-    actorAllowCeiling,
-    actorDeniedPermissions: []
+    requestId
   };
 }
 
@@ -239,7 +234,7 @@ describePostgres("角色成员变更的真实 PostgreSQL 锁顺序", () => {
     expect(userTableLockObserved).toBe(true);
   });
 
-  it("提交的权限撤销阻止带旧 ceiling 的角色突变", async () => {
+  it("提交的权限管理授权撤销阻止使用旧上下文修改角色", async () => {
     if (primary === undefined || observer === undefined) return;
     const actorId = "900001";
     const grantIds = [randomUUID(), randomUUID(), randomUUID()];
@@ -272,7 +267,7 @@ describePostgres("角色成员变更的真实 PostgreSQL 锁顺序", () => {
       await transaction.execute(sql`
         UPDATE permission_grants
         SET revoked_at = now(), revoked_by_user_id = 0
-        WHERE id = ${grantIds[2]}::uuid AND revoked_at IS NULL
+        WHERE id = ${grantIds[1]}::uuid AND revoked_at IS NULL
       `);
       revocationReady();
       await revocationRelease;
@@ -289,11 +284,7 @@ describePostgres("角色成员变更的真实 PostgreSQL 锁顺序", () => {
         userIds: []
       },
       {
-        ...roleContext("00000000-0000-4000-8000-000000000020", [
-          "auth.login",
-          "user.permission.manage",
-          "problem.view.all"
-        ]),
+        ...roleContext("00000000-0000-4000-8000-000000000020"),
         actorUserId: actorId
       }
     );
@@ -316,7 +307,7 @@ describePostgres("角色成员变更的真实 PostgreSQL 锁顺序", () => {
       expect(mutationBlocked).toBe(true);
       releaseRevocation();
       await expect(mutation).rejects.toMatchObject({
-        code: "ROLE_PERMISSION_CEILING"
+        code: "NOT_FOUND"
       });
     } finally {
       releaseRevocation();
@@ -330,7 +321,7 @@ describePostgres("角色成员变更的真实 PostgreSQL 锁顺序", () => {
     expect(Number(roles[0]?.count ?? 0)).toBe(0);
     const grants = await primary.query<{ revoked: boolean }>(sql`
       SELECT revoked_at IS NOT NULL AS revoked
-      FROM permission_grants WHERE id = ${grantIds[2]}::uuid
+      FROM permission_grants WHERE id = ${grantIds[1]}::uuid
     `);
     expect(grants[0]?.revoked).toBe(true);
   });

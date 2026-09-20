@@ -89,6 +89,7 @@ export interface ProblemTransaction {
 }
 
 export interface DataStore {
+  removeManagedUser?(input: { actorUserId: string; userId: string; requestId: string }): Promise<void>;
   listLinkedIdentities(userId: string): Promise<LinkedIdentity[]>;
   linkExternalIdentity(input: LinkExternalIdentityInput): Promise<StoredUser>;
   unlinkExternalIdentity(input: UnlinkExternalIdentityInput): Promise<boolean>;
