@@ -1665,6 +1665,30 @@ textarea:read-only {
   font-size: 11px;
 }
 
+.account-switch-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding: 16px 20px;
+  color: #164e63;
+  background: rgba(207, 250, 254, 0.8);
+  border: 1px solid #67c9d2;
+  border-radius: 16px;
+}
+
+.account-switch-notice p {
+  margin: 5px 0 0;
+  font-size: 0.875rem;
+}
+
+.account-switch-notice > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .stacked-editors {
   max-width: 1260px;
 }

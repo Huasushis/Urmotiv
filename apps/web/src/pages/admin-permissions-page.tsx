@@ -25,6 +25,7 @@ import {
 import { AdminLayout } from "../components/admin-layout";
 import { UserRoleEditor } from "../components/user-role-editor";
 import { UserContact } from "../components/user-contact";
+import { SearchInput } from "../components/search-input";
 import { clearProblemDrafts } from "../lib/client-security";
 
 type AdminPermissionSection = "users" | "roles" | "defaults";
@@ -93,9 +94,10 @@ function roleToDraft(role: AdminManagedRole): RoleDraft {
 }
 
 function sourceLabel(source: string): string {
-  if (source.startsWith("role:")) return "角色基线";
-  if (source === "user:allow") return "用户 allow";
-  if (source === "user:deny") return "用户 deny";
+  if (source.startsWith("role:")) return source.endsWith(":deny") ? "角色明确拒绝" : "角色允许";
+  if (source === "root:complete") return "root 完整权限";
+  if (source === "user:allow") return "用户单独允许";
+  if (source === "user:deny") return "用户明确拒绝";
   if (source === "robot:hard-deny" || source.startsWith("hard-deny")) return "硬拒绝";
   return source;
 }
@@ -568,7 +570,7 @@ function UserPanel({
       </div>
       <div className="permission-user-layout">
         <div className="permission-user-list plain-panel">
-          <label>搜索账号<input value={search} placeholder="昵称、用户名或账号 ID" onChange={(event) => setSearch(event.target.value)} /></label>
+          <label>搜索账号<SearchInput value={search} placeholder="昵称、用户名或账号 ID" onSearch={setSearch} /></label>
           <div className="permission-user-table-wrap">
             <table className="permission-user-table">
               <thead><tr><th>账号</th><th>状态</th><th>角色</th></tr></thead>
@@ -628,12 +630,12 @@ function UserPanel({
                 }}>切换到此用户</button>
                 {switchAction.error ? <p role="alert">{switchAction.error.message}</p> : null}
               </div> : null}
-              <p className="notice-line">生效来源：角色基线、用户 allow、用户 deny；用户拒绝（优先）覆盖同名允许，机器人还会受硬拒绝规则约束。</p>
+              <p className="notice-line">在所属权限组的基础上，可以单独增加或拒绝权限。角色或用户的明确拒绝优先，机器人固定禁止项不可解除。</p>
               <div className="permission-delta-columns">
                 <PermissionDeltaMatrix
                   key={`allow-${selectedUserId}-${permissionQuery.data.delta.revision}`}
                   catalogGroups={catalogGroups}
-                  title="用户允许（allow additions）"
+                  title="用户允许（单独增加）"
                   values={draft.allows}
                   disabled={protectedUser}
                   onToggle={(name, checked) => setDraft({ ...draft, allows: updateStringList(draft.allows, name, checked) })}
@@ -641,7 +643,7 @@ function UserPanel({
                 <PermissionDeltaMatrix
                   key={`deny-${selectedUserId}-${permissionQuery.data.delta.revision}`}
                   catalogGroups={catalogGroups}
-                  title="用户拒绝（deny removals）"
+                  title="用户拒绝（优先）"
                   values={draft.denies}
                   disabled={protectedUser}
                   onToggle={(name, checked) => setDraft({ ...draft, denies: updateStringList(draft.denies, name, checked) })}
@@ -689,7 +691,7 @@ function EffectivePermissionPreview({
   return (
     <div className="permission-effective-preview">
       <h3>生效权限预览</h3>
-      <p>每项权限列出来源；同一项同时 allow 和 deny 时，以用户拒绝为准。</p>
+      <p>展开查看权限来源。角色或用户的明确拒绝均优先于允许。</p>
       <div className="effective-domains">
         {domains.map((domain) => {
           const deniedCount = domain.entries.filter((entry) => !entry.allowed).length;

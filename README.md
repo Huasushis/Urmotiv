@@ -96,7 +96,7 @@ docker compose --env-file /secure/path/urmotiv.env exec api pnpm --filter @urmot
 - **默认角色**：`/admin/roles/defaults`，维护人工账号和机器人账号的默认角色。
 - **服务账号与令牌**：创建和停用机器人账号，并创建、轮换或撤销令牌。停用账号会同时撤销现有令牌；新令牌只在创建或轮换成功后显示一次，数据库和后续页面都不能恢复原文。
 - **审计记录**：查看不含题面、答案和密钥的操作摘要。
-- **Fermata 服务**：查看 AI 审题服务健康状态和公开配置。
+- **Fermata 服务**：启用对应插件后，可配置模型、模型接口与密钥、题库连接和机器人令牌，查看服务健康状态。插件独立保存配置，不与题库共享数据库。
 - **USTC OAuth**：分别填写授权 URL、令牌 URL、用户资料 URL、回调 URL和可选 scopes；固定回调路径为 `/api/v1/auth/ustc/callback`。客户端编号与密钥保存后输入框清空，读取只返回配置状态。
 - **插件配置**：管理已内置插件配置，不提供 ZIP/GitHub 安装、更新、卸载或任意代码执行。
 - **知识点目录**：查看和维护知识点分类与标签。
@@ -114,9 +114,9 @@ OAuth 的 HTTP 回环开发例外必须显式开启；生产环境不接受 HTTP
 ```bash
 pnpm --filter @urmotiv/contracts typecheck
 pnpm --filter @urmotiv/api typecheck
-pnpm --filter @urmotiv/api test -- tests/final-integration-red.test.ts
+pnpm --filter @urmotiv/api exec vitest run tests/final-integration-red.test.ts --maxWorkers=1 --no-file-parallelism
 pnpm --filter @urmotiv/web typecheck
-pnpm --filter @urmotiv/web test -- src/pages/admin-page.test.tsx
+pnpm --filter @urmotiv/web exec vitest run src/pages/admin-page.test.tsx --maxWorkers=1 --no-file-parallelism
 ```
 
 构建全部工作区：

@@ -78,7 +78,7 @@ function App() {
   }
 
   return (
-    <AppShell session={sessionData.user} demoEnabled={sessionData.auth.demoEnabled}>
+    <AppShell session={sessionData.user} identity={sessionData.identity} demoEnabled={sessionData.auth.demoEnabled}>
       <Routes>
         <Route path="/" element={<Navigate to="/problems" replace />} />
         <Route path="/problems" element={<ProblemListPage />} />

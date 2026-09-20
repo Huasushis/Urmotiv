@@ -43,7 +43,7 @@ docker compose --env-file /secure/path/urmotiv.env exec api pnpm --filter @urmot
 
 ### root 本地恢复
 
-bootstrap 完成后，固定 `root` 仍没有本地凭据；紧急维护时只能在真实服务器 TTY 执行：
+全新安装完成 bootstrap 后，固定 `root` 尚无本地凭据。首次设置或忘记 root 密码时，在真实服务器 TTY 执行：
 
 ```bash
 docker compose --env-file /secure/path/urmotiv.env exec api pnpm --filter @urmotiv/api recover-root-credentials
@@ -99,11 +99,11 @@ docker compose --env-file /secure/path/urmotiv.env exec -T api pnpm --filter @ur
 | `problem_setter` | 命题组成员 | 编辑可见题目、维护评测资料、组题和查看访问风险 |
 | `leader` | 组长 | 终审题目、授予单题访问权、管理组题、题目包导入导出和知识点 |
 | `system_administrator` | 系统管理员 | 账号、权限、题目批量状态管理、系统设置、插件、机器人账号、知识点和审计 |
-| `root` | root | 仅用于首次配置和紧急恢复的种子角色；不应作为日常登录身份 |
+| `root` | root | 固定账号 0 的完整管理权限，设好本地密码后可直接登录；不依赖统一身份，也不能转授给其它账号 |
 
 核心权限包括 `auth.login`、`problem.create`、`problem.view.own`/`problem.view.all`、`problem.edit.own`/`problem.edit.all`、`problem.review`、`problem.status.change`、`problem.frozen.edit`、`problem.import`、`problem.export.own`/`problem.export.all`、`problem.testdata.read`/`problem.testdata.write`、`contest.*`、`plugin.manage`、`user.create` 和 `audit.read`。完整名称与作用域见[权限参考](permissions.md)。
 
-本版本的管理页面路径为 `/admin/users`、`/admin/roles` 和 `/admin/roles/defaults`，分别用于用户权限增量、角色权限和默认角色维护；角色管理 API 使用 `GET/POST /api/v1/admin/roles` 和 `PUT /api/v1/admin/roles/:roleId`，可创建自定义角色、设置每项权限的允许或明确拒绝、分配人工账号或机器人账号。内置角色的名称和权限不可修改，但可以调整成员归属；服务端仍会检查 `user.permission.manage`，机器人账号不能通过角色解除固定禁止。所有修改都按角色修订号乐观并发检查并写入审计记录，冲突时应刷新后重试；不要直接在生产数据库临时写 SQL。
+管理页面 `/admin/users`、`/admin/roles` 和 `/admin/roles/defaults` 分别维护个人权限增减、权限组定义和新账号默认角色。普通账号的所属权限组在用户管理中修改，机器人在服务账号页修改，不在角色定义页列成员复选框。除了固定 root，内置角色的权限也可调整；其标识、名称和说明保持稳定。有 `user.permission.manage` 的真人管理员可配置完整业务授权，不按自身已有权限逐级缩小，但明确拒绝和机器人固定禁止项仍优先。角色接口为 `GET/POST /api/v1/admin/roles` 和 `PUT /api/v1/admin/roles/:roleId`；修改检查角色修订号并记录审计，冲突后刷新重试。
 
 ### 明确拒绝优先
 

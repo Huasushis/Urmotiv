@@ -24,6 +24,7 @@ import { canOpenAdmin } from "./admin-layout";
 type AppShellProps = {
   session: NonNullable<SessionResponse["user"]>;
   demoEnabled: boolean;
+  identity?: SessionResponse["identity"];
   children: ReactNode;
 };
 
@@ -84,7 +85,7 @@ function HeaderAvatar({ user }: { user: NonNullable<SessionResponse["user"]> }) 
   );
 }
 
-export function AppShell({ session, demoEnabled, children }: AppShellProps) {
+export function AppShell({ session, identity, demoEnabled, children }: AppShellProps) {
   const { items: navItems, showManagement } = buildNavItems(session);
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const client = useQueryClient();
@@ -172,7 +173,14 @@ export function AppShell({ session, demoEnabled, children }: AppShellProps) {
           </details>
         </div>
       </header>
-      <main id="main-content" className="main-content" tabIndex={-1}>{children}</main>
+      <main id="main-content" className="main-content" tabIndex={-1}>
+        {identity?.switched ? <aside className="account-switch-notice" aria-label="当前切换身份">
+          <div><strong>正在以 {session.nickname} 的身份操作</strong><p>当前只拥有此账号的权限。返回管理员身份需要重新登录。</p></div>
+          <button type="button" className="secondary-button" disabled={signOut.isPending} onClick={() => signOut.mutate()}>退出并重新登录</button>
+        </aside> : null}
+        {signOut.isError ? <p className="notice-line" role="alert">退出失败，请重试。</p> : null}
+        {children}
+      </main>
     </div>
   );
 }

@@ -193,7 +193,7 @@ describe("权限管理页", () => {
     expect(view.textContent).toContain("角色基线：contributor");
     expect(view.textContent).toContain("用户允许");
     expect(view.textContent).toContain("用户拒绝（优先）");
-    expect(view.textContent).toContain("角色基线、用户 allow、用户 deny");
+    expect(view.textContent).toContain("角色或用户的明确拒绝优先");
     const save = [...view.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.includes("保存用户权限"));
     expect(save).toBeDefined();
     await act(async () => { save?.click(); });
