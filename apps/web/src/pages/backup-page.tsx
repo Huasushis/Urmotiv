@@ -192,7 +192,7 @@ export function BackupPage({ session }: { session: SessionUser }) {
             ) : null}
           </section>
           <form
-            className="plain-panel form-grid"
+            className="plain-panel form-grid backup-settings-form"
             aria-label="WebDAV 配置"
             onSubmit={(event) => {
               event.preventDefault();
@@ -349,6 +349,7 @@ export function BackupPage({ session }: { session: SessionUser }) {
                         disabled={busy || !settings.data?.enabled}
                         onClick={() => {
                           setSelected(file.name);
+                          restore.reset();
                           setRestorePassword("");
                           setCurrentPassword("");
                           setConfirmation("");
@@ -407,7 +408,7 @@ export function BackupPage({ session }: { session: SessionUser }) {
                   <button
                     type="button"
                     className="secondary-button"
-                    onClick={() => setSelected("")}
+                    onClick={() => {setSelected("");restore.reset();}}
                   >
                     取消
                   </button>

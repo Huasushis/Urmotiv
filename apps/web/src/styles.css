@@ -6234,6 +6234,9 @@ textarea:read-only {
 .contact-card dt { color: var(--text-soft); font-size: 13px; }
 .contact-card dd { margin: 0; overflow-wrap: anywhere; }
 .leaderboard-page { max-width: 1000px; margin: 0 auto; }
+.backup-settings-form > :is(h2,h3,p,small) { grid-column: 1 / -1; margin: 0; }
+.backup-settings-form > h3 { padding-top: 12px; border-top: 1px solid var(--border); }
+.backup-settings-form > label:not(.settings-form-toggle) { display: grid; gap: 8px; align-content: start; }
 .account-security-panel { margin-top: 24px; max-width: 960px; scroll-margin-top: 90px; }
 .linked-identities-panel { margin-top: 24px; max-width: 960px; }
 .linked-identity-card { margin: 18px 0; padding: 20px; border: 1px solid var(--border); border-radius: 14px; }
