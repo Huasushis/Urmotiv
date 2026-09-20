@@ -12,6 +12,7 @@ import {
   resendEmailVerification
 } from "../lib/api";
 import { clearProblemDrafts } from "../lib/client-security";
+import { BrandMark } from "../components/brand-mark";
 
 const demoAccounts = [
   { id: "author", title: "投稿人", description: "创建、编辑和提交自己的题目" },
@@ -57,7 +58,7 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
   return (
     <div className="login-page">
       <section className="login-intro">
-        <div className="brand compact"><span className="brand-mark">U</span><span>Urmotiv</span></div>
+        <div className="brand compact"><BrandMark /><span>Urmotiv</span></div>
         <h1>题库协作，从一份可审阅的草稿开始</h1>
         <p>登录后可按已授予的权限投题、审题和整理题目资料。系统会在服务端再次核对权限。</p>
         <Link to="/leaderboard" className="secondary-button">查看公开投稿榜单</Link>

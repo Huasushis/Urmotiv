@@ -1,10 +1,32 @@
+![Urmotiv：让一个想法，成为一道好题](docs/assets/cover.svg)
+
 # Urmotiv
 
-Urmotiv 是面向命题协作的题库系统：命题人编写 Markdown 题面与题解，审核人按服务端策略协作审题，管理员管理权限、导入任务和内置服务。
+面向算法竞赛命题团队的协作工作台。从一份题稿出发，完成共同审阅、组题、归档与题目包交付。
+
+[入门部署](docs/getting-started.md) · [使用指南](docs/user-guide.md) · [管理员指南](docs/admin-guide.md) · [插件开发](docs/plugin-development.md) · [报告问题](https://github.com/Huasushis/Urmotiv/issues)
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-087e94.svg)](LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6.svg)](package.json)
+
+| 从想法到比赛 | 已提供的能力 |
+| --- | --- |
+| 写好一道题 | Markdown 与公式预览、知识点目录、题目修订、样例和附件管理 |
+| 一起审阅 | 审核轮次、人工意见、可选 AI 审题、原题检索、按角色与个人微调权限 |
+| 交付一场比赛 | 固定题目版本、参与者访问风险、比赛归档、Hydro / FPS 整包导出 |
+
+Urmotiv 不执行选手代码。AI 审题和原题检索分别由独立的 [Fermata](https://github.com/Huasushis/Fermata) 与 [Anklang](https://github.com/Huasushis/Anklang) 提供，可以按需启用。
+
+## 界面预览
+
+![组题归档工作台，使用合成比赛与题目](docs/assets/contest-archive.png)
+
+截图来自真实界面的合成演示数据，不包含私有题库。新标志以展开的题稿和一个音符般的圆点，表达 Urmotiv 的“初始动机”：一个想法逐渐成为完整作品。
 
 ## 目录
 
 - [安全](#安全)
+- [界面预览](#界面预览)
 - [背景](#背景)
 - [前置条件](#前置条件)
 - [安装](#安装)
@@ -84,6 +106,8 @@ docker compose --env-file /secure/path/urmotiv.env exec api pnpm --filter @urmot
 题面与题解使用 Markdown；题目附件按公开图片、公开文件、内部题解附件和评测数据区分权限。没有 `problem.view` 或相应导入权限时，API 按题目不存在处理。
 
 比赛整包导出在「组题 → 打开方案 → 导出比赛题目包」。选择已启用的 Hydro 等格式，检查后生成下载包；全部题目按方案顺序导出，保留加入方案时固定的版本。详细操作见[使用指南](docs/user-guide.md#组题与比赛)。
+
+比赛结束后点击「归档比赛」，确认后移入「已归档」。归档保留只读方案、固定版本和导出入口，不会公开私有题目；「进行中 / 已归档 / 全部」可随时切换。
 
 ## 管理设置
 

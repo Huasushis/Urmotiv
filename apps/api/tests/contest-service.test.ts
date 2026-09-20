@@ -82,6 +82,21 @@ async function createContest(context: ReturnType<typeof makeContext>) {
 }
 
 describe("组题与访问记录服务", () => {
+  it("归档保留固定版本与原访问权限，归档后不能更改或重新打开", async () => {
+    const context = makeContext();
+    const original = await createContest(context);
+    const archived = await context.service.updateContest(context.leader, original.id, {state:"archived",expectedUpdatedAt:original.updatedAt});
+    expect(archived.state).toBe("archived");
+    expect(archived.problems).toEqual(original.problems);
+    expect(archived.capabilities).toMatchObject({canEdit:false,canExport:true});
+    for (const input of [{state:"draft" as const},{title:"归档后改名"}]) {
+      await expect(context.service.updateContest(context.leader, original.id, {...input,expectedUpdatedAt:archived.updatedAt})).rejects.toMatchObject({statusCode:409});
+    }
+    await expect(context.service.getContest(context.author,original.id)).rejects.toMatchObject({statusCode:404});
+    expect((await context.service.listContests(context.author)).items).toEqual([]);
+    const denied = {...context.leader,grants:[...context.leader.grants,{permission:"contest.edit.all" as const,effect:"deny" as const,scope:"global" as const},{permission:"contest.export" as const,effect:"deny" as const,scope:"global" as const}]};
+    await expect(context.service.getContest(denied,original.id)).rejects.toMatchObject({statusCode:404});
+  });
   it("只有比赛导出权限可读方案，但不能借此修改或读取风险", async () => {
     const context = makeContext();
     const contest = await createContest(context);

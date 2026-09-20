@@ -164,14 +164,11 @@ h3 {
 }
 
 .brand-mark {
-  display: inline-grid;
-  place-items: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 10px;
-  background: linear-gradient(145deg, #26b3c9, var(--teal));
-  color: white;
-  font-weight: 800;
+  display: block;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  object-fit: contain;
 }
 
 .global-nav {
@@ -2267,6 +2264,41 @@ textarea:read-only {
   overflow: hidden;
 }
 
+.contest-views {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 20px;
+}
+.contest-views button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-soft);
+  cursor: pointer;
+}
+.contest-views button[aria-pressed="true"] {
+  color: var(--teal);
+  background: var(--teal-soft);
+  border-color: var(--teal);
+}
+.contest-views button span { font-variant-numeric: tabular-nums; }
+.contest-archive-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 16px 22px;
+  margin: 0;
+  background: var(--teal-soft);
+  color: var(--text-soft);
+  font-size: 14px;
+  line-height: 1.65;
+}
+.contest-archive-notice svg { flex: 0 0 auto; margin-top: 3px; }
 .contest-index {
   min-width: 0;
   border-right: 1px solid var(--border);

@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import type { Contest, CreateContestInput } from "@urmotiv/contracts";
 import {
   createContest,
@@ -64,12 +64,17 @@ export function ContestPage() {
   const contests = useQuery({ queryKey: ["contests"], queryFn: listContests });
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const view = searchParams.get("view") === "archived" ? "archived" : searchParams.get("view") === "all" ? "all" : "active";
+  const visibleContests = (contests.data?.items ?? []).filter(contest => view === "all" || (contest.state === "archived") === (view === "archived"));
+  const selectView = (next: string) => {
+    setSearchParams(current => { const updated = new URLSearchParams(current); updated.set("view", next); return updated; });
+    setCreating(false);
+  };
 
   useEffect(() => {
-    if (selectedId === null && contests.data?.items[0]) {
-      setSelectedId(contests.data.items[0].id);
-    }
-  }, [contests.data, selectedId]);
+    if (!visibleContests.some(contest => contest.id === selectedId)) setSelectedId(visibleContests[0]?.id ?? null);
+  }, [contests.data, selectedId, view]);
 
   const selected = useQuery({
     queryKey: ["contest", selectedId],
@@ -87,6 +92,10 @@ export function ContestPage() {
 
   const refreshContest = (contest: Contest) => {
     client.setQueryData(["contest", contest.id], contest);
+    client.setQueryData(["contests"], (current: Awaited<ReturnType<typeof listContests>> | undefined) => current === undefined ? current : {
+      ...current, items: current.items.map(item => item.id === contest.id ? {...item, state:contest.state, updatedAt:contest.updatedAt} : item)
+    });
+    if (contest.state === "archived") selectView("archived");
     void client.invalidateQueries({ queryKey: ["contests"] });
   };
 
@@ -124,17 +133,24 @@ export function ContestPage() {
       </div>
 
       {contests.isError ? <div className="inline-error">{contests.error.message}</div> : null}
+      <nav className="contest-views" aria-label="比赛方案分类">
+        {([['active','进行中'],['archived','已归档'],['all','全部']] as const).map(([key,label]) => <button
+          key={key} type="button" aria-pressed={view === key} onClick={() => selectView(key)}>
+          {key === 'archived' ? <Archive size={16} aria-hidden="true" /> : null}{label}
+          <span>{(contests.data?.items ?? []).filter(item => key === 'all' || (item.state === 'archived') === (key === 'archived')).length}</span>
+        </button>)}
+      </nav>
       <div className="contest-layout">
         <aside className="contest-index" aria-label="组题方案列表">
           <div className="contest-index-heading">
             <strong>方案</strong>
-            <span>{contests.data?.items.length ?? 0}</span>
+            <span>{visibleContests.length}</span>
           </div>
           {contests.isLoading ? <p className="contest-empty">正在加载…</p> : null}
-          {!contests.isLoading && contests.data?.items.length === 0 ? (
-            <p className="contest-empty">当前没有可查看的组题方案。</p>
+          {!contests.isLoading && visibleContests.length === 0 ? (
+            <p className="contest-empty">{view === 'archived' ? '暂无已归档方案。比赛结束后，可在方案详情中归档。' : '当前分类没有可查看的方案，可以切换到已归档或新建方案。'}</p>
           ) : null}
-          {contests.data?.items.map((contest) => (
+          {visibleContests.map((contest) => (
             <button
               type="button"
               className={`contest-index-item ${selectedId === contest.id && !creating ? "active" : ""}`}
@@ -159,8 +175,10 @@ export function ContestPage() {
         <div className="contest-main">
           {creating ? (
             <ContestCreateForm
-              onCreated={(contest) => {
+              onCreated={async (contest) => {
                 refreshContest(contest);
+                await client.invalidateQueries({ queryKey: ["contests"] });
+                selectView("active");
                 setSelectedId(contest.id);
                 setCreating(false);
               }}
@@ -169,7 +187,7 @@ export function ContestPage() {
             <div className="contest-empty large">正在打开方案…</div>
           ) : selected.isError ? (
             <div className="inline-error">{selected.error.message}</div>
-          ) : selected.data ? (
+          ) : selected.data && visibleContests.some(item => item.id === selected.data.id) ? (
             <ContestDetail key={selected.data.id} contest={selected.data} currentUserId={session.data?.user?.id ?? ""} onChanged={refreshContest} />
           ) : (
             <div className="contest-empty large">
@@ -346,20 +364,25 @@ function ContestDetail({ contest, currentUserId, onChanged }: { contest: Contest
             <Download size={15} aria-hidden="true" />{exporting ? "收起导出" : "导出比赛题目包"}
           </button> : null}
           {contest.state === "draft" && contest.capabilities.canEdit ? (
-            <button className="secondary-button compact-button" type="button" disabled={changeState.isPending} onClick={() => changeState.mutate("locked")}>
+            <button className="secondary-button compact-button" type="button" disabled={changeState.isPending} onClick={() => {
+              if (window.confirm("锁定后题目版本、成员和比赛信息将不能修改，只能归档。确定锁定？")) changeState.mutate("locked");
+            }}>
               <LockKeyhole size={15} aria-hidden="true" />
               锁定
             </button>
           ) : null}
-          {contest.state === "locked" && contest.capabilities.canEdit ? (
-            <button className="secondary-button compact-button" type="button" disabled={changeState.isPending} onClick={() => changeState.mutate("archived")}>
+          {contest.state !== "archived" && contest.capabilities.canEdit ? (
+            <button className="secondary-button compact-button" type="button" disabled={changeState.isPending} onClick={() => {
+              if (window.confirm("归档后方案只读，不能继续编辑；仍可查看和导出已有题目，不会公开私有题目。确定归档？")) changeState.mutate("archived");
+            }}>
               <Archive size={15} aria-hidden="true" />
-              归档
+              归档比赛
             </button>
           ) : null}
         </div>
       </header>
-      {changeState.error ? <div className="inline-error">{changeState.error.message}</div> : null}
+      {changeState.error ? <div className="inline-error" role="alert">{changeState.error.message}</div> : null}
+      {contest.state === "archived" ? <p className="contest-archive-notice"><Archive size={18} aria-hidden="true" /><span>此比赛已归档，方案与题目版本只读保留。仍按原权限查看和导出，不会因此公开题目。</span></p> : null}
       {exporting && contest.capabilities.canExport ? <section aria-label="导出比赛题目包" className="contest-detail-section">
         <ExportSection key={`${currentUserId}:${contest.id}:${contest.updatedAt}`} currentUserId={currentUserId} contest={contest} />
       </section> : null}

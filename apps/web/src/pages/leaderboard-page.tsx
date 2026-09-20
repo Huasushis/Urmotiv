@@ -3,6 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { Trophy } from "lucide-react";
 import type { LeaderboardQuery } from "@urmotiv/contracts";
 import { getLeaderboard } from "../lib/api";
+import { BrandMark } from "../components/brand-mark";
 
 export function LeaderboardPage({ publicView = false }: { publicView?: boolean }) {
   const [params,setParams] = useSearchParams();
@@ -31,5 +32,5 @@ export function LeaderboardPage({ publicView = false }: { publicView?: boolean }
     <p className="muted-note leaderboard-explanation">投稿数按题目去重，重复送审不重复计数；未提交的草稿、已删除题目和迁移的历史题库不计入。通过与拒绝按题目当前状态统计。榜单仅公开昵称和汇总数量，不公开题目内容或联系方式。</p>
   </div>;
   if(!publicView) return content;
-  return <div className="app-shell"><header className="global-header public-header"><div className="global-header-inner"><Link to="/leaderboard" className="brand"><span className="brand-mark">U</span><span>Urmotiv</span></Link><Link to="/login" className="secondary-button">登录 / 注册</Link></div></header><main className="main-content">{content}</main></div>;
+  return <div className="app-shell"><header className="global-header public-header"><div className="global-header-inner"><Link to="/leaderboard" className="brand"><BrandMark /><span>Urmotiv</span></Link><Link to="/login" className="secondary-button">登录 / 注册</Link></div></header><main className="main-content">{content}</main></div>;
 }

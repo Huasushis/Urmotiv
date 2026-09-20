@@ -39,7 +39,7 @@ test("比赛页导出全部固定版本，只展示启用格式，生成下载�
   await page.goto("/demo-login");
   await page.getByRole("button", { name: /组长/ }).click();
   await expect(page).toHaveURL(/\/problems$/);
-  await page.goto("/contests");
+  await page.goto("/contests?view=archived");
   await page.getByRole("button", { name: "导出比赛题目包", exact: true }).click();
   const panel = page.getByRole("region", { name: "导出比赛题目包", exact: true });
   await expect(panel).toContainText("全部 2 道题");

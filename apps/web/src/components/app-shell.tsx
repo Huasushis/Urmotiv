@@ -20,6 +20,7 @@ import type { SessionResponse } from "@urmotiv/contracts";
 import { avatarUrlFor, logout } from "../lib/api";
 import { clearProblemDrafts } from "../lib/client-security";
 import { canOpenAdmin } from "./admin-layout";
+import { BrandMark } from "./brand-mark";
 
 type AppShellProps = {
   session: NonNullable<SessionResponse["user"]>;
@@ -108,7 +109,7 @@ export function AppShell({ session, identity, demoEnabled, children }: AppShellP
       <header className="global-header">
         <div className="global-header-inner">
           <NavLink className="brand" to="/problems" aria-label="Urmotiv 题目">
-            <span className="brand-mark">U</span>
+            <BrandMark />
             <span>Urmotiv</span>
           </NavLink>
           <button

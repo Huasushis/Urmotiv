@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <title>Urmotiv — 让一个想法，成为一道好题。</title>
+  <desc>命题 · 审阅 · 组题 · 归档。原创矢量项目封面，不是产品截图。</desc>
+  <defs>
+    <linearGradient id="bg" x2="1" y2="1"><stop stop-color="#f4fafb"/><stop offset="1" stop-color="#bfeef3"/></linearGradient>
+    <linearGradient id="glass" x2="1" y2="1"><stop stop-color="#fff" stop-opacity=".85"/><stop offset="1" stop-color="#fff" stop-opacity=".25"/></linearGradient>
+    <radialGradient id="glow"><stop stop-color="#087e94" stop-opacity=".16"/><stop offset="1" stop-color="#087e94" stop-opacity="0"/></radialGradient>
+    <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%"><feDropShadow dx="0" dy="22" stdDeviation="25" flood-color="#123d49" flood-opacity=".12"/></filter>
+    <g id="mark"><path d="M7 17c10-1 18 3 23 10v28C24 48 16 44 7 44V17Z" fill="#087e94"/><path d="M35 27c6-7 14-11 22-10v27c-9 0-16 4-22 11V27Z" fill="#23b7c8"/><circle cx="41" cy="10" r="6" fill="#087e94"/></g>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  <circle cx="1000" cy="290" r="370" fill="url(#glow)"/>
+  <path d="M744 0v640M0 554h1280" stroke="#143c49" stroke-opacity=".09"/>
+  <g font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans CJK SC', sans-serif">
+    <g transform="translate(72 49) scale(.56)"><use href="#mark"/></g>
+    <text x="126" y="75" fill="#143c49" font-size="15" font-weight="600" letter-spacing="2.6">A WORKSPACE FOR PROBLEM SETTERS</text>
+    <text x="72" y="236" fill="#143c49" font-size="94" font-weight="650" letter-spacing="-4">Urmotiv</text>
+    <text x="76" y="309" fill="#143c49" font-size="35" font-weight="500">让一个想法，成为一道好题。</text>
+    <text x="77" y="361" fill="#143c49" opacity=".75" font-size="21" letter-spacing="1.5">命题 · 审阅 · 组题 · 归档</text>
+    <g transform="translate(76 423)"><rect width="155" height="40" rx="20" fill="#f4fafb" fill-opacity=".62" stroke="#143c49" stroke-opacity=".12"/><text x="77.5" y="26" text-anchor="middle" fill="#143c49" font-size="16">Markdown</text></g>
+    <g transform="translate(248 423)"><rect width="155" height="40" rx="20" fill="#f4fafb" fill-opacity=".62" stroke="#143c49" stroke-opacity=".12"/><text x="77.5" y="26" text-anchor="middle" fill="#143c49" font-size="16">Hydro / FPS</text></g>
+    <g transform="translate(420 423)"><rect width="155" height="40" rx="20" fill="#f4fafb" fill-opacity=".62" stroke="#143c49" stroke-opacity=".12"/><text x="77.5" y="26" text-anchor="middle" fill="#143c49" font-size="16">Plugins</text></g>
+    <text x="76" y="599" fill="#143c49" opacity=".7" font-size="12" letter-spacing="2">FROM THE FIRST MOTIF TO THE FINAL CONTEST</text>
+    <text x="1198" y="599" text-anchor="end" fill="#143c49" opacity=".7" font-size="13">OPEN SOURCE / MIT</text>
+  </g>
+  <g transform="translate(848 178) rotate(12 135 142)">
+    <rect x="-12" y="7" width="270" height="286" rx="40" fill="url(#glass)" stroke="#143c49" stroke-opacity=".07"/>
+  </g>
+  <g transform="translate(833 161) rotate(-9 140 151)" filter="url(#shadow)">
+    <rect width="294" height="306" rx="42" fill="url(#glass)" stroke="#fff" stroke-opacity=".65"/>
+    <g transform="translate(52 50) scale(3)"><use href="#mark"/></g>
+  </g>
+  <g fill="#087e94" opacity=".45"><circle cx="1190" cy="117" r="3"/><circle cx="1186" cy="470" r="3"/><circle cx="796" cy="472" r="3"/></g>
+</svg>
