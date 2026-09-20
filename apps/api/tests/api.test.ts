@@ -164,7 +164,7 @@ describe("题目 API", () => {
     );
   });
 
-  it("邮箱验证链接过期后不能激活账号，注册关闭时所有注册接口拒绝请求", async () => {
+  it("邮箱验证链接过期后不能激活账号，关闭注册后不能新注册或匿名重发", async () => {
     const outbox = new InMemoryEmailVerificationOutbox();
     let now = new Date("2026-09-19T00:00:00.000Z");
     const app = await createApp({
@@ -196,12 +196,35 @@ describe("题目 API", () => {
 
     const closed = await createApp();
     openApps.push(closed);
-    for (const path of ["email-register", "email-verification/resend", "email-verification/verify"]) {
+    for (const path of ["email-register", "email-verification/resend"]) {
       const result = await closed.inject({
         method: "POST", url: `/api/v1/auth/${path}`, headers: { origin: localOrigin }, payload: {}
       });
       expect(result.statusCode).toBe(404);
     }
+    const unknown = await closed.inject({method:"POST",url:"/api/v1/auth/email-verification/verify",
+      headers:{origin:localOrigin},payload:{token}});
+    expect(unknown.statusCode).toBe(400);
+    expect(unknown.json().error.code).toBe("INVALID_VERIFICATION");
+  });
+
+  it("关闭公开注册不阻断已发链接验证，仍不能新建账号且验证凭证只能消费一次", async () => {
+    const store = new InMemoryDataStore(createDemoUsers(), demoTags);
+    const outbox = new InMemoryEmailVerificationOutbox();
+    const open = await createApp({store,emailRegistrationEnabled:true,emailVerificationDelivery:outbox,emailVerificationWebUrl:localOrigin});
+    openApps.push(open);
+    const input = {username:"existing-pending",email:"pending@example.test",password:"synthetic-password-123",nickname:"合成待验证账号"};
+    expect((await open.inject({method:"POST",url:"/api/v1/auth/email-register",headers:{origin:localOrigin},payload:input})).statusCode).toBe(202);
+    const token = new URLSearchParams(new URL(outbox.messages[0]!.verificationUrl).hash.split("?",2)[1]).get("token");
+    const closed = await createApp({store});openApps.push(closed);
+    expect((await closed.inject({method:"POST",url:"/api/v1/auth/email-register",headers:{origin:localOrigin},payload:{...input,username:"new-blocked",email:"blocked@example.test"}})).statusCode).toBe(404);
+    expect((await store.listUsers()).some(user=>user.username==="new-blocked")).toBe(false);
+    const loginRequest = {method:"POST" as const,url:"/api/v1/auth/username-login",headers:{origin:localOrigin},payload:{username:input.username,password:input.password}};
+    expect((await closed.inject(loginRequest)).statusCode).toBe(401);
+    const verifyRequest = {method:"POST" as const,url:"/api/v1/auth/email-verification/verify",headers:{origin:localOrigin},payload:{token}};
+    expect((await closed.inject(verifyRequest)).statusCode).toBe(200);
+    expect((await closed.inject(verifyRequest)).statusCode).toBe(400);
+    expect((await closed.inject(loginRequest)).statusCode).toBe(200);
   });
 
   it("resending a verification email invalidates the older link", async () => {
