@@ -3,6 +3,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MarkdownEditor, MarkdownPreview } from "./markdown-editor";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import * as api from "../lib/api";
 
 function StatefulEditor({ value: initialValue }: { value: string }) {
   const [value, setValue] = useState(initialValue);
@@ -88,6 +90,21 @@ afterEach(() => {
 });
 
 describe("Markdown 图片预览", () => {
+  it("导入包相对图片只解析当前题目允许读取的题面资源", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const file = { id: "7293643f-8197-449c-b48b-f674ab0b3772", category: "statement_image" as const,
+      logicalPath: "assets/示意图.png", mediaType: "image/png", originalName: "示意图.png", position: 0, byteSize: 10, sha256: "a".repeat(64), createdAt: "2026-09-20T00:00:00.000Z" };
+    const request = vi.spyOn(api, "listProblemFiles").mockResolvedValue({ items: [file] });
+    client.setQueryData(["problem-files", "42", "markdown"], { items: [file] });
+    const render = (value: string) => renderToStaticMarkup(<QueryClientProvider client={client}><MarkdownPreview problemId="42" value={value} /></QueryClientProvider>);
+    expect(render("![图](./assets/%E7%A4%BA%E6%84%8F%E5%9B%BE.png)")).toContain(`/api/v1/problems/42/files/${file.id}`);
+    expect(render("![错路径](other/示意图.png)")).not.toContain("<img");
+    for (const value of ["../assets/示意图.png", "%2F%2Ftracker.example/pixel.png", "https://tracker.example/pixel.png"]) expect(render(`![图](${value})`)).not.toContain("<img");
+    client.setQueryData(["problem-files", "42", "markdown"], { items: [{ ...file, category: "internal_attachment" }] });
+    expect(render("![图](assets/示意图.png)")).not.toContain("<img");
+    client.clear(); request.mockRestore();
+  });
+
   it("隐藏外部图片地址", () => {
     const html = renderToStaticMarkup(
       <MarkdownPreview value="![跟踪图片](https://tracker.example/pixel.png)" problemId="42" />

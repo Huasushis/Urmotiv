@@ -20,6 +20,8 @@ import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { useQuery } from "@tanstack/react-query";
+import { listProblemFiles, problemFileReferenceUrl } from "../lib/api";
 
 type MarkdownEditorProps = {
   label: string;
@@ -61,6 +63,8 @@ export function MarkdownPreview({ value, problemId }: { value: string; problemId
           img: ({ src, alt }) => {
             const controlledFile = isControlledProblemFileSource(src, problemId);
             if (!controlledFile) {
+              const path = relativeImagePath(src);
+              if (problemId && path) return <ImportedProblemImage problemId={problemId} path={path} alt={alt ?? ""} />;
               return <span className="blocked-markdown-image">外部图片已隐藏</span>;
             }
             return <img src={src} alt={alt ?? ""} loading="lazy" referrerPolicy="no-referrer" />;
@@ -71,6 +75,22 @@ export function MarkdownPreview({ value, problemId }: { value: string; problemId
       </ReactMarkdown>
     </div>
   );
+}
+
+function relativeImagePath(source: string | undefined): string | undefined {
+  if (!source) return undefined;
+  try {
+    const path = decodeURIComponent(source).replace(/^(\.\/)+/, "");
+    if (!path || /^[a-z][a-z0-9+.-]*:/i.test(path) || path.startsWith("/") || path.includes("\\") || path.split("/").some((segment) => segment === "..")) return undefined;
+    return path;
+  } catch { return undefined; }
+}
+
+function ImportedProblemImage({ problemId, path, alt }: { problemId: string; path: string; alt: string }) {
+  const files = useQuery({ queryKey: ["problem-files", problemId, "markdown"], queryFn: () => listProblemFiles(problemId), retry: false });
+  const file = !files.isError ? files.data?.items.find((item) => item.logicalPath === path && item.category === "statement_image" && supportedImageTypes.has(item.mediaType)) : undefined;
+  if (!file) return <span className="blocked-markdown-image">{files.isPending ? "正在读取题面图片…" : "题面图片不可用"}</span>;
+  return <img src={problemFileReferenceUrl(problemId, file.id)} alt={alt} loading="lazy" referrerPolicy="no-referrer" />;
 }
 
 export function MarkdownEditor({
