@@ -42,7 +42,7 @@ URMOTIV_ALLOW_LOOPBACK_INSECURE_COOKIES=true
 
 ```bash
 bash scripts/deploy/validate-env.sh /secure/path/urmotiv.env
-docker compose --env-file /secure/path/urmotiv.env config
+docker compose --env-file /secure/path/urmotiv.env config --quiet
 docker compose --env-file /secure/path/urmotiv.env up -d --build
 ```
 
@@ -74,14 +74,14 @@ docker compose --env-file /secure/path/urmotiv.env run --rm --no-deps api pnpm -
 docker compose --env-file /secure/path/urmotiv.env up -d api web worker
 ```
 
-首次管理员得到的是“系统管理员”角色：可以管理账号、权限、插件、知识点和运行设置，但不会因为这个角色自动获得最终审题权。按需再分配“审题人”“命题组成员”或“组长”。
+首次管理员得到“系统管理员”角色，默认可以管理账号、权限、插件、知识点、运行设置和题目终审。日常协作可以另建账号并分配“审题人”“命题组成员”或“组长”。需要使用固定 root 时，先按[管理员指南](admin-guide.md#root-本地恢复)设置本地密码，再在同一登录页输入 `root`；无需启用统一身份认证。
 
 ## 4. 登录并创建第一道合成题
 
 1. 通过 SSH 转发或本机浏览器打开 `http://127.0.0.1:8080/login`。
-2. 选择“邮箱登录”，输入刚初始化的邮箱和密码。邮箱注册默认关闭；这不影响已有凭据登录。
+2. 在“用户名或邮箱”输入刚初始化的邮箱，填写密码并登录。邮箱注册默认关闭；这不影响已有凭据登录。
 3. 登录后进入 `/problems`，点击“新建题目”。填写题目名称、至少一个知识点和题目类型；先保存草稿。
-4. 在题目工作区补充题面、题解、样例和评测设置，使用“程序与附件”上传公开附件或内部资料。
+4. 在题目工作区补充题面、题解、样例和评测设置；“题解与资料”和“数据与评测”页提供对应附件、程序和数据入口。
 5. 点击“提交审核”。提交时客户端会携带当前修订号；如果出现版本冲突，刷新后重新确认改动。待审修订会冻结基础题面与基础题解。
 
 普通用户完整操作顺序和权限说明见[用户指南](user-guide.md)，首位管理员和恢复流程见[管理员指南](admin-guide.md)。

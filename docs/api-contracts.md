@@ -82,11 +82,13 @@ USTC 登录以提供方 + gid/id 找账号；学校提供的用户名、姓名�
 | `GET /api/v1/session` | 无 | 返回当前用户与已启用的登录方式 |
 | `POST /api/v1/auth/email-login` | 无 | JSON `{ "email", "password" }`；成功设置 HttpOnly 会话 Cookie |
 | `POST /api/v1/auth/username-login` | 无 | JSON `{ "username", "password" }`；用户名忽略大小写，root 不走此入口 |
-| `POST /api/v1/auth/root-login` | 无 | 仅接受固定标识 `root`/`0` 与服务器 TTY 恢复生成的口令；成功设置 HttpOnly 会话 Cookie |
+| `POST /api/v1/auth/root-login` | 无 | 接受固定标识 `root`/`0` 与当前本地口令；初始口令由服务器设置，成功设置 HttpOnly 会话 Cookie |
 | `POST /api/v1/auth/email-register` | 无 | 仅在邮箱注册显式开启且配置投递时可用；返回验证等待状态 |
 | `POST /api/v1/auth/email-verification/resend` | 无 | 重新发送验证邮件 |
 | `POST /api/v1/auth/email-verification/verify` | 无 | JSON `{ "token" }`，消费一次性验证令牌 |
 | `POST /api/v1/auth/logout` | 会话可选 | 撤销当前会话 |
+| `POST /api/v1/auth/switch-account` | 真人直接登录并具有 `user.impersonate` | `{targetUserId}`；撤销旧会话，仅按目标权限建立模拟会话，响应 `identity` 说明当前身份 |
+| `POST /api/v1/auth/switch-account/exit` | 模拟会话 | 注销模拟会话，不恢复旧管理员权限；也可调用 logout，返回需重新登录 |
 | `GET /api/v1/auth/ustc/start?returnPath=/login` | 无 | OAuth 开始入口；会设置浏览器绑定 Cookie 并重定向到提供方 |
 | `GET /api/v1/auth/ustc/callback` | OAuth Cookie | 提供方回调；生产回调 URI 必须精确为 `URMOTIV_WEB_ORIGIN` 加此路径 |
 | `GET /api/v1/auth/cas/start`、`GET /api/v1/auth/cas/callback` | 无/票据 Cookie | 经典 CAS 仅在显式配置时启用，与 USTC OAuth 并行而不互相替代 |

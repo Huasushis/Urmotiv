@@ -60,7 +60,7 @@
 | 插件 ID | 版本 | 能力 |
 | --- | --- | --- |
 | `org.ustc.urmotiv.review-default` | `1.0.0` | 默认审核人数决策规则 |
-| `org.ustc.urmotiv.anklang` | `0.3.0` | 私有边界内的仅检索结果原题检索与受控索引同步 |
+| `org.ustc.urmotiv.anklang` | `0.4.0` | 私有边界内的仅检索结果原题检索与受控索引同步 |
 | `org.ustc.urmotiv.fermata-control` | `0.1.0` | Fermata 管理健康/设置/唤醒接口 |
 | `org.ustc.urmotiv.hydro-format` | `0.1.0` | Hydro ZIP 题目包适配器 |
 | `org.ustc.urmotiv.fps-format` | `0.1.0` | FPS XML 单文件适配器 |
