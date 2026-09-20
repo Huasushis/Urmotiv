@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
+import { registerAccountSecurityRoutes } from "./account-security-routes";
 import { leaderboardQuerySchema, leaderboardResponseSchema, userContactSchema } from "@urmotiv/contracts";
 import {
   adminSettingsQuerySchema,
@@ -104,7 +105,7 @@ import {
   createProblemVisibility,
   hasPermission,
 } from "./permissions";
-import { InMemoryDataStore, UsernameUnavailableError, type DataStore } from "./repository";
+import { CredentialChangedError, InMemoryDataStore, UsernameUnavailableError, type DataStore, type PasswordSessionProof } from "./repository";
 import {
   createEmailVerificationUrl,
   SmtpEmailVerificationDelivery,
@@ -763,6 +764,10 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       sendError(reply, request.id, new ApiError(409, "USERNAME_UNAVAILABLE", "用户名不可用，请换一个。"));
       return;
     }
+    if (error instanceof CredentialChangedError) {
+      sendError(reply, request.id, unauthorized());
+      return;
+    }
 
     if (error instanceof FermataControlError) {
       app.log.error(
@@ -1041,14 +1046,14 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     });
   }
 
-  async function beginSession(user: StoredUser, reply: FastifyReply): Promise<StoredSession> {
+  async function beginSession(user: StoredUser, reply: FastifyReply, passwordProof?: PasswordSessionProof): Promise<StoredSession> {
     if (!hasPermission(user, "auth.login", {}, dependencies.now())) {
       throw unauthorized();
     }
     const expiresAt = new Date(
       dependencies.now().getTime() + sessionLifetimeSeconds * 1000
     ).toISOString();
-    const session = await dependencies.store.createSession(user.id, expiresAt);
+    const session = await dependencies.store.createSession(user.id, expiresAt, undefined, passwordProof);
     setSessionCookie(session, reply);
     return session;
   }
@@ -1081,6 +1086,16 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   }
 
   app.get("/api/v1/health", async () => ({ status: "ok", service: "urmotiv-api" }));
+
+  registerAccountSecurityRoutes(app, {
+    store: dependencies.store,
+    delivery: dependencies.emailVerificationDelivery,
+    now: dependencies.now,
+    webUrl: async () => dependencies.emailVerificationWebUrl ?? dependencies.adminService.getEmailVerificationWebUrl(),
+    currentSession,
+    clientAddress: request => resolveClientAddress(request, dependencies.trustedProxyCidrs),
+    clearSession: reply => { reply.clearCookie(sessionCookieName, { path: "/" }); }
+  });
 
   app.get("/api/v1/health/ready", async (_request, reply) => {
     try {
@@ -1834,7 +1849,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       throw unauthorized();
     }
     limiter?.recordSuccess(sourceAddress);
-    const session = await beginSession(credential.user, reply);
+    const session = await beginSession(credential.user, reply, credential);
     return authSummary(credential.user, session);
   });
 
@@ -1860,7 +1875,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       throw unauthorized();
     }
     limiter?.recordSuccess(sourceAddress);
-    await beginSession(credential.user, reply);
+    await beginSession(credential.user, reply, credential);
     return authSummary(credential.user);
   });
 
@@ -1887,7 +1902,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       throw unauthorized();
     }
     limiter?.recordSuccess(sourceAddress);
-    await beginSession(credential.user, reply);
+    await beginSession(credential.user, reply, credential);
     return authSummary(credential.user);
   });
 

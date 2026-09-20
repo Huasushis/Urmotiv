@@ -1,0 +1,54 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createLocalDatabase, migrateDatabase, seedCoreDatabase } from "@urmotiv/database";
+import { sql } from "drizzle-orm";
+import { expect, it } from "vitest";
+import { DatabaseDataStore } from "../src/database-store";
+
+it("凭据变更的数据库事务：单次消费、版本失效、邮箱冲突、会话撤销与审计回滚",async()=>{
+  const directory=await mkdtemp(join(tmpdir(),"urmotiv-account-security-"));
+  const database=createLocalDatabase({dataDirectory:directory});
+  try {
+    await migrateDatabase(database);await seedCoreDatabase(database);
+    const store=new DatabaseDataStore(database);
+    const user=(await store.registerEmailUser({username:"AccountOwner",nickname:"合成账号",normalizedEmail:"before@example.test",displayEmail:"before@example.test",passwordHash:"synthetic-before-hash"}))!;
+    const now=new Date().toISOString();
+    const expiresAt=new Date(Date.now()+600_000).toISOString();
+    await store.replaceEmailVerificationToken({userId:user.id,normalizedEmail:"before@example.test",tokenDigest:"a".repeat(64),expiresAt});
+    await store.consumeEmailVerificationToken("a".repeat(64),now);
+    let state=(await store.getAccountSecurity(user.id))!;
+    const session=await store.createSession(user.id,expiresAt);
+    const oldCredential=(await store.findEmailCredential("before@example.test"))!;
+    expect(await store.replaceAccountActionToken({tokenDigest:"b".repeat(64),userId:user.id,purpose:"password-reset",authRevision:state.authRevision,normalizedAddress:"before@example.test",expiresAt})).toBe(true);
+    expect(await store.consumeAccountAction({tokenDigest:"b".repeat(64),purpose:"email-change",requestId:randomUUID(),now})).toBeUndefined();
+    expect(await store.changeAccountPassword({userId:user.id,expectedAuthRevision:state.authRevision,expectedPasswordHash:state.passwordHash!,newPasswordHash:"synthetic-next-hash",requestId:randomUUID(),now})).toBe(true);
+    expect(await store.getSession(session.id)).toBeUndefined();
+    await expect(store.createSession(user.id,expiresAt,undefined,oldCredential)).rejects.toThrow("登录凭据已经改变");
+    expect(await store.consumeAccountAction({tokenDigest:"b".repeat(64),purpose:"password-reset",newPasswordHash:"synthetic-stale",requestId:randomUUID(),now})).toBeUndefined();
+    state=(await store.getAccountSecurity(user.id))!;
+    await store.replaceAccountActionToken({tokenDigest:"c".repeat(64),userId:user.id,purpose:"password-reset",authRevision:state.authRevision,normalizedAddress:"before@example.test",expiresAt});
+    const consumed=await Promise.all([1,2].map(()=>store.consumeAccountAction({tokenDigest:"c".repeat(64),purpose:"password-reset",newPasswordHash:"synthetic-recovered-hash",requestId:randomUUID(),now})));
+    expect(consumed.filter(Boolean)).toHaveLength(1);
+    await store.registerEmailUser({nickname:"合成另一账号",normalizedEmail:"occupied@example.test",displayEmail:"occupied@example.test",passwordHash:"synthetic-other"});
+    state=(await store.getAccountSecurity(user.id))!;
+    await store.replaceAccountActionToken({tokenDigest:"d".repeat(64),userId:user.id,purpose:"email-change",authRevision:state.authRevision,normalizedAddress:"occupied@example.test",expiresAt});
+    expect(await store.consumeAccountAction({tokenDigest:"d".repeat(64),purpose:"email-change",requestId:randomUUID(),now})).toBeUndefined();
+    expect((await store.getAccountSecurity(user.id))?.email?.normalizedAddress).toBe("before@example.test");
+    await store.replaceAccountActionToken({tokenDigest:"e".repeat(64),userId:user.id,purpose:"email-change",authRevision:state.authRevision,normalizedAddress:"after@example.test",expiresAt});
+    expect(await store.consumeAccountAction({tokenDigest:"d".repeat(64),purpose:"email-change",requestId:randomUUID(),now})).toBeUndefined();
+    await store.consumeAccountAction({tokenDigest:"e".repeat(64),purpose:"email-change",requestId:randomUUID(),now});
+    expect(await store.findEmailCredential("before@example.test")).toBeUndefined();
+    expect((await store.findEmailCredential("after@example.test"))?.user.id).toBe(user.id);
+    expect((await store.getUser(user.id))?.username).toBe("AccountOwner");
+    await expect(store.createSession(user.id,expiresAt,undefined,{passwordHash:"synthetic-recovered-hash",authRevision:state.authRevision})).rejects.toThrow("登录凭据已经改变");
+    const audit=await database.query<{count:number}>(sql`select count(*)::integer as count from audit_events where action like 'account.%' and subject_user_id=${user.id}`);
+    expect(audit[0]?.count).toBe(3);
+    await database.execute(sql`create function reject_account_audit() returns trigger language plpgsql as $$ begin raise exception 'synthetic-audit-failure'; end $$`);
+    await database.execute(sql`create trigger reject_account_audit before insert on audit_events for each row execute function reject_account_audit()`);
+    state=(await store.getAccountSecurity(user.id))!;
+    await expect(store.changeAccountPassword({userId:user.id,expectedAuthRevision:state.authRevision,expectedPasswordHash:state.passwordHash!,newPasswordHash:"synthetic-rollback",requestId:randomUUID(),now})).rejects.toThrow();
+    expect(await store.getAccountSecurity(user.id)).toEqual(state);
+  } finally {await database.close();await rm(directory,{recursive:true,force:true});}
+});

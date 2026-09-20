@@ -48,6 +48,21 @@ Accept: application/json
 
 `404` 掩码尤其适用于私有题目、文件、导出任务、插件管理和机器人任务；客户端不要根据耗时、标题列表数量或错误差异推断资源存在。
 
+## 密码与邮箱安全
+
+| 路由 | 输入 | 行为 |
+| --- | --- | --- |
+| `GET /api/v1/me/security` | 本人会话 | 仅返回 `hasPassword`、`canChangeCredentials`，不返回散列或凭据 |
+| `POST /api/v1/me/password` | `currentPassword`、`newPassword` | 验证当前密码后原子修改并撤销所有旧会话 |
+| `POST /api/v1/auth/password-reset/request` | `email` | 始终 202/`{ok:true}`，存在与否不影响响应；符合条件才发送邮件 |
+| `POST /api/v1/auth/password-reset/confirm` | `token`、`newPassword` | 一次性恢复，成功后要求重新登录 |
+| `POST /api/v1/me/email-change` | `currentPassword`、`newEmail` | 向新邮箱发送确认链接，旧邮箱暂不变 |
+| `POST /api/v1/auth/email-change/confirm` | `token` | 原子切换主要邮箱、撤销旧会话，返回 `notificationSent` 表示旧邮箱通知结果 |
+
+凭证使用 `uac_` 前缀、256 位随机量和 30 分钟有效期。数据库只保存摘要、用途、目标地址与认证版本；不存链接原文。用途不能混用，同一用途重发后旧链接失效；密码、邮箱或认证版本变化后旧链接不可消费。变更与审计在同一事务完成，邮箱唯一冲突或审计写入失败不产生部分修改。发起时要求当前密码，模拟会话和机器人固定拒绝；所有 POST 继续检查网页来源，并按来源限制每 15 分钟最多 10 次账号安全操作。
+
+登录建立会话前复查密码散列及认证版本，避免密码或邮箱刚改变时，先前发起的旧凭据登录仍取得新会话。找回邮件异步发送，错误与耗时不暴露账号存在；旧邮箱通知失败不撤销已经完成的新邮箱验证，响应会明确给出 `notificationSent:false`。
+
 ## 认证路由
 
 | 方法与路径 | 需要 | 说明 |

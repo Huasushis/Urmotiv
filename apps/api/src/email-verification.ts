@@ -2,6 +2,7 @@ import { createTransport } from "nodemailer";
 import type { RuntimeSmtpSettings } from "./admin-service";
 
 export interface EmailVerificationMessage {
+  readonly purpose?: "email-verification" | "password-reset" | "email-change" | "email-changed";
   readonly recipient: string;
   /** The token is only present in this delivery message and must not be logged or persisted. */
   readonly verificationUrl: string;
@@ -48,17 +49,23 @@ export class SmtpEmailVerificationDelivery implements EmailVerificationDelivery 
         ? {}
         : { auth: { user: settings.username, pass: settings.password } })
     });
+    const wording = {
+      "email-verification": ["验证你的 Urmotiv 邮箱", "请打开下面的链接完成邮箱验证："],
+      "password-reset": ["重设你的 Urmotiv 密码", "请打开下面的链接设置新密码。完成后所有旧会话都会退出："],
+      "email-change": ["确认更换 Urmotiv 联系邮箱", "请打开下面的链接确认新邮箱。确认前原邮箱保持不变："],
+      "email-changed": ["你的 Urmotiv 联系邮箱已更改", "此邮箱已从账号的主要联系地址解绑。如果这不是你的操作，请立即联系站点管理员："]
+    } as const;
+    const [subject,introduction]=wording[message.purpose ?? "email-verification"];
     try {
       await transport.sendMail({
         from: { name: settings.fromName, address: settings.fromEmail },
         to: message.recipient,
-        subject: "验证你的 Urmotiv 邮箱",
+        subject,
         text: [
-          "请打开下面的链接完成邮箱验证：",
+          introduction,
           message.verificationUrl,
           "",
-          `链接有效期至：${message.expiresAt}`,
-          "如果这不是你的操作，请忽略本邮件。"
+          ...(message.purpose === "email-changed" ? [] : [`链接有效期至：${message.expiresAt}`, "如果这不是你的操作，请忽略本邮件。"])
         ].join("\n")
       });
     } finally {

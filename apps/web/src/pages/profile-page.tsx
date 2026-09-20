@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ImagePlus, Trash2, UserRound } from "lucide-react";
 import type { ProfileView } from "@urmotiv/contracts";
+import { AccountSecurityPanel } from "../components/account-security-panel";
 import {
   ApiError,
   avatarUrlFor,
@@ -285,7 +286,7 @@ export function ProfilePage() {
               readOnly
               disabled
             />
-            <small>{profile.emailVerified ? "已验证" : "尚未验证"}</small>
+            <small>{profile.emailVerified ? "已验证" : "尚未验证"}{profile.accountType === "human" ? <> · <a href="#account-security">更换邮箱</a></> : null}</small>
           </div>
           {profile.studentIds.length > 0 ? (
             <div className="field wide">
@@ -386,6 +387,7 @@ export function ProfilePage() {
           ) : null}
         </div>
       </section>
+      <AccountSecurityPanel />
     </div>
   );
 }

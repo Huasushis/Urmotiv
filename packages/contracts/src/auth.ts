@@ -107,6 +107,17 @@ export const ustcOAuthCallbackQuerySchema = z.object({
 
 export const okResponseSchema = z.object({ ok: z.literal(true) });
 
+export const changePasswordInputSchema = z.object({
+  currentPassword: z.string().min(1).max(1024),
+  newPassword: z.string().min(12).max(1024)
+}).strict();
+export const requestPasswordResetInputSchema = z.object({ email: z.string().trim().email().max(320) }).strict();
+export const accountActionTokenSchema = z.string().regex(/^uac_[A-Za-z0-9_-]{43}$/);
+export const resetPasswordInputSchema = z.object({ token: accountActionTokenSchema, newPassword: z.string().min(12).max(1024) }).strict();
+export const requestEmailChangeInputSchema = z.object({ currentPassword: z.string().min(1).max(1024), newEmail: z.string().trim().email().max(320) }).strict();
+export const confirmEmailChangeInputSchema = z.object({ token: accountActionTokenSchema }).strict();
+export const accountSecurityViewSchema = z.object({ hasPassword: z.boolean(), canChangeCredentials: z.boolean() }).strict();
+
 export const emailVerificationPendingResponseSchema = z.object({
   ok: z.literal(true),
   verificationPending: z.literal(true)

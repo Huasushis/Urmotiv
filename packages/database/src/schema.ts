@@ -584,6 +584,24 @@ export const emailVerificationTokens = pgTable(
   ]
 );
 
+/** Password recovery and email changes: one pending digest per user and purpose. */
+export const accountActionTokens = pgTable("account_action_tokens", {
+  tokenDigest: char("token_digest", { length: 64 }).primaryKey(),
+  userId: bigint("user_id", { mode: "bigint" }).notNull().references(() => users.id, { onDelete: "cascade" }),
+  purpose: varchar("purpose", { length: 32 }).notNull(),
+  authRevision: integer("auth_revision").notNull(),
+  normalizedAddress: varchar("normalized_address", { length: 320 }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+}, table => [
+  uniqueIndex("account_action_tokens_user_purpose_uq").on(table.userId, table.purpose),
+  index("account_action_tokens_expiry_idx").on(table.expiresAt),
+  check("account_action_tokens_digest_ck", sql`${table.tokenDigest} ~ '^[0-9a-f]{64}$'`),
+  check("account_action_tokens_purpose_ck", sql`${table.purpose} IN ('password-reset', 'email-change')`),
+  check("account_action_tokens_revision_ck", sql`${table.authRevision} > 0`),
+  check("account_action_tokens_address_ck", sql`${table.normalizedAddress} = lower(btrim(${table.normalizedAddress})) AND length(${table.normalizedAddress}) > 0`)
+]);
+
 export const apiTokens = pgTable(
   "api_tokens",
   {

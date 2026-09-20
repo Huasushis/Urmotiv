@@ -1,5 +1,5 @@
 import { hashPassword } from "@urmotiv/auth";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { createApp } from "../src/app";
 import { createDemoUsers, demoTags } from "../src/demo-data";
@@ -99,17 +99,12 @@ describe("用户名登录", () => {
   it("忽略用户名大小写登录，且未知用户名与错误口令返回同一错误", async () => {
     const password = "synthetic-username-password";
     const passwordHash = await hashPassword(password);
-    const user = {
-      ...createDemoUsers()[0]!,
-      id: "username-user",
-      username: "PB-SYNTH-0001"
-    };
-    const store = new InMemoryDataStore([user], demoTags);
-    vi.spyOn(store, "findUsernameCredential").mockImplementation(async (username) =>
-      username.trim().toLocaleLowerCase() === "pb-synth-0001"
-        ? { user, passwordHash }
-        : undefined
-    );
+    const store = new InMemoryDataStore(createDemoUsers(), demoTags);
+    const user = (await store.registerEmailUser({ username: "PB-SYNTH-0001", nickname: "合成用户",
+      normalizedEmail: "username@example.test", displayEmail: "username@example.test", passwordHash }))!;
+    await store.replaceEmailVerificationToken({ userId: user.id, normalizedEmail: "username@example.test",
+      tokenDigest: "a".repeat(64), expiresAt: new Date(Date.now() + 60000).toISOString() });
+    await store.consumeEmailVerificationToken("a".repeat(64), new Date().toISOString());
     const app = await createApp({ store });
     openApps.push(app);
 

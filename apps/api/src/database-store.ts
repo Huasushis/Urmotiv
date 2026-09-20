@@ -19,11 +19,13 @@ import type {
   StoredUser,
   VisibleProblemPage,
 } from "./domain";
-import type { ProblemPermissionFilter, ProblemVisibility } from "./permissions";
+import { hasPermission, type ProblemPermissionFilter, type ProblemVisibility } from "./permissions";
 import { DatabaseBatchAccountAuditWriter, type BatchAccountAuditWriter } from "./account-audit";
 import { BatchAccountConflictError, normalizeUsernameKey } from "./batch-account";
 import {
   ExternalIdentityCollisionError,
+  CredentialChangedError,
+  type PasswordSessionProof,
   UsernameUnavailableError,
   type BatchAccountCreationInput,
   type BatchAccountCreationResult,
@@ -40,6 +42,7 @@ import {
   type ProblemRevisionAction,
   type ProblemTransaction
 } from "./repository";
+import type { AccountActionConsumption, AccountActionResult, AccountActionToken, AccountPasswordChange, AccountSecurityState } from "./repository";
 import { initialReviewPolicyRule } from "./review-decision";
 
 const maximumDatabaseId = 9_223_372_036_854_775_807n;
@@ -1562,8 +1565,8 @@ export class DatabaseDataStore implements DataStore {
   }
 
   public async findEmailCredential(normalizedEmail: string): Promise<EmailCredential | undefined> {
-    const rows = await this.handle.query<{ user_id: string; password_hash: string | null }>(sql`
-      SELECT email.user_id::text AS user_id, user_record.password_hash
+    const rows = await this.handle.query<{ user_id: string; password_hash: string | null; auth_revision: number }>(sql`
+      SELECT email.user_id::text AS user_id, user_record.password_hash, user_record.auth_revision
       FROM user_emails email
       JOIN users user_record ON user_record.id = email.user_id
       WHERE email.normalized_address = ${normalizedEmail}
@@ -1576,11 +1579,113 @@ export class DatabaseDataStore implements DataStore {
       return undefined;
     }
     const user = await this.getUser(row.user_id);
-    return user === undefined ? undefined : { user, passwordHash: row.password_hash };
+    return user === undefined ? undefined : { user, passwordHash: row.password_hash, authRevision: row.auth_revision };
   }
+  private async readAccountSecurity(executor: DatabaseExecutor, userId: bigint): Promise<AccountSecurityState | undefined> {
+    const user = (await loadUsers(executor,[userId]))[0];
+    if (!user || user.accountType !== "human" || !hasPermission(user,"auth.login")) return undefined;
+    const rows = await executor.query<{ password_hash: string | null; auth_revision: number; address: string | null; normalized_address: string | null; verified: boolean }>(sql`
+      select account.password_hash, account.auth_revision, email.address, email.normalized_address,
+        email.verified_at is not null as verified
+      from users account left join user_emails email on email.user_id=account.id and email.is_primary=true
+      where account.id=${userId}
+    `);
+    const row=rows[0];
+    return row ? {userId:String(userId),passwordHash:row.password_hash,authRevision:row.auth_revision,
+      email:row.address === null ? null : {address:row.address,normalizedAddress:row.normalized_address!,verified:row.verified}} : undefined;
+  }
+
+  public async getAccountSecurity(userId: string): Promise<AccountSecurityState | undefined> {
+    const id=parseDatabaseId(userId);
+    return id===undefined ? undefined : this.readAccountSecurity(this.handle,id);
+  }
+
+  public async findPasswordRecoveryAccount(normalizedEmail: string): Promise<AccountSecurityState | undefined> {
+    const rows=await this.handle.query<{user_id:string}>(sql`
+      select user_id::text from user_emails where normalized_address=${normalizedEmail}
+        and is_primary=true and verified_at is not null and user_id<>0 limit 1
+    `);
+    return rows[0] ? this.getAccountSecurity(rows[0].user_id) : undefined;
+  }
+
+  public async replaceAccountActionToken(token: AccountActionToken): Promise<boolean> {
+    const userId=requireDatabaseId(token.userId,"用户编号");
+    return this.handle.transaction(async transaction=>{
+      await transaction.execute(sql`select id from users where id=${userId} for update`);
+      const state=await this.readAccountSecurity(transaction,userId);
+      if (!state || state.authRevision!==token.authRevision) return false;
+      await transaction.execute(sql`delete from account_action_tokens where user_id=${userId} and purpose=${token.purpose}`);
+      await transaction.execute(sql`
+        insert into account_action_tokens(token_digest,user_id,purpose,auth_revision,normalized_address,expires_at)
+        values(${token.tokenDigest},${userId},${token.purpose},${token.authRevision},${token.normalizedAddress},${token.expiresAt}::timestamptz)
+      `);
+      return true;
+    });
+  }
+
+  private async finishAccountChange(transaction: DatabaseExecutor, userId: bigint, action: string, requestId: string, now: string): Promise<void> {
+    await transaction.execute(sql`update users set auth_revision=auth_revision+1, updated_at=${now}::timestamptz where id=${userId}`);
+    await transaction.execute(sql`update sessions set revoked_at=coalesce(revoked_at,${now}::timestamptz) where user_id=${userId} or impersonator_user_id=${userId}`);
+    await transaction.execute(sql`delete from account_action_tokens where user_id=${userId}`);
+    await transaction.execute(sql`delete from email_verification_tokens where user_id=${userId}`);
+    await transaction.execute(sql`
+      insert into audit_events(actor_user_id,subject_user_id,request_id,action,object_type,object_id,result,metadata)
+      values(${userId},${userId},${requestId}::uuid,${action},'user',${String(userId)},'success','{}'::jsonb)
+    `);
+  }
+
+  public async changeAccountPassword(input: AccountPasswordChange): Promise<boolean> {
+    const userId=requireDatabaseId(input.userId,"用户编号");
+    return this.handle.transaction(async transaction=>{
+      await transaction.execute(sql`select id from users where id=${userId} for update`);
+      const state=await this.readAccountSecurity(transaction,userId);
+      if (!state || state.authRevision!==input.expectedAuthRevision || state.passwordHash!==input.expectedPasswordHash) return false;
+      await transaction.execute(sql`update users set password_hash=${input.newPasswordHash}, password_changed_at=${input.now}::timestamptz where id=${userId}`);
+      await this.finishAccountChange(transaction,userId,"account.password.change",input.requestId,input.now);
+      return true;
+    });
+  }
+
+  public async consumeAccountAction(input: AccountActionConsumption): Promise<AccountActionResult | undefined> {
+    try {
+      return await this.handle.transaction(async transaction=>{
+        // 先定位用户，再按统一用户行锁顺序验证一次性凭证，避免重发与消费互相死锁。
+        const owner=await transaction.query<{user_id:string}>(sql`select user_id::text from account_action_tokens where token_digest=${input.tokenDigest}`);
+        if (!owner[0]) return undefined;
+        const userId=requireDatabaseId(owner[0].user_id,"用户编号");
+        await transaction.execute(sql`select id from users where id=${userId} for update`);
+        const tokens=await transaction.query<{auth_revision:number;normalized_address:string}>(sql`
+          select auth_revision,normalized_address from account_action_tokens
+          where token_digest=${input.tokenDigest} and purpose=${input.purpose} and expires_at>${input.now}::timestamptz for update
+        `);
+        const token=tokens[0];
+        const state=await this.readAccountSecurity(transaction,userId);
+        if (!token || !state || state.authRevision!==token.auth_revision) return undefined;
+        if (input.purpose==="password-reset") {
+          if (userId===0n || !state.email?.verified || state.email.normalizedAddress!==token.normalized_address || !input.newPasswordHash) return undefined;
+          await transaction.execute(sql`update users set password_hash=${input.newPasswordHash}, password_changed_at=${input.now}::timestamptz where id=${userId}`);
+        } else {
+          const conflict=await transaction.query<{user_id:string}>(sql`select user_id::text from user_emails where normalized_address=${token.normalized_address} and user_id<>${userId}`);
+          if (conflict.length) return undefined;
+          // 旧地址解绑：否则它仍能通过邮箱登录或恢复密码。
+          await transaction.execute(sql`delete from user_emails where user_id=${userId} and (is_primary=true or normalized_address=${token.normalized_address})`);
+          await transaction.execute(sql`
+            insert into user_emails(id,user_id,address,normalized_address,is_primary,verified_at)
+            values(${randomUUID()}::uuid,${userId},${token.normalized_address},${token.normalized_address},true,${input.now}::timestamptz)
+          `);
+        }
+        await this.finishAccountChange(transaction,userId,"account."+input.purpose,input.requestId,input.now);
+        return {userId:String(userId),previousEmail:state.email?.verified ? state.email.address : null};
+      });
+    } catch(error) {
+      if (isUniqueViolation(error)) return undefined;
+      throw error;
+    }
+  }
+
   public async findRootCredential(): Promise<RootCredential | undefined> {
-    const rows = await this.handle.query<{ password_hash: string | null }>(sql`
-      SELECT password_hash
+    const rows = await this.handle.query<{ password_hash: string | null; auth_revision: number }>(sql`
+      SELECT password_hash, auth_revision
       FROM users
       WHERE id = 0
         AND account_type = 'human'
@@ -1592,12 +1697,12 @@ export class DatabaseDataStore implements DataStore {
       return undefined;
     }
     const user = await this.getUser("0");
-    return user === undefined || !user.isRoot ? undefined : { user, passwordHash };
+    return user === undefined || !user.isRoot ? undefined : { user, passwordHash, authRevision: rows[0]!.auth_revision };
   }
 
   public async findUsernameCredential(username: string): Promise<EmailCredential | undefined> {
-    const rows = await this.handle.query<{ user_id: string; password_hash: string | null }>(sql`
-      SELECT user_record.id::text AS user_id, user_record.password_hash
+    const rows = await this.handle.query<{ user_id: string; password_hash: string | null; auth_revision: number }>(sql`
+      SELECT user_record.id::text AS user_id, user_record.password_hash, user_record.auth_revision
       FROM users user_record
       WHERE user_record.id <> 0
         AND lower(btrim(user_record.username)) = lower(btrim(${username}))
@@ -1612,7 +1717,7 @@ export class DatabaseDataStore implements DataStore {
       return undefined;
     }
     const user = await this.getUser(row.user_id);
-    return user === undefined ? undefined : { user, passwordHash: row.password_hash };
+    return user === undefined ? undefined : { user, passwordHash: row.password_hash, authRevision: row.auth_revision };
   }
 
   public async getUserPermissionDelta(userId: string): Promise<UserPermissionDelta> {
@@ -2177,7 +2282,8 @@ export class DatabaseDataStore implements DataStore {
   public async createSession(
     userId: string,
     expiresAt: string,
-    impersonatorUserId?: string | null
+    impersonatorUserId?: string | null,
+    passwordProof?: PasswordSessionProof
   ): Promise<StoredSession> {
     const databaseUserId = requireDatabaseId(userId, "用户编号");
     const impersonatorDatabaseUserId =
@@ -2188,9 +2294,12 @@ export class DatabaseDataStore implements DataStore {
       SELECT auth_revision
       FROM users
       WHERE id = ${databaseUserId} AND disabled_at IS NULL
+        ${passwordProof === undefined ? sql`` : sql`AND password_hash = ${passwordProof.passwordHash}`}
+        ${passwordProof?.authRevision === undefined ? sql`` : sql`AND auth_revision = ${passwordProof.authRevision}`}
     `);
     const authRevision = authRows[0]?.auth_revision;
     if (authRevision === undefined) {
+      if (passwordProof !== undefined) throw new CredentialChangedError();
       throw new Error("无法为不存在或已停用的用户创建会话。");
     }
 

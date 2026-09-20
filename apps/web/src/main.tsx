@@ -18,6 +18,7 @@ import { TransferPage } from "./pages/transfer-page";
 import { VerifyEmailPage } from "./pages/verify-email-page";
 import { FermataAdminPage } from "./pages/fermata-admin-page";
 import { LeaderboardPage } from "./pages/leaderboard-page";
+import { AccountActionPage, PasswordRecoveryPage } from "./pages/account-recovery-page";
 
 import { AdminSectionPage } from "./pages/admin-section-page";
 import { AdminPermissionsPage } from "./pages/admin-permissions-page";
@@ -31,6 +32,13 @@ function App() {
   const location = useLocation();
   const session = useQuery({ queryKey: ["session"], queryFn: getSession, staleTime: 60_000 });
   const verificationToken = readVerificationToken(window.location.hash);
+
+  const actionMatch = /^#\/(reset-password|change-email)(?:\?|$)/.exec(window.location.hash);
+  if (actionMatch) {
+    const token = new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("token") ?? "";
+    return <AccountActionPage purpose={actionMatch[1] === "reset-password" ? "password-reset" : "email-change"} token={token} />;
+  }
+  if (location.pathname === "/forgot-password") return <PasswordRecoveryPage />;
 
   if (verificationToken !== null) {
     return <VerifyEmailPage token={verificationToken || undefined} />;

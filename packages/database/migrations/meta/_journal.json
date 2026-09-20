@@ -197,6 +197,13 @@
       "when": 1788307200000,
       "tag": "0027_external_review_enabled",
       "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1789862400000,
+      "tag": "0028_account_action_tokens",
+      "breakpoints": true
     }
   ]
 }

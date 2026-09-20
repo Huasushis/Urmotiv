@@ -7,6 +7,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const api = vi.hoisted(() => ({
+  getAccountSecurity: vi.fn(async () => ({hasPassword:true,canChangeCredentials:true})),
   getMyProfile: vi.fn(),
   updateMyProfile: vi.fn(),
   uploadMyAvatar: vi.fn(),

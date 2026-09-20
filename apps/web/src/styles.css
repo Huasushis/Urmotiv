@@ -6150,6 +6150,11 @@ textarea:read-only {
 .contact-card dt { color: var(--text-soft); font-size: 13px; }
 .contact-card dd { margin: 0; overflow-wrap: anywhere; }
 .leaderboard-page { max-width: 1000px; margin: 0 auto; }
+.account-security-panel { margin-top: 24px; max-width: 960px; scroll-margin-top: 90px; }
+.account-security-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 32px; }
+.account-security-grid > .form-grid, .account-recovery-panel .form-grid { grid-template-columns: minmax(0, 1fr); align-content: start; }
+.account-security-grid label { display: grid; gap: 8px; }
+@media (max-width: 700px) { .account-security-grid { grid-template-columns: minmax(0, 1fr); } }
 .public-header .global-header-inner { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .public-header .secondary-button { width: auto; min-height: 36px; }
 .leaderboard-page h1 { display: flex; align-items: center; gap: 12px; }

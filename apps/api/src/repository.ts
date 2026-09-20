@@ -10,7 +10,7 @@ import type {
   StoredUser,
   VisibleProblemPage
 } from "./domain";
-import { canViewProblem, type ProblemVisibility } from "./permissions";
+import { canViewProblem, hasPermission, type ProblemVisibility } from "./permissions";
 import {
   BatchAccountConflictError,
   normalizeUsernameKey,
@@ -89,6 +89,11 @@ export interface ProblemTransaction {
 }
 
 export interface DataStore {
+  getAccountSecurity(userId: string): Promise<AccountSecurityState | undefined>;
+  findPasswordRecoveryAccount(normalizedEmail: string): Promise<AccountSecurityState | undefined>;
+  replaceAccountActionToken(token: AccountActionToken): Promise<boolean>;
+  changeAccountPassword(input: AccountPasswordChange): Promise<boolean>;
+  consumeAccountAction(input: AccountActionConsumption): Promise<AccountActionResult | undefined>;
   listLeaderboard(query: LeaderboardQuery): Promise<LeaderboardResponse>;
   getUser(userId: string): Promise<StoredUser | undefined>;
   listUsers(): Promise<StoredUser[]>;
@@ -136,7 +141,8 @@ export interface DataStore {
   createSession(
     userId: string,
     expiresAt: string,
-    impersonatorUserId?: string | null
+    impersonatorUserId?: string | null,
+    passwordProof?: PasswordSessionProof
   ): Promise<StoredSession>;
   getSession(sessionId: string): Promise<StoredSession | undefined>;
   deleteSession(sessionId: string): Promise<void>;
@@ -199,6 +205,46 @@ export interface UserPermissionDeltaAtomicInput extends ReplaceUserPermissionDel
 export interface RootCredential {
   readonly user: StoredUser;
   readonly passwordHash: string;
+  readonly authRevision?: number;
+}
+
+export type PasswordSessionProof = Pick<RootCredential, "passwordHash" | "authRevision">;
+export class CredentialChangedError extends Error {
+  constructor() { super("登录凭据已经改变，请重新登录。"); this.name="CredentialChangedError"; }
+}
+
+export interface AccountSecurityState {
+  readonly userId: string;
+  readonly authRevision: number;
+  readonly passwordHash: string | null;
+  readonly email: { readonly address: string; readonly normalizedAddress: string; readonly verified: boolean } | null;
+}
+export interface AccountActionToken {
+  readonly tokenDigest: string;
+  readonly userId: string;
+  readonly purpose: "password-reset" | "email-change";
+  readonly authRevision: number;
+  readonly normalizedAddress: string;
+  readonly expiresAt: string;
+}
+export interface AccountPasswordChange {
+  readonly userId: string;
+  readonly expectedAuthRevision: number;
+  readonly expectedPasswordHash: string;
+  readonly newPasswordHash: string;
+  readonly requestId: string;
+  readonly now: string;
+}
+export interface AccountActionConsumption {
+  readonly tokenDigest: string;
+  readonly purpose: AccountActionToken["purpose"];
+  readonly newPasswordHash?: string;
+  readonly requestId: string;
+  readonly now: string;
+}
+export interface AccountActionResult {
+  readonly userId: string;
+  readonly previousEmail: string | null;
 }
 export type EmailCredential = RootCredential;
 
@@ -300,7 +346,9 @@ export class InMemoryDataStore implements DataStore {
   private readonly externalIdentities = new Map<string, string>();
   private readonly emailVerificationTokens = new Map<string, EmailVerificationToken & { consumed: boolean }>();
   private defaultRoleKeys = { humanRoleKey: "contributor", robotRoleKey: "reviewer" };
-  private readonly rootPasswordHash: string | undefined;
+  private rootPasswordHash: string | undefined;
+  private readonly accountRevisions = new Map<string, number>();
+  private readonly accountActionTokens = new Map<string, AccountActionToken>();
   private readonly loginStates = new Map<string, { expiresAt: string; consumed: boolean }>();
   private readonly primaryEmails = new Map<string, { address: string; verified: boolean }>();
   public readonly batchAccountAuditEvents: BatchAccountAuditEvent[] = [];
@@ -448,13 +496,80 @@ export class InMemoryDataStore implements DataStore {
     return copy(user);
   }
 
+  public async getAccountSecurity(userId: string): Promise<AccountSecurityState | undefined> {
+    const user = this.users.get(userId);
+    if (!user || user.accountType !== "human" || !hasPermission(user, "auth.login")) return undefined;
+    const email = this.primaryEmails.get(userId);
+    const credential = [...this.emailCredentials.values()].find(item => item.userId === userId);
+    return { userId, authRevision: this.accountRevisions.get(userId) ?? 1,
+      passwordHash: user.isRoot ? this.rootPasswordHash ?? null : credential?.passwordHash ?? null,
+      email: email ? { ...email, normalizedAddress: email.address.trim().toLowerCase() } : null };
+  }
+
+  public async findPasswordRecoveryAccount(normalizedEmail: string): Promise<AccountSecurityState | undefined> {
+    const entry = [...this.primaryEmails.entries()].find(([id,email]) => id !== "0" && email.verified && email.address.trim().toLowerCase() === normalizedEmail);
+    return entry ? this.getAccountSecurity(entry[0]) : undefined;
+  }
+
+  public async replaceAccountActionToken(token: AccountActionToken): Promise<boolean> {
+    const state = await this.getAccountSecurity(token.userId);
+    if (!state || (this.accountRevisions.get(token.userId) ?? 1) !== token.authRevision) return false;
+    for (const [digest,existing] of this.accountActionTokens) {
+      if (existing.userId === token.userId && existing.purpose === token.purpose) this.accountActionTokens.delete(digest);
+    }
+    this.accountActionTokens.set(token.tokenDigest, copy(token));
+    return true;
+  }
+
+  private finishAccountChange(userId: string): void {
+    this.accountRevisions.set(userId, (this.accountRevisions.get(userId) ?? 1) + 1);
+    for (const [digest,token] of this.accountActionTokens) if (token.userId === userId) this.accountActionTokens.delete(digest);
+    for (const [digest,token] of this.emailVerificationTokens) if (token.userId === userId) this.emailVerificationTokens.delete(digest);
+    for (const [id,session] of this.sessions) if (session.userId === userId || session.impersonatorUserId === userId) this.sessions.delete(id);
+  }
+
+  private setAccountPassword(userId: string, passwordHash: string): void {
+    if (userId === "0") this.rootPasswordHash = passwordHash;
+    for (const credential of this.emailCredentials.values()) if (credential.userId === userId) credential.passwordHash = passwordHash;
+    const email = this.primaryEmails.get(userId);
+    if (email && userId !== "0") this.emailCredentials.set(email.address.trim().toLowerCase(), { userId, passwordHash, verified: email.verified });
+  }
+
+  public async changeAccountPassword(input: AccountPasswordChange): Promise<boolean> {
+    const state = await this.getAccountSecurity(input.userId);
+    if (!state || state.passwordHash !== input.expectedPasswordHash || (this.accountRevisions.get(input.userId) ?? 1) !== input.expectedAuthRevision) return false;
+    this.setAccountPassword(input.userId, input.newPasswordHash);
+    this.finishAccountChange(input.userId);
+    return true;
+  }
+
+  public async consumeAccountAction(input: AccountActionConsumption): Promise<AccountActionResult | undefined> {
+    const token = this.accountActionTokens.get(input.tokenDigest);
+    if (!token || token.purpose !== input.purpose || Date.parse(token.expiresAt) <= Date.parse(input.now)) return undefined;
+    const state = await this.getAccountSecurity(token.userId);
+    if (!state || !this.accountActionTokens.has(input.tokenDigest) || (this.accountRevisions.get(token.userId) ?? 1) !== token.authRevision) return undefined;
+    if (token.purpose === "password-reset") {
+      if (token.userId === "0" || !state.email?.verified || state.email.normalizedAddress !== token.normalizedAddress || !input.newPasswordHash) return undefined;
+      this.setAccountPassword(token.userId,input.newPasswordHash);
+    } else {
+      if ([...this.primaryEmails].some(([id,email]) => id !== token.userId && email.address.trim().toLowerCase() === token.normalizedAddress)) return undefined;
+      const other = this.emailCredentials.get(token.normalizedAddress);
+      if (other && other.userId !== token.userId) return undefined;
+      if (state.email) this.emailCredentials.delete(state.email.normalizedAddress);
+      this.primaryEmails.set(token.userId,{address:token.normalizedAddress,verified:true});
+      if (state.passwordHash && token.userId !== "0") this.emailCredentials.set(token.normalizedAddress,{userId:token.userId,passwordHash:state.passwordHash,verified:true});
+    }
+    this.finishAccountChange(token.userId);
+    return {userId:token.userId,previousEmail:state.email?.verified ? state.email.address : null};
+  }
+
   public async findEmailCredential(normalizedEmail: string): Promise<EmailCredential | undefined> {
     const credential = this.emailCredentials.get(normalizedEmail);
     if (credential === undefined || !credential.verified) {
       return undefined;
     }
     const user = this.users.get(credential.userId);
-    return user === undefined ? undefined : { user: copy(user), passwordHash: credential.passwordHash };
+    return user === undefined ? undefined : { user: copy(user), passwordHash: credential.passwordHash, authRevision: this.accountRevisions.get(user.id) ?? 1 };
   }
   public async findRootCredential(): Promise<RootCredential | undefined> {
     const user = this.users.get("0");
@@ -467,7 +582,7 @@ export class InMemoryDataStore implements DataStore {
     ) {
       return undefined;
     }
-    return { user: copy(user), passwordHash: this.rootPasswordHash };
+    return { user: copy(user), passwordHash: this.rootPasswordHash, authRevision: this.accountRevisions.get(user.id) ?? 1 };
   }
 
   public async findUsernameCredential(username: string): Promise<EmailCredential | undefined> {
@@ -484,7 +599,7 @@ export class InMemoryDataStore implements DataStore {
     );
     return credential === undefined
       ? undefined
-      : { user: copy(user), passwordHash: credential.passwordHash };
+      : { user: copy(user), passwordHash: credential.passwordHash, authRevision: this.accountRevisions.get(user.id) ?? 1 };
   }
 
   public async getUserPermissionDelta(userId: string): Promise<UserPermissionDelta> {
@@ -735,6 +850,11 @@ export class InMemoryDataStore implements DataStore {
     }
     token.consumed = true;
     credential.verified = true;
+    const primary = this.primaryEmails.get(token.userId);
+    if (primary?.address.trim().toLowerCase() === token.normalizedEmail) {
+      this.primaryEmails.set(token.userId, { ...primary, verified: true });
+    }
+    this.finishAccountChange(token.userId);
     return token.userId;
   }
 
@@ -889,6 +1009,7 @@ export class InMemoryDataStore implements DataStore {
   }
 
   public async revokeUserSessions(userId: string): Promise<void> {
+    this.accountRevisions.set(userId, (this.accountRevisions.get(userId) ?? 1) + 1);
     for (const [sessionId, session] of this.sessions) {
       if (session.userId === userId || session.impersonatorUserId === userId) {
         this.sessions.delete(sessionId);
@@ -899,8 +1020,13 @@ export class InMemoryDataStore implements DataStore {
   public async createSession(
     userId: string,
     expiresAt: string,
-    impersonatorUserId?: string | null
+    impersonatorUserId?: string | null,
+    passwordProof?: PasswordSessionProof
   ): Promise<StoredSession> {
+    if (passwordProof) {
+      const hash=userId==="0" ? this.rootPasswordHash : [...this.emailCredentials.values()].find(item=>item.userId===userId)?.passwordHash;
+      if (hash!==passwordProof.passwordHash || (passwordProof.authRevision!==undefined && passwordProof.authRevision!==(this.accountRevisions.get(userId) ?? 1))) throw new CredentialChangedError();
+    }
     const session: StoredSession = {
       id: randomUUID(),
       userId,

@@ -1,6 +1,6 @@
 import { LogIn, ShieldCheck } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useState } from "react";
 import type { SessionResponse } from "@urmotiv/contracts";
 import {
@@ -26,6 +26,7 @@ const demoAccounts = [
 export function DemoLoginPage({ existingSession }: { existingSession: SessionResponse | undefined }) {
   const client = useQueryClient();
   const navigate = useNavigate();
+  const feedback = new URLSearchParams(useLocation().search);
   const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [nickname, setNickname] = useState("");
@@ -87,6 +88,8 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
               <button type="button" className="text-button" onClick={() => setRegistering((value) => !value)}>{registering ? "已有账号，去登录" : "注册新账号"}</button>
             ) : null}
           </form>
+        {!registering ? <Link to="/forgot-password">忘记密码？</Link> : null}
+        {["password-changed","password-reset","email-changed"].includes(feedback.get("security") ?? "") ? <p className="notice-line" role="status">账号信息已更新，请使用新的凭据重新登录。{feedback.get("notification")==="failed"?"旧邮箱通知暂未发送，如需帮助请联系管理员。":""}</p> : null}
         {verificationPending ? (
           <div className="notice-line" role="status">
             验证邮件已安排发送。请打开邮件中的链接完成验证，再使用邮箱和密码登录。

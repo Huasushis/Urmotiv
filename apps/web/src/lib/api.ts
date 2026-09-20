@@ -1,4 +1,5 @@
 import {
+  accountSecurityViewSchema,
   leaderboardResponseSchema,
   userContactSchema,
   type LeaderboardQuery,
@@ -318,6 +319,25 @@ export function switchAccount(targetUserId: string): Promise<SessionResponse> {
 
 export function getMyProfile(): Promise<ProfileView> {
   return request("/me", { method: "GET" }, profileViewSchema);
+}
+
+export function getAccountSecurity(): Promise<{ hasPassword: boolean; canChangeCredentials: boolean }> {
+  return request("/me/security", { method: "GET" }, accountSecurityViewSchema);
+}
+export function changeMyPassword(input: { currentPassword: string; newPassword: string }): Promise<{ ok: true }> {
+  return request("/me/password", json(input), okResponseSchema);
+}
+export function requestPasswordReset(email: string): Promise<{ ok: true }> {
+  return request("/auth/password-reset/request", json({ email }), okResponseSchema);
+}
+export function confirmPasswordReset(token: string, newPassword: string): Promise<{ ok: true }> {
+  return request("/auth/password-reset/confirm", json({ token, newPassword }), okResponseSchema);
+}
+export function requestMyEmailChange(input: { currentPassword: string; newEmail: string }): Promise<{ ok: true }> {
+  return request("/me/email-change", json(input), okResponseSchema);
+}
+export function confirmEmailChange(token: string): Promise<{ ok: true; notificationSent: boolean }> {
+  return request("/auth/email-change/confirm", json({ token }), z.object({ok:z.literal(true),notificationSent:z.boolean()}).strict());
 }
 
 export function updateMyProfile(input: UpdateProfileInput): Promise<ProfileView> {
