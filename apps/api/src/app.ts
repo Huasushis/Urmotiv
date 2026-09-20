@@ -2954,6 +2954,11 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       return transfer.getImportJob(user, parseJobId(request));
     });
 
+    app.get("/api/v1/transfer/formats", async (request) => {
+      await requireUser(request);
+      return transfer.listFormats();
+    });
+
     app.post("/api/v1/transfer/exports/preview", async (request) => {
       const user = await requireUser(request);
       return transfer.previewExport(

@@ -2,7 +2,7 @@ import { AlertTriangle, Archive, ArrowDownToLine, ArrowUpFromLine, Download, Fil
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import type { ExportPreviewResponse, ImportJobView, PackageFileCategory } from "@urmotiv/contracts";
+import type { Contest, ExportPreviewResponse, ImportJobView, PackageFileCategory } from "@urmotiv/contracts";
 import {
   createExportJob,
   createImportJob,
@@ -11,6 +11,7 @@ import {
   getImportJob,
   getSession,
   listImportHistory,
+  listTransferFormats,
   previewExport,
   previewImport,
   uploadProblemPackage
@@ -589,13 +590,21 @@ function ImportSection({ currentUserId }: { currentUserId: string }) {
   );
 }
 
-function ExportSection({ currentUserId }: { currentUserId: string }) {
+export function ExportSection({ currentUserId, contest }: { currentUserId: string; contest?: Contest }) {
   const client = useQueryClient();
   const [problemIdsText, setProblemIdsText] = useState("");
   const [targetFormat, setTargetFormat] = useState<SourceFormat>("urmotiv");
   const [categoryChecks, setCategoryChecks] = useState<Record<CategoryGroupKey, boolean>>(defaultCategoryChecks());
   const [exportJobId, setExportJobId] = useState<string | null>(null);
   const [accessDenied, setAccessDenied] = useState(false);
+  const formats = useQuery({ queryKey: ["transfer-formats", currentUserId], queryFn: listTransferFormats });
+  const contestSource = contest ? { id: contest.id, expectedUpdatedAt: contest.updatedAt } : undefined;
+
+  useEffect(() => {
+    if (formats.data && !formats.data.items.some((format) => format.id === targetFormat)) {
+      setTargetFormat(formats.data.items[0]?.id ?? "");
+    }
+  }, [formats.data, targetFormat]);
 
   const preview = useMutation({ mutationFn: previewExport });
   const createExport = useMutation({
@@ -638,7 +647,7 @@ function ExportSection({ currentUserId }: { currentUserId: string }) {
     setExportJobId(null);
   };
 
-  const problemIds = parseIdList(problemIdsText);
+  const problemIds = contest ? [...contest.problems].sort((a, b) => a.position - b.position).map((problem) => problem.problemId) : parseIdList(problemIdsText);
   const includeFileCategories = categoryGroups
     .filter((group) => categoryChecks[group.key])
     .flatMap((group) => group.categories);
@@ -664,7 +673,7 @@ function ExportSection({ currentUserId }: { currentUserId: string }) {
             </div>
             <ArrowDownToLine size={22} aria-hidden="true" />
           </div>
-          <label className="field">
+          {contest ? <p>导出此比赛的全部 {problemIds.length} 道题，保留题目顺序，使用加入方案时固定的版本。不会改用题库最新版本。</p> : <label className="field">
             <span>题目编号</span>
             <textarea
               rows={3}
@@ -675,7 +684,7 @@ function ExportSection({ currentUserId }: { currentUserId: string }) {
                 resetProgress();
               }}
             />
-          </label>
+          </label>}
           <label className="field">
             <span>目标格式</span>
             <select
@@ -685,11 +694,11 @@ function ExportSection({ currentUserId }: { currentUserId: string }) {
                 resetProgress();
               }}
             >
-              <option value="urmotiv">{formatDisplayName("urmotiv")}</option>
-              <option value="hydro">{formatDisplayName("hydro")}</option>
-              <option value="fps">{formatDisplayName("fps")}</option>
+              {formats.data?.items.map((format) => <option key={format.id} value={format.id}>{sourceFormatText[format.id] ?? format.displayName}</option>)}
             </select>
           </label>
+          {formats.isError ? <p className="form-error">{formats.error.message}</p> : null}
+          {formats.data?.items.length === 0 ? <p>当前没有启用题目包格式，请管理员先在插件管理中启用。</p> : null}
           <fieldset className="checkbox-group">
             <legend>包含内容</legend>
             {categoryGroups.map((group) => (
@@ -709,10 +718,11 @@ function ExportSection({ currentUserId }: { currentUserId: string }) {
           <button
             className="primary-button"
             type="button"
-            disabled={problemIds.length === 0 || preview.isPending}
+            disabled={problemIds.length === 0 || preview.isPending || !formats.data?.items.some((format) => format.id === targetFormat)}
             onClick={() =>
               preview.mutate({
                 targetFormat,
+                ...(contestSource ? { contest: contestSource } : {}),
                 problems: problemIds.map((problemId) => ({ problemId, includeFileCategories }))
               })
             }
@@ -774,6 +784,7 @@ function ExportSection({ currentUserId }: { currentUserId: string }) {
                   );
                   createExport.mutate({
                     targetFormat,
+                    ...(contestSource ? { contest: contestSource } : {}),
                     problems: problemIds.map((problemId) => {
                       const revisionId = revisionByProblemId.get(problemId);
                       return {

@@ -153,11 +153,13 @@ export interface FixedRevisionExportReader {
  */
 export interface ExportReadAuthorization {
   canReadProblem(input: {
+    readonly options?: Readonly<Record<string, unknown>>;
     readonly requestedByUserId: string;
     readonly selection: ProblemPackageExportSelection;
     readonly signal: AbortSignal;
   }): Promise<boolean>;
   canReadFile(input: {
+    readonly options?: Readonly<Record<string, unknown>>;
     readonly requestedByUserId: string;
     readonly selection: ProblemPackageExportSelection;
     readonly file: ExportProblemFileDescriptor;
@@ -167,6 +169,7 @@ export interface ExportReadAuthorization {
 
 export interface ExportArtifactWriter {
   write(input: {
+    readonly groupByPosition?: boolean;
     readonly exportJobId: string;
     readonly requestedByUserId: string;
     readonly targetFormat: string;
@@ -178,6 +181,7 @@ export interface ExportArtifactWriter {
    * 只实现 write 的测试或旧实现仍由任务存储单独完成任务。
    */
   writeAndComplete?(input: {
+    readonly groupByPosition?: boolean;
     readonly exportJobId: string;
     readonly requestedByUserId: string;
     readonly targetFormat: string;
@@ -520,6 +524,7 @@ export function createProblemPackageExportHandler(
         assertActive(context.signal);
         await putRunningItemOrRetry(context, String(position));
         const allowedProblem = await dependencies.authorization.canReadProblem({
+          options: job.options,
           requestedByUserId: job.requestedByUserId,
           selection,
           signal: context.signal
@@ -545,6 +550,7 @@ export function createProblemPackageExportHandler(
           if (!selected.has(descriptor.category)) continue;
           assertActive(context.signal);
           const allowedFile = await dependencies.authorization.canReadFile({
+            options: job.options,
             requestedByUserId: job.requestedByUserId,
             selection,
             file: descriptor,
@@ -613,6 +619,7 @@ export function createProblemPackageExportHandler(
       const written =
         dependencies.artifacts.writeAndComplete === undefined
           ? await dependencies.artifacts.write({
+              groupByPosition: typeof job.options.contestId === "string",
               exportJobId,
               requestedByUserId: job.requestedByUserId,
               targetFormat: job.targetFormat,
@@ -620,6 +627,7 @@ export function createProblemPackageExportHandler(
               signal: context.signal
             })
           : await dependencies.artifacts.writeAndComplete({
+              groupByPosition: typeof job.options.contestId === "string",
               exportJobId,
               requestedByUserId: job.requestedByUserId,
               targetFormat: job.targetFormat,
@@ -746,6 +754,7 @@ async function precheckSelectedExportFiles(
   for (const selection of job.problems) {
     assertActive(signal);
     const allowedProblem = await dependencies.authorization.canReadProblem({
+      options: job.options,
       requestedByUserId: job.requestedByUserId,
       selection,
       signal
@@ -764,6 +773,7 @@ async function precheckSelectedExportFiles(
       if (!selected.has(descriptor.category)) continue;
       assertActive(signal);
       const allowedFile = await dependencies.authorization.canReadFile({
+        options: job.options,
         requestedByUserId: job.requestedByUserId,
         selection,
         file: descriptor,
@@ -1039,7 +1049,7 @@ function exportOptionsForSelection(
   job: ProblemPackageExportJob,
   selection: ProblemPackageExportSelection
 ): { readonly includeFileCategories: readonly ProblemPackageFileCategory[]; readonly values?: Record<string, JsonValue> } {
-  const { includeFileCategories: _ignored, values, ...other } = job.options;
+  const { includeFileCategories: _ignored, contestId: _contest, values, ...other } = job.options;
   return {
     includeFileCategories: selection.includedFileCategories,
     ...(Object.keys(other).length === 0 && values === undefined ? {} : { values: { ...other, ...(isJsonObject(values) ? values : {}) } })

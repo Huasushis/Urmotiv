@@ -82,6 +82,19 @@ async function createContest(context: ReturnType<typeof makeContext>) {
 }
 
 describe("组题与访问记录服务", () => {
+  it("只有比赛导出权限可读方案，但不能借此修改或读取风险", async () => {
+    const context = makeContext();
+    const contest = await createContest(context);
+    const exporter: StoredUser = { ...context.author, grants: [
+      { permission: "auth.login", effect: "allow", scope: "global" },
+      { permission: "contest.export", effect: "allow", scope: "global" }
+    ] };
+    expect((await context.service.listContests(exporter)).items).toHaveLength(1);
+    expect((await context.service.getContest(exporter, contest.id)).capabilities).toMatchObject({ canExport: true, canEdit: false, canReadRisk: false });
+    await expect(context.service.updateContest(exporter, contest.id, { title: "禁止修改", expectedUpdatedAt: contest.updatedAt })).rejects.toMatchObject({ statusCode: 404 });
+    const denied: StoredUser = { ...exporter, grants: [...exporter.grants, { permission: "contest.export", effect: "deny", scope: "global" }] };
+    await expect(context.service.getContest(denied, contest.id)).rejects.toMatchObject({ statusCode: 404 });
+  });
   it("不向普通投稿人泄露组题方案是否存在", async () => {
     const context = makeContext();
     const contest = await createContest(context);
@@ -183,7 +196,10 @@ describe("组题与访问记录服务", () => {
       problems: [{ problemId: "11", score: 100, estimatedDifficulty: null }]
     });
 
-    await expect(context.service.getContest(restrictedLeader, created.id)).rejects.toMatchObject({
+    expect((await context.service.getContest(restrictedLeader, created.id)).capabilities.canEdit).toBe(false);
+    await expect(context.service.updateContest(restrictedLeader, created.id, {
+      title: "不能通过导出权限编辑", expectedUpdatedAt: created.updatedAt
+    })).rejects.toMatchObject({
       statusCode: 404
     });
   });

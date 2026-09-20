@@ -16,6 +16,8 @@ import {
   type JobLogger
 } from "@urmotiv/jobs";
 import { hydroProblemFormatAdapter } from "@urmotiv/plugin-hydro-format";
+import { fpsProblemFormatAdapter } from "@urmotiv/plugin-fps-format";
+import type { Contest } from "@urmotiv/contracts";
 import {
   canonicalProblemSchema,
   createStaticProblemFormatAdapterCatalog,
@@ -206,6 +208,7 @@ async function makeTransferApp(
       source: exportReader,
       authorization: new ServiceExportReadAuthorization({
         getUser: (userId) => store.getUser(userId),
+        contests: new DatabaseContestStore(database),
         service
       }),
       artifacts,
@@ -2161,6 +2164,116 @@ describe("题目包导入", () => {
       WHERE revision.problem_id = ${BigInt(result.problemId)}
     `);
     expect(Number(linkedFiles[0]?.count)).toBe(fixtureProblem().files.length);
+  });
+});
+
+describe("比赛整包导出", () => {
+  it("顺序目录不能掩盖原包路径跳转、重名文件或突破整包容量", async () => {
+    const { artifacts, storage } = await makeTransferApp({ multiProblemOuterArchiveMaxBytes: 128 });
+    const staged = vi.spyOn(storage, "stage");
+    for (const files of [
+      [{ path: "../escaped.txt", content: new Uint8Array([1]) }],
+      [{ path: "p/a.txt", content: new Uint8Array([1]) }, { path: "p/a.txt", content: new Uint8Array([2]) }],
+      [{ path: "p/a.txt", content: new Uint8Array(129) }]
+    ]) {
+      await expect(artifacts.write({ exportJobId: randomUUID(), requestedByUserId: databaseDemoUserIds.leader,
+        targetFormat: "hydro", groupByPosition: true, signal: new AbortController().signal,
+        archives: [{ kind: "zip", fileName: "synthetic.zip", mediaType: "application/zip", files }]
+      })).rejects.toBeInstanceOf(UnsafeArchiveError);
+    }
+    expect(staged).not.toHaveBeenCalled();
+  });
+
+  async function fixture() {
+    const context = await makeTransferApp({ adapters: new Map([
+      ["urmotiv", urmotivNativeAdapter], ["hydro", hydroProblemFormatAdapter], ["fps", fpsProblemFormatAdapter]
+    ]) });
+    const cookie = await login(context.app, databaseDemoUserIds.leader);
+    const ids: string[] = [];
+    for (const title of ["合成比赛甲题", "合成比赛乙题"]) {
+      const id = await importFixtureProblem(context.app, context.worker, cookie, { ...fixtureProblem(), title });
+      ids.push(id);
+      await context.database.execute(sql`UPDATE problems SET status = 'approved' WHERE id = ${BigInt(id)}`);
+    }
+    const response = await context.app.inject({ method: "POST", url: "/api/v1/contests", headers: { cookie, origin: localOrigin }, payload: {
+      title: "合成比赛导出", problems: ids.map((problemId) => ({ problemId, score: 100, estimatedDifficulty: null }))
+    } });
+    expect(response.statusCode).toBe(200);
+    const contest = response.json<Contest>();
+    const input = { targetFormat: "hydro", contest: { id: contest.id, expectedUpdatedAt: contest.updatedAt },
+      problems: ids.map((problemId) => ({ problemId, includeFileCategories: ["testdata"] })) };
+    return { ...context, cookie, contest, input, ids };
+  }
+
+  it("Hydro 整包保留顺序、旧修订和数据，可直接重新导入；FPS 也可整包下载", async () => {
+    const { app, store, service, worker, jobs, cookie, input, ids, contest } = await fixture();
+    const user = (await store.getUser(databaseDemoUserIds.leader))!;
+    const { problem } = await service.getProblemForFileAccess(user, ids[0]!);
+    expect(await store.replaceProblem({ ...problem, title: "新的合成题名", content: { ...problem.content, basicStatement: "改过的合成题面", statement: "改过的合成题面" }, revision: problem.revision + 1 }, problem.revision, user.id)).toBe(true);
+    const formats = await app.inject({ method: "GET", url: "/api/v1/transfer/formats", headers: { cookie } });
+    expect(formats.json().items.map((item: { id: string }) => item.id).sort()).toEqual(["fps", "hydro", "urmotiv"]);
+    const preview = await app.inject({ method: "POST", url: "/api/v1/transfer/exports/preview", headers: { cookie, origin: localOrigin }, payload: input });
+    expect(preview.statusCode).toBe(200);
+    expect(preview.json()).toMatchObject({ canExport: true, problems: [
+      { title: "合成比赛甲题", revisionId: contest.problems[0]!.revisionId },
+      { title: "合成比赛乙题", revisionId: contest.problems[1]!.revisionId }
+    ] });
+    for (const targetFormat of ["hydro", "fps"]) {
+      const created = await app.inject({ method: "POST", url: "/api/v1/transfer/exports", headers: { cookie, origin: localOrigin }, payload: {
+        ...input, targetFormat, idempotencyKey: `contest-${targetFormat}`
+      } });
+      expect(created.statusCode).toBe(200);
+      const id = created.json().id as string;
+      expect((await jobs.getExportJob(id))?.problems.map((item) => item.revisionId)).toEqual(contest.problems.map((item) => item.revisionId));
+      expect(await worker.runOnce()).toBe(true);
+      const completed = await jobs.getExportJob(id);
+      expect({ targetFormat, state: completed?.state, failure: completed?.failure }).toEqual({ targetFormat, state: "succeeded", failure: null });
+      const download = await app.inject({ method: "GET", url: `/api/v1/transfer/exports/${id}/download`, headers: { cookie } });
+      expect(download.statusCode).toBe(200);
+      expect(download.headers["cache-control"]).toBe("private, no-store");
+      const archive = readZipArchive(new Uint8Array(download.rawPayload));
+      if (targetFormat === "hydro") {
+        const imported = await hydroProblemFormatAdapter.import(archive, { conflictAction: "create" });
+        expect(imported.map((item) => item.title)).toEqual(["合成比赛甲题", "合成比赛乙题"]);
+        expect(imported[0]?.content.basicStatement).toBe("完整题面。");
+        expect(imported[0]?.files.filter((file) => file.category === "testdata")).toHaveLength(2);
+        expect(JSON.stringify(imported)).not.toContain("改过的合成题面");
+      } else {
+        expect(archive.list().map((file) => file.path)).toEqual(["001-problem.xml", "002-problem.xml"]);
+      }
+    }
+  });
+
+  it("拒绝不完整/换序/过期方案和无权请求；撤权使排队任务失败并隐藏已有下载", async () => {
+    const { app, database, cookie, input, worker, jobs } = await fixture();
+    const post = (payload: Record<string, unknown>, suffix = "/preview", session = cookie) => app.inject({ method: "POST", url: `/api/v1/transfer/exports${suffix}`, headers: { cookie: session, origin: localOrigin }, payload });
+    for (const changed of [
+      { ...input, problems: input.problems.slice(0, 1) },
+      { ...input, problems: [...input.problems].reverse() },
+      { ...input, contest: { ...input.contest, expectedUpdatedAt: "2000-01-01T00:00:00.000Z" } }
+    ]) expect((await post(changed)).statusCode).toBe(409);
+    const author = await login(app, databaseDemoUserIds.author);
+    for (const id of [input.contest.id, "9999999"]) {
+      const response = await post({ ...input, contest: { ...input.contest, id } }, "/preview", author);
+      expect(response.statusCode).toBe(404);
+      expect(response.json().error.code).toBe("NOT_FOUND");
+      expect(response.body).not.toContain("合成比赛");
+    }
+    const first = await post({ ...input, idempotencyKey: "contest-before-revoke" }, "");
+    expect(first.statusCode).toBe(200);
+    expect(await worker.runOnce()).toBe(true);
+    const second = await post({ ...input, idempotencyKey: "contest-queued-revoke" }, "");
+    expect(second.statusCode).toBe(200);
+    await database.execute(sql`INSERT INTO permission_grants (id, subject_user_id, permission_name, effect, scope, granted_by_user_id, reason)
+      VALUES (${randomUUID()}::uuid, ${BigInt(databaseDemoUserIds.leader)}, 'contest.export', 'deny', 'global', 0, '合成撤权测试')`);
+    expect((await post(input)).statusCode).toBe(404);
+    expect((await post({ ...input, idempotencyKey: "contest-queued-revoke" }, "")).statusCode).toBe(404);
+    expect(await worker.runOnce()).toBe(true);
+    expect(await jobs.getExportJob(second.json().id)).toMatchObject({ state: "failed", failure: { code: "export_access_revoked" } });
+    for (const suffix of ["", "/download"]) {
+      const response = await app.inject({ method: "GET", url: `/api/v1/transfer/exports/${first.json().id}${suffix}`, headers: { cookie } });
+      expect(response.statusCode).toBe(404);
+    }
   });
 });
 

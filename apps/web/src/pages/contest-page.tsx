@@ -3,6 +3,7 @@ import {
   Archive,
   CalendarDays,
   ChevronRight,
+  Download,
   ListChecks,
   LockKeyhole,
   Plus,
@@ -22,6 +23,7 @@ import {
   updateContest
 } from "../lib/api";
 import { duration } from "../lib/presentation";
+import { ExportSection } from "./transfer-page";
 
 const stateText = {
   draft: "草稿",
@@ -168,7 +170,7 @@ export function ContestPage() {
           ) : selected.isError ? (
             <div className="inline-error">{selected.error.message}</div>
           ) : selected.data ? (
-            <ContestDetail contest={selected.data} onChanged={refreshContest} />
+            <ContestDetail key={selected.data.id} contest={selected.data} currentUserId={session.data?.user?.id ?? ""} onChanged={refreshContest} />
           ) : (
             <div className="contest-empty large">
               <ListChecks size={28} aria-hidden="true" />
@@ -322,7 +324,8 @@ function ContestCreateForm({ onCreated }: { onCreated: (contest: Contest) => voi
   );
 }
 
-function ContestDetail({ contest, onChanged }: { contest: Contest; onChanged: (contest: Contest) => void }) {
+function ContestDetail({ contest, currentUserId, onChanged }: { contest: Contest; currentUserId: string; onChanged: (contest: Contest) => void }) {
+  const [exporting, setExporting] = useState(false);
   const changeState = useMutation({
     mutationFn: (state: "locked" | "archived") =>
       updateContest(contest.id, { state, expectedUpdatedAt: contest.updatedAt }),
@@ -339,6 +342,9 @@ function ContestDetail({ contest, onChanged }: { contest: Contest; onChanged: (c
         </div>
         <div className="inline-actions">
           <span className={`contest-state ${contest.state}`}>{stateText[contest.state]}</span>
+          {contest.capabilities.canExport ? <button className="secondary-button compact-button" type="button" aria-expanded={exporting} onClick={() => setExporting((value) => !value)}>
+            <Download size={15} aria-hidden="true" />{exporting ? "收起导出" : "导出比赛题目包"}
+          </button> : null}
           {contest.state === "draft" && contest.capabilities.canEdit ? (
             <button className="secondary-button compact-button" type="button" disabled={changeState.isPending} onClick={() => changeState.mutate("locked")}>
               <LockKeyhole size={15} aria-hidden="true" />
@@ -354,6 +360,9 @@ function ContestDetail({ contest, onChanged }: { contest: Contest; onChanged: (c
         </div>
       </header>
       {changeState.error ? <div className="inline-error">{changeState.error.message}</div> : null}
+      {exporting && contest.capabilities.canExport ? <section aria-label="导出比赛题目包" className="contest-detail-section">
+        <ExportSection key={`${currentUserId}:${contest.id}:${contest.updatedAt}`} currentUserId={currentUserId} contest={contest} />
+      </section> : null}
       <dl className="contest-metadata">
         <div><dt>创建者</dt><dd>{contest.creator.nickname}</dd></div>
         <div><dt>开始</dt><dd>{dateTime(contest.startsAt)}</dd></div>

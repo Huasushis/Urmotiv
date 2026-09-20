@@ -51,6 +51,8 @@ import {
   type ProblemPackageAuditWriter
 } from "./problem-package-audit";
 import type { ProblemService } from "./service";
+import { DatabaseContestStore } from "./database-contest-store";
+import { requireContestExport } from "./contest-service";
 
 /**
  * 题目包导入导出的接口层。它负责：上传包的安全检查与登记、按格式预览、创建后台任务、
@@ -419,6 +421,7 @@ export class TransferService {
     requestId: string,
     input: ExportPreviewRequest
   ): Promise<ExportPreviewResponse> {
+    const fixed = await this.#contestSelections(user, input);
     const adapter = await this.#requireAdapter(input.targetFormat);
     const problems: ExportPreviewResponse["problems"] = [];
     let canExport = true;
@@ -426,6 +429,7 @@ export class TransferService {
     for (const selection of input.problems) {
       const evaluated = await this.#evaluateExportSelection(user, adapter, {
         problemId: selection.problemId,
+        ...(fixed?.get(selection.problemId) ? { revisionId: fixed.get(selection.problemId)! } : {}),
         includeFileCategories: selection.includeFileCategories
       });
       if (evaluated.status !== "ready") {
@@ -458,6 +462,7 @@ export class TransferService {
     requestId: string,
     input: CreateExportJobRequest
   ): Promise<ExportJobView> {
+    const fixed = await this.#contestSelections(user, input);
     const clientRequestDigest = digestExportCreateRequest(input);
     try {
       const replayed = await this.#coordinator.findExportJobForReplay({
@@ -483,6 +488,7 @@ export class TransferService {
     for (const requested of input.problems) {
       const evaluated = await this.#evaluateExportSelection(user, adapter, {
         problemId: requested.problemId,
+        ...(fixed?.get(requested.problemId) ? { revisionId: fixed.get(requested.problemId)! } : {}),
         includeFileCategories: requested.includeFileCategories
       });
       if (evaluated.status === "not_found") {
@@ -512,7 +518,7 @@ export class TransferService {
         clientRequestDigest,
         targetFormat: adapter.id,
         targetFormatVersion: adapter.version,
-        options: {},
+        options: input.contest ? { contestId: input.contest.id } : {},
         lossSummary: {
           targetFormat: adapter.id,
           canExport: true,
@@ -538,6 +544,23 @@ export class TransferService {
     }
     await this.#requireReplayExportAccess(user, job);
     return this.#toExportJobView(job);
+  }
+
+  public async listFormats(): Promise<{ items: { id: string; displayName: string }[] }> {
+    return { items: (await this.#listEnabledAdapters()).map(({ id, displayName }) => ({ id, displayName })) };
+  }
+
+  async #contestSelections(user: StoredUser, input: ExportPreviewRequest): Promise<Map<string, string> | undefined> {
+    if (!input.contest) return undefined;
+    const contest = await requireContestExport(user, new DatabaseContestStore(this.#database), input.contest.id, this.#now());
+    if (contest.updatedAt !== input.contest.expectedUpdatedAt) {
+      throw conflict("比赛方案已更新，请刷新后重新导出。");
+    }
+    const ordered = [...contest.problems].sort((a, b) => a.position - b.position);
+    if (ordered.length !== input.problems.length || ordered.some((problem, index) => problem.problemId !== input.problems[index]?.problemId)) {
+      throw conflict("比赛导出必须包含方案中全部题目，并保留原顺序。");
+    }
+    return new Map(ordered.map((problem) => [problem.problemId, problem.revisionId]));
   }
 
   /**
@@ -566,18 +589,7 @@ export class TransferService {
       throw notFound();
     }
 
-    for (const selection of job.problems) {
-      const access = await this.#tryProblemAccess(user, selection.problemId);
-      if (access === undefined || !access.capabilities.canExport) {
-        throw notFound();
-      }
-      const includesInternal = selection.includedFileCategories.some((category) =>
-        internalPackageCategories.has(category)
-      );
-      if (includesInternal && !access.capabilities.canReadTestdata) {
-        throw notFound();
-      }
-    }
+    await this.#requireReplayExportAccess(user, job);
 
     const record = await this.#metadata.findStoredFile(job.resultFileId);
     if (
@@ -667,7 +679,7 @@ export class TransferService {
   async #evaluateExportSelection(
     user: StoredUser,
     adapter: ProblemFormatAdapter,
-    request: { problemId: string; includeFileCategories: readonly PackageFileCategory[] }
+    request: { problemId: string; revisionId?: string; includeFileCategories: readonly PackageFileCategory[] }
   ): Promise<{
     status: "ready" | "blocked" | "not_found";
     view: ExportPreviewResponse["problems"][number];
@@ -712,7 +724,7 @@ export class TransferService {
       };
     }
 
-    const revisionId = problem.revisionId;
+    const revisionId = request.revisionId ?? problem.revisionId;
     if (revisionId === undefined) {
       throw new Error("题目包导出需要数据库存储提供版本编号。");
     }
@@ -754,7 +766,7 @@ export class TransferService {
       view: {
         problemId: request.problemId,
         status: loss.canExport ? "ready" : "blocked",
-        title: problem.title,
+        title: revision.document.title,
         revisionId,
         items
       },
@@ -800,6 +812,10 @@ export class TransferService {
     user: StoredUser,
     job: ProblemPackageExportJob
   ): Promise<void> {
+    if (job.options.contestId !== undefined) {
+      if (typeof job.options.contestId !== "string") throw notFound();
+      await requireContestExport(user, new DatabaseContestStore(this.#database), job.options.contestId, this.#now());
+    }
     for (const selection of job.problems) {
       const access = await this.#tryProblemAccess(user, selection.problemId);
       if (access === undefined || !access.capabilities.canExport) throw notFound();
@@ -1046,6 +1062,7 @@ function digestExportCreateRequest(input: CreateExportJobRequest): string {
     JSON.stringify({
       version: 1,
       kind: "problem-package-export",
+      ...(input.contest ? { contest: input.contest } : {}),
       targetFormat: input.targetFormat,
       problems: input.problems.map((problem) => ({
         problemId: problem.problemId,

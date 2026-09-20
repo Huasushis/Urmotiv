@@ -33,6 +33,7 @@ import {
   emailVerificationPendingResponseSchema,
   exportJobViewSchema,
   exportPreviewResponseSchema,
+  transferFormatsResponseSchema,
   importJobViewSchema,
   importPreviewResponseSchema,
   managedTagCatalogResponseSchema,
@@ -1072,6 +1073,10 @@ export function getImportJob(jobId: string): Promise<ImportJobView> {
 
 export function previewExport(input: ExportPreviewRequest): Promise<ExportPreviewResponse> {
   return request("/transfer/exports/preview", json(input), exportPreviewResponseSchema);
+}
+
+export function listTransferFormats() {
+  return request("/transfer/formats", { method: "GET" }, transferFormatsResponseSchema);
 }
 
 export function createExportJob(input: CreateExportJobRequest): Promise<ExportJobView> {

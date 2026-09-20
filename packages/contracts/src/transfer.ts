@@ -154,9 +154,19 @@ export const exportSelectionRequestSchema = z
   })
   .strict();
 
+export const contestExportSourceSchema = z.object({
+  id: z.string().regex(/^[1-9]\d*$/),
+  expectedUpdatedAt: z.string().datetime()
+}).strict();
+
+export const transferFormatsResponseSchema = z.object({
+  items: z.array(z.object({ id: packageFormatIdSchema, displayName: z.string().min(1).max(200) }).strict())
+}).strict();
+
 export const exportPreviewRequestSchema = z
   .object({
     targetFormat: packageFormatIdSchema,
+    contest: contestExportSourceSchema.optional(),
     problems: z.array(exportSelectionRequestSchema).min(1).max(100)
   })
   .strict()
@@ -204,6 +214,7 @@ export type ExportPreviewResponse = z.infer<typeof exportPreviewResponseSchema>;
 export const createExportJobRequestSchema = z
   .object({
     targetFormat: packageFormatIdSchema,
+    contest: contestExportSourceSchema.optional(),
     problems: z
       .array(
         exportSelectionRequestSchema

@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const api = vi.hoisted(() => ({
   getSession: vi.fn(),
+  listTransferFormats: vi.fn(async () => ({ items: [{ id: "urmotiv", displayName: "Urmotiv" }] })),
   previewExport: vi.fn()
 }));
 
@@ -165,6 +166,7 @@ describe("导入导出客户端权限边界", () => {
       setter!.call(input, "12345");
       input!.dispatchEvent(new Event("input", { bubbles: true }));
     });
+    await waitFor(() => expect(buttonWithText(view, "检查格式差异").disabled).toBe(false));
     await act(async () => {
       buttonWithText(view, "检查格式差异").click();
     });

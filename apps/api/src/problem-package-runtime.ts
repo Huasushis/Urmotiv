@@ -58,6 +58,8 @@ import {
   type ProblemPackageAuditWriter
 } from "./problem-package-audit";
 import type { ProblemService } from "./service";
+import type { ContestStore } from "./contest-store";
+import { requireContestExport } from "./contest-service";
 import { assertStatementImageBytes, InvalidStatementImageError } from "./statement-image";
 
 /**
@@ -692,6 +694,7 @@ export class DatabaseImportedProblemWriter implements AtomicImportedProblemWrite
 export interface ServiceExportReadAuthorizationDependencies {
   readonly getUser: (userId: string) => Promise<StoredUser | undefined>;
   readonly service: ProblemService;
+  readonly contests?: Pick<ContestStore, "getContest">;
 }
 
 /**
@@ -702,18 +705,21 @@ export class ServiceExportReadAuthorization implements ExportReadAuthorization {
   public constructor(private readonly dependencies: ServiceExportReadAuthorizationDependencies) {}
 
   public async canReadProblem(input: {
+    readonly options?: Readonly<Record<string, unknown>>;
     readonly requestedByUserId: string;
     readonly selection: ProblemPackageExportSelection;
     readonly signal: AbortSignal;
   }): Promise<boolean> {
     const capabilities = await this.#capabilitiesFor(
       input.requestedByUserId,
-      input.selection.problemId
+      input.selection.problemId,
+      input.options
     );
     return capabilities?.canExport === true;
   }
 
   public async canReadFile(input: {
+    readonly options?: Readonly<Record<string, unknown>>;
     readonly requestedByUserId: string;
     readonly selection: ProblemPackageExportSelection;
     readonly file: ExportProblemFileDescriptor;
@@ -721,7 +727,8 @@ export class ServiceExportReadAuthorization implements ExportReadAuthorization {
   }): Promise<boolean> {
     const capabilities = await this.#capabilitiesFor(
       input.requestedByUserId,
-      input.selection.problemId
+      input.selection.problemId,
+      input.options
     );
     if (capabilities?.canExport !== true) {
       return false;
@@ -734,12 +741,17 @@ export class ServiceExportReadAuthorization implements ExportReadAuthorization {
 
   async #capabilitiesFor(
     userId: string,
-    problemId: string
+    problemId: string,
+    options?: Readonly<Record<string, unknown>>
   ): Promise<{ canExport: boolean; canReadTestdata: boolean } | undefined> {
     try {
       const user = await this.dependencies.getUser(userId);
       if (user === undefined) {
         return undefined;
+      }
+      if (options?.contestId !== undefined) {
+        if (typeof options.contestId !== "string" || !this.dependencies.contests) return undefined;
+        await requireContestExport(user, this.dependencies.contests, options.contestId);
       }
       const { capabilities } = await this.dependencies.service.getProblemForFileAccess(
         user,
@@ -1041,6 +1053,7 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
   }
 
   public async write(input: {
+    readonly groupByPosition?: boolean;
     readonly exportJobId: string;
     readonly requestedByUserId: string;
     readonly targetFormat: string;
@@ -1051,6 +1064,7 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
   }
 
   public async writeAndComplete(input: {
+    readonly groupByPosition?: boolean;
     readonly exportJobId: string;
     readonly requestedByUserId: string;
     readonly targetFormat: string;
@@ -1063,6 +1077,7 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
 
   async #write(
     input: {
+      readonly groupByPosition?: boolean;
       readonly exportJobId: string;
       readonly requestedByUserId: string;
       readonly targetFormat: string;
@@ -1080,7 +1095,28 @@ export class StorageExportArtifactWriter implements ExportArtifactWriter {
     let mediaType: string;
     let bytes: Uint8Array;
     const first = input.archives[0];
-    if (input.archives.length === 1 && first !== undefined) {
+    if (input.groupByPosition) {
+      const outputKind = requireUniformOutputKind(input.archives);
+      const files = input.archives.flatMap((archive, index) => {
+        assertActive(input.signal);
+        const position = String(index + 1).padStart(3, "0");
+        if (outputKind === "zip") {
+          // Validate each original package before adding a directory prefix.
+          // Otherwise a path such as ../001 could become valid after prefixing.
+          writeZipArchive((archive as GeneratedZipArchive).files);
+          const entries = (archive as GeneratedZipArchive).files;
+          const firstPath = entries[0]?.path ?? "";
+          const root = firstPath.includes("/") ? `${firstPath.split("/")[0]}/` : "";
+          const prefix = root && entries.every((file) => file.path.startsWith(root)) ? root : "";
+          return entries.map((file) => ({ ...file, path: `${position}/${file.path.slice(prefix.length)}` }));
+        }
+        const file = validateGeneratedSingleFile(archive as GeneratedSingleFileArchive);
+        return [{ path: `${position}-${file.fileName}`, content: file.content }];
+      });
+      fileName = `urmotiv-contest-${input.targetFormat}.zip`;
+      mediaType = "application/zip";
+      bytes = writeZipArchive(files, { ...this.#multiProblemOuterArchiveLimits, allowNestedArchives: false });
+    } else if (input.archives.length === 1 && first !== undefined) {
       const outputKind = requireGeneratedOutputKind(first);
       if (outputKind === "zip") {
         fileName = safeZipArtifactName(first.fileName);

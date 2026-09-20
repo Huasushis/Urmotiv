@@ -156,6 +156,7 @@ try {
       source: exportReader,
       authorization: new ServiceExportReadAuthorization({
         getUser: (userId) => store.getUser(userId),
+        contests: new DatabaseContestStore(database),
         service: problemService
       }),
       artifacts: new StorageExportArtifactWriter({

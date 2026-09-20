@@ -32,6 +32,25 @@ function contestTarget(contest: ContestRecord): { id: string; creatorId: string 
   return { id: contest.id, creatorId: contest.creator.id };
 }
 
+function canViewContest(user: StoredUser, contest: ContestRecord, now: Date): boolean {
+  const target = { ownerId: contest.creator.id, objectId: contest.id };
+  return canEditContest(user, contestTarget(contest), now) ||
+    hasPermission(user, "contest.export", target, now);
+}
+
+export async function requireContestExport(
+  user: StoredUser,
+  store: Pick<ContestStore, "getContest">,
+  contestId: string,
+  now = new Date()
+): Promise<ContestRecord> {
+  const contest = await store.getContest(contestId);
+  if (!contest || !hasPermission(user, "contest.export", {
+    ownerId: contest.creator.id, objectId: contest.id
+  }, now)) throw notFound();
+  return contest;
+}
+
 export class ContestService {
   private readonly now: () => Date;
 
@@ -45,7 +64,7 @@ export class ContestService {
 
   public async listContests(user: StoredUser): Promise<ContestListResponse> {
     const contests = (await this.contestStore.listContests()).filter((contest) =>
-      canEditContest(user, contestTarget(contest), this.now())
+      canViewContest(user, contest, this.now())
     );
     return { items: contests.map((contest) => this.toListItem(contest, user)) };
   }
@@ -70,6 +89,7 @@ export class ContestService {
     input: UpdateContestInput
   ): Promise<Contest> {
     const current = await this.requireVisibleContest(user, contestId);
+    if (!canEditContest(user, contestTarget(current), this.now())) throw notFound();
     if (current.state === "archived") {
       throw conflict("已归档的组题方案不能继续修改。");
     }
@@ -155,7 +175,7 @@ export class ContestService {
     const contest = await this.contestStore.getContest(contestId);
     if (
       contest === undefined ||
-      !canEditContest(user, contestTarget(contest), this.now())
+      !canViewContest(user, contest, this.now())
     ) {
       throw notFound();
     }
