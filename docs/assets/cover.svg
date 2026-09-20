@@ -6,7 +6,7 @@
     <linearGradient id="glass" x2="1" y2="1"><stop stop-color="#fff" stop-opacity=".85"/><stop offset="1" stop-color="#fff" stop-opacity=".25"/></linearGradient>
     <radialGradient id="glow"><stop stop-color="#087e94" stop-opacity=".16"/><stop offset="1" stop-color="#087e94" stop-opacity="0"/></radialGradient>
     <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%"><feDropShadow dx="0" dy="22" stdDeviation="25" flood-color="#123d49" flood-opacity=".12"/></filter>
-    <g id="mark"><path d="M7 17c10-1 18 3 23 10v28C24 48 16 44 7 44V17Z" fill="#087e94"/><path d="M35 27c6-7 14-11 22-10v27c-9 0-16 4-22 11V27Z" fill="#23b7c8"/><circle cx="41" cy="10" r="6" fill="#087e94"/></g>
+    <g id="mark"><path d="M6 33q0-2 2-3l7-4q3-2 3 2v12q0 2-2 3l-7 4q-3 2-3-2Z" fill="#0b4554"/><path d="M21 23q0-2 2-3l8-5q3-2 3 2v29q0 2-2 3l-8 5q-3 2-3-2Z" fill="#10bad0"/><path d="M37 22q0-2 2-3l8-5q3-2 3 2v31q0 2-2 3l-8 5q-3 2-3-2Z" fill="#0b4554"/><path d="M53 24q0-3 3-1l6 4q2 1 2 3v6q0 2-2 3l-6 4q-3 2-3-1Z" fill="#10bad0"/></g>
   </defs>
   <rect width="1280" height="640" fill="url(#bg)"/>
   <circle cx="1000" cy="290" r="370" fill="url(#glow)"/>
