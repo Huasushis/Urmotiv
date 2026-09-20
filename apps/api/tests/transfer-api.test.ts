@@ -2184,13 +2184,14 @@ describe("比赛整包导出", () => {
     expect(staged).not.toHaveBeenCalled();
   });
 
-  async function fixture() {
+  async function fixture(count = 2) {
     const context = await makeTransferApp({ adapters: new Map([
       ["urmotiv", urmotivNativeAdapter], ["hydro", hydroProblemFormatAdapter], ["fps", fpsProblemFormatAdapter]
     ]) });
     const cookie = await login(context.app, databaseDemoUserIds.leader);
     const ids: string[] = [];
-    for (const title of ["合成比赛甲题", "合成比赛乙题"]) {
+    const titles = count === 2 ? ["合成比赛甲题", "合成比赛乙题"] : Array.from({ length: count }, (_, i) => `合成比赛第 ${i + 1} 题`);
+    for (const title of titles) {
       const id = await importFixtureProblem(context.app, context.worker, cookie, { ...fixtureProblem(), title });
       ids.push(id);
       await context.database.execute(sql`UPDATE problems SET status = 'approved' WHERE id = ${BigInt(id)}`);
@@ -2204,6 +2205,19 @@ describe("比赛整包导出", () => {
       problems: ids.map((problemId) => ({ problemId, includeFileCategories: ["testdata"] })) };
     return { ...context, cookie, contest, input, ids };
   }
+
+  it("十一题经过数据库单调进度检查后完成整包导出", async () => {
+    const { app, cookie, input, worker, jobs } = await fixture(11);
+    const response = await app.inject({ method: "POST", url: "/api/v1/transfer/exports", headers: { cookie, origin: localOrigin },
+      payload: { ...input, idempotencyKey: "eleven-problem-contest" } });
+    expect(response.statusCode).toBe(200);
+    expect(await worker.runOnce()).toBe(true);
+    const job = await jobs.getExportJob(response.json().id);
+    expect({ state: job?.state, failure: job?.failure, progress: job?.progressPercent }).toEqual({ state: "succeeded", failure: null, progress: 100 });
+    const downloaded = await app.inject({ method: "GET", url: `/api/v1/transfer/exports/${response.json().id}/download`, headers: { cookie } });
+    expect(downloaded.statusCode).toBe(200);
+    expect(await hydroProblemFormatAdapter.import(readZipArchive(new Uint8Array(downloaded.rawPayload)), { conflictAction: "create" })).toHaveLength(11);
+  });
 
   it("Hydro 整包保留顺序、旧修订和数据，可直接重新导入；FPS 也可整包下载", async () => {
     const { app, store, service, worker, jobs, cookie, input, ids, contest } = await fixture();

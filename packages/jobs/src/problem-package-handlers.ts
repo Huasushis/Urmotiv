@@ -540,7 +540,7 @@ export function createProblemPackageExportHandler(
         await updateExportOrRetry(
           dependencies.jobs,
           exportJobId,
-          Math.max(5, Math.floor((position * 70) / job.problems.length)),
+          Math.max(10, Math.floor((position * 70) / job.problems.length)),
           report("reading", position, 0)
         );
 

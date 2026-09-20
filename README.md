@@ -83,6 +83,8 @@ docker compose --env-file /secure/path/urmotiv.env exec api pnpm --filter @urmot
 
 题面与题解使用 Markdown；题目附件按公开图片、公开文件、内部题解附件和评测数据区分权限。没有 `problem.view` 或相应导入权限时，API 按题目不存在处理。
 
+比赛整包导出在「组题 → 打开方案 → 导出比赛题目包」。选择已启用的 Hydro 等格式，检查后生成下载包；全部题目按方案顺序导出，保留加入方案时固定的版本。详细操作见[使用指南](docs/user-guide.md#组题与比赛)。
+
 ## 管理设置
 
 拥有相应服务端能力的系统管理员在“管理”首页可以点击进入这些路径：
