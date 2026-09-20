@@ -84,6 +84,33 @@ function approvedProblem(): StoredProblem {
 }
 
 describe("数据库组题与访问记录仓库", () => {
+  it("取消归档保留固定版本；删除重新校验权限、审计失败回滚且保留题目", async () => {
+    const database = await openDatabase(true);
+    const problems = new DatabaseDataStore(database);
+    const contests = new DatabaseContestStore(database);
+    const root = requireUser(await problems.getUser("0"));
+    const service = new ContestService(problems, contests);
+    const problem = await problems.createProblem(approvedProblem());
+    const created = await service.createContest(root, {
+      title: "合成删除比赛", description: "", startsAt: null, endsAt: null,
+      members: [], problems: [{problemId: problem.id, score: 100, estimatedDifficulty: null}]
+    });
+    const archived = await service.updateContest(root, created.id, {state: "archived", expectedUpdatedAt: created.updatedAt});
+    const draft = await service.updateContest(root, created.id, {state: "draft", expectedUpdatedAt: archived.updatedAt});
+    expect(draft.problems[0]?.revisionId).toBe(created.problems[0]?.revisionId);
+    await expect(service.deleteContest(root, created.id, draft.updatedAt, "invalid-audit-request")).rejects.toBeDefined();
+    expect(await contests.getContest(created.id)).toBeDefined();
+    await database.execute(sql`INSERT INTO permission_grants(id,subject_user_id,permission_name,effect,scope,granted_by_user_id,reason)
+      VALUES(${randomUUID()}::uuid,0,'contest.delete','deny','global',0,'合成撤权')`);
+    // root 是旧快照，事务必须再次读取权限，不能凭先前许可继续删除。
+    await expect(service.deleteContest(root, created.id, draft.updatedAt, randomUUID())).rejects.toMatchObject({statusCode: 404});
+    await database.execute(sql`DELETE FROM permission_grants WHERE subject_user_id=0 AND permission_name='contest.delete'`);
+    await service.deleteContest(root, created.id, draft.updatedAt, randomUUID());
+    expect(await contests.getContest(created.id)).toBeUndefined();
+    expect(await database.query(sql`SELECT id FROM problems WHERE id=${BigInt(problem.id)} AND deleted_at IS NULL`)).toHaveLength(1);
+    expect(await database.query(sql`SELECT contest_id FROM contest_problems WHERE contest_id=${BigInt(created.id)}`)).toHaveLength(1);
+    expect(await database.query(sql`SELECT id FROM audit_events WHERE action='contest.delete'`)).toHaveLength(1);
+  });
   it("重启后保留固定修订和风险记录，重复心跳不重复累计", async () => {
     const database = await openDatabase(true);
     const problemStore = new DatabaseDataStore(database);

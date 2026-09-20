@@ -54,6 +54,11 @@ export const updateContestInputSchema = contestFieldsSchema.partial().extend({
 export type CreateContestInput = z.infer<typeof createContestInputSchema>;
 export type UpdateContestInput = z.infer<typeof updateContestInputSchema>;
 
+export const deleteContestInputSchema = z.object({
+  expectedUpdatedAt: z.string().datetime(),
+  confirm: z.literal(true)
+}).strict();
+
 export const contestMemberSchema = z.object({
   user: userSummarySchema,
   role: contestMemberRoleSchema
@@ -84,6 +89,7 @@ export type ContestProblem = z.infer<typeof contestProblemSchema>;
 
 export const contestCapabilitiesSchema = z.object({
   canEdit: z.boolean(),
+  canChangeState: z.boolean().optional(),
   canDelete: z.boolean(),
   canExport: z.boolean(),
   canReadRisk: z.boolean()

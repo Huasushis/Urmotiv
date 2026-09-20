@@ -68,6 +68,7 @@ export function createBuiltinPluginDefinitions(
   return [
     {
       source: "builtin:review-default",
+      projectUrl: "https://github.com/Huasushis/Urmotiv/tree/main/plugins/review-default",
       initialState: "enabled",
       requiresRestart: false,
       manifest: {
@@ -100,6 +101,7 @@ export function createBuiltinPluginDefinitions(
     },
     {
       source: "builtin:anklang",
+      projectUrl: "https://github.com/Huasushis/Anklang",
       manifest: {
         id: anklangPluginId, name: "原题相似度检查", version: "0.4.0", apiVersion: "1",
         serverEntry: "dist/index.js", permissions: ["org.ustc.urmotiv.anklang.configure", "org.ustc.urmotiv.anklang.results.read"], settingsSchema: "settings.schema.json"
@@ -218,6 +220,7 @@ export function createBuiltinPluginDefinitions(
     },
     {
       source: "builtin:fermata-control",
+      projectUrl: "https://github.com/Huasushis/Fermata",
       managementLinks: [{ label: "管理审核服务", href: "/admin/fermata", requiredPermissions: ["plugin.manage", "system.manage"] }],
       manifest: {
         id: fermataPluginId, name: "Fermata 审核服务管理", version: "0.1.0", apiVersion: "1",
@@ -244,12 +247,14 @@ export function createBuiltinPluginDefinitions(
     },
     {
       source: "builtin:hydro-format",
+      projectUrl: "https://github.com/Huasushis/Urmotiv/tree/main/plugins/hydro-format",
       requiresRestart: false,
       manifest: { id: hydroFormatPluginId, name: "Hydro 题目包格式", version: hydroAdapterVersion, apiVersion: "1", serverEntry: "dist/index.js", permissions: [] },
       registerHooks: registerHydroFormatPlugin
     },
     {
       source: "builtin:fps-format",
+      projectUrl: "https://github.com/Huasushis/Urmotiv/tree/main/plugins/fps-format",
       requiresRestart: false,
       manifest: { id: fpsFormatPluginId, name: "FPS XML 题目包格式", version: fpsAdapterVersion, apiVersion: "1", serverEntry: "dist/index.js", permissions: [] },
       registerHooks: registerFpsFormatPlugin

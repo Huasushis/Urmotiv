@@ -59,6 +59,9 @@ import {
   readServerStorageOptions
 } from "./server-config";
 import { assertAdminBootstrapReadyForServer } from "./bootstrap-admin";
+import {BackupService} from "./backup/service";
+import {PostgresBackupEngine} from "./backup/postgres";
+import {RestoreMaintenance} from "./backup/routes";
 
 const appOptions = readServerOptions(process.env);
 const authenticationOptions = readServerAuthenticationOptions(process.env);
@@ -83,6 +86,17 @@ try {
     await seedDatabaseDemoData(database);
   }
   const pluginSecretBox = createPluginSecretBox(process.env.URMOTIV_PLUGIN_SECRET_KEY);
+  const backupMaintenance=new RestoreMaintenance();
+  let backup:BackupService|undefined;
+  if(database.kind==="postgres"&&databaseOptions.kind==="postgres"&&pluginSecretBox&&process.env.URMOTIV_BACKUP_DIR){
+    const engine=new PostgresBackupEngine({database,connectionString:databaseOptions.connectionString,storage:fileStorage,storageKeyForId:id=>`${storageOptions.kind==="s3"?"urmotiv/":""}objects/${id}`,secretKey:process.env.URMOTIV_PLUGIN_SECRET_KEY!});
+    backup=await BackupService.open({directory:process.env.URMOTIV_BACKUP_DIR,secretBox:pluginSecretBox,engine,maintenance:{
+      enter:async()=>{await backupMaintenance.enter(()=>engine.assertRestoreIdle());try{await packageWorker.stop();}catch(error){backupMaintenance.leave();throw error;}},
+      leave:()=>{void packageWorker.run();backupMaintenance.leave();}
+    },
+      ...(process.env.WEBDAV_ADDR&&process.env.WEBDAV_USER&&process.env.WEBDAV_PASS?{defaults:{address:process.env.WEBDAV_ADDR,username:process.env.WEBDAV_USER,password:process.env.WEBDAV_PASS}}:{})});
+    backup.startSchedule();
+  }
   const adminSettingsStore = new DatabaseAdminSettingsStore(
     database,
     pluginSecretBox,
@@ -210,6 +224,7 @@ try {
   });
 
   const app = await createApp({
+    ...(backup?{backup,backupMaintenance}:{}),
     ...appOptions,
     ...authenticationOptions,
     ...(casClient === undefined ? {} : { casClient }),
@@ -242,6 +257,7 @@ try {
   });
   void packageWorker.run();
   app.addHook("onClose", async () => {
+    await backup?.close();
     await packageWorker.stop().catch(() => undefined);
     await packageQueue.close().catch(() => undefined);
     await database.close();

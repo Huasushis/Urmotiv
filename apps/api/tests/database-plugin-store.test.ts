@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import {updatePluginInputSchema} from "@urmotiv/contracts";
 import {
   createLocalDatabase,
   type LocalDatabaseHandle,
@@ -31,6 +32,7 @@ async function createHost(): Promise<{
   const host = new TrustedPluginHost([
     {
       source: "builtin:database-test",
+      projectUrl: "https://example.test/plugin",
       manifest: {
         id: pluginId,
         name: "数据库插件测试",
@@ -62,6 +64,19 @@ afterEach(async () => {
 });
 
 describe("数据库插件设置", () => {
+  it("项目链接可自定义和清空，重启不复原；非法链接和旧版本被拒绝", async () => {
+    const {host,store} = await createHost();
+    expect((await host.list())[0]?.projectUrl).toBe("https://example.test/plugin");
+    for (const projectUrl of ["javascript:alert(1)", "https://user:secret@example.test", "not-a-url"])
+      expect(updatePluginInputSchema.safeParse({expectedRevision:1,projectUrl}).success).toBe(false);
+    const custom = await host.update(pluginId,{expectedRevision:1,clearSecrets:[],projectUrl:"https://example.test/custom"},"0",randomUUID());
+    expect(custom?.projectUrl).toBe("https://example.test/custom");
+    await expect(host.update(pluginId,{expectedRevision:1,clearSecrets:[],projectUrl:""},"0",randomUUID())).rejects.toBeInstanceOf(PluginRevisionConflictError);
+    await host.update(pluginId,{expectedRevision:2,clearSecrets:[],projectUrl:""},"0",randomUUID());
+    await host.initialize();
+    expect((await host.list())[0]?.projectUrl).toBe("");
+    expect((await store.get(pluginId))?.projectUrl).toBe("");
+  });
   it("空存储允许轻量启动，已有密钥时缺少服务器配置则固定失败", async () => {
     const { database, store } = await createHost();
     expect(await store.hasStoredSecrets()).toBe(false);

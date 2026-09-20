@@ -110,7 +110,13 @@ services:
       context: .
       dockerfile: Dockerfile.api
     restart: unless-stopped
+    volumes:
+      - backup-data:/app/backups
     environment:
+      URMOTIV_BACKUP_DIR: /app/backups
+      WEBDAV_ADDR: ${WEBDAV_ADDR:-}
+      WEBDAV_USER: ${WEBDAV_USER:-}
+      WEBDAV_PASS: ${WEBDAV_PASS:-}
       NODE_ENV: production
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
@@ -313,6 +319,7 @@ services:
           pids: 1024
 
 volumes:
+  backup-data:
   postgres-data:
   redis-data:
   minio-data:

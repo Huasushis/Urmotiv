@@ -2206,6 +2206,23 @@ describe("比赛整包导出", () => {
     return { ...context, cookie, contest, input, ids };
   }
 
+  it("删除比赛后旧导出任务和下载不再可读，排队任务重新检查比赛存在", async () => {
+    const {app,database,cookie,input,worker,jobs,contest} = await fixture();
+    const post = (key:string) => app.inject({method:"POST",url:"/api/v1/transfer/exports",headers:{cookie,origin:localOrigin},payload:{...input,idempotencyKey:key}});
+    const first = await post("before-contest-delete");
+    expect(first.statusCode).toBe(200);expect(await worker.runOnce()).toBe(true);
+    const queued = await post("queued-contest-delete");expect(queued.statusCode).toBe(200);
+    await database.execute(sql`INSERT INTO permission_grants(id,subject_user_id,permission_name,effect,scope,granted_by_user_id,reason)
+      VALUES(${randomUUID()}::uuid,${BigInt(databaseDemoUserIds.leader)},'contest.delete','allow','global',0,'合成删除测试')`);
+    const removed=await app.inject({method:"DELETE",url:`/api/v1/contests/${contest.id}`,headers:{cookie,origin:localOrigin},payload:{expectedUpdatedAt:contest.updatedAt,confirm:true}});
+    expect(removed.statusCode).toBe(200);
+    for(const suffix of["","/download"]){
+      expect((await app.inject({method:"GET",url:`/api/v1/transfer/exports/${first.json().id}${suffix}`,headers:{cookie}})).statusCode).toBe(404);
+    }
+    expect(await worker.runOnce()).toBe(true);
+    expect(await jobs.getExportJob(queued.json().id)).toMatchObject({state:"failed",failure:{code:"export_access_revoked"}});
+  });
+
   it("十一题经过数据库单调进度检查后完成整包导出", async () => {
     const { app, cookie, input, worker, jobs } = await fixture(11);
     const response = await app.inject({ method: "POST", url: "/api/v1/transfer/exports", headers: { cookie, origin: localOrigin },

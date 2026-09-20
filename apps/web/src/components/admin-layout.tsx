@@ -108,6 +108,7 @@ export function adminNavigationGroups(session: SessionUser): AdminNavigationGrou
       label: "系统",
       items: [
         ...(canManageSystem ? [{ to: "/admin/settings", label: "常规设置" }] : []),
+        ...(canManageSystem && session.isRoot ? [{ to: "/admin/backups", label: "备份与恢复" }] : []),
         ...(canManageOAuth ? [{ to: "/admin/oauth", label: "统一身份认证" }] : []),
         ...(canReadAudit ? [{ to: "/admin/audit", label: "审计记录" }] : [])
       ]

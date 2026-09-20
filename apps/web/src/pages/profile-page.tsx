@@ -9,6 +9,8 @@ import {
   avatarUrlFor,
   deleteMyAvatar,
   getMyProfile,
+  getAccountSecurity,
+  getLinkedIdentities,
   updateMyProfile,
   uploadMyAvatar
 } from "../lib/api";
@@ -73,6 +75,8 @@ export function ProfilePage() {
   const queryClient = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const profileQuery = useQuery({ queryKey: ["profile"], queryFn: getMyProfile });
+  useQuery({queryKey:["account-security"],queryFn:getAccountSecurity,retry:false,staleTime:30_000});
+  useQuery({queryKey:["linked-identities"],queryFn:getLinkedIdentities,retry:false,staleTime:30_000});
   const [nickname, setNickname] = useState("");
   const [qq, setQq] = useState("");
   const [uploadError, setUploadError] = useState<string | null>(null);

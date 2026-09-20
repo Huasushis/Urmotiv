@@ -15,3 +15,4 @@ export * from "./tag";
 export * from "./transfer";
 export * from "./account";
 export * from "./plugin";
+export * from "./backup";

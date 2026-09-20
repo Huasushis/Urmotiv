@@ -160,12 +160,15 @@ USTC 登录以提供方 + gid/id 找账号；学校提供的用户名、姓名�
 
 ## 组题方案路由
 
+完整站点备份另提供 `GET /api/v1/admin/backups`（状态）、`PUT /api/v1/admin/backups/settings`（验证后保存）、`GET /api/v1/admin/backups/files`（远端列表）、`POST /api/v1/admin/backups/run` 与 `POST /api/v1/admin/backups/restore`。仅直接登录的 root 真人且仍拥有 `system.manage` 可访问；恢复还校验当前 root 密码和确认文本，机器人令牌不能调用。启动操作返回 202 和 `job`，随后从状态接口读取结果。配置使用 `expectedRevision`，密钥不回显；具体请求类型见 `packages/contracts/src/backup.ts`，操作流程见[管理员指南](admin-guide.md#网页完整备份)。
+
 | 方法与路径 | 说明 |
 | --- | --- |
 | `GET /api/v1/contests` | 列出当前用户可编辑的组题方案 |
 | `POST /api/v1/contests` | 创建组题方案；至少一题，题目必须为已通过状态 |
 | `GET /api/v1/contests/:contestId` | 读取方案和调用者能力 |
-| `PATCH /api/v1/contests/:contestId` | 带 `expectedUpdatedAt` 更新草稿；锁定后只能归档 |
+| `PATCH /api/v1/contests/:contestId` | 带 `expectedUpdatedAt` 更新草稿；锁定或归档可单独改 `state: "draft"`，之后才允许改内容 |
+| `DELETE /api/v1/contests/:contestId` | `contest.delete` 权限；提交 `{expectedUpdatedAt, confirm: true}`，返回 `{ok: true}`；不删除题库题目 |
 
 创建请求的合法形状示例（题目编号 `1` 仅为合成契约值，部署时替换为实际已通过题目）：
 

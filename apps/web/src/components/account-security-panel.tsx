@@ -5,7 +5,7 @@ import { changeMyPassword, getAccountSecurity, requestMyEmailChange, initializeM
 import { clearProblemDrafts } from "../lib/client-security";
 
 export function AccountSecurityPanel() {
-  const query=useQuery({queryKey:["account-security"],queryFn:getAccountSecurity,retry:false});
+  const query=useQuery({queryKey:["account-security"],queryFn:getAccountSecurity,retry:false,staleTime:30_000});
   const [currentPassword,setCurrentPassword]=useState("");
   const [newPassword,setNewPassword]=useState("");
   const [confirmedPassword,setConfirmedPassword]=useState("");

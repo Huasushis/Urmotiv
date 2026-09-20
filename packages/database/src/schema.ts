@@ -671,6 +671,7 @@ export const installedPlugins = pgTable(
     apiVersion: varchar("api_version", { length: 40 }).notNull(),
     source: varchar("source", { length: 500 }).notNull(),
     manifestDigest: char("manifest_digest", { length: 64 }).notNull(),
+    projectUrl: text("project_url"),
     state: pluginState("state").notNull().default("disabled"),
     failureCode: varchar("failure_code", { length: 120 }),
     installedByUserId: bigint("installed_by_user_id", { mode: "bigint" })
@@ -681,6 +682,7 @@ export const installedPlugins = pgTable(
   },
   (table) => [
     check("installed_plugins_id_ck", sql`${table.id} ~ '^[a-z0-9]+([._-][a-z0-9]+)*$'`),
+    check("installed_plugins_project_url_length_ck",sql`${table.projectUrl} IS NULL OR length(${table.projectUrl}) <= 2048`),
     check(
       "installed_plugins_digest_ck",
       sql`${table.manifestDigest} ~ '^[0-9a-f]{64}$'`

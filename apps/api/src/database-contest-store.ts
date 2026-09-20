@@ -1,6 +1,9 @@
 import type { ProblemAccessRecord, UserSummary } from "@urmotiv/contracts";
 import type { DatabaseExecutor, DatabaseHandle } from "@urmotiv/database";
 import { sql } from "drizzle-orm";
+import {lockUserPolicyForAuthorization} from "./database-store";
+import {canEditContest, hasPermission} from "./permissions";
+import {notFound} from "./errors";
 import type {
   ContestMemberRecord,
   ContestProblemRecord,
@@ -142,13 +145,19 @@ export class DatabaseContestStore implements ContestStore {
   public async replaceContest(
     contestId: string,
     input: ContestWriteRecord,
-    expectedUpdatedAt: string
+    expectedUpdatedAt: string,
+    actor?: {userId:string;requestId:string}
   ): Promise<ContestRecord | undefined> {
     const id = parseDatabaseId(contestId);
     if (id === undefined) {
       return undefined;
     }
     return this.handle.transaction(async (transaction) => {
+      if (actor) {
+        const user = await lockUserPolicyForAuthorization(transaction,requireDatabaseId(actor.userId,"操作者"));
+        const current = await transaction.query<{creator_id:string}>(sql`SELECT created_by_user_id::text AS creator_id FROM contests WHERE id=${id} AND deleted_at IS NULL FOR UPDATE`);
+        if (!user || !current[0] || !canEditContest(user,{id:contestId,creatorId:current[0].creator_id},new Date())) throw notFound();
+      }
       const updated = await transaction.query<{ id: string }>(sql`
         UPDATE contests
         SET title = ${input.title},
@@ -168,8 +177,26 @@ export class DatabaseContestStore implements ContestStore {
       await transaction.execute(sql`DELETE FROM contest_members WHERE contest_id = ${id}`);
       await transaction.execute(sql`DELETE FROM contest_problems WHERE contest_id = ${id}`);
       await this.writeMembersAndProblems(transaction, id, input);
+      if (actor) await this.auditMutation(transaction,id,actor,"contest.update",{state:input.state});
       return this.loadContest(transaction, id);
     });
+  }
+
+  public async deleteContest(contestId:string,expectedUpdatedAt:string,actor:{userId:string;requestId:string}):Promise<boolean> {
+    const id=parseDatabaseId(contestId);if(id===undefined)return false;
+    return this.handle.transaction(async transaction=>{
+      const user=await lockUserPolicyForAuthorization(transaction,requireDatabaseId(actor.userId,"操作者"));
+      const current=await transaction.query<{creator_id:string}>(sql`SELECT created_by_user_id::text AS creator_id FROM contests WHERE id=${id} AND deleted_at IS NULL FOR UPDATE`);
+      if(!user||!current[0]||!hasPermission(user,"contest.delete",{ownerId:current[0].creator_id,objectId:contestId},new Date()))throw notFound();
+      const changed=await transaction.query(sql`UPDATE contests SET deleted_at=now(),updated_at=now() WHERE id=${id} AND deleted_at IS NULL AND updated_at=${expectedUpdatedAt}::timestamptz RETURNING id`);
+      if(changed.length!==1)return false;
+      await this.auditMutation(transaction,id,actor,"contest.delete",{});
+      return true;
+    });
+  }
+
+  private async auditMutation(transaction:DatabaseExecutor,id:bigint,actor:{userId:string;requestId:string},action:string,metadata:Record<string,unknown>):Promise<void>{
+    await transaction.execute(sql`INSERT INTO audit_events(actor_user_id,request_id,action,object_type,object_id,result,metadata) VALUES(${BigInt(actor.userId)},${actor.requestId}::uuid,${action},'contest',${String(id)},'success',${JSON.stringify(metadata)}::jsonb)`);
   }
 
   public async recordProblemAccess(input: RecordProblemAccessInput): Promise<void> {

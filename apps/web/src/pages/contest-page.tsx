@@ -17,6 +17,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import type { Contest, CreateContestInput } from "@urmotiv/contracts";
 import {
   createContest,
+  deleteContest,
   getContest,
   getSession,
   listContests,
@@ -96,6 +97,7 @@ export function ContestPage() {
       ...current, items: current.items.map(item => item.id === contest.id ? {...item, state:contest.state, updatedAt:contest.updatedAt} : item)
     });
     if (contest.state === "archived") selectView("archived");
+    else if (view === "archived") selectView("active");
     void client.invalidateQueries({ queryKey: ["contests"] });
   };
 
@@ -188,7 +190,12 @@ export function ContestPage() {
           ) : selected.isError ? (
             <div className="inline-error">{selected.error.message}</div>
           ) : selected.data && visibleContests.some(item => item.id === selected.data.id) ? (
-            <ContestDetail key={selected.data.id} contest={selected.data} currentUserId={session.data?.user?.id ?? ""} onChanged={refreshContest} />
+            <ContestDetail key={selected.data.id} contest={selected.data} currentUserId={session.data?.user?.id ?? ""} onChanged={refreshContest} onDeleted={() => {
+              client.removeQueries({queryKey:["contest",selectedId],exact:true});
+              client.setQueryData(["contests"],(current:Awaited<ReturnType<typeof listContests>>|undefined)=>current?{...current,items:current.items.filter(item=>item.id!==selectedId)}:current);
+              setSelectedId(null);
+              void client.invalidateQueries({queryKey:["contests"]});
+            }} />
           ) : (
             <div className="contest-empty large">
               <ListChecks size={28} aria-hidden="true" />
@@ -342,13 +349,14 @@ function ContestCreateForm({ onCreated }: { onCreated: (contest: Contest) => voi
   );
 }
 
-function ContestDetail({ contest, currentUserId, onChanged }: { contest: Contest; currentUserId: string; onChanged: (contest: Contest) => void }) {
+function ContestDetail({ contest, currentUserId, onChanged, onDeleted }: { contest: Contest; currentUserId: string; onChanged: (contest: Contest) => void; onDeleted: () => void }) {
   const [exporting, setExporting] = useState(false);
   const changeState = useMutation({
-    mutationFn: (state: "locked" | "archived") =>
+    mutationFn: (state: "draft" | "locked" | "archived") =>
       updateContest(contest.id, { state, expectedUpdatedAt: contest.updatedAt }),
     onSuccess: onChanged
   });
+  const remove = useMutation({mutationFn:()=>deleteContest(contest.id,contest.updatedAt),onSuccess:onDeleted});
   const participants = contest.members.filter((member) => member.role === "participant");
   return (
     <article className="contest-detail">
@@ -365,7 +373,7 @@ function ContestDetail({ contest, currentUserId, onChanged }: { contest: Contest
           </button> : null}
           {contest.state === "draft" && contest.capabilities.canEdit ? (
             <button className="secondary-button compact-button" type="button" disabled={changeState.isPending} onClick={() => {
-              if (window.confirm("锁定后题目版本、成员和比赛信息将不能修改，只能归档。确定锁定？")) changeState.mutate("locked");
+              if (window.confirm("锁定后暂停修改题目、成员和比赛信息；有权限时可取消锁定。确定锁定？")) changeState.mutate("locked");
             }}>
               <LockKeyhole size={15} aria-hidden="true" />
               锁定
@@ -373,16 +381,23 @@ function ContestDetail({ contest, currentUserId, onChanged }: { contest: Contest
           ) : null}
           {contest.state !== "archived" && contest.capabilities.canEdit ? (
             <button className="secondary-button compact-button" type="button" disabled={changeState.isPending} onClick={() => {
-              if (window.confirm("归档后方案只读，不能继续编辑；仍可查看和导出已有题目，不会公开私有题目。确定归档？")) changeState.mutate("archived");
+              if (window.confirm("归档后方案只读，仍可查看和导出；可取消归档回到草稿。不会公开私有题目。确定归档？")) changeState.mutate("archived");
             }}>
               <Archive size={15} aria-hidden="true" />
               归档比赛
             </button>
           ) : null}
+          {contest.state !== "draft" && contest.capabilities.canChangeState ? <button type="button" className="secondary-button compact-button" disabled={changeState.isPending||remove.isPending} onClick={()=>{
+            if(window.confirm("恢复为草稿后可以继续编辑方案，已选题目的固定版本保持不变。确定继续？"))changeState.mutate("draft");
+          }}>{contest.state === "archived" ? "取消归档" : "取消锁定"}</button> : null}
+          {contest.capabilities.canDelete ? <button type="button" className="danger-button compact-button" disabled={remove.isPending||changeState.isPending} onClick={()=>{
+            if(window.confirm("确定删除这个比赛方案？删除后不再出现在列表，原有导出链接失效；题库里的题目不会删除。没有回收站入口。"))remove.mutate();
+          }}><Trash2 size={15} aria-hidden="true" />删除比赛</button> : null}
         </div>
       </header>
       {changeState.error ? <div className="inline-error" role="alert">{changeState.error.message}</div> : null}
-      {contest.state === "archived" ? <p className="contest-archive-notice"><Archive size={18} aria-hidden="true" /><span>此比赛已归档，方案与题目版本只读保留。仍按原权限查看和导出，不会因此公开题目。</span></p> : null}
+      {remove.error ? <div className="inline-error" role="alert">{remove.error.message}</div> : null}
+      {contest.state === "archived" ? <p className="contest-archive-notice"><Archive size={18} aria-hidden="true" /><span>此比赛已归档，方案与题目版本只读保留。可取消归档回到草稿；仍按原权限查看和导出，不会因此公开题目。</span></p> : null}
       {exporting && contest.capabilities.canExport ? <section aria-label="导出比赛题目包" className="contest-detail-section">
         <ExportSection key={`${currentUserId}:${contest.id}:${contest.updatedAt}`} currentUserId={currentUserId} contest={contest} />
       </section> : null}

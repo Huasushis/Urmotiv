@@ -1,3 +1,4 @@
+FROM postgres:17-bookworm AS postgres-tools
 FROM node:24-bookworm-slim AS dependencies
 WORKDIR /app
 RUN corepack enable
@@ -20,6 +21,10 @@ COPY plugins/review-default/package.json plugins/review-default/package.json
 RUN pnpm install --frozen-lockfile
 
 FROM dependencies AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends libpq5 libldap-2.5-0 libgssapi-krb5-2 liblz4-1 libzstd1 && rm -rf /var/lib/apt/lists/*
+COPY --from=postgres-tools /usr/lib/postgresql/17/bin/pg_dump /usr/local/bin/pg_dump
+COPY --from=postgres-tools /usr/lib/postgresql/17/bin/pg_restore /usr/local/bin/pg_restore
+COPY --from=postgres-tools /usr/lib/x86_64-linux-gnu/libpq.so.5* /usr/lib/x86_64-linux-gnu/
 COPY . .
 ENV NODE_ENV=production
 EXPOSE 3000

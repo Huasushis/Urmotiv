@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import {
   pluginSettingsFormSchema,
+  pluginProjectUrlSchema,
   pluginManagementLinkSchema,
   type AdminPlugin,
   type ParsedUpdatePluginInput,
@@ -57,6 +58,7 @@ export class PluginUnavailableError extends Error {
 }
 
 export interface StoredPlugin {
+  readonly projectUrl?: string | null;
   readonly id: string;
   readonly displayName: string;
   readonly version: string;
@@ -86,6 +88,7 @@ export interface PluginUpdateSuccessAudit {
   readonly result: "success";
   readonly reasonCode: null;
   readonly metadata: {
+    readonly changedProjectUrl?: boolean;
     readonly changedState: boolean;
     readonly changedSettings: boolean;
     readonly changedSecretNames: readonly string[];
@@ -114,6 +117,7 @@ export interface PluginStore {
     pluginId: string,
     input: {
       expectedRevision: number;
+      projectUrl?: string;
       state?: z.infer<typeof stateSchema>;
       settings?: JsonObject;
       encryptedSecrets?: readonly PluginSecretRecord[];
@@ -184,6 +188,7 @@ export interface PluginSecretDefinition {
 }
 
 export interface TrustedPluginDefinition {
+  readonly projectUrl?: string;
   readonly manifest: unknown;
   /** A local build path or package name. It is shown to administrators, not fetched. */
   readonly source: string;
@@ -204,6 +209,7 @@ export interface TrustedPluginDefinition {
 }
 
 interface RegisteredPlugin {
+  readonly projectUrl: string;
   readonly managementLinks: NonNullable<AdminPlugin["managementLinks"]>;
   readonly manifest: PluginManifest;
   readonly source: string;
@@ -277,6 +283,7 @@ export class TrustedPluginHost {
         managementLinks: z.array(pluginManagementLinkSchema).max(10).parse(definition.managementLinks ?? []),
         manifest,
         source: definition.source,
+        projectUrl: pluginProjectUrlSchema.parse(definition.projectUrl ?? ""),
         settingsSchema,
         settingsManagedBy: settingsSchema !== undefined
           ? "plugin"
@@ -388,6 +395,7 @@ export class TrustedPluginHost {
     }
     const update = {
       expectedRevision: input.expectedRevision,
+      ...(input.projectUrl === undefined ? {} : {projectUrl:input.projectUrl}),
       ...(input.state === undefined ? {} : { state: input.state }),
       ...(settings === undefined ? {} : { settings }),
       ...(encryptedSecrets === undefined ? {} : { encryptedSecrets }),
@@ -402,6 +410,7 @@ export class TrustedPluginHost {
       result: "success",
       reasonCode: null,
       metadata: {
+        ...(input.projectUrl === undefined ? {} : {changedProjectUrl:true}),
         changedState: input.state !== undefined,
         changedSettings: input.settings !== undefined,
         changedSecretNames: submittedSecretNames,
@@ -695,6 +704,7 @@ function toAdminPlugin(
     version: registered.manifest.version,
     apiVersion: registered.manifest.apiVersion,
     source: registered.source,
+    projectUrl: stored?.projectUrl ?? registered.projectUrl,
     state: stored?.state ?? "disabled",
     failureCode: stored?.failureCode ?? null,
     settings: registered.settingsManagedBy === "plugin" ? stored?.settings ?? {} : {},
@@ -830,13 +840,15 @@ export class InMemoryPluginStore implements PluginStore {
       failureCode: existing?.failureCode ?? null,
       settings: existing?.settings ?? {},
       settingsRevision: existing?.settingsRevision ?? 1,
-      secrets: existing?.secrets ?? []
+      secrets: existing?.secrets ?? [],
+      ...(existing?.projectUrl === undefined ? {} : {projectUrl:existing.projectUrl})
     });
   }
   public async updateAndAudit(
     pluginId: string,
     input: {
       expectedRevision: number;
+      projectUrl?: string;
       state?: z.infer<typeof stateSchema>;
       settings?: JsonObject;
       encryptedSecrets?: readonly PluginSecretRecord[];
@@ -858,6 +870,7 @@ export class InMemoryPluginStore implements PluginStore {
       ...(input.state === undefined ? {} : { state: input.state }),
       ...(input.state === undefined ? {} : { failureCode: null }),
       ...(input.settings === undefined ? {} : { settings: structuredClone(input.settings) }),
+      ...(input.projectUrl === undefined ? {} : {projectUrl:input.projectUrl}),
       settingsRevision: existing.settingsRevision + 1,
       secrets: [...secretMap.values()].map(copy)
     };

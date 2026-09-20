@@ -5,6 +5,7 @@ import { InMemoryContestStore } from "../src/contest-store";
 import { createDemoUsers, demoTags } from "../src/demo-data";
 import type { StoredProblem, StoredUser } from "../src/domain";
 import { InMemoryDataStore } from "../src/repository";
+import {createProblemVisibility} from "../src/permissions";
 
 const content = {
   basicStatement: "给定一个整数。",
@@ -82,20 +83,32 @@ async function createContest(context: ReturnType<typeof makeContext>) {
 }
 
 describe("组题与访问记录服务", () => {
-  it("归档保留固定版本与原访问权限，归档后不能更改或重新打开", async () => {
+  it("归档保留固定版本与原访问权限，取消归档/锁定后回草稿，删除隐藏方案但保留题目", async () => {
     const context = makeContext();
     const original = await createContest(context);
     const archived = await context.service.updateContest(context.leader, original.id, {state:"archived",expectedUpdatedAt:original.updatedAt});
     expect(archived.state).toBe("archived");
     expect(archived.problems).toEqual(original.problems);
     expect(archived.capabilities).toMatchObject({canEdit:false,canExport:true});
-    for (const input of [{state:"draft" as const},{title:"归档后改名"}]) {
+    for (const input of [{title:"归档后改名"}]) {
       await expect(context.service.updateContest(context.leader, original.id, {...input,expectedUpdatedAt:archived.updatedAt})).rejects.toMatchObject({statusCode:409});
     }
     await expect(context.service.getContest(context.author,original.id)).rejects.toMatchObject({statusCode:404});
     expect((await context.service.listContests(context.author)).items).toEqual([]);
     const denied = {...context.leader,grants:[...context.leader.grants,{permission:"contest.edit.all" as const,effect:"deny" as const,scope:"global" as const},{permission:"contest.export" as const,effect:"deny" as const,scope:"global" as const}]};
     await expect(context.service.getContest(denied,original.id)).rejects.toMatchObject({statusCode:404});
+    await expect(context.service.updateContest(denied,original.id,{state:"draft",expectedUpdatedAt:archived.updatedAt})).rejects.toMatchObject({statusCode:404});
+    const reopened=await context.service.updateContest(context.leader,original.id,{state:"draft",expectedUpdatedAt:archived.updatedAt});
+    expect(reopened.problems).toEqual(original.problems);
+    const locked=await context.service.updateContest(context.leader,original.id,{state:"locked",expectedUpdatedAt:reopened.updatedAt});
+    const unlocked=await context.service.updateContest(context.leader,original.id,{state:"draft",expectedUpdatedAt:locked.updatedAt});
+    expect(unlocked.state).toBe("draft");expect(unlocked.problems).toEqual(original.problems);
+    await expect(context.service.deleteContest(context.robot,original.id,unlocked.updatedAt,crypto.randomUUID())).rejects.toMatchObject({statusCode:404});
+    await expect(context.service.deleteContest(context.leader,original.id,original.updatedAt,crypto.randomUUID())).rejects.toMatchObject({statusCode:409});
+    await context.service.deleteContest(context.leader,original.id,unlocked.updatedAt,crypto.randomUUID());
+    expect((await context.service.listContests(context.leader)).items).toEqual([]);
+    await expect(context.service.getContest(context.leader,original.id)).rejects.toMatchObject({statusCode:404});
+    expect(await context.problemStore.findVisibleProblem("11",createProblemVisibility(context.author))).toBeDefined();
   });
   it("只有比赛导出权限可读方案，但不能借此修改或读取风险", async () => {
     const context = makeContext();

@@ -269,9 +269,15 @@ export const pluginSecretNameSchema = z
   .max(120)
   .regex(/^[A-Za-z][A-Za-z0-9_.-]*$/);
 
+export const pluginProjectUrlSchema = z.string().trim().max(2048).refine(value=>{
+  if(value==="")return true;
+  try {const url=new URL(value);return ["https:","http:"].includes(url.protocol)&&!url.username&&!url.password;}catch{return false;}
+},"项目链接须为 HTTP/HTTPS 地址，且不能包含账号密码。");
+
 export const updatePluginInputSchema = z
   .object({
     expectedRevision: z.number().int().positive(),
+    projectUrl: pluginProjectUrlSchema.optional(),
     state: z.enum(["enabled", "disabled"]).optional(),
     settings: pluginSettingsSchema.optional(),
     secrets: z.record(pluginSecretNameSchema, z.string().min(1).max(16_384)).optional(),
@@ -281,6 +287,7 @@ export const updatePluginInputSchema = z
   .refine(
     (value) =>
       value.state !== undefined ||
+      value.projectUrl !== undefined ||
       value.settings !== undefined ||
       value.secrets !== undefined ||
       value.clearSecrets.length > 0,
@@ -313,6 +320,7 @@ export const adminPluginSchema = z
     version: z.string().min(1).max(80),
     apiVersion: z.string().min(1).max(40),
     source: z.string().min(1).max(500),
+    projectUrl: pluginProjectUrlSchema.optional(),
     state: z.enum(["enabled", "disabled", "failed"]),
     failureCode: z.string().max(120).nullable(),
     settings: pluginSettingsSchema,

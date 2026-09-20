@@ -3,6 +3,8 @@ import { Readable } from "node:stream";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import { registerAccountSecurityRoutes } from "./account-security-routes";
+import {registerBackupRoutes,type RestoreMaintenance} from "./backup/routes";
+import type {BackupService} from "./backup/service";
 import { leaderboardQuerySchema, leaderboardResponseSchema, userContactSchema, linkedIdentitiesResponseSchema, manageIdentityInputSchema, unlinkIdentityInputSchema } from "@urmotiv/contracts";
 import {
   adminSettingsQuerySchema,
@@ -30,6 +32,7 @@ import {
   robotReviewTaskCompletionSchema,
   robotReviewTaskSchema,
   createContestInputSchema,
+  deleteContestInputSchema,
   createTagAliasInputSchema,
   createTagCatalogItemInputSchema,
   createProblemInputSchema,
@@ -204,6 +207,8 @@ export interface ProblemFilePartsOptions {
 }
 
 export interface ApiAppOptions {
+  backup?: BackupService;
+  backupMaintenance?: RestoreMaintenance;
   store?: DataStore;
   contestStore?: ContestStore;
   allowedOrigins?: string[];
@@ -703,6 +708,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     genReqId: () => randomUUID(),
     trustProxy: false
   });
+  options.backupMaintenance?.attach(app);
 
   await app.register(cors, {
     origin: dependencies.allowedOrigins,
@@ -1096,6 +1102,17 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     clientAddress: request => resolveClientAddress(request, dependencies.trustedProxyCidrs),
     clearSession: reply => { reply.clearCookie(sessionCookieName, { path: "/" }); }
   });
+
+  registerBackupRoutes(app,{...(options.backup ? {service:options.backup} : {}),requireRoot:async(request,password)=>{
+    const current=await currentSession(request);
+    if(!current)throw unauthorized();
+    if(!current.user.isRoot||current.user.id!=="0"||current.user.accountType!=="human"||current.session.impersonatorUserId||!hasPermission(current.user,"system.manage",{},dependencies.now()))throw notFound();
+    if(password!==undefined){
+      limitAccountAction(request);
+      const credential=await dependencies.store.findRootCredential();
+      if(!credential||!await verifyEmailLoginPassword(credential.passwordHash,password))throw unauthorized();
+    }
+  }});
 
   app.get("/api/v1/health/ready", async (_request, reply) => {
     try {
@@ -3073,7 +3090,14 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   app.patch("/api/v1/contests/:contestId", async (request) => {
     const user = await requireUser(request);
     const input = updateContestInputSchema.strict().parse(request.body);
-    return dependencies.contestService.updateContest(user, parseContestId(request), input);
+    return dependencies.contestService.updateContest(user, parseContestId(request), input, request.id);
+  });
+
+  app.delete("/api/v1/contests/:contestId", async (request) => {
+    const user = await requireUser(request);
+    const input = deleteContestInputSchema.parse(request.body);
+    await dependencies.contestService.deleteContest(user,parseContestId(request),input.expectedUpdatedAt,request.id);
+    return {ok:true};
   });
 
   return app;

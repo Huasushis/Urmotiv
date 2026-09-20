@@ -1,27 +1,55 @@
-import "katex/dist/katex.min.css";
 import "./styles.css";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { StrictMode } from "react";
+import { StrictMode, Suspense, lazy, useEffect } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { AppShell } from "./components/app-shell";
+import { SiteFooter } from "./components/site-footer";
 import { ApiError, getSession } from "./lib/api";
-import { AdminPage } from "./pages/admin-page";
 import { DemoLoginPage } from "./pages/demo-login-page";
-import { CreateProblemPage } from "./pages/create-problem-page";
-import { ContestPage } from "./pages/contest-page";
 import { ProblemListPage } from "./pages/problem-list-page";
-import { ProblemWorkspacePage } from "./pages/problem-workspace-page";
 import { ProfilePage } from "./pages/profile-page";
-import { BatchAccountPage } from "./pages/batch-account-page";
-import { TransferPage } from "./pages/transfer-page";
 import { VerifyEmailPage } from "./pages/verify-email-page";
-import { FermataAdminPage } from "./pages/fermata-admin-page";
 import { LeaderboardPage } from "./pages/leaderboard-page";
 import { AccountActionPage, PasswordRecoveryPage } from "./pages/account-recovery-page";
 
-import { AdminSectionPage } from "./pages/admin-section-page";
-import { AdminPermissionsPage } from "./pages/admin-permissions-page";
+import { PageLoadBoundary } from "./components/page-load-boundary";
+
+const loaders = {
+  backup: () => import("./pages/backup-page"),
+  admin: () => import("./pages/admin-page"),
+  create: () => import("./pages/create-problem-page"),
+  contest: () => import("./pages/contest-page"),
+  workspace: () => import("./pages/problem-workspace-page"),
+  batch: () => import("./pages/batch-account-page"),
+  transfer: () => import("./pages/transfer-page"),
+  fermata: () => import("./pages/fermata-admin-page"),
+  section: () => import("./pages/admin-section-page"),
+  permissions: () => import("./pages/admin-permissions-page")
+};
+const AdminPage=lazy(()=>loaders.admin().then(m=>({default:m.AdminPage})));
+const BackupPage=lazy(()=>loaders.backup().then(m=>({default:m.BackupPage})));
+const CreateProblemPage=lazy(()=>loaders.create().then(m=>({default:m.CreateProblemPage})));
+const ContestPage=lazy(()=>loaders.contest().then(m=>({default:m.ContestPage})));
+const ProblemWorkspacePage=lazy(()=>loaders.workspace().then(m=>({default:m.ProblemWorkspacePage})));
+const BatchAccountPage=lazy(()=>loaders.batch().then(m=>({default:m.BatchAccountPage})));
+const TransferPage=lazy(()=>loaders.transfer().then(m=>({default:m.TransferPage})));
+const FermataAdminPage=lazy(()=>loaders.fermata().then(m=>({default:m.FermataAdminPage})));
+const AdminSectionPage=lazy(()=>loaders.section().then(m=>({default:m.AdminSectionPage})));
+const AdminPermissionsPage=lazy(()=>loaders.permissions().then(m=>({default:m.AdminPermissionsPage})));
+
+function loadRoute(path:string):Promise<unknown>|undefined {
+  if(path==='/admin/backups')return loaders.backup();
+  if(path==='/problems/new')return loaders.create();
+  if(/^\/problems\/[^/]+$/.test(path))return loaders.workspace();
+  if(path==='/contests')return loaders.contest();
+  if(path==='/transfer')return loaders.transfer();
+  if(path==='/admin/accounts')return loaders.batch();
+  if(path==='/admin/fermata')return loaders.fermata();
+  if(/^\/admin\/(users|roles)(\/|$)/.test(path))return loaders.permissions();
+  if(/^\/admin\/(settings|service-accounts|audit|oauth|imports)$/.test(path))return loaders.section();
+  if(path.startsWith('/admin')&&path!=='/admin/problems')return loaders.admin();
+}
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: { retry: 1, refetchOnWindowFocus: false }
@@ -31,6 +59,7 @@ const queryClient = new QueryClient({
 function App() {
   const location = useLocation();
   const session = useQuery({ queryKey: ["session"], queryFn: getSession, staleTime: 60_000 });
+  useEffect(()=>{void loadRoute(location.pathname)?.catch(()=>undefined);},[location.pathname]);
   const verificationToken = readVerificationToken(window.location.hash);
 
   const actionMatch = /^#\/(reset-password|change-email)(?:\?|$)/.exec(window.location.hash);
@@ -79,7 +108,7 @@ function App() {
 
   return (
     <AppShell session={sessionData.user} identity={sessionData.identity} demoEnabled={sessionData.auth.demoEnabled}>
-      <Routes>
+      <PageLoadBoundary key={location.pathname}><Suspense fallback={<p className="centered-message" role="status">正在加载页面…</p>}><Routes>
         <Route path="/" element={<Navigate to="/problems" replace />} />
         <Route path="/problems" element={<ProblemListPage />} />
         <Route path="/problems/new" element={<CreateProblemPage />} />
@@ -101,6 +130,7 @@ function App() {
         <Route path="/admin/accounts" element={<BatchAccountPage />} />
         <Route path="/admin/problems" element={<ProblemListPage managementSession={sessionData.user} />} />
         <Route path="/admin/settings" element={<AdminSectionPage section="settings" session={sessionData.user} />} />
+        <Route path="/admin/backups" element={<BackupPage session={sessionData.user} />} />
         <Route path="/admin/users" element={<AdminPermissionsPage section="users" session={sessionData.user} />} />
         <Route path="/admin/roles" element={<AdminPermissionsPage section="roles" session={sessionData.user} />} />
         <Route path="/admin/roles/defaults" element={<AdminPermissionsPage section="defaults" session={sessionData.user} />} />
@@ -114,7 +144,7 @@ function App() {
         <Route path="/admin/imports" element={<AdminSectionPage section="imports" session={sessionData.user} />} />
         <Route path="/admin" element={<AdminPage session={sessionData.user} />} />
         <Route path="*" element={<Navigate to="/problems" replace />} />
-      </Routes>
+      </Routes></Suspense></PageLoadBoundary>
     </AppShell>
   );
 }
@@ -135,6 +165,7 @@ createRoot(document.getElementById("root")!).render(
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>
         <App />
+        <SiteFooter />
       </BrowserRouter>
     </QueryClientProvider>
   </StrictMode>

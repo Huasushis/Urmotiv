@@ -77,8 +77,10 @@ export interface ContestStore {
   replaceContest(
     contestId: string,
     input: ContestWriteRecord,
-    expectedUpdatedAt: string
+    expectedUpdatedAt: string,
+    actor?: {userId: string; requestId: string}
   ): Promise<ContestRecord | undefined>;
+  deleteContest(contestId: string, expectedUpdatedAt: string, actor: {userId: string; requestId: string}): Promise<boolean>;
   recordProblemAccess(input: RecordProblemAccessInput): Promise<void>;
   listProblemAccess(problemId: string): Promise<ProblemAccessRecord[]>;
 }
@@ -99,18 +101,20 @@ function nextIso(previous: string, now: Date): string {
 
 export class InMemoryContestStore implements ContestStore {
   private readonly contests = new Map<string, ContestRecord>();
+  private readonly deleted = new Set<string>();
   private readonly accessRecords = new Map<string, MemoryAccessRecord>();
   private nextContestId = 1;
 
   public async listContests(): Promise<ContestRecord[]> {
     return [...this.contests.values()]
+      .filter(contest => !this.deleted.has(contest.id))
       .map((contest) => this.withCurrentRisk(contest))
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
   }
 
   public async getContest(contestId: string): Promise<ContestRecord | undefined> {
     const contest = this.contests.get(contestId);
-    return contest === undefined ? undefined : this.withCurrentRisk(contest);
+    return contest === undefined || this.deleted.has(contestId) ? undefined : this.withCurrentRisk(contest);
   }
 
   public async createContest(input: ContestWriteRecord): Promise<ContestRecord> {
@@ -126,7 +130,7 @@ export class InMemoryContestStore implements ContestStore {
     expectedUpdatedAt: string
   ): Promise<ContestRecord | undefined> {
     const existing = this.contests.get(contestId);
-    if (existing === undefined || existing.updatedAt !== expectedUpdatedAt) {
+    if (existing === undefined || this.deleted.has(contestId) || existing.updatedAt !== expectedUpdatedAt) {
       return undefined;
     }
     const updatedAt = nextIso(existing.updatedAt, new Date());
@@ -162,6 +166,13 @@ export class InMemoryContestStore implements ContestStore {
     existing.totalActiveSeconds += Math.min(input.activeSeconds, elapsedSeconds);
     existing.lastAccessedAt = input.occurredAt;
     existing.lastRevision = input.revision;
+  }
+
+  public async deleteContest(contestId: string, expectedUpdatedAt: string): Promise<boolean> {
+    const contest = this.contests.get(contestId);
+    if (!contest || this.deleted.has(contestId) || contest.updatedAt !== expectedUpdatedAt) return false;
+    this.deleted.add(contestId);
+    return true;
   }
 
   public async listProblemAccess(problemId: string): Promise<ProblemAccessRecord[]> {

@@ -595,6 +595,7 @@ function PluginEditor({
   onOpenReviewPolicy?: (() => void) | undefined;
 }) {
   const [saved, setSaved] = useState(plugin);
+  const [projectUrl,setProjectUrl]=useState(plugin.projectUrl ?? "");
   const [enabled, setEnabled] = useState(plugin.state === "enabled");
   const [stateTouched, setStateTouched] = useState(false);
   const [settings, setSettings] = useState<AdminPlugin["settings"]>({ ...plugin.settings });
@@ -605,6 +606,7 @@ function PluginEditor({
 
   const resetFrom = (next: AdminPlugin) => {
     setSaved(next);
+    setProjectUrl(next.projectUrl ?? "");
     setEnabled(next.state === "enabled");
     setStateTouched(false);
     setSettings({ ...next.settings });
@@ -665,6 +667,7 @@ function PluginEditor({
     }
   });
   const hasChanges =
+    projectUrl.trim() !== (saved.projectUrl ?? "") ||
     stateChanged ||
     settingsChanged ||
     Object.keys(enteredSecrets).length > 0 ||
@@ -673,6 +676,7 @@ function PluginEditor({
   const savePlugin = () => {
     const input: UpdatePluginRequest = {
       expectedRevision: saved.settingsRevision,
+      ...(projectUrl.trim() === (saved.projectUrl ?? "") ? {} : {projectUrl:projectUrl.trim()}),
       ...(stateChanged ? { state: enabled ? "enabled" : "disabled" } : {}),
       ...(settingsChanged ? { settings } : {}),
       ...(Object.keys(enteredSecrets).length > 0 ? { secrets: enteredSecrets } : {}),
@@ -700,7 +704,7 @@ function PluginEditor({
         <div>
           <p className="eyebrow">插件设置</p>
           <h2 id="plugin-editor-title">{saved.name}</h2>
-          <p>版本 {saved.version}</p>
+          <p>版本 {saved.version}{saved.projectUrl ? <> · <a href={saved.projectUrl} target="_blank" rel="noopener noreferrer">项目主页 ↗</a></> : null}</p>
         </div>
         <span className={`status-badge ${pluginStateTone[saved.state]}`}>
           {pluginStateText[saved.state]}
@@ -714,6 +718,7 @@ function PluginEditor({
         </div>
       ) : null}
 
+      <label className="field">项目链接（可选）<input type="url" value={projectUrl} onChange={event=>setProjectUrl(event.target.value)} placeholder="https://github.com/owner/repository" maxLength={2048} disabled={mutation.isPending} /><small>保存后在插件卡片提供跳转；留空可移除链接，不会从该地址加载代码。</small></label>
       <div className="admin-plugin-state">
         <label className="settings-form-toggle">
           <input

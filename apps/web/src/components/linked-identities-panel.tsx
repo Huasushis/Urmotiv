@@ -5,7 +5,7 @@ import { getLinkedIdentities, startUstcIdentityLink, unlinkIdentity } from "../l
 import { clearProblemDrafts } from "../lib/client-security";
 
 export function LinkedIdentitiesPanel() {
-  const identities=useQuery({queryKey:["linked-identities"],queryFn:getLinkedIdentities,retry:false});
+  const identities=useQuery({queryKey:["linked-identities"],queryFn:getLinkedIdentities,retry:false,staleTime:30_000});
   const [password,setPassword]=useState("");
   const [params]=useSearchParams();
   const client=useQueryClient();const navigate=useNavigate();

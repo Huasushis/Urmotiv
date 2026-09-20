@@ -1,4 +1,8 @@
 import {
+  backupSettingsViewSchema,
+  backupListSchema,
+  backupJobSchema,
+  type BackupSettingsInput,
   accountSecurityViewSchema,
   linkedIdentitiesResponseSchema,
   identityLinkStartResponseSchema,
@@ -1035,6 +1039,12 @@ export function listContests(): Promise<ContestListResponse> {
   return request("/contests", { method: "GET" }, contestListResponseSchema);
 }
 
+export const getBackupSettings=()=>request("/admin/backups",{method:"GET"},backupSettingsViewSchema);
+export const saveBackupSettings=(input:BackupSettingsInput)=>request("/admin/backups/settings",{...json(input),method:"PUT"},backupSettingsViewSchema);
+export const listBackups=()=>request("/admin/backups/files",{method:"GET"},backupListSchema);
+export const startBackup=()=>request("/admin/backups/run",json({}),z.object({job:backupJobSchema}));
+export const restoreBackup=(input:{name:string;encryptionPassword:string;currentPassword:string;confirmation:"恢复整个站点"})=>request("/admin/backups/restore",json(input),z.object({job:backupJobSchema}));
+
 export function getContest(id: string): Promise<Contest> {
   return request(`/contests/${encodeURIComponent(id)}`, { method: "GET" }, contestSchema);
 }
@@ -1049,6 +1059,10 @@ export function updateContest(id: string, input: UpdateContestInput): Promise<Co
     { ...json(input), method: "PATCH" },
     contestSchema
   );
+}
+
+export function deleteContest(id:string,expectedUpdatedAt:string):Promise<{ok:true}> {
+  return request(`/contests/${encodeURIComponent(id)}`,{...json({expectedUpdatedAt,confirm:true}),method:"DELETE"},okResponseSchema);
 }
 
 export function uploadProblemPackage(file: File): Promise<PackageUploadResponse> {

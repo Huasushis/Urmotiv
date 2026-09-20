@@ -19,6 +19,7 @@ interface PluginRow extends Record<string, unknown> {
   api_version: string;
   source: string;
   manifest_digest: string;
+  project_url: string | null;
   state: PluginState;
   failure_code: string | null;
   settings: Record<string, unknown> | string | null;
@@ -54,6 +55,7 @@ function toPlugin(row: PluginRow, secrets: readonly SecretRow[]): StoredPlugin {
     apiVersion: row.api_version,
     source: row.source,
     manifestDigest: row.manifest_digest,
+    projectUrl: row.project_url,
     state: row.state,
     failureCode: row.failure_code,
     settings: jsonObject(row.settings),
@@ -70,7 +72,7 @@ export class DatabasePluginStore implements PluginStore {
 
   public async list(): Promise<StoredPlugin[]> {
     const rows = await this.database.query<PluginRow>(sql`
-      SELECT p.id, p.display_name, p.version, p.api_version, p.source, p.manifest_digest,
+      SELECT p.id, p.display_name, p.version, p.api_version, p.source, p.manifest_digest, p.project_url,
              p.state, p.failure_code, s.settings, s.revision AS settings_revision
       FROM installed_plugins p
       LEFT JOIN plugin_settings s ON s.plugin_id = p.id
@@ -88,7 +90,7 @@ export class DatabasePluginStore implements PluginStore {
     executor: DatabaseExecutor = this.database
   ): Promise<StoredPlugin | undefined> {
     const rows = await executor.query<PluginRow>(sql`
-      SELECT p.id, p.display_name, p.version, p.api_version, p.source, p.manifest_digest,
+      SELECT p.id, p.display_name, p.version, p.api_version, p.source, p.manifest_digest, p.project_url,
              p.state, p.failure_code, s.settings, s.revision AS settings_revision
       FROM installed_plugins p LEFT JOIN plugin_settings s ON s.plugin_id = p.id WHERE p.id = ${pluginId}
     `);
@@ -125,6 +127,7 @@ export class DatabasePluginStore implements PluginStore {
     pluginId: string,
     input: {
       expectedRevision: number;
+      projectUrl?: string;
       state?: PluginState;
       settings?: Record<string, unknown>;
       encryptedSecrets?: readonly PluginSecretRecord[];
@@ -150,6 +153,7 @@ export class DatabasePluginStore implements PluginStore {
     pluginId: string,
     input: {
       expectedRevision: number;
+      projectUrl?: string;
       state?: PluginState;
       settings?: Record<string, unknown>;
       encryptedSecrets?: readonly PluginSecretRecord[];
@@ -174,6 +178,9 @@ export class DatabasePluginStore implements PluginStore {
       throw new PluginRevisionConflictError();
     }
     const nextSettings = input.settings ?? jsonObject(currentSettings?.settings ?? null);
+    if (input.projectUrl !== undefined) {
+      await transaction.execute(sql`UPDATE installed_plugins SET project_url=${input.projectUrl},updated_at=now() WHERE id=${pluginId}`);
+    }
 
     if (input.state !== undefined) {
       await transaction.execute(sql`

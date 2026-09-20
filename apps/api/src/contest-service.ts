@@ -1,3 +1,4 @@
+import {randomUUID} from "node:crypto";
 import type {
   Contest,
   ContestListItem,
@@ -83,17 +84,20 @@ export class ContestService {
     return this.toContest(created, user);
   }
 
+  public async deleteContest(user:StoredUser, contestId:string, expectedUpdatedAt:string, requestId:string):Promise<void> {
+    const contest = await this.requireVisibleContest(user, contestId);
+    if (!hasPermission(user,"contest.delete",{ownerId:contest.creator.id,objectId:contest.id},this.now())) throw notFound();
+    if (!await this.contestStore.deleteContest(contestId,expectedUpdatedAt,{userId:user.id,requestId})) throw conflict("比赛方案已变化，请刷新后重试。");
+  }
+
   public async updateContest(
     user: StoredUser,
     contestId: string,
-    input: UpdateContestInput
+    input: UpdateContestInput,
+    requestId: string = randomUUID()
   ): Promise<Contest> {
     const current = await this.requireVisibleContest(user, contestId);
     if (!canEditContest(user, contestTarget(current), this.now())) throw notFound();
-    if (current.state === "archived") {
-      throw conflict("已归档的组题方案不能继续修改。");
-    }
-
     const changesLockedContent =
       input.title !== undefined ||
       input.description !== undefined ||
@@ -101,8 +105,11 @@ export class ContestService {
       input.endsAt !== undefined ||
       input.members !== undefined ||
       input.problems !== undefined;
-    if (current.state === "locked" && (changesLockedContent || input.state !== "archived")) {
-      throw conflict("组题方案锁定后只能归档，不能更换题目、成员或比赛信息。");
+    if (current.state === "archived" && (changesLockedContent || input.state !== "draft")) {
+      throw conflict("请先取消归档，再修改比赛方案。");
+    }
+    if (current.state === "locked" && (changesLockedContent || !["archived", "draft"].includes(input.state ?? ""))) {
+      throw conflict("请先取消锁定，再修改比赛方案；也可以直接归档。");
     }
 
     const mergedMembers = input.members ?? current.members.map((member) => ({
@@ -130,7 +137,8 @@ export class ContestService {
     const updated = await this.contestStore.replaceContest(
       contestId,
       writeRecord,
-      input.expectedUpdatedAt
+      input.expectedUpdatedAt,
+      {userId:user.id,requestId}
     );
     if (updated === undefined) {
       throw conflict("组题方案已被其他操作修改，请刷新后重试。");
@@ -290,6 +298,7 @@ export class ContestService {
     const target = { ownerId: contest.creator.id, objectId: contest.id };
     return {
       canEdit: contest.state !== "archived" && canEditContest(user, contestTarget(contest), this.now()),
+      canChangeState: canEditContest(user, contestTarget(contest), this.now()),
       canDelete: hasPermission(user, "contest.delete", target, this.now()),
       canExport: hasPermission(user, "contest.export", target, this.now()),
       canReadRisk: hasPermission(user, "contest.risk.read", target, this.now())
