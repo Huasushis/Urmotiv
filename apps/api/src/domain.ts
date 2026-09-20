@@ -91,6 +91,8 @@ export interface StoredSession {
   /** Root actor preserved across a supported account switch. */
   impersonatorUserId?: string | null;
   expiresAt: string;
+  /** 服务端会话创建时间，用于近期直接登录后的首次密码设置；不向公开接口返回。 */
+  createdAt?: string;
 }
 
 export interface ProblemListFilters {

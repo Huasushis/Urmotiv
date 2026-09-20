@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { builtinRoleDefinitions, type DatabaseExecutor } from "@urmotiv/database";
-import type { CorePermission, PermissionGrant, ProblemTag, ReviewSuggestionField, LeaderboardQuery, LeaderboardResponse } from "@urmotiv/contracts";
+import type { CorePermission, PermissionGrant, ProblemTag, ReviewSuggestionField, LeaderboardQuery, LeaderboardResponse, LinkedIdentity } from "@urmotiv/contracts";
 import type {
   ProblemListFilters,
   StoredProblem,
@@ -89,6 +89,9 @@ export interface ProblemTransaction {
 }
 
 export interface DataStore {
+  listLinkedIdentities(userId: string): Promise<LinkedIdentity[]>;
+  linkExternalIdentity(input: LinkExternalIdentityInput): Promise<StoredUser>;
+  unlinkExternalIdentity(input: UnlinkExternalIdentityInput): Promise<boolean>;
   getAccountSecurity(userId: string): Promise<AccountSecurityState | undefined>;
   findPasswordRecoveryAccount(normalizedEmail: string): Promise<AccountSecurityState | undefined>;
   replaceAccountActionToken(token: AccountActionToken): Promise<boolean>;
@@ -142,7 +145,8 @@ export interface DataStore {
     userId: string,
     expiresAt: string,
     impersonatorUserId?: string | null,
-    passwordProof?: PasswordSessionProof
+    passwordProof?: PasswordSessionProof,
+    externalProof?: ExternalSessionProof
   ): Promise<StoredSession>;
   getSession(sessionId: string): Promise<StoredSession | undefined>;
   deleteSession(sessionId: string): Promise<void>;
@@ -209,6 +213,7 @@ export interface RootCredential {
 }
 
 export type PasswordSessionProof = Pick<RootCredential, "passwordHash" | "authRevision">;
+export interface ExternalSessionProof { readonly provider: string; readonly subject: string; }
 export class CredentialChangedError extends Error {
   constructor() { super("登录凭据已经改变，请重新登录。"); this.name="CredentialChangedError"; }
 }
@@ -230,7 +235,7 @@ export interface AccountActionToken {
 export interface AccountPasswordChange {
   readonly userId: string;
   readonly expectedAuthRevision: number;
-  readonly expectedPasswordHash: string;
+  readonly expectedPasswordHash: string | null;
   readonly newPasswordHash: string;
   readonly requestId: string;
   readonly now: string;
@@ -296,10 +301,38 @@ export interface ExternalIdentity {
   readonly username?: string;
   readonly realName?: string;
   readonly email?: string;
+  readonly emailVerified?: boolean;
+  /** USTC 关联登录：属性与账号标识分离，已有资料仅补空，不自动覆盖或按属性合并。 */
+  readonly decoupled?: boolean;
   /** OAuth2 使用严格模式：学工号、邮箱或同一 subject 的用户名冲突一律失败。 */
   readonly strictReconciliation?: boolean;
   /** 认证来源返回的学号等用户标识；只用于历史资料匹配，不作为身份主键。 */
   readonly studentIds?: readonly { readonly attribute: string; readonly value: string }[];
+}
+
+export interface LinkExternalIdentityInput {
+  readonly userId: string;
+  readonly expectedAuthRevision: number;
+  readonly identity: ExternalIdentity;
+  readonly requestId: string;
+  readonly now: string;
+}
+export interface UnlinkExternalIdentityInput {
+  readonly userId: string;
+  readonly provider: string;
+  readonly subject: string;
+  readonly expectedAuthRevision: number;
+  readonly expectedPasswordHash: string;
+  readonly localLoginEnabled: boolean;
+  readonly otherEnabledProviders: readonly string[];
+  readonly requestId: string;
+  readonly now: string;
+}
+
+export function linkedIdentityProfile(input: ExternalIdentity, now = new Date().toISOString()): LinkedIdentity {
+  return { provider: input.provider, subject: input.subject,
+    studentId: input.studentIds?.[0]?.value ?? (input.decoupled ? null : input.username ?? null),
+    realName: input.realName ?? null, email: input.email ?? null, lastAuthenticatedAt: now };
 }
 
 function copy<T>(value: T): T {
@@ -344,11 +377,13 @@ export class InMemoryDataStore implements DataStore {
   private readonly reviews = new Map<string, StoredReview>();
   private readonly emailCredentials = new Map<string, { userId: string; passwordHash: string; verified: boolean }>();
   private readonly externalIdentities = new Map<string, string>();
+  private readonly externalProfiles = new Map<string, LinkedIdentity>();
   private readonly emailVerificationTokens = new Map<string, EmailVerificationToken & { consumed: boolean }>();
   private defaultRoleKeys = { humanRoleKey: "contributor", robotRoleKey: "reviewer" };
   private rootPasswordHash: string | undefined;
   private readonly accountRevisions = new Map<string, number>();
   private readonly accountActionTokens = new Map<string, AccountActionToken>();
+  private readonly localPasswordHashes = new Map<string, string>();
   private readonly loginStates = new Map<string, { expiresAt: string; consumed: boolean }>();
   private readonly primaryEmails = new Map<string, { address: string; verified: boolean }>();
   public readonly batchAccountAuditEvents: BatchAccountAuditEvent[] = [];
@@ -502,7 +537,7 @@ export class InMemoryDataStore implements DataStore {
     const email = this.primaryEmails.get(userId);
     const credential = [...this.emailCredentials.values()].find(item => item.userId === userId);
     return { userId, authRevision: this.accountRevisions.get(userId) ?? 1,
-      passwordHash: user.isRoot ? this.rootPasswordHash ?? null : credential?.passwordHash ?? null,
+      passwordHash: user.isRoot ? this.rootPasswordHash ?? null : credential?.passwordHash ?? this.localPasswordHashes.get(userId) ?? null,
       email: email ? { ...email, normalizedAddress: email.address.trim().toLowerCase() } : null };
   }
 
@@ -529,6 +564,7 @@ export class InMemoryDataStore implements DataStore {
   }
 
   private setAccountPassword(userId: string, passwordHash: string): void {
+    this.localPasswordHashes.set(userId,passwordHash);
     if (userId === "0") this.rootPasswordHash = passwordHash;
     for (const credential of this.emailCredentials.values()) if (credential.userId === userId) credential.passwordHash = passwordHash;
     const email = this.primaryEmails.get(userId);
@@ -597,9 +633,8 @@ export class InMemoryDataStore implements DataStore {
     const credential = [...this.emailCredentials.values()].find((candidate) =>
       candidate.userId === user.id && candidate.verified
     );
-    return credential === undefined
-      ? undefined
-      : { user: copy(user), passwordHash: credential.passwordHash, authRevision: this.accountRevisions.get(user.id) ?? 1 };
+    const passwordHash=credential?.passwordHash ?? (!this.primaryEmails.has(user.id)?this.localPasswordHashes.get(user.id):undefined);
+    return passwordHash === undefined ? undefined : {user:copy(user),passwordHash,authRevision:this.accountRevisions.get(user.id) ?? 1};
   }
 
   public async getUserPermissionDelta(userId: string): Promise<UserPermissionDelta> {
@@ -845,17 +880,59 @@ export class InMemoryDataStore implements DataStore {
       return undefined;
     }
     const credential = this.emailCredentials.get(token.normalizedEmail);
-    if (credential === undefined || credential.userId !== token.userId) {
+    const primary = this.primaryEmails.get(token.userId);
+    if ((credential !== undefined && credential.userId !== token.userId) ||
+      (credential === undefined && primary?.address.trim().toLowerCase() !== token.normalizedEmail)) {
       return undefined;
     }
     token.consumed = true;
-    credential.verified = true;
-    const primary = this.primaryEmails.get(token.userId);
+    if (credential !== undefined) credential.verified = true;
     if (primary?.address.trim().toLowerCase() === token.normalizedEmail) {
       this.primaryEmails.set(token.userId, { ...primary, verified: true });
     }
     this.finishAccountChange(token.userId);
     return token.userId;
+  }
+
+  public async listLinkedIdentities(userId: string): Promise<LinkedIdentity[]> {
+    return [...this.externalIdentities].filter(([,id])=>id===userId).map(([key])=>{
+      const separator=key.indexOf("\u0000");
+      return copy(this.externalProfiles.get(key) ?? {provider:key.slice(0,separator),subject:key.slice(separator+1),studentId:null,realName:null,email:null,lastAuthenticatedAt:null});
+    });
+  }
+
+  public async linkExternalIdentity(input: LinkExternalIdentityInput): Promise<StoredUser> {
+    const state=await this.getAccountSecurity(input.userId);
+    const user=this.users.get(input.userId);
+    const key=`${input.identity.provider}\u0000${input.identity.subject}`;
+    if (!state || !user || user.isRoot || (this.accountRevisions.get(user.id) ?? 1)!==input.expectedAuthRevision) throw new CredentialChangedError();
+    if ([...this.externalIdentities].some(([existing,owner])=>
+      (existing===key && owner!==user.id) || (owner===user.id && existing.startsWith(input.identity.provider+"\u0000") && existing!==key))) throw new ExternalIdentityCollisionError();
+    this.externalIdentities.set(key,user.id);
+    this.externalProfiles.set(key,linkedIdentityProfile(input.identity,input.now));
+    if (!user.realName && input.identity.realName) user.realName=input.identity.realName;
+    if (!state.email && input.identity.email && input.identity.emailVerified===true && ![...this.primaryEmails.values()].some(email=>email.address===input.identity.email)) {
+      this.primaryEmails.set(user.id,{address:input.identity.email,verified:input.identity.emailVerified===true});
+    }
+    this.finishAccountChange(user.id);
+    return copy(user);
+  }
+
+  public async unlinkExternalIdentity(input: UnlinkExternalIdentityInput): Promise<boolean> {
+    const state=await this.getAccountSecurity(input.userId);
+    const user=this.users.get(input.userId);
+    if (!state || !user || user.isRoot || state.passwordHash!==input.expectedPasswordHash || (this.accountRevisions.get(user.id) ?? 1)!==input.expectedAuthRevision) throw new CredentialChangedError();
+    const bindings=[...this.externalIdentities].filter(([,owner])=>owner===user.id);
+    const verifiedEmail=state.email?.verified===true || [...this.emailCredentials.values()].some(item=>item.userId===user.id && item.verified);
+    const canUseLocal=input.localLoginEnabled && Boolean(state.passwordHash) && (verifiedEmail || (state.email===null && Boolean(user.username)));
+    const targetKey=`${input.provider}\u0000${input.subject}`;
+    const hasOther=bindings.some(([key])=>key!==targetKey && input.otherEnabledProviders.some(provider=>key.startsWith(provider+"\u0000")));
+    if (!canUseLocal && !hasOther) return false;
+    const removed=bindings.filter(([key])=>key===targetKey);
+    if (!removed.length) return false;
+    for (const [key] of removed) {this.externalIdentities.delete(key);this.externalProfiles.delete(key);}
+    this.finishAccountChange(user.id);
+    return true;
   }
 
   public async hasExternalIdentity(provider: string, subject: string): Promise<boolean> {
@@ -868,6 +945,15 @@ export class InMemoryDataStore implements DataStore {
     if (existingId !== undefined) {
       const existing = this.users.get(existingId);
       if (existing !== undefined) {
+        if (input.decoupled) {
+          if (existing.isRoot || existing.accountType!=="human" || !hasPermission(existing,"auth.login")) throw new CredentialChangedError();
+          this.externalProfiles.set(key,linkedIdentityProfile(input));
+          if (!existing.realName && input.realName) existing.realName=input.realName;
+          if (!this.primaryEmails.has(existing.id) && input.email && input.emailVerified===true && ![...this.primaryEmails.values()].some(email=>email.address===input.email)) {
+            this.primaryEmails.set(existing.id,{address:input.email,verified:input.emailVerified===true});
+          }
+          return copy(existing);
+        }
         if (
           input.strictReconciliation === true &&
           input.username !== undefined &&
@@ -945,7 +1031,7 @@ export class InMemoryDataStore implements DataStore {
       ) {
         throw new ExternalIdentityCollisionError();
       }
-      for (const identifiers of this.userIdentifiers.values()) {
+      for (const identifiers of input.decoupled ? [] : this.userIdentifiers.values()) {
         if (
           input.studentIds?.some((candidate) =>
             identifiers.some(
@@ -983,8 +1069,9 @@ export class InMemoryDataStore implements DataStore {
     this.users.set(user.id, copy(user));
     this.baselineGrants.set(user.id, copy(user.grants));
     this.externalIdentities.set(key, user.id);
+    this.externalProfiles.set(key,linkedIdentityProfile(input));
     if (input.email !== undefined) {
-      this.primaryEmails.set(user.id, { address: input.email, verified: true });
+      this.primaryEmails.set(user.id, { address: input.email, verified: input.decoupled ? input.emailVerified===true : true });
     }
     if (input.studentIds !== undefined && input.studentIds.length > 0) {
       this.userIdentifiers.set(
@@ -1021,16 +1108,19 @@ export class InMemoryDataStore implements DataStore {
     userId: string,
     expiresAt: string,
     impersonatorUserId?: string | null,
-    passwordProof?: PasswordSessionProof
+    passwordProof?: PasswordSessionProof,
+    externalProof?: ExternalSessionProof
   ): Promise<StoredSession> {
+    if (externalProof && this.externalIdentities.get(`${externalProof.provider}\u0000${externalProof.subject}`)!==userId) throw new CredentialChangedError();
     if (passwordProof) {
-      const hash=userId==="0" ? this.rootPasswordHash : [...this.emailCredentials.values()].find(item=>item.userId===userId)?.passwordHash;
+      const hash=userId==="0" ? this.rootPasswordHash : [...this.emailCredentials.values()].find(item=>item.userId===userId)?.passwordHash ?? this.localPasswordHashes.get(userId);
       if (hash!==passwordProof.passwordHash || (passwordProof.authRevision!==undefined && passwordProof.authRevision!==(this.accountRevisions.get(userId) ?? 1))) throw new CredentialChangedError();
     }
     const session: StoredSession = {
       id: randomUUID(),
       userId,
       expiresAt,
+      createdAt:new Date().toISOString(),
       ...(impersonatorUserId === undefined ? {} : { impersonatorUserId })
     };
     this.sessions.set(session.id, session);

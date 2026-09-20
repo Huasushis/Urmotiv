@@ -1,5 +1,7 @@
 import {
   accountSecurityViewSchema,
+  linkedIdentitiesResponseSchema,
+  identityLinkStartResponseSchema,
   leaderboardResponseSchema,
   userContactSchema,
   type LeaderboardQuery,
@@ -321,8 +323,23 @@ export function getMyProfile(): Promise<ProfileView> {
   return request("/me", { method: "GET" }, profileViewSchema);
 }
 
-export function getAccountSecurity(): Promise<{ hasPassword: boolean; canChangeCredentials: boolean }> {
+export function getAccountSecurity(): Promise<{ hasPassword: boolean; canChangeCredentials: boolean; canInitializePassword?: boolean | undefined }> {
   return request("/me/security", { method: "GET" }, accountSecurityViewSchema);
+}
+export function initializeMyPassword(newPassword: string) {
+  return request("/me/password/initialize", json({newPassword}), okResponseSchema);
+}
+export function getLinkedIdentities() {
+  return request("/me/identities", { method: "GET" }, linkedIdentitiesResponseSchema);
+}
+export function startUstcIdentityLink(currentPassword: string) {
+  return request("/me/identities/ustc/start", json({currentPassword}), identityLinkStartResponseSchema);
+}
+export function unlinkIdentity(provider: string, subject: string, currentPassword: string) {
+  return request(`/me/identities/${encodeURIComponent(provider)}/unlink`, json({subject,currentPassword}), okResponseSchema);
+}
+export function verifyMyContactEmail() {
+  return request("/me/email-verification", json({}), okResponseSchema);
 }
 export function changeMyPassword(input: { currentPassword: string; newPassword: string }): Promise<{ ok: true }> {
   return request("/me/password", json(input), okResponseSchema);

@@ -180,7 +180,7 @@ describe("R-ACCT-026 集成：统一身份登录后的个人资料与头像维�
         username: "PB21000077",
         realName: "张三",
         email: "zhangsan@example.test",
-        emailVerified: true,
+        emailVerified: false,
         qq: null,
         avatarSource: "none",
         avatarUrl: null,

@@ -105,8 +105,8 @@ export type UstcOAuthHostResolver = (hostname: string) => Promise<readonly strin
 
 /**
  * 从 USTC OAuth2 资料端点解析出的稳定身份。subject 取自 attributes.gid（优先）
- * 或顶层 id，作为“认证来源 + 稳定编号”的唯一键；username 取自学工号 zjhm，
- * realName 取自 name，email 取自 email。这些字段只在登录瞬间用于建档或更新，
+ * 或顶层 id，作为“认证来源 + 稳定编号”的唯一键；username 取自学号 zjhm，
+ * realName 取自 name，email 取自 email。站内账号把这些认证属性与本地用户名分开，
  * 不写入日志，也不回显给除本人以外的接口。
  */
 export interface UstcOAuthIdentity {
@@ -115,6 +115,7 @@ export interface UstcOAuthIdentity {
   readonly username: string | undefined;
   readonly realName: string | undefined;
   readonly email: string | undefined;
+  readonly emailVerified?: boolean;
   readonly nickname: string;
   readonly studentIds: readonly { readonly attribute: string; readonly value: string }[];
 }
@@ -130,6 +131,13 @@ export interface UstcOAuthLoginStart {
   };
 }
 
+export const ustcOAuthLinkContextSchema = z.object({
+  userId: z.string().min(1).max(80),
+  sessionDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  authRevision: z.number().int().positive()
+}).strict();
+export type UstcOAuthLinkContext = z.infer<typeof ustcOAuthLinkContextSchema>;
+
 interface UstcOAuthStatePayload {
   readonly version: 3;
   readonly nonce: string;
@@ -137,6 +145,7 @@ interface UstcOAuthStatePayload {
   readonly returnTo: string;
   readonly issuedAt: string;
   readonly expiresAt: string;
+  readonly link?: UstcOAuthLinkContext;
 }
 
 export class UstcOAuthError extends Error {
@@ -210,7 +219,7 @@ export class UstcOAuthClient {
     this.#now = options.now ?? (() => new Date());
   }
 
-  public async startLogin(returnTo = "/"): Promise<UstcOAuthLoginStart> {
+  public async startLogin(returnTo = "/", link?: UstcOAuthLinkContext): Promise<UstcOAuthLoginStart> {
     const safeReturnTo = parseReturnPath(returnTo);
     const now = this.#now();
     const expiresAt = new Date(now.getTime() + stateLifetimeMs).toISOString();
@@ -221,7 +230,8 @@ export class UstcOAuthClient {
       browserBindingDigest: digestBrowserBinding(browserBinding),
       returnTo: safeReturnTo,
       issuedAt: now.toISOString(),
-      expiresAt
+      expiresAt,
+      ...(link === undefined ? {} : { link: ustcOAuthLinkContextSchema.parse(link) })
     };
     const state = signState(payload, this.#stateSecret);
     await this.#states.put(digestNonce(payload.nonce), expiresAt);
@@ -242,7 +252,7 @@ export class UstcOAuthClient {
     state: string;
     code: string;
     browserBinding: string | undefined;
-  }): Promise<{ identity: UstcOAuthIdentity; returnTo: string }> {
+  }): Promise<{ identity: UstcOAuthIdentity; returnTo: string; link?: UstcOAuthLinkContext }> {
     const payload = verifyState(input.state, this.#stateSecret);
     const now = this.#now();
     if (Date.parse(payload.expiresAt) <= now.getTime()) {
@@ -287,7 +297,7 @@ export class UstcOAuthClient {
       (url, init) => this.fetchProvider(url, init)
     );
     const identity = parseOAuthProfile(profile);
-    return { identity, returnTo: payload.returnTo };
+    return { identity, returnTo: payload.returnTo, ...(payload.link === undefined ? {} : { link: payload.link }) };
   }
 
   private async fetchProvider(input: string | URL | Request, init?: RequestInit): Promise<Response> {
@@ -635,6 +645,7 @@ function parseOAuthProfile(profile: Record<string, unknown>): UstcOAuthIdentity 
     username: zjhm ?? jrzjhm,
     realName: name,
     email,
+    emailVerified: attributes.email_verified === true || profile.email_verified === true,
     nickname: name ?? "统一身份认证用户",
     studentIds
   };
@@ -677,14 +688,16 @@ function verifyState(state: string, secret: Uint8Array): UstcOAuthStatePayload {
       browserBindingDigest: browserBindingSchema,
       returnTo: z.string().max(2_000),
       issuedAt: z.string().datetime(),
-      expiresAt: z.string().datetime()
+      expiresAt: z.string().datetime(),
+      link: ustcOAuthLinkContextSchema.optional()
     })
     .strict();
   const result = schema.safeParse(raw);
   if (!result.success) {
     throw new UstcOAuthError("统一身份认证登录状态无效。", "invalid_state");
   }
-  return { ...result.data, returnTo: parseReturnPath(result.data.returnTo) };
+  const { link, ...rest }=result.data;
+  return { ...rest, returnTo: parseReturnPath(result.data.returnTo), ...(link===undefined?{}:{link}) };
 }
 
 function parseReturnPath(value: string): string {

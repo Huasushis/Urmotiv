@@ -40,6 +40,26 @@ export const userContactSchema = profileViewSchema.pick({
 }).strict();
 export type UserContact = z.infer<typeof userContactSchema>;
 
+export const linkedIdentitySchema = z.object({
+  provider: z.string().min(1).max(80),
+  subject: z.string().min(1).max(255),
+  studentId: z.string().max(255).nullable(),
+  realName: z.string().max(120).nullable(),
+  email: z.string().max(320).nullable(),
+  lastAuthenticatedAt: z.string().nullable()
+}).strict();
+export type LinkedIdentity = z.infer<typeof linkedIdentitySchema>;
+export const linkedIdentitiesResponseSchema = z.object({
+  items: z.array(linkedIdentitySchema),
+  ustcEnabled: z.boolean(),
+  canManage: z.boolean(),
+  hasPassword: z.boolean(),
+  localLoginAvailable: z.boolean()
+}).strict();
+export const manageIdentityInputSchema = z.object({ currentPassword: z.string().min(1).max(1024) }).strict();
+export const unlinkIdentityInputSchema = manageIdentityInputSchema.extend({ subject: z.string().min(1).max(255) }).strict();
+export const identityLinkStartResponseSchema = z.object({ authorizeUrl: z.string().url() }).strict();
+
 export const leaderboardQuerySchema = z.object({
   sort: z.enum(["submitted", "approved", "rejected"]).default("submitted"),
   page: z.coerce.number().int().min(1).max(100_000).default(1),

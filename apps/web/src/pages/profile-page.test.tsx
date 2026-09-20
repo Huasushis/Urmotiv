@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const api = vi.hoisted(() => ({
   getAccountSecurity: vi.fn(async () => ({hasPassword:true,canChangeCredentials:true})),
+  getLinkedIdentities: vi.fn(async () => ({items:[],ustcEnabled:false,canManage:true,hasPassword:true,localLoginAvailable:true})),
   getMyProfile: vi.fn(),
   updateMyProfile: vi.fn(),
   uploadMyAvatar: vi.fn(),
@@ -114,9 +115,8 @@ describe("个人资料页", () => {
       (document.querySelector('[data-testid="profile-real-name"]') as HTMLInputElement)?.value
     ).toBe("作者姓名");
     expect(emailInput()?.value).toBe("author@example.test");
-    expect(document.querySelector('[data-testid="identifier-list"]')?.textContent).toContain(
-      "PB22000001"
-    );
+    expect(document.querySelector('[aria-label="关联登录"]')).not.toBeNull();
+    expect(document.querySelector('[data-testid="identifier-list"]')).toBeNull();
     expect(document.querySelector('[data-testid="avatar-initial"]')?.textContent).toContain("作");
     expect(document.querySelector('[data-testid="avatar-source-qq"]')?.hasAttribute("disabled")).toBe(
       true

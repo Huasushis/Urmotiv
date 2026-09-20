@@ -24,10 +24,17 @@ export function requireEditableProfile(actor: StoredUser | undefined): StoredUse
 }
 
 export async function readProfileView(user: StoredUser, store: DataStore): Promise<ProfileView> {
-  const [email, studentIds] = await Promise.all([
+  const [email, studentIds, identities] = await Promise.all([
     store.getPrimaryEmail(user.id),
-    store.listUserIdentifiers(user.id)
+    store.listUserIdentifiers(user.id),
+    store.listLinkedIdentities(user.id)
   ]);
+  const ustc = identities.find(identity => identity.provider === "ustc-oauth");
+  const visibleIdentifiers = [
+    ...(ustc?.studentId ? [{ attribute: "zjhm", value: ustc.studentId }] : []),
+    ...(identities.some(identity => identity.provider !== "ustc-oauth")
+      ? studentIds.filter(item => !["zjhm", "jrzjhm"].includes(item.attribute)) : [])
+  ];
   return {
     id: user.id,
     nickname: user.nickname,
@@ -39,7 +46,7 @@ export async function readProfileView(user: StoredUser, store: DataStore): Promi
     qq: user.qq ?? null,
     avatarSource: avatarSourceOf(user),
     avatarUrl: avatarSourceOf(user) === "none" ? null : avatarUrlPath(user.id),
-    studentIds: studentIds.map((item) => ({ attribute: item.attribute, value: item.value }))
+    studentIds: visibleIdentifiers.map((item) => ({ attribute: item.attribute, value: item.value }))
   };
 }
 

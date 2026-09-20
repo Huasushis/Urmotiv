@@ -5,11 +5,13 @@ import {
   ustcOAuthBrowserBindingCookieName,
   type CasLoginStateStore,
   type UstcOAuthConfiguration,
+  hashPassword,
 } from "@urmotiv/auth";
 import { createApp } from "../src/app";
 import { InMemoryAdminSettingsStore } from "../src/admin-service";
 import { createDemoUsers, demoTags } from "../src/demo-data";
 import { InMemoryDataStore } from "../src/repository";
+import { InMemoryEmailVerificationOutbox } from "../src/email-verification";
 
 const callbackPath = "/api/v1/auth/ustc/callback";
 const callbackUrl = `https://site.example.test${callbackPath}`;
@@ -109,8 +111,11 @@ async function makeHarness(
       : {}),
   });
   const store = new InMemoryDataStore(createDemoUsers(), demoTags);
+  const outbox=new InMemoryEmailVerificationOutbox();
   const app = await createApp({
     store,
+    emailVerificationDelivery:outbox,emailVerificationWebUrl:new URL(options.redirectUri ?? configuration.redirectUri).origin,
+    allowedOrigins:[new URL(options.redirectUri ?? configuration.redirectUri).origin],
     adminSettingsStore: new InMemoryAdminSettingsStore(undefined, {
       autoCreateUsers: options.autoCreateUsers ?? true
     }),
@@ -124,6 +129,7 @@ async function makeHarness(
     fetch,
     states,
     store,
+    outbox,
     setProfileBody(value: string) {
       profileBody = value;
     },
@@ -179,7 +185,139 @@ function publicFailure(response: { statusCode: number; json(): unknown }): unkno
   return (response.json() as { error: { code: string } }).error.code;
 }
 
+const localPassword="synthetic-local-link-password";
+async function localAccount(harness:Awaited<ReturnType<typeof makeHarness>>,suffix="owner") {
+  const email=`local-${suffix}@example.test`;
+  const user=(await harness.store.registerEmailUser({username:`FreeAlias-${suffix}`,nickname:`本地昵称-${suffix}`,
+    normalizedEmail:email,displayEmail:email,passwordHash:await hashPassword(localPassword)}))!;
+  const digest=(suffix==="owner"?"a":"b").repeat(64);
+  const expiry=new Date(Date.now()+600_000).toISOString();
+  await harness.store.replaceEmailVerificationToken({userId:user.id,normalizedEmail:email,tokenDigest:digest,expiresAt:expiry});
+  await harness.store.consumeEmailVerificationToken(digest,new Date().toISOString());
+  const session=await harness.store.createSession(user.id,expiry);
+  return {user,email,cookie:`urmotiv_session=${session.id}`};
+}
+async function startLink(harness:Awaited<ReturnType<typeof makeHarness>>,cookie:string) {
+  const response=await harness.app.inject({method:"POST",url:"/api/v1/me/identities/ustc/start",
+    headers:{origin:"https://site.example.test",cookie},payload:{currentPassword:localPassword}});
+  expect(response.statusCode).toBe(200);
+  const state=new URL(response.json().authorizeUrl).searchParams.get("state")!;
+  const cookiePair=cookieLines(response.headers["set-cookie"])[0]!.split(";")[0]!;
+  return {state,cookiePair};
+}
+
 describe("USTC OAuth2 应用级流程", () => {
+  it("学校邮箱未声明验证时须本人验证，关闭公开注册也能完成联系邮箱验证",async()=>{
+    const harness=await makeHarness();const flow=await startFlow(harness.app);
+    const callback=await harness.app.inject({method:"GET",url:callbackRequest(flow.state,"verify-contact"),headers:{cookie:flow.cookiePair}});
+    const cookie=cookieLines(callback.headers["set-cookie"]).find(line=>line.startsWith("urmotiv_session="))!.split(";")[0]!;
+    const pending=await harness.app.inject({method:"POST",url:"/api/v1/me/email-verification",headers:{cookie,origin:"https://site.example.test"},payload:{}});
+    expect(pending.statusCode).toBe(202);
+    expect(harness.outbox.messages).toHaveLength(1);
+    const token=new URLSearchParams(new URL(harness.outbox.messages[0]!.verificationUrl).hash.split("?")[1]).get("token");
+    const verified=await harness.app.inject({method:"POST",url:"/api/v1/auth/email-verification/verify",headers:{origin:"https://site.example.test"},payload:{token}});
+    expect(verified.statusCode).toBe(200);
+    expect((await harness.store.getPrimaryEmail((await harness.store.listUsers()).find(user=>user.username==="PB21000077")!.id))?.verified).toBe(true);
+  });
+  it("只有学校登录且没有邮箱时，近期直接认证可设置初始密码，不再依赖学校登录",async()=>{
+    const harness=await makeHarness({profileBody:profileWith({email:undefined})});
+    const flow=await startFlow(harness.app);
+    const callback=await harness.app.inject({method:"GET",url:callbackRequest(flow.state,"initial-password"),headers:{cookie:flow.cookiePair}});
+    const cookie=cookieLines(callback.headers["set-cookie"]).find(line=>line.startsWith("urmotiv_session="))!.split(";")[0]!;
+    const security=await harness.app.inject({method:"GET",url:"/api/v1/me/security",headers:{cookie}});
+    expect(security.json()).toMatchObject({hasPassword:false,canInitializePassword:true});
+    const getSession=harness.store.getSession.bind(harness.store);
+    const stale=vi.spyOn(harness.store,"getSession").mockImplementation(async id=>{
+      const session=await getSession(id);return session?{...session,createdAt:new Date(Date.now()-11*60_000).toISOString()}:undefined;
+    });
+    expect((await harness.app.inject({method:"POST",url:"/api/v1/me/password/initialize",headers:{cookie,origin:"https://site.example.test"},payload:{newPassword:localPassword}})).statusCode).toBe(403);
+    stale.mockRestore();
+    const initialized=await harness.app.inject({method:"POST",url:"/api/v1/me/password/initialize",headers:{cookie,origin:"https://site.example.test"},payload:{newPassword:localPassword}});
+    expect(initialized.statusCode).toBe(200);
+    const signed=await harness.app.inject({method:"POST",url:"/api/v1/auth/username-login",headers:{origin:"https://site.example.test"},payload:{username:"PB21000077",password:localPassword}});
+    expect(signed.statusCode).toBe(200);
+    const localCookie=cookieLines(signed.headers["set-cookie"])[0]!.split(";")[0]!;
+    const repeated=await harness.app.inject({method:"POST",url:"/api/v1/me/password/initialize",headers:{cookie:localCookie,origin:"https://site.example.test"},payload:{newPassword:"synthetic-overwrite-password"}});
+    expect(repeated.statusCode).toBe(403);
+  });
+
+  it("提供方停用不删除关联，已有本地登录方式仍可主动解绑",async()=>{
+    const harness=await makeHarness();const local=await localAccount(harness);
+    const flow=await startLink(harness,local.cookie);
+    const linked=await harness.app.inject({method:"GET",url:callbackRequest(flow.state,"before-disabled"),headers:{cookie:`${local.cookie}; ${flow.cookiePair}`}});
+    const cookie=cookieLines(linked.headers["set-cookie"]).find(line=>line.startsWith("urmotiv_session="))!.split(";")[0]!;
+    const noLocal=await createApp({store:harness.store,allowedOrigins:["https://site.example.test"],emailLoginEnabled:false});openApps.push(noLocal);
+    const prevented=await noLocal.inject({method:"POST",url:"/api/v1/me/identities/ustc-oauth/unlink",headers:{cookie,origin:"https://site.example.test"},payload:{subject:"stable-gid-456",currentPassword:localPassword}});
+    expect(prevented.statusCode).toBe(409);expect(prevented.json().error.code).toBe("LAST_LOGIN_METHOD");
+    const disabled=await createApp({store:harness.store,allowedOrigins:["https://site.example.test"]});openApps.push(disabled);
+    expect((await disabled.inject({method:"GET",url:"/api/v1/me/identities",headers:{cookie}})).json()).toMatchObject({ustcEnabled:false,items:[{subject:"stable-gid-456"}]});
+    expect((await disabled.inject({method:"POST",url:"/api/v1/me/identities/ustc/start",headers:{cookie,origin:"https://site.example.test"},payload:{currentPassword:localPassword}})).statusCode).toBe(404);
+    expect((await disabled.inject({method:"POST",url:"/api/v1/me/identities/ustc-oauth/unlink",headers:{cookie,origin:"https://site.example.test"},payload:{subject:"stable-gid-456",currentPassword:localPassword}})).statusCode).toBe(200);
+  });
+  it("主动绑定保留本地账号，后续认证只更新学校资料；解绑撤销旧会话",async()=>{
+    const harness=await makeHarness();
+    const local=await localAccount(harness);
+    const flow=await startLink(harness,local.cookie);
+    const bound=await harness.app.inject({method:"GET",url:callbackRequest(flow.state,"synthetic-link"),headers:{cookie:`${local.cookie}; ${flow.cookiePair}`}});
+    expect(bound.statusCode).toBe(302);expect(bound.headers.location).toBe("/profile?identity=linked");
+    let cookie=cookieLines(bound.headers["set-cookie"]).find(line=>line.startsWith("urmotiv_session="))!.split(";")[0]!;
+    expect((await harness.app.inject({method:"GET",url:"/api/v1/me",headers:{cookie}})).json()).toMatchObject({id:local.user.id,username:local.user.username,nickname:local.user.nickname,email:local.email,emailVerified:true});
+    const identities=await harness.app.inject({method:"GET",url:"/api/v1/me/identities",headers:{cookie}});
+    expect(identities.json().items).toHaveLength(1);
+    expect(identities.json().items[0]).toMatchObject({subject:"stable-gid-456",studentId:"PB21000077",realName:"张三",email:"zhangsan@example.test"});
+    expect(identities.body).not.toContain(clientSecret);
+    harness.setProfileBody(profileWith({zjhm:"PB22009999",name:"新学校姓名",email:"school-updated@example.test"}));
+    const again=await startFlow(harness.app);
+    const signed=await harness.app.inject({method:"GET",url:callbackRequest(again.state,"synthetic-return"),headers:{cookie:again.cookiePair}});
+    expect(signed.statusCode).toBe(302);
+    cookie=cookieLines(signed.headers["set-cookie"]).find(line=>line.startsWith("urmotiv_session="))!.split(";")[0]!;
+    expect((await harness.app.inject({method:"GET",url:"/api/v1/me",headers:{cookie}})).json()).toMatchObject({id:local.user.id,username:local.user.username,email:local.email,realName:"张三"});
+    expect((await harness.app.inject({method:"GET",url:"/api/v1/me/identities",headers:{cookie}})).json().items[0]).toMatchObject({studentId:"PB22009999",realName:"新学校姓名",email:"school-updated@example.test"});
+    const removed=await harness.app.inject({method:"POST",url:"/api/v1/me/identities/ustc-oauth/unlink",headers:{cookie,origin:"https://site.example.test"},payload:{subject:"stable-gid-456",currentPassword:localPassword}});
+    expect(removed.statusCode).toBe(200);
+    expect(await harness.store.hasExternalIdentity("ustc-oauth","stable-gid-456")).toBe(false);
+    expect((await harness.app.inject({method:"GET",url:"/api/v1/me",headers:{cookie}})).statusCode).toBe(401);
+    expect((await harness.store.findUsernameCredential(local.user.username!))?.user.id).toBe(local.user.id);
+  });
+
+  it("绑定请求限定原账号与原会话，换账号或换会话不能使用原回调",async()=>{
+    const harness=await makeHarness();const local=await localAccount(harness);const other=await localAccount(harness,"other");
+    for(const wrongCookie of [other.cookie,`urmotiv_session=${(await harness.store.createSession(local.user.id,new Date(Date.now()+600_000).toISOString())).id}`]) {
+      const flow=await startLink(harness,local.cookie);
+      const result=await harness.app.inject({method:"GET",url:callbackRequest(flow.state,"cross-account"),headers:{cookie:`${wrongCookie}; ${flow.cookiePair}`}});
+      expect(result.statusCode).toBe(401);
+      expect(await harness.store.hasExternalIdentity("ustc-oauth","stable-gid-456")).toBe(false);
+    }
+  });
+
+  it("同一学校身份不能绑定两个账号，冲突不会修改第二个账号",async()=>{
+    const harness=await makeHarness();const first=await localAccount(harness);const second=await localAccount(harness,"other");
+    const flow=await startLink(harness,first.cookie);
+    await harness.app.inject({method:"GET",url:callbackRequest(flow.state,"first"),headers:{cookie:`${first.cookie}; ${flow.cookiePair}`}});
+    const other=await startLink(harness,second.cookie);
+    const rejected=await harness.app.inject({method:"GET",url:callbackRequest(other.state,"second"),headers:{cookie:`${second.cookie}; ${other.cookiePair}`}});
+    expect(rejected.statusCode).toBe(302);expect(rejected.headers.location).toBe("/profile?identity=conflict");
+    expect(await harness.store.listLinkedIdentities(second.user.id)).toEqual([]);
+    expect((await harness.store.getPrimaryEmail(second.user.id))?.address).toBe(second.email);
+  });
+
+  it("匿名或错误密码不能发起绑定",async()=>{
+    const harness=await makeHarness();const local=await localAccount(harness);
+    expect((await harness.app.inject({method:"POST",url:"/api/v1/me/identities/ustc/start",headers:{origin:"https://site.example.test"},payload:{currentPassword:localPassword}})).statusCode).toBe(401);
+    expect((await harness.app.inject({method:"POST",url:"/api/v1/me/identities/ustc/start",headers:{origin:"https://site.example.test",cookie:local.cookie},payload:{currentPassword:"wrong"}})).statusCode).toBe(400);
+    expect(harness.fetch).not.toHaveBeenCalled();
+    const robot=await harness.store.createSession("robot",new Date(Date.now()+600_000).toISOString());
+    expect((await harness.app.inject({method:"POST",url:"/api/v1/me/identities/ustc/start",headers:{origin:"https://site.example.test",cookie:`urmotiv_session=${robot.id}`},payload:{currentPassword:localPassword}})).statusCode).toBe(404);
+    const original=harness.store.getUser.bind(harness.store);
+    const actor=vi.spyOn(harness.store,"getUser").mockImplementation(async id=>{
+      const user=await original(id);
+      if(user?.id==="administrator")user.grants.push({permission:"user.impersonate",effect:"allow",scope:"global"});
+      return user;
+    });
+    const switched=await harness.store.createSession(local.user.id,new Date(Date.now()+600_000).toISOString(),"administrator");
+    expect((await harness.app.inject({method:"POST",url:"/api/v1/me/identities/ustc/start",headers:{origin:"https://site.example.test",cookie:`urmotiv_session=${switched.id}`},payload:{currentPassword:localPassword}})).statusCode).toBe(403);
+    actor.mockRestore();
+  });
   it("启动与回调完整建档：gid 稳定身份、zjhm 作为用户名、name 作为姓名", async () => {
     const { app, states } = await makeHarness();
     const flow = await startFlow(app, "/problems?tab=2");
@@ -210,7 +348,7 @@ describe("USTC OAuth2 应用级流程", () => {
         username: "PB21000077",
         realName: "张三",
         email: "zhangsan@example.test",
-        emailVerified: true,
+        emailVerified: false,
         studentIds: [{ attribute: "zjhm", value: "PB21000077" }],
       }),
     );
@@ -328,8 +466,9 @@ describe("USTC OAuth2 应用级流程", () => {
       url: callbackRequest(first.state, "new-account-disabled"),
       headers: { cookie: first.cookiePair }
     });
-    expect(rejected.statusCode).toBe(401);
-    expect(publicFailure(rejected)).toBe("UNAUTHENTICATED");
+    expect(rejected.statusCode).toBe(302);
+    expect(rejected.headers.location).toBe("/login?identity=link-required");
+    expect(cookieLines(rejected.headers["set-cookie"]).some(line=>line.startsWith("urmotiv_session="))).toBe(false);
     expect(await harness.store.hasExternalIdentity("ustc-oauth", "stable-gid-456")).toBe(false);
 
     const existing = await harness.store.findOrCreateExternalUser({
@@ -360,7 +499,7 @@ describe("USTC OAuth2 应用级流程", () => {
     expect(profile.json()).toMatchObject({ id: existing.id, username: "PB21000077" });
   });
 
-  it("同一 zjhm 已绑定到其他 gid 时不自动改绑，直接失败关闭", async () => {
+  it("新 gid 的用户名与现有账号冲突时引导主动绑定，不创建或合并账号", async () => {
     const harness = await makeHarness();
     const first = await startFlow(harness.app);
     const firstCallback = await harness.app.inject({
@@ -377,13 +516,13 @@ describe("USTC OAuth2 应用级流程", () => {
       url: callbackRequest(second.state, "code-2"),
       headers: { cookie: second.cookiePair },
     });
-    // 同一学号不能自动改绑——按“未认证”失败关闭，不泄露差异。
-    expect(secondCallback.statusCode).toBe(401);
-    expect(publicFailure(secondCallback)).toBe("UNAUTHENTICATED");
+    expect(secondCallback.statusCode).toBe(302);
+    expect(secondCallback.headers.location).toBe("/login?identity=link-required");
+    expect(await harness.store.hasExternalIdentity("ustc-oauth","other-gid-999")).toBe(false);
     expect(harness.states.consumeCalls).toBe(2);
   });
 
-  it("缺少 zjhm/name/email 建档字段时统一失败且不泄露资料差异", async () => {
+  it("缺少可选邮箱时仍按 gid 登录，不编造邮箱", async () => {
     const { app, states } = await makeHarness({
       profileBody: profileWith({ email: undefined }),
     });
@@ -393,8 +532,9 @@ describe("USTC OAuth2 应用级流程", () => {
       url: callbackRequest(flow.state, "code-missing-email"),
       headers: { cookie: flow.cookiePair },
     });
-    expect(callback.statusCode).toBe(401);
-    expect(publicFailure(callback)).toBe("UNAUTHENTICATED");
+    expect(callback.statusCode).toBe(302);
+    const cookie=cookieLines(callback.headers["set-cookie"]).find(line=>line.startsWith("urmotiv_session="))!.split(";")[0]!;
+    expect((await app.inject({method:"GET",url:"/api/v1/me",headers:{cookie}})).json().email).toBeNull();
     expect(callback.headers["cache-control"]).toBe("no-store");
     expect(callback.headers["referrer-policy"]).toBe("no-referrer");
     expect(callback.body).not.toContain("code-missing-email");

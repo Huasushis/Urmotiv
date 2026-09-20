@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { digestSecretToken, hashPassword, normalizeEmail, verifyEmailLoginPassword } from "@urmotiv/auth";
-import { accountSecurityViewSchema, changePasswordInputSchema, confirmEmailChangeInputSchema,
+import { accountSecurityViewSchema, changePasswordInputSchema, confirmEmailChangeInputSchema, initializePasswordInputSchema,
   requestEmailChangeInputSchema, requestPasswordResetInputSchema, resetPasswordInputSchema } from "@urmotiv/contracts";
 import type { StoredSession, StoredUser } from "./domain";
 import type { AccountActionToken, AccountSecurityState, DataStore } from "./repository";
@@ -19,7 +19,7 @@ interface AccountSecurityDependencies {
   clearSession: (reply: FastifyReply) => void;
 }
 
-export function registerAccountSecurityRoutes(app: FastifyInstance, deps: AccountSecurityDependencies): void {
+export function registerAccountSecurityRoutes(app: FastifyInstance, deps: AccountSecurityDependencies): (request: FastifyRequest) => void {
   const limiter = new LoginRateLimiter({ maxFailedAttempts: 10, windowMs: 15 * 60_000,
     storage: new InMemoryLoginRateLimiterStorage(), now: () => deps.now().getTime() });
   const pendingMail = new Set<Promise<void>>();
@@ -64,14 +64,32 @@ export function registerAccountSecurityRoutes(app: FastifyInstance, deps: Accoun
     return new ApiError(400,"INVALID_ACCOUNT_LINK","链接无效、已过期或账号状态已变化，请重新申请。");
   }
   function privateResponse(reply: FastifyReply): void { reply.header("cache-control","private, no-store"); }
+  function canInitializePassword(current: {user:StoredUser;session:StoredSession},state:AccountSecurityState|undefined): boolean {
+    const age=deps.now().getTime()-Date.parse(current.session.createdAt ?? "");
+    return current.user.accountType==="human" && !current.user.isRoot && current.session.impersonatorUserId==null
+      && state?.passwordHash===null && (state.email===null || state.email.verified)
+      && Number.isFinite(age) && age>=-1000 && age<=10*60_000;
+  }
 
   app.get("/api/v1/me/security",async(request,reply)=>{
     privateResponse(reply);
     const current=await deps.currentSession(request);
     if (!current) throw unauthorized();
     const state=await deps.store.getAccountSecurity(current.user.id);
-    return accountSecurityViewSchema.parse({hasPassword:Boolean(state?.passwordHash),
+    return accountSecurityViewSchema.parse({hasPassword:Boolean(state?.passwordHash),canInitializePassword:canInitializePassword(current,state),
       canChangeCredentials:current.user.accountType==="human" && current.session.impersonatorUserId==null});
+  });
+
+  app.post("/api/v1/me/password/initialize",async(request,reply)=>{
+    privateResponse(reply);const user=await requireSelf(request);limit(request);
+    const current=await deps.currentSession(request);
+    const state=await deps.store.getAccountSecurity(user.id);
+    if(!current || !state || !canInitializePassword(current,state)) throw new ApiError(403,"FRESH_LOGIN_REQUIRED","请先验证联系邮箱，或重新使用学校身份登录后再设置初始密码。");
+    const input=initializePasswordInputSchema.parse(request.body);
+    const changed=await deps.store.changeAccountPassword({userId:user.id,expectedAuthRevision:state.authRevision,expectedPasswordHash:null,
+      newPasswordHash:await hashPassword(input.newPassword),requestId:request.id,now:deps.now().toISOString()});
+    if(!changed)throw new ApiError(409,"ACCOUNT_CHANGED","账号状态已变化，请重新登录后再试。");
+    deps.clearSession(reply);return {ok:true};
   });
 
   app.post("/api/v1/me/password",async(request,reply)=>{
@@ -134,4 +152,5 @@ export function registerAccountSecurityRoutes(app: FastifyInstance, deps: Accoun
     }
     return {ok:true,notificationSent};
   });
+  return limit;
 }

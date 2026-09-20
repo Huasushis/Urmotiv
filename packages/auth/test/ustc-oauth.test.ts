@@ -140,6 +140,21 @@ describe("USTC OAuth2 授权码流程", () => {
     await expect(client.startLogin("https://evil.example.test/path")).rejects.toThrow();
   });
 
+  it("关联上下文经过签名，不能把回调修改为另一个账号",async()=>{
+    const {client,recording}=makeClient();
+    const link={userId:"local-user",sessionDigest:"a".repeat(64),authRevision:3};
+    const started=await client.startLogin("/profile",link);
+    const [encoded,signature]=started.state.split(".");
+    const payload=JSON.parse(Buffer.from(encoded!,"base64url").toString("utf8"));
+    payload.link.userId="another-user";
+    const tampered=Buffer.from(JSON.stringify(payload)).toString("base64url")+"."+signature;
+    await expect(client.finishLogin({state:tampered,code:"synthetic-code",browserBinding:started.browserBindingCookie.value})).rejects.toThrow();
+    expect(recording.calls).toHaveLength(0);
+    const completed=await client.finishLogin({state:started.state,code:"synthetic-code",browserBinding:started.browserBindingCookie.value});
+    expect(completed.link).toEqual(link);
+    expect(completed.identity.emailVerified).toBe(false);
+  });
+
   it("finishLogin 换码取资料，映射 gid/zjhm/name/email，绑定一次消费", async () => {
     const { client, states, recording } = makeClient();
     const start = await client.startLogin("/");

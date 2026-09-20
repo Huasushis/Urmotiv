@@ -89,6 +89,8 @@ export function DemoLoginPage({ existingSession }: { existingSession: SessionRes
             ) : null}
           </form>
         {!registering ? <Link to="/forgot-password">忘记密码？</Link> : null}
+        {feedback.get("identity")==="link-required"?<p className="notice-line" role="status">该学校身份尚未关联可直接登录的账号。请先登录已有账号，再到个人资料主动绑定；没有账号时可先注册。系统不会按相同学号或邮箱自动合并账号。</p>:null}
+        {feedback.get("identity")==="unlinked"?<p className="notice-line" role="status">第三方身份已解绑，请使用其他登录方式重新登录。</p>:null}
         {["password-changed","password-reset","email-changed"].includes(feedback.get("security") ?? "") ? <p className="notice-line" role="status">账号信息已更新，请使用新的凭据重新登录。{feedback.get("notification")==="failed"?"旧邮箱通知暂未发送，如需帮助请联系管理员。":""}</p> : null}
         {verificationPending ? (
           <div className="notice-line" role="status">

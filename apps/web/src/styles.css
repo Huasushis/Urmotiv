@@ -6151,6 +6151,15 @@ textarea:read-only {
 .contact-card dd { margin: 0; overflow-wrap: anywhere; }
 .leaderboard-page { max-width: 1000px; margin: 0 auto; }
 .account-security-panel { margin-top: 24px; max-width: 960px; scroll-margin-top: 90px; }
+.linked-identities-panel { margin-top: 24px; max-width: 960px; }
+.linked-identity-card { margin: 18px 0; padding: 20px; border: 1px solid var(--border); border-radius: 14px; }
+.identity-attributes { display: grid; gap: 12px; }
+.identity-attributes > div { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(0, 2fr); gap: 16px; }
+.identity-attributes dt { color: var(--text-soft); }
+.identity-attributes dd { margin: 0; overflow-wrap: anywhere; }
+.identity-actions.form-grid { grid-template-columns: minmax(0, 1fr); max-width: 480px; }
+.identity-actions label { display: grid; gap: 8px; }
+@media (max-width: 600px) { .identity-attributes > div { grid-template-columns: minmax(0, 1fr); gap: 4px; } }
 .account-security-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 32px; }
 .account-security-grid > .form-grid, .account-recovery-panel .form-grid { grid-template-columns: minmax(0, 1fr); align-content: start; }
 .account-security-grid label { display: grid; gap: 8px; }

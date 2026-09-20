@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ImagePlus, Trash2, UserRound } from "lucide-react";
 import type { ProfileView } from "@urmotiv/contracts";
 import { AccountSecurityPanel } from "../components/account-security-panel";
+import { LinkedIdentitiesPanel } from "../components/linked-identities-panel";
 import {
   ApiError,
   avatarUrlFor,
@@ -11,6 +12,7 @@ import {
   updateMyProfile,
   uploadMyAvatar
 } from "../lib/api";
+import { verifyMyContactEmail } from "../lib/api";
 
 const avatarMaxBytes = 512 * 1024;
 const allowedAvatarTypes = ["image/jpeg", "image/png", "image/webp"];
@@ -66,6 +68,7 @@ function AvatarPreview({ profile, className = "" }: AvatarPreviewProps) {
 }
 
 export function ProfilePage() {
+  const verifyContactEmail=useMutation({mutationFn:verifyMyContactEmail});
   const idPrefix = useId();
   const queryClient = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -177,7 +180,7 @@ export function ProfilePage() {
         <div>
           <p className="eyebrow">个人资料</p>
           <h1>账号与头像</h1>
-          <p>这里维护你的显示昵称、QQ 号码和头像。学号等身份信息来自统一身份认证，只能查看不能修改。</p>
+          <p>维护昵称、QQ、头像和登录方式。学校提供的认证学号、姓名等资料在“关联登录”中单独展示。</p>
         </div>
       </div>
 
@@ -262,7 +265,7 @@ export function ProfilePage() {
             <input
               data-testid="profile-username"
               type="text"
-              value={profile.username ?? "（统一身份认证未提供）"}
+              value={profile.username ?? "未设置，可使用邮箱登录"}
               readOnly
               disabled
             />
@@ -272,7 +275,7 @@ export function ProfilePage() {
             <input
               data-testid="profile-real-name"
               type="text"
-              value={profile.realName ?? "（统一身份认证未提供）"}
+              value={profile.realName ?? "未填写"}
               readOnly
               disabled
             />
@@ -287,20 +290,10 @@ export function ProfilePage() {
               disabled
             />
             <small>{profile.emailVerified ? "已验证" : "尚未验证"}{profile.accountType === "human" ? <> · <a href="#account-security">更换邮箱</a></> : null}</small>
+            {profile.email && !profile.emailVerified && profile.accountType==="human"?<button type="button" className="secondary-button" disabled={verifyContactEmail.isPending} onClick={()=>verifyContactEmail.mutate()}>验证联系邮箱</button>:null}
+            {verifyContactEmail.isSuccess?<small role="status">验证邮件已发送，请打开邮件链接确认。</small>:null}
+            {verifyContactEmail.error?<small role="alert">{verifyContactEmail.error.message}</small>:null}
           </div>
-          {profile.studentIds.length > 0 ? (
-            <div className="field wide">
-              <label>身份标识（来自统一身份认证）</label>
-              <ul className="identifier-list" data-testid="identifier-list">
-                {profile.studentIds.map((item) => (
-                  <li key={`${item.attribute}:${item.value}`}>
-                    <span className="identifier-attribute">{item.attribute}</span>
-                    <span className="identifier-value">{item.value}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ) : null}
           <div className="field wide sticky-form-actions">
             <button
               type="submit"
@@ -388,6 +381,7 @@ export function ProfilePage() {
         </div>
       </section>
       <AccountSecurityPanel />
+      <LinkedIdentitiesPanel />
     </div>
   );
 }

@@ -6,7 +6,7 @@ import {
   type ProblemSample,
   type ProblemTag
 } from "@urmotiv/contracts";
-import type { LeaderboardQuery, LeaderboardResponse } from "@urmotiv/contracts";
+import { linkedIdentitySchema, type LinkedIdentity, type LeaderboardQuery, type LeaderboardResponse } from "@urmotiv/contracts";
 import type { DatabaseExecutor, DatabaseHandle } from "@urmotiv/database";
 import { type SQL, sql } from "drizzle-orm";
 import type {
@@ -25,7 +25,11 @@ import { BatchAccountConflictError, normalizeUsernameKey } from "./batch-account
 import {
   ExternalIdentityCollisionError,
   CredentialChangedError,
+  linkedIdentityProfile,
   type PasswordSessionProof,
+  type ExternalSessionProof,
+  type LinkExternalIdentityInput,
+  type UnlinkExternalIdentityInput,
   UsernameUnavailableError,
   type BatchAccountCreationInput,
   type BatchAccountCreationResult,
@@ -2069,6 +2073,84 @@ export class DatabaseDataStore implements DataStore {
     return rows[0]?.user_id;
   }
 
+  public async listLinkedIdentities(userId: string): Promise<LinkedIdentity[]> {
+    const id=parseDatabaseId(userId);
+    if (id===undefined) return [];
+    const rows=await this.handle.query<{provider:string;subject:string;profile:Record<string,unknown>;last_authenticated_at:Date|string|null;legacy_real_name:string|null;legacy_student_id:string|null}>(sql`
+      select identity.provider,identity.subject,identity.profile,identity.last_authenticated_at,account.real_name as legacy_real_name,
+        (select value from user_identifiers where user_id=${id} and kind='student_id' and source in ('zjhm','jrzjhm')
+          order by case when source='zjhm' then 0 else 1 end,created_at desc limit 1) as legacy_student_id
+      from external_identities identity join users account on account.id=identity.user_id
+      where identity.user_id=${id} order by identity.provider,identity.created_at
+    `);
+    return rows.map(row=>linkedIdentitySchema.parse({provider:row.provider,subject:row.subject,
+      studentId:typeof row.profile.studentId==="string"?row.profile.studentId:row.provider==="ustc-oauth"&&Object.keys(row.profile).length===0?row.legacy_student_id:null,
+      realName:typeof row.profile.realName==="string"?row.profile.realName:row.provider==="ustc-oauth"&&Object.keys(row.profile).length===0?row.legacy_real_name:null,
+      email:typeof row.profile.email==="string"?row.profile.email:null,
+      lastAuthenticatedAt:row.last_authenticated_at===null?null:toIso(row.last_authenticated_at)}));
+  }
+
+  private async fillLinkedProfile(executor: DatabaseExecutor, userId: bigint, identity: ExternalIdentity, now: string): Promise<void> {
+    await executor.execute(sql`update users set real_name=coalesce(real_name,${identity.realName ?? null}),updated_at=${now}::timestamptz where id=${userId}`);
+    if (identity.email && identity.emailVerified===true) {
+      await executor.execute(sql`
+        insert into user_emails(id,user_id,address,normalized_address,is_primary,verified_at)
+        select ${randomUUID()}::uuid,${userId},${identity.email},${identity.email},true,${identity.emailVerified===true?now:null}::timestamptz
+        where not exists(select 1 from user_emails where user_id=${userId} and is_primary=true)
+        on conflict(normalized_address) do nothing
+      `);
+    }
+  }
+
+  public async linkExternalIdentity(input: LinkExternalIdentityInput): Promise<StoredUser> {
+    const userId=requireDatabaseId(input.userId,"用户编号");
+    try {
+      return await this.handle.transaction(async transaction=>{
+        await transaction.execute(sql`select id from users where id=${userId} for update`);
+        const state=await this.readAccountSecurity(transaction,userId);
+        if (!state || userId===0n || state.authRevision!==input.expectedAuthRevision) throw new CredentialChangedError();
+        const current=await transaction.query<{user_id:string;subject:string}>(sql`
+          select user_id::text,subject from external_identities where provider=${input.identity.provider}
+            and (subject=${input.identity.subject} or user_id=${userId}) for update
+        `);
+        if (current.some(row=>row.user_id!==input.userId || row.subject!==input.identity.subject)) throw new ExternalIdentityCollisionError();
+        const linked=await transaction.query<{user_id:string}>(sql`
+          insert into external_identities(id,user_id,provider,subject,profile,last_authenticated_at)
+          values(${randomUUID()}::uuid,${userId},${input.identity.provider},${input.identity.subject},${JSON.stringify(linkedIdentityProfile(input.identity,input.now))}::jsonb,${input.now}::timestamptz)
+          on conflict(provider,subject) do update set profile=excluded.profile,last_authenticated_at=excluded.last_authenticated_at,updated_at=excluded.last_authenticated_at
+          where external_identities.user_id=excluded.user_id
+          returning user_id::text
+        `);
+        if (linked.length!==1) throw new ExternalIdentityCollisionError();
+        await this.fillLinkedProfile(transaction,userId,input.identity,input.now);
+        await this.finishAccountChange(transaction,userId,"account.identity.link",input.requestId,input.now);
+        return (await loadUsers(transaction,[userId]))[0]!;
+      });
+    } catch(error) {if(isUniqueViolation(error))throw new ExternalIdentityCollisionError();throw error;}
+  }
+
+  public async unlinkExternalIdentity(input: UnlinkExternalIdentityInput): Promise<boolean> {
+    const userId=requireDatabaseId(input.userId,"用户编号");
+    return this.handle.transaction(async transaction=>{
+      await transaction.execute(sql`select id from users where id=${userId} for update`);
+      const state=await this.readAccountSecurity(transaction,userId);
+      if (!state || userId===0n || state.authRevision!==input.expectedAuthRevision || state.passwordHash!==input.expectedPasswordHash) throw new CredentialChangedError();
+      const bindings=await transaction.query<{provider:string;subject:string}>(sql`select provider,subject from external_identities where user_id=${userId} for update`);
+      if (!bindings.some(row=>row.provider===input.provider && row.subject===input.subject)) return false;
+      const usable=await transaction.query<{available:boolean}>(sql`
+        select exists(select 1 from user_emails where user_id=${userId} and verified_at is not null)
+          or (exists(select 1 from users where id=${userId} and username is not null)
+            and not exists(select 1 from user_emails where user_id=${userId})) as available
+      `);
+      const local=input.localLoginEnabled && Boolean(state.passwordHash) && usable[0]?.available===true;
+      const other=bindings.some(row=>(row.provider!==input.provider || row.subject!==input.subject) && input.otherEnabledProviders.includes(row.provider));
+      if (!local && !other) return false;
+      await transaction.execute(sql`delete from external_identities where user_id=${userId} and provider=${input.provider} and subject=${input.subject}`);
+      await this.finishAccountChange(transaction,userId,"account.identity.unlink",input.requestId,input.now);
+      return true;
+    });
+  }
+
   public async hasExternalIdentity(provider: string, subject: string): Promise<boolean> {
     const rows = await this.handle.query<{ present: boolean }>(sql`
       SELECT EXISTS (
@@ -2091,6 +2173,16 @@ export class DatabaseDataStore implements DataStore {
       const existingId = existing[0]?.user_id;
       if (existingId !== undefined) {
         const existingUserId = requireDatabaseId(existingId, "用户编号");
+        if (input.decoupled) {
+          await transaction.execute(sql`select id from users where id=${existingUserId} for update`);
+          const state=await this.readAccountSecurity(transaction,existingUserId);
+          const binding=await transaction.query<{present:boolean}>(sql`select exists(select 1 from external_identities where user_id=${existingUserId} and provider=${input.provider} and subject=${input.subject}) as present`);
+          if (!state || existingUserId===0n || !binding[0]?.present) throw new CredentialChangedError();
+          const now=new Date().toISOString();
+          await transaction.execute(sql`update external_identities set profile=${JSON.stringify(linkedIdentityProfile(input,now))}::jsonb,last_authenticated_at=${now}::timestamptz,updated_at=${now}::timestamptz where provider=${input.provider} and subject=${input.subject}`);
+          await this.fillLinkedProfile(transaction,existingUserId,input,now);
+          return (await loadUsers(transaction,[existingUserId]))[0]!;
+        }
         const current = (await loadUsers(transaction, [existingUserId]))[0];
         if (current === undefined) {
           throw new Error("统一身份认证绑定的账号不存在。");
@@ -2194,14 +2286,14 @@ export class DatabaseDataStore implements DataStore {
           ${databaseUserId},
           ${input.provider},
           ${input.subject},
-          ${JSON.stringify({})}::jsonb,
+          ${JSON.stringify(linkedIdentityProfile(input))}::jsonb,
           now()
         )
       `);
       await upsertStudentIdentifiers(
         transaction,
         databaseUserId,
-        input.studentIds,
+        input.decoupled ? undefined : input.studentIds,
         input.strictReconciliation === true
       );
       if (input.email !== undefined) {
@@ -2214,7 +2306,7 @@ export class DatabaseDataStore implements DataStore {
             ${input.email},
             ${input.email},
             true,
-            now()
+            ${!input.decoupled || input.emailVerified===true ? new Date().toISOString() : null}::timestamptz
           )
           ON CONFLICT (normalized_address) DO NOTHING
           RETURNING user_id::text AS user_id
@@ -2283,7 +2375,8 @@ export class DatabaseDataStore implements DataStore {
     userId: string,
     expiresAt: string,
     impersonatorUserId?: string | null,
-    passwordProof?: PasswordSessionProof
+    passwordProof?: PasswordSessionProof,
+    externalProof?: ExternalSessionProof
   ): Promise<StoredSession> {
     const databaseUserId = requireDatabaseId(userId, "用户编号");
     const impersonatorDatabaseUserId =
@@ -2294,19 +2387,21 @@ export class DatabaseDataStore implements DataStore {
       SELECT auth_revision
       FROM users
       WHERE id = ${databaseUserId} AND disabled_at IS NULL
+        ${externalProof===undefined?sql``:sql`AND EXISTS (SELECT 1 FROM external_identities WHERE user_id=${databaseUserId} AND provider=${externalProof.provider} AND subject=${externalProof.subject})`}
         ${passwordProof === undefined ? sql`` : sql`AND password_hash = ${passwordProof.passwordHash}`}
         ${passwordProof?.authRevision === undefined ? sql`` : sql`AND auth_revision = ${passwordProof.authRevision}`}
     `);
     const authRevision = authRows[0]?.auth_revision;
     if (authRevision === undefined) {
-      if (passwordProof !== undefined) throw new CredentialChangedError();
+      if (passwordProof !== undefined || externalProof !== undefined) throw new CredentialChangedError();
       throw new Error("无法为不存在或已停用的用户创建会话。");
     }
 
     const token = randomBytes(32).toString("base64url");
+    const createdAt=new Date().toISOString();
     await this.handle.execute(sql`
       INSERT INTO sessions (
-        id, token_digest, user_id, impersonator_user_id, auth_revision, expires_at
+        id, token_digest, user_id, impersonator_user_id, auth_revision, expires_at, created_at
       )
       VALUES (
         ${randomUUID()}::uuid,
@@ -2314,13 +2409,15 @@ export class DatabaseDataStore implements DataStore {
         ${databaseUserId},
         ${impersonatorDatabaseUserId},
         ${Number(authRevision)},
-        ${expiresAt}::timestamptz
+        ${expiresAt}::timestamptz,
+        ${createdAt}::timestamptz
       )
     `);
     return {
       id: token,
       userId,
       expiresAt,
+      createdAt,
       ...(impersonatorUserId === undefined ? {} : { impersonatorUserId })
     };
   }
@@ -2329,11 +2426,13 @@ export class DatabaseDataStore implements DataStore {
       user_id: string;
       impersonator_user_id: string | null;
       expires_at: Date | string;
+      created_at: Date | string;
     }>(sql`
       SELECT
         session_record.user_id::text AS user_id,
         session_record.impersonator_user_id::text AS impersonator_user_id,
-        session_record.expires_at
+        session_record.expires_at,
+        session_record.created_at
       FROM sessions session_record
       JOIN users user_record ON user_record.id = session_record.user_id
       WHERE session_record.token_digest = ${sessionDigest(sessionId)}
@@ -2350,6 +2449,7 @@ export class DatabaseDataStore implements DataStore {
       id: sessionId,
       userId: row.user_id,
       expiresAt: toIso(row.expires_at),
+      createdAt: toIso(row.created_at),
       ...(row.impersonator_user_id === null
         ? {}
         : { impersonatorUserId: row.impersonator_user_id })

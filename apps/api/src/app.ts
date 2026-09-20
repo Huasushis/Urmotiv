@@ -3,7 +3,7 @@ import { Readable } from "node:stream";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import { registerAccountSecurityRoutes } from "./account-security-routes";
-import { leaderboardQuerySchema, leaderboardResponseSchema, userContactSchema } from "@urmotiv/contracts";
+import { leaderboardQuerySchema, leaderboardResponseSchema, userContactSchema, linkedIdentitiesResponseSchema, manageIdentityInputSchema, unlinkIdentityInputSchema } from "@urmotiv/contracts";
 import {
   adminSettingsQuerySchema,
   importHistoryQuerySchema,
@@ -105,7 +105,7 @@ import {
   createProblemVisibility,
   hasPermission,
 } from "./permissions";
-import { CredentialChangedError, InMemoryDataStore, UsernameUnavailableError, type DataStore, type PasswordSessionProof } from "./repository";
+import { CredentialChangedError, ExternalIdentityCollisionError, InMemoryDataStore, UsernameUnavailableError, type DataStore, type PasswordSessionProof, type ExternalIdentity, type ExternalSessionProof } from "./repository";
 import {
   createEmailVerificationUrl,
   SmtpEmailVerificationDelivery,
@@ -1046,14 +1046,14 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     });
   }
 
-  async function beginSession(user: StoredUser, reply: FastifyReply, passwordProof?: PasswordSessionProof): Promise<StoredSession> {
+  async function beginSession(user: StoredUser, reply: FastifyReply, passwordProof?: PasswordSessionProof, externalProof?: ExternalSessionProof): Promise<StoredSession> {
     if (!hasPermission(user, "auth.login", {}, dependencies.now())) {
       throw unauthorized();
     }
     const expiresAt = new Date(
       dependencies.now().getTime() + sessionLifetimeSeconds * 1000
     ).toISOString();
-    const session = await dependencies.store.createSession(user.id, expiresAt, undefined, passwordProof);
+    const session = await dependencies.store.createSession(user.id, expiresAt, undefined, passwordProof, externalProof);
     setSessionCookie(session, reply);
     return session;
   }
@@ -1087,7 +1087,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   app.get("/api/v1/health", async () => ({ status: "ok", service: "urmotiv-api" }));
 
-  registerAccountSecurityRoutes(app, {
+  const limitAccountAction = registerAccountSecurityRoutes(app, {
     store: dependencies.store,
     delivery: dependencies.emailVerificationDelivery,
     now: dependencies.now,
@@ -1814,9 +1814,6 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
   });
 
   app.post("/api/v1/auth/email-verification/verify", async (request) => {
-    if (!(await dependencies.adminService.isPublicRegistrationEnabled())) {
-      throw notFound();
-    }
     const input = emailVerificationInputSchema.strict().parse(request.body);
     const userId = await dependencies.store.consumeEmailVerificationToken(
       digestSecretToken(input.token),
@@ -1906,6 +1903,74 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     return authSummary(credential.user);
   });
 
+  async function requireIdentityPassword(request: FastifyRequest, validatedPassword?: string) {
+    const current=await currentSession(request);
+    if (!current) throw unauthorized();
+    if (current.user.accountType!=="human" || current.user.isRoot) throw notFound();
+    if (current.session.impersonatorUserId!=null) throw new ApiError(403,"IMPERSONATION_CREDENTIAL_CHANGE","切换用户期间不能修改登录方式，请重新登录本人账号。");
+    limitAccountAction(request);
+    const input=validatedPassword===undefined?manageIdentityInputSchema.parse(request.body):{currentPassword:validatedPassword};
+    const source=resolveClientAddress(request,dependencies.trustedProxyCidrs);
+    if (dependencies.loginRateLimiter?.isBlocked(source)) throw new ApiError(429,"LOGIN_RATE_LIMITED","验证尝试过于频繁，请稍后再试。");
+    const security=await dependencies.store.getAccountSecurity(current.user.id);
+    if (!await verifyEmailLoginPassword(security?.passwordHash ?? undefined,input.currentPassword) || !security?.passwordHash) {
+      dependencies.loginRateLimiter?.recordFailure(source);
+      throw new ApiError(400,"CURRENT_PASSWORD_INVALID","请确认当前密码。尚无本地密码时，请先验证联系邮箱并通过找回密码设置。");
+    }
+    dependencies.loginRateLimiter?.recordSuccess(source);
+    return {...current,security};
+  }
+
+  app.get("/api/v1/me/identities",async(request,reply)=>{
+    reply.header("cache-control","private, no-store");
+    const current=await currentSession(request);if(!current)throw unauthorized();
+    const security=await dependencies.store.getAccountSecurity(current.user.id);
+    const localEnabled=await dependencies.adminService.isEmailLoginEnabled();
+    return linkedIdentitiesResponseSchema.parse({items:await dependencies.store.listLinkedIdentities(current.user.id),
+      ustcEnabled:await dependencies.adminService.isUstcOAuthEnabled(dependencies.ustcOAuthClient!==undefined),
+      canManage:current.user.accountType==="human" && !current.user.isRoot && current.session.impersonatorUserId==null,
+      hasPassword:Boolean(security?.passwordHash),localLoginAvailable:localEnabled && Boolean(security?.passwordHash) &&
+        (security?.email?.verified===true || (security?.email===null && Boolean(current.user.username)))});
+  });
+
+  app.post("/api/v1/me/identities/ustc/start",async(request,reply)=>{
+    reply.header("cache-control","no-store");reply.header("referrer-policy","no-referrer");
+    const current=await requireIdentityPassword(request);
+    const client=await resolveUstcOAuthClient();if(!client)throw notFound();
+    const start=await client.startLogin("/profile?identity=linked",{userId:current.user.id,
+      sessionDigest:digestSecretToken(current.session.id),authRevision:current.security.authRevision});
+    reply.setCookie(ustcOAuthBrowserBindingCookieName(start.state,dependencies.secureCookies),start.browserBindingCookie.value,
+      {...casBrowserBindingCookieOptions,secure:dependencies.secureCookies,maxAge:start.browserBindingCookie.maxAgeSeconds});
+    return {authorizeUrl:start.authorizeUrl};
+  });
+
+  app.post("/api/v1/me/identities/:provider/unlink",async(request,reply)=>{
+    reply.header("cache-control","private, no-store");
+    const input=unlinkIdentityInputSchema.parse(request.body);
+    const current=await requireIdentityPassword(request,input.currentPassword);
+    const {provider}=z.object({provider:z.string().min(1).max(80)}).strict().parse(request.params);
+    const identities=await dependencies.store.listLinkedIdentities(current.user.id);
+    if(!identities.some(identity=>identity.provider===provider && identity.subject===input.subject))throw notFound();
+    const otherEnabledProviders=[...(dependencies.casClient?["ustc-cas"]:[]),
+      ...(await dependencies.adminService.isUstcOAuthEnabled(dependencies.ustcOAuthClient!==undefined)?["ustc-oauth"]:[])];
+    const removed=await dependencies.store.unlinkExternalIdentity({userId:current.user.id,provider,subject:input.subject,
+      expectedAuthRevision:current.security.authRevision,expectedPasswordHash:current.security.passwordHash!,
+      localLoginEnabled:await dependencies.adminService.isEmailLoginEnabled(),otherEnabledProviders,requestId:request.id,now:dependencies.now().toISOString()});
+    if(!removed)throw new ApiError(409,"LAST_LOGIN_METHOD","解绑后必须保留至少一种可用的登录方式。请先验证邮箱并设置密码，或启用其他已绑定登录方式。");
+    reply.clearCookie(sessionCookieName,{path:"/"});return {ok:true};
+  });
+
+  app.post("/api/v1/me/email-verification",async(request,reply)=>{
+    reply.header("cache-control","private, no-store");
+    const current=await currentSession(request);if(!current)throw unauthorized();
+    if(current.user.accountType!=="human" || current.session.impersonatorUserId!=null)throw notFound();
+    limitAccountAction(request);
+    const email=await dependencies.store.getPrimaryEmail(current.user.id);
+    if(!email || email.verified)throw new ApiError(409,"EMAIL_VERIFICATION_UNAVAILABLE","当前没有需要验证的联系邮箱。");
+    await sendEmailVerification({userId:current.user.id,normalizedEmail:normalizeEmail(email.address)},email.address);
+    reply.code(202);return {ok:true};
+  });
+
   app.get("/api/v1/auth/ustc/start", async (request, reply) => {
       reply.header("cache-control", "no-store");
       reply.header("referrer-policy", "no-referrer");
@@ -1949,6 +2014,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
       reply.header("referrer-policy", "no-referrer");
       const oauthClient = await resolveUstcOAuthClient();
       if (oauthClient === undefined) throw notFound();
+      let linking=false;
       try {
         const parsedInput = ustcOAuthCallbackQuerySchema.strict().safeParse(request.query);
         if (!parsedInput.success) {
@@ -1963,59 +2029,53 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
           ...input,
           browserBinding: readUnambiguousCookie(request, browserBindingCookieName)
         });
+        linking=completed.link!==undefined;
         const subject = z.string().trim().min(1).max(255).safeParse(
           completed.identity.subject
         );
-        const username = z.string().trim().min(1).max(255).safeParse(
-          completed.identity.username
-        );
-        const realName = z.string().trim().min(1).max(120).safeParse(
-          completed.identity.realName
-        );
-        const nickname = z.string().trim().min(1).max(120).safeParse(
-          completed.identity.nickname
-        );
-        if (!subject.success || !username.success || !realName.success || !nickname.success) {
-          throw unauthorized();
-        }
-        if (
-          !(await dependencies.store.hasExternalIdentity(completed.identity.provider, subject.data)) &&
-          !(await dependencies.adminService.isUstcOAuthUserAutoCreationEnabled())
-        ) {
-          throw unauthorized();
-        }
-        let email: string;
-        try {
-          if (completed.identity.email === undefined) {
-            throw new Error("missing email");
-          }
-          email = normalizeEmail(completed.identity.email);
-        } catch {
-          throw unauthorized();
-        }
+        if (!subject.success) throw unauthorized();
+        const username=z.string().trim().min(1).max(255).refine(value=>!/[\s@]/u.test(value)&&!["root","0"].includes(value.toLowerCase())).safeParse(completed.identity.username);
+        const realName=z.string().trim().min(1).max(120).safeParse(completed.identity.realName);
+        const nickname=z.string().trim().min(1).max(120).safeParse(completed.identity.nickname);
+        const email=z.string().trim().email().max(320).safeParse(completed.identity.email);
         const studentIds = completed.identity.studentIds
           .map((identifier) => ({
             attribute: identifier.attribute,
             value: identifier.value.trim()
           }))
           .filter((identifier) => identifier.value.length > 0 && identifier.value.length <= 255);
-        const user = await dependencies.store.findOrCreateExternalUser({
+        const identity:ExternalIdentity={
           provider: completed.identity.provider,
           subject: subject.data,
-          nickname: nickname.data,
-          username: username.data,
-          realName: realName.data,
-          email,
+          nickname: nickname.success?nickname.data:"USTC 用户",
+          username: username.success?username.data.toUpperCase():`ustc_${randomUUID().slice(0,8)}`,
+          ...(realName.success?{realName:realName.data}:{}),
+          ...(email.success?{email:normalizeEmail(email.data)}:{}),
+          emailVerified:completed.identity.emailVerified===true,
+          decoupled:true,
           strictReconciliation: true,
           ...(studentIds.length === 0 ? {} : { studentIds })
-        });
-        await beginSession(user, reply);
+        };
         reply.clearCookie(browserBindingCookieName, {
           ...casBrowserBindingCookieOptions,
           secure: dependencies.secureCookies
         });
+        let user:StoredUser;
+        if(completed.link) {
+          const current=await currentSession(request);
+          if(!current || current.session.impersonatorUserId!=null || current.user.id!==completed.link.userId || digestSecretToken(current.session.id)!==completed.link.sessionDigest)throw unauthorized();
+          user=await dependencies.store.linkExternalIdentity({userId:current.user.id,expectedAuthRevision:completed.link.authRevision,
+            identity,requestId:request.id,now:dependencies.now().toISOString()});
+        } else {
+          if(!await dependencies.store.hasExternalIdentity(identity.provider,identity.subject) && !await dependencies.adminService.isUstcOAuthUserAutoCreationEnabled()) {
+            return reply.redirect("/login?identity=link-required");
+          }
+          user=await dependencies.store.findOrCreateExternalUser(identity);
+        }
+        await beginSession(user, reply,undefined,{provider:identity.provider,subject:identity.subject});
         return reply.redirect(completed.returnTo);
-      } catch {
+      } catch (error) {
+        if(error instanceof ExternalIdentityCollisionError)return reply.redirect(linking?"/profile?identity=conflict":"/login?identity=link-required");
         throw unauthorized();
       }
     };
@@ -2100,7 +2160,7 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
           ...(email === undefined ? {} : { email }),
           ...(studentIds.length === 0 ? {} : { studentIds })
         });
-        await beginSession(user, reply);
+        await beginSession(user, reply,undefined,{provider:completed.identity.provider,subject:subject.data});
         reply.clearCookie(browserBindingCookieName, {
           ...casBrowserBindingCookieOptions,
           secure: dependencies.secureCookies
