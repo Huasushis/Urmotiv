@@ -77,6 +77,13 @@ export const leaderboardResponseSchema = z.object({
 }).strict();
 export type LeaderboardResponse = z.infer<typeof leaderboardResponseSchema>;
 
+export const reviewerLeaderboardQuerySchema=z.object({sort:z.enum(['reviewed','accuracy']).default('reviewed'),page:z.coerce.number().int().min(1).max(100000).default(1),pageSize:z.coerce.number().int().min(1).max(100).default(30)}).strict();
+export const reviewerStatisticsSchema=z.object({reviewed:z.number().int().nonnegative(),decided:z.number().int().nonnegative(),matched:z.number().int().nonnegative(),accuracy:z.number().min(0).max(1).nullable()}).strict();
+export const reviewerLeaderboardResponseSchema=z.object({items:z.array(reviewerStatisticsSchema.extend({id:z.string(),nickname:z.string()})),total:z.number().int().nonnegative(),page:z.number().int().positive(),pageSize:z.number().int().positive()}).strict();
+export type ReviewerLeaderboardQuery=z.infer<typeof reviewerLeaderboardQuerySchema>;
+export type ReviewerLeaderboardResponse=z.infer<typeof reviewerLeaderboardResponseSchema>;
+export type ReviewerStatistics=z.infer<typeof reviewerStatisticsSchema>;
+
 /** 更新个人资料：空字符串的 qq 表示清除。
  * avatarSource 的切换规则由服务端校验（qq 需要已填写 qq，uploaded 需要已有上传头像）。
  */
@@ -99,3 +106,9 @@ export const avatarUploadResponseSchema = z.object({
 });
 
 export type AvatarUploadResponse = z.infer<typeof avatarUploadResponseSchema>;
+export const emailNotificationPreferencesSchema = z.object({
+  newReview: z.boolean(),
+  approved: z.boolean(),
+  rejected: z.boolean()
+}).strict();
+export type EmailNotificationPreferences = z.infer<typeof emailNotificationPreferencesSchema>;

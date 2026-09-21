@@ -105,10 +105,13 @@ export interface ProblemListFilters {
   origin?: string;
   batch?: string;
   source?: string;
+  reviewByMe?: "reviewed"|"unreviewed";
   sort: "updated_desc" | "updated_asc" | "difficulty_asc" | "difficulty_desc";
 }
 
 export interface VisibleProblemPage {
   items: StoredProblem[];
   total: number;
+  reviewedIds?: string[];
+  reviewCounts?: Record<string,{approve:number;reject:number;requestChanges:number;ai:number}>;
 }

@@ -35,6 +35,7 @@ import {
 } from "../lib/api";
 import { statusText, statusTone } from "../lib/presentation";
 import { isAccessBoundaryError } from "../lib/client-security";
+import {usePeriodicAutosave} from '../lib/use-periodic-autosave';
 import {
   DataAndJudgeTab,
   OverviewTab,
@@ -233,6 +234,8 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
     save.mutate({ problem: working, edit: editNumber.current });
   }, [working, dirty, save, fileUploadPending]);
 
+  const composing=usePeriodicAutosave(saveNow,saveState!=='failed',dirty);
+
   useEffect(() => {
     if (
       !dirty ||
@@ -243,7 +246,7 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
     ) {
       return;
     }
-    const timer = window.setTimeout(saveNow, 1200);
+    const timer = window.setTimeout(()=>{if(!composing.current)saveNow();}, 1200);
     return () => window.clearTimeout(timer);
   }, [dirty, fileUploadPending, save.isPending, saveNow, saveState, working?.capabilities.canEdit, working?.capabilities.canEditTitle]);
 
@@ -415,7 +418,7 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
         </div>
         <div className="workspace-state">
           <span className={`status-badge ${statusTone[working.status]}`}>{statusText[working.status]}</span>
-          <span className={`save-status ${saveState}`}>
+          <span className={`save-status ${saveState}`} role="status" title="停顿后自动保存；连续编辑时每 15 秒保存。保存冲突或失败时停止自动重试，请检查提示。">
             {saveState === "saved" ? <Check size={14} aria-hidden="true" /> : null}
             {saveState === "saving" ? <RefreshCw className="spin" size={14} aria-hidden="true" /> : null}
             {saveText}

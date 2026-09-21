@@ -7,6 +7,7 @@ type TagPickerProps = {
   value: string[];
   onChange: (value: string[]) => void;
   disabled?: boolean;
+  inline?: boolean;
 };
 
 type TagGroup = {
@@ -31,7 +32,7 @@ function tagMatchesSearch(tag: ProblemTag, normalizedSearch: string): boolean {
   return searchable.includes(normalizedSearch);
 }
 
-export function TagPicker({ tags, value, onChange, disabled = false }: TagPickerProps) {
+export function TagPicker({ tags, value, onChange, disabled = false, inline = false }: TagPickerProps) {
   const helpId = useId();
   const menuId = useId();
   const pickerRef = useRef<HTMLFieldSetElement>(null);
@@ -112,7 +113,7 @@ export function TagPicker({ tags, value, onChange, disabled = false }: TagPicker
   useEffect(() => {
     if (!menuOpen) return;
     const closeOutside = (event: PointerEvent) => {
-      if (event.target instanceof Node && !pickerRef.current?.contains(event.target)) {
+      if (!inline && event.target instanceof Node && !pickerRef.current?.contains(event.target)) {
         setMenuOpen(false);
       }
     };
@@ -127,7 +128,7 @@ export function TagPicker({ tags, value, onChange, disabled = false }: TagPicker
       document.removeEventListener("pointerdown", closeOutside);
       document.removeEventListener("keydown", closeOnEscape);
     };
-  }, [menuOpen]);
+  }, [menuOpen, inline]);
 
   const setSelected = (id: string, selected: boolean) => {
     if (disabled) {

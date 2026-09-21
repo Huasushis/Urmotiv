@@ -25,6 +25,7 @@ import {
 
 import type { BeforeSubmitCheck, PluginRegistry } from "@urmotiv/plugin-sdk";
 import type { TrustedPluginDefinition } from "./plugin-host";
+import {aiDraftPluginId} from './ai-draft';
 
 /**
  * 内置插件清单。API 只认识这些随服务一起发布的描述，不会加载上传的代码。
@@ -66,6 +67,17 @@ export function createBuiltinPluginDefinitions(
   runtime: BuiltinPluginRuntime = {}
 ): readonly TrustedPluginDefinition[] {
   return [
+    {
+      source:'builtin:ai-draft',initialState:'disabled',requiresRestart:false,
+      projectUrl:'https://github.com/Huasushis/Urmotiv',
+      manifest:{id:aiDraftPluginId,name:'AI 快速建题',version:'1.0.0',apiVersion:'1',serverEntry:'dist/index.js',permissions:[],settingsSchema:'settings.schema.json'},
+      secretDefinitions:[{name:'apiKey',label:'模型 API 密钥',description:'OpenAI 兼容模型接口密钥，仅加密保存于本插件。使用与 Fermata 相同的服务时，填入相同的模型 API 密钥，不是管理令牌或机器人令牌。'}],
+      settingsSchema:{type:'object',additionalProperties:false,required:['baseUrl','model'],properties:{
+        baseUrl:{type:'string',format:'uri',title:'模型接口地址',description:'OpenAI 兼容接口基础地址，通常以 /v1 结尾；自动追加 /chat/completions。'},
+        model:{type:'string',minLength:1,maxLength:160,title:'模型名称',description:'服务提供方支持的完整模型名称。'},
+        thinking:{type:'boolean',default:true,title:'深度思考',description:'使用 enabled/max 思考强度；不支持该字段的提供方可关闭。'}
+      }}
+    },
     {
       source: "builtin:review-default",
       projectUrl: "https://github.com/Huasushis/Urmotiv/tree/main/plugins/review-default",

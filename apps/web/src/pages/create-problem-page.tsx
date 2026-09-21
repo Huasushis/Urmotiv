@@ -2,12 +2,15 @@ import { ArrowLeft, FilePlus2 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import type { ProblemType } from "@urmotiv/contracts";
+import type { ProblemType,AiDraftResult } from "@urmotiv/contracts";
 import { MarkdownEditor } from "../components/markdown-editor";
 import { TagPicker } from "../components/tag-picker";
 import { createProblem, getSession, listTags } from "../lib/api";
 import {ProblemTemplateImport} from '../components/problem-template-import';
 import type {ParsedProblemTemplate} from '../lib/problem-template';
+import {AiDraftImport} from '../components/ai-draft-import';
+
+function extractedContent(value:AiDraftResult){return {...value.content,solution:[value.content.solution,value.standardSolution?'## 标程（原文）\n\n'+value.standardSolution:'',value.unclassified.trim()?'## 待整理的原文\n\n'+value.unclassified:''].filter(Boolean).join('\n\n')};}
 
 export function CreateProblemPage() {
   const navigate = useNavigate();
@@ -90,6 +93,11 @@ export function CreateProblemPage() {
       </div>
 
       <ProblemTemplateImport onApply={value=>{if((title||basicStatement||basicSolution||template)&&!window.confirm('用模板替换当前题名、内容和样例？类型、知识点和难度保持不变。'))return;setTitle(value.title);setBasicStatement(value.content.basicStatement);setBasicSolution(value.content.basicSolution??'');setTemplate(value);}}/>
+      <AiDraftImport tags={tags.data?.items??[]} tagIds={tagIds} onTagsChange={setTagIds} creating={create.isPending} onCreate={value=>create.mutate({title:value.title,type,tagIds,externalReviewEnabled,codeforcesDifficulty:null,thinkingLevel:null,codingLevel:null,content:extractedContent(value),samples:value.samples,judgeConfig:null})} onApply={value=>{
+        if((title||basicStatement||basicSolution||template)&&!window.confirm('用识别内容替换当前题名、内容和样例？类型、知识点和难度保持不变。'))return;
+        const content=extractedContent(value);
+        setTitle(value.title);setBasicStatement(content.basicStatement);setBasicSolution(content.basicSolution??'');setTemplate({title:value.title,content,samples:value.samples});
+      }}/>
       {template?<p className="notice-line">已带入模板中的正式内容与 {template.samples.length} 组样例，创建后可逐项编辑。</p>:null}
       <div className="form-section">
         <div className="section-heading">

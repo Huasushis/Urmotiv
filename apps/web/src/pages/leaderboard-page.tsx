@@ -4,19 +4,23 @@ import { Trophy } from "lucide-react";
 import type { LeaderboardQuery } from "@urmotiv/contracts";
 import { getLeaderboard } from "../lib/api";
 import { BrandMark } from "../components/brand-mark";
+import {ReviewerRanking} from '../components/reviewer-ranking';
 
 export function LeaderboardPage({ publicView = false }: { publicView?: boolean }) {
   const [params,setParams] = useSearchParams();
+  const reviewers=params.get('kind')==='reviewers';
   const requestedSort=params.get("sort");
   const sort: LeaderboardQuery["sort"] = requestedSort === "approved" || requestedSort === "rejected" ? requestedSort : "submitted";
   const requestedPage=Number(params.get("page") ?? 1);
   const page=Number.isInteger(requestedPage) && requestedPage>=1 && requestedPage<=100_000 ? requestedPage : 1;
   const pageSize=30;
-  const ranking=useQuery({queryKey:["leaderboard",sort,page],queryFn:()=>getLeaderboard({sort,page,pageSize})});
+  const ranking=useQuery({queryKey:["leaderboard",sort,page],queryFn:()=>getLeaderboard({sort,page,pageSize}),enabled:!reviewers});
   const pages=Math.max(1,Math.ceil((ranking.data?.total??0)/pageSize));
   const content=<div className="leaderboard-page">
-    <header className="page-heading"><div><p className="eyebrow">每一份投稿都值得被看见</p><h1><Trophy size={30} aria-hidden="true" /> 投稿榜单</h1>
-      <p>一起让题库更丰富。这里记录大家正式提交过的题目。</p></div></header>
+    <header className="page-heading"><div><p className="eyebrow">每一份贡献都值得被看见</p><h1><Trophy size={30} aria-hidden="true" /> {reviewers?'审题人榜':'投稿榜单'}</h1>
+      <p>{reviewers?'感谢每一次认真审阅。':'一起让题库更丰富。这里记录大家正式提交过的题目。'}</p></div></header>
+    <nav className="guide-tabs" aria-label="榜单分类"><button aria-pressed={!reviewers} onClick={()=>setParams({})}>投稿榜</button><button aria-pressed={reviewers} onClick={()=>setParams({kind:'reviewers'})}>审题人榜</button></nav>
+    {reviewers?<ReviewerRanking/>:<>
     <section className="plain-panel leaderboard-panel" aria-label="投稿排名">
       <div className="leaderboard-toolbar"><span>{ranking.data ? `${ranking.data.total} 位投稿人` : "投稿人"}</span>
         <label>排序方式<select value={sort} onChange={event=>setParams({sort:event.target.value,page:"1"})}>
@@ -30,6 +34,7 @@ export function LeaderboardPage({ publicView = false }: { publicView?: boolean }
       <nav className="leaderboard-pagination" aria-label="榜单分页"><button type="button" className="secondary-button" disabled={page<=1||ranking.isPending} onClick={()=>setParams({sort,page:String(page-1)})}>上一页</button><span>{page} / {pages}</span><button type="button" className="secondary-button" disabled={page>=pages||ranking.isPending} onClick={()=>setParams({sort,page:String(page+1)})}>下一页</button></nav>
     </section>
     <p className="muted-note leaderboard-explanation">投稿数按题目去重，重复送审不重复计数；未提交的草稿、已删除题目和迁移的历史题库不计入。通过与拒绝按题目当前状态统计。榜单仅公开昵称和汇总数量，不公开题目内容或联系方式。</p>
+    </>}
   </div>;
   if(!publicView) return content;
   return <div className="app-shell"><header className="global-header public-header"><div className="global-header-inner"><Link to="/leaderboard" className="brand"><BrandMark /><span>Urmotiv</span></Link><Link to="/login" className="secondary-button">登录 / 注册</Link></div></header><main className="main-content">{content}</main></div>;

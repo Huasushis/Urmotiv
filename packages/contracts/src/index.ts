@@ -17,3 +17,4 @@ export * from "./account";
 export * from "./plugin";
 export * from "./backup";
 export * from "./announcement";
+export * from './ai-draft';

@@ -20,7 +20,7 @@ import type {
 } from "@urmotiv/contracts";
 import { AdminLayout } from "../components/admin-layout";
 import { SearchInput } from "../components/search-input";
-import { batchChangeProblemStatus, getSession, listProblems, listTags } from "../lib/api";
+import { batchChangeProblemStatus, getSession, listProblems, listTags, getMyReviewStatistics } from "../lib/api";
 import { dateTime, difficultyText, statusText, statusTone, typeText } from "../lib/presentation";
 
 type ProblemListPageProps = {
@@ -65,9 +65,11 @@ export function ProblemListPage({
   const origin = searchParams.get("origin") ?? "";
   const batch = searchParams.get("batch") ?? "";
   const source = searchParams.get("source") ?? "";
+  const reviewFilter=searchParams.get('reviewed');
+  const reviewed = reviewFilter === "unreviewed";
   const page = Math.max(1, Number(searchParams.get("page") ?? "1") || 1);
   const pageSize = management ? 50 : 20;
-  const effectiveStatus = fixedStatus ?? status;
+  const effectiveStatus = reviewed?'pending_review':fixedStatus ?? status;
   const mayManage = managementSession?.canManageProblemStatuses === true;
 
   const updateQuery = (key: string, value: string) => {
@@ -90,7 +92,8 @@ export function ProblemListPage({
     ...(type ? { type } : {}),
     ...(origin ? { origin } : {}),
     ...(batch ? { batch } : {}),
-    ...(source ? { source } : {})
+    ...(source ? { source } : {}),
+    ...(reviewed?{reviewer:'unreviewed' as const}:reviewFilter==='me'?{reviewer:'me' as const}:{})
   };
   const problems = useQuery({
     queryKey: ["problems", query],
@@ -112,6 +115,7 @@ export function ProblemListPage({
   });
   const currentSession = managementSession ?? session.data?.user ?? undefined;
   const canCreateProblem = currentSession?.permissions.includes("problem.create") ?? false;
+  const stats=useQuery({queryKey:['my-review-statistics',currentSession?.id],queryFn:getMyReviewStatistics,enabled:currentSession?.accountType==='human'&&(currentSession.permissions.includes('problem.review')||!!fixedStatus),staleTime:30000});
   const tagNames = new Map(tags.data?.items.map((tag) => [tag.id, tag.name]) ?? []);
   const pages = Math.max(1, Math.ceil((problems.data?.total ?? 0) / pageSize));
   const currentEligible = (problems.data?.items ?? []).filter((problem) =>
@@ -221,6 +225,7 @@ export function ProblemListPage({
           <option value="rejected">审核不通过</option>
         </select>
       </label>
+      {!ownOnly&&currentSession?.permissions.includes('problem.review')?<label><span>我的审核</span><select value={reviewFilter==='me'?'me':reviewed?'unreviewed':''} onChange={event=>updateQuery('reviewed',event.target.value)}><option value="">全部题目</option><option value="unreviewed">待审且本轮我未审</option><option value="me">本轮我已审</option></select></label>:null}
       <label>
         <span>题目类型</span>
         <select value={type} onChange={(event) => updateQuery("type", event.target.value)}>
@@ -411,12 +416,17 @@ export function ProblemListPage({
                     <Link to={`/problems/${encodeURIComponent(problem.id)}`} className="problem-link">
                       <strong>{problem.title}</strong>
                       <span>{problem.id}</span>
+                      {problem.myReviewed?<span className="my-review-badge">本轮已审</span>:null}
                     </Link>
                   </td>
                   <td data-label="状态">
                     <span className={`status-badge ${statusTone[problem.status]}`}>
                       {statusText[problem.status]}
                     </span>
+                    {problem.reviewCounts?<small className="review-counts" title="当前轮次已提交的意见数量，不等于审核规则中的有效票数；AI 是否计票由站点规则决定。">
+                      <span>{Object.values(problem.reviewCounts).some(count=>count>0)?`人工：通过 ${problem.reviewCounts.approve} · 不通过 ${problem.reviewCounts.reject} · 需修改 ${problem.reviewCounts.requestChanges}`:'暂无审核'}</span>
+                      {problem.reviewCounts.ai>0?<span>AI 意见 {problem.reviewCounts.ai}</span>:null}
+                    </small>:null}
                   </td>
                   <td data-label="类型">{typeText[problem.type]}</td>
                   <td data-label="知识点">
@@ -493,6 +503,7 @@ export function ProblemListPage({
         <div>
           <p className="eyebrow">{ownOnly ? "投稿" : fixedStatus ? "审核" : "题库"}</p>
           <h1>{ownOnly ? "我的投稿" : fixedStatus ? "待审核题目" : "题目"}</h1>
+          {stats.data?<p className="review-contribution">我已审 <strong>{stats.data.reviewed}</strong> 道题 · <Link to="/reviews?reviewed=unreviewed">待审且我未审</Link> · <Link to="/leaderboard?kind=reviewers">审题人榜</Link></p>:null}
           <p>
             {ownOnly
               ? "查看自己创建的草稿和审核进度。"

@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { emailNotificationPreferencesSchema } from '@urmotiv/contracts';
+import { ReviewEmailService, sendReviewEmail } from './review-email';
+import {AiDraftService} from './ai-draft';
+import {aiDraftJobSchema} from '@urmotiv/contracts';
 import { Readable } from "node:stream";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
@@ -6,6 +10,7 @@ import { registerAccountSecurityRoutes } from "./account-security-routes";
 import {registerBackupRoutes,type RestoreMaintenance} from "./backup/routes";
 import type {BackupService} from "./backup/service";
 import type {AnnouncementService} from "./announcement-service";
+import {reviewerLeaderboardQuerySchema,reviewerLeaderboardResponseSchema,reviewerStatisticsSchema} from '@urmotiv/contracts';
 import {registerAnnouncementRoutes} from "./announcement-routes";
 import { leaderboardQuerySchema, leaderboardResponseSchema, userContactSchema, linkedIdentitiesResponseSchema, manageIdentityInputSchema, unlinkIdentityInputSchema } from "@urmotiv/contracts";
 import {
@@ -209,6 +214,7 @@ export interface ProblemFilePartsOptions {
 }
 
 export interface ApiAppOptions {
+  reviewEmail?: ReviewEmailService;
   announcements?: AnnouncementService;
   backup?: BackupService;
   backupMaintenance?: RestoreMaintenance;
@@ -1096,6 +1102,41 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
 
   app.get("/api/v1/health", async () => ({ status: "ok", service: "urmotiv-api" }));
 
+  const aiDraft=new AiDraftService(dependencies.pluginHost);
+  const requireDraftAuthor=async(request:FastifyRequest)=>{
+    const user=await requireUser(request);
+    if(user.accountType!=='human'||!hasPermission(user,'problem.create',{},dependencies.now()))throw notFound();
+    return user;
+  };
+  app.get('/api/v1/ai-drafts/availability',async(request)=>{await requireDraftAuthor(request);return {available:await aiDraft.available()};});
+  app.post('/api/v1/ai-drafts',{bodyLimit:1_000_000},async(request,reply)=>{
+    const user=await requireDraftAuthor(request);reply.code(202);
+    return aiDraftJobSchema.parse(await aiDraft.start(user.id,request.body));
+  });
+  app.get('/api/v1/ai-drafts/:id',async(request)=>{
+    const user=await requireDraftAuthor(request),{id}=z.object({id:z.string().uuid()}).parse(request.params);
+    return aiDraftJobSchema.parse(await aiDraft.get(user.id,id));
+  });
+
+  const notificationUser=async(request:FastifyRequest)=>{
+    const user=await requireUser(request);
+    if(user.accountType!=='human'||!options.reviewEmail)throw notFound();
+    return user;
+  };
+  app.get('/api/v1/me/email-notifications',async(request,reply)=>{
+    const user=await notificationUser(request);reply.header('cache-control','private, no-store');
+    return options.reviewEmail!.preferences(user.id);
+  });
+  app.put('/api/v1/me/email-notifications',async(request,reply)=>{
+    const user=await notificationUser(request);reply.header('cache-control','private, no-store');
+    return options.reviewEmail!.savePreferences(user.id,emailNotificationPreferencesSchema.parse(request.body));
+  });
+  if(options.reviewEmail){
+    const notifications=options.reviewEmail;
+    app.addHook('onListen',async()=>{notifications.start(async message=>sendReviewEmail(await dependencies.adminService.getRuntimeSmtpSettings(),message),()=>dependencies.adminService.getEmailVerificationWebUrl());});
+    app.addHook('onClose',()=>notifications.stop());
+  }
+
   const limitAccountAction = registerAccountSecurityRoutes(app, {
     store: dependencies.store,
     delivery: dependencies.emailVerificationDelivery,
@@ -1314,6 +1355,8 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     const query = leaderboardQuerySchema.parse(request.query);
     return leaderboardResponseSchema.parse(await dependencies.store.listLeaderboard(query));
   });
+  app.get('/api/v1/leaderboard/reviewers',async(request,reply)=>{reply.header('cache-control','no-store');return reviewerLeaderboardResponseSchema.parse(await dependencies.store.listReviewerLeaderboard(reviewerLeaderboardQuerySchema.parse(request.query)));});
+  app.get('/api/v1/me/review-statistics',async(request,reply)=>{reply.header('cache-control','private, no-store');const user=await requireUser(request);if(user.accountType!=='human')throw notFound();return reviewerStatisticsSchema.parse(await dependencies.store.getReviewerStatistics(user.id));});
 
   app.get("/api/v1/admin/users/:userId/permissions", async (request, reply) => {
     reply.header("cache-control", "private, no-store");

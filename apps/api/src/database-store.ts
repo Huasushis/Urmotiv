@@ -1,4 +1,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { enqueueReviewEmail } from './review-email';
+import type {ReviewerLeaderboardQuery,ReviewerLeaderboardResponse,ReviewerStatistics} from '@urmotiv/contracts';
+import {databaseReviewerStatistics,emptyReviewerStatistics} from './reviewer-statistics';
 import {
   problemJudgeConfigSchema,
   type PermissionGrant,
@@ -1085,6 +1088,9 @@ async function replaceProblemInTransaction(
   if (updated.length !== 1) {
     throw new Error("保存题目修订时数据库状态发生变化。");
   }
+  if(current.status!==problem.status&&(problem.status==='approved'||problem.status==='rejected')){
+    await enqueueReviewEmail(executor,problem.id,problem.status,`decision:${problem.id}:${problem.revision}`);
+  }
   if (current.external_review_enabled !== (problem.externalReviewEnabled ?? true)) {
     await executor.execute(sql`
       INSERT INTO audit_events (actor_user_id, request_id, action, object_type, object_id, result, metadata)
@@ -1381,6 +1387,8 @@ async function defaultRoleId(
 }
 
 export class DatabaseDataStore implements DataStore {
+  public listReviewerLeaderboard(query:ReviewerLeaderboardQuery):Promise<ReviewerLeaderboardResponse>{return databaseReviewerStatistics(this.handle,query);}
+  public async getReviewerStatistics(userId:string):Promise<ReviewerStatistics>{const row=(await databaseReviewerStatistics(this.handle,{sort:'reviewed',page:1,pageSize:1},userId)).items[0];return row?{reviewed:row.reviewed,decided:row.decided,matched:row.matched,accuracy:row.accuracy}:emptyReviewerStatistics();}
   public async listLeaderboard(query: LeaderboardQuery): Promise<LeaderboardResponse> {
     const order = query.sort === "approved" ? sql`approved` : query.sort === "rejected" ? sql`rejected` : sql`submitted`;
     const rows = await this.handle.query<{ total: number; items: LeaderboardResponse["items"] }>(sql`
@@ -2643,6 +2651,10 @@ export class DatabaseDataStore implements DataStore {
     if (filters.source !== undefined) {
       conditions.push(sql`problem.import_source = ${filters.source}`);
     }
+    if (filters.reviewByMe !== undefined) {
+      const reviewed=sql`EXISTS (SELECT 1 FROM review_opinions o JOIN review_rounds r ON r.id=o.round_id WHERE r.problem_id=problem.id AND r.round=problem.current_review_round AND o.reviewer_user_id=${viewerId} AND o.is_active=true AND o.source='human')`;
+      conditions.push(filters.reviewByMe==='unreviewed'?sql`problem.status='pending_review' AND NOT (${reviewed})`:reviewed);
+    }
     if (filters.search.length > 0) {
       conditions.push(sql`strpos(lower(revision.title), lower(${filters.search})) > 0`);
     }
@@ -2670,10 +2682,20 @@ export class DatabaseDataStore implements DataStore {
       where,
       sql`ORDER BY ${order} LIMIT ${filters.pageSize} OFFSET ${offset}`,
     );
-    return {
-      items: await hydrateProblems(this.handle, rows),
-      total: Number(countRows[0]?.count ?? 0),
-    };
+    const items=await hydrateProblems(this.handle,rows);
+    const reviewed=items.length?await this.handle.query<{id:string}>(sql`SELECT DISTINCT r.problem_id::text AS id FROM review_opinions o JOIN review_rounds r ON r.id=o.round_id JOIN problems p ON p.id=r.problem_id AND p.current_review_round=r.round WHERE o.reviewer_user_id=${viewerId} AND o.is_active=true AND o.source='human' AND p.id IN (${sql.join(items.map(item=>sql`${BigInt(item.id)}`),sql`,`)})`):[];
+    const visibleIds=items.map(item=>BigInt(item.id));
+    const counts=visibleIds.length?await this.handle.query<{id:string;approve:number;reject:number;requestChanges:number;ai:number}>(sql`
+      SELECT p.id::text AS id,
+        count(*) FILTER(WHERE o.source='human' AND o.verdict='approve')::int AS approve,
+        count(*) FILTER(WHERE o.source='human' AND o.verdict='reject')::int AS reject,
+        count(*) FILTER(WHERE o.source='human' AND o.verdict='request_changes')::int AS "requestChanges",
+        count(*) FILTER(WHERE o.source<>'human')::int AS ai
+      FROM problems p JOIN review_rounds r ON r.problem_id=p.id AND r.round=p.current_review_round
+      JOIN review_opinions o ON o.round_id=r.id AND o.is_active=true
+      WHERE p.id IN (${sql.join(visibleIds.map(id=>sql`${id}`),sql`,`)}) GROUP BY p.id
+    `):[];
+    return {items,total:Number(countRows[0]?.count??0),reviewedIds:reviewed.map(row=>row.id),reviewCounts:Object.fromEntries(counts.map(({id,...count})=>[id,count]))};
   }
 
   public async replaceProblem(
@@ -2847,6 +2869,7 @@ export class DatabaseDataStore implements DataStore {
           copy(review),
         ]),
       );
+      const existingReviewIds = new Set([...reviews.values()].map(review=>review.id));
       const changedReviews = new Set<string>();
       const afterReviewWrites: Array<(executor: DatabaseExecutor) => Promise<void>> = [];
       let pendingReplacement:
@@ -2992,6 +3015,7 @@ export class DatabaseDataStore implements DataStore {
         const review = reviews.get(key);
         if (review !== undefined) {
           await writeReview(executor, id, review);
+          if(!existingReviewIds.has(review.id))await enqueueReviewEmail(executor,problemId,'newReview',`review:${review.id}`);
         }
       }
       for (const action of afterReviewWrites) {

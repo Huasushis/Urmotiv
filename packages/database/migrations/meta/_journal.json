@@ -219,6 +219,7 @@
       "tag": "0030_plugin_project_url",
       "breakpoints": true
     },
-    {"idx":31,"version":"7","when":1790000000000,"tag":"0031_announcements","breakpoints":true}
+    {"idx":31,"version":"7","when":1790000000000,"tag":"0031_announcements","breakpoints":true},
+    {"idx":32,"version":"7","when":1790000001000,"tag":"0032_review_email_notifications","breakpoints":true}
   ]
 }

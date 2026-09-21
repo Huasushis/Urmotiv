@@ -33,6 +33,23 @@ export const bytea = customType<{ data: Uint8Array }>({
 
 export type JsonObject = Record<string, unknown>;
 
+export const emailNotificationPreferences=pgTable('email_notification_preferences',{
+  userId:bigint('user_id',{mode:'bigint'}).primaryKey().references(()=>users.id,{onDelete:'cascade'}),
+  newReview:boolean('new_review').notNull().default(true),approved:boolean('approved').notNull().default(true),rejected:boolean('rejected').notNull().default(true)
+});
+export const reviewEmailOutbox=pgTable('review_email_outbox',{
+  id:uuid('id').primaryKey(),eventKey:text('event_key').notNull().unique(),
+  userId:bigint('user_id',{mode:'bigint'}).notNull().references(()=>users.id,{onDelete:'cascade'}),
+  problemId:bigint('problem_id',{mode:'bigint'}).notNull().references(()=>problems.id,{onDelete:'cascade'}),
+  kind:text('kind').notNull(),attempts:integer('attempts').notNull().default(0),
+  availableAt:timestamp('available_at',{withTimezone:true}).notNull().defaultNow(),createdAt:timestamp('created_at',{withTimezone:true}).notNull().defaultNow(),
+  completedAt:timestamp('completed_at',{withTimezone:true}),outcome:text('outcome')
+},table=>[
+  check('review_email_outbox_kind_check',sql`${table.kind} IN ('newReview','approved','rejected')`),
+  check('review_email_outbox_outcome_check',sql`${table.outcome} IN ('sent','skipped','failed')`),
+  index('review_email_pending_idx').on(table.availableAt).where(sql`${table.completedAt} IS NULL`)
+]);
+
 export const announcements = pgTable("announcements",{
   id:uuid("id").primaryKey(),title:text("title").notNull(),body:text("body").notNull(),
   audience:text("audience").notNull(),roleIds:jsonb("role_ids").$type<string[]>().notNull().default(sql`'[]'::jsonb`),

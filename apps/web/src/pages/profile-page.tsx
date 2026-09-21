@@ -4,6 +4,7 @@ import { ImagePlus, Trash2, UserRound } from "lucide-react";
 import type { ProfileView } from "@urmotiv/contracts";
 import { AccountSecurityPanel } from "../components/account-security-panel";
 import { LinkedIdentitiesPanel } from "../components/linked-identities-panel";
+import { EmailNotificationsPanel } from '../components/email-notifications-panel';
 import {
   ApiError,
   avatarUrlFor,
@@ -385,6 +386,7 @@ export function ProfilePage() {
         </div>
       </section>
       <AccountSecurityPanel />
+      <EmailNotificationsPanel />
       <LinkedIdentitiesPanel />
     </div>
   );

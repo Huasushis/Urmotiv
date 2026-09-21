@@ -6316,6 +6316,10 @@ textarea:read-only {
 .leaderboard-rank.podium { background: #d9f2f4; color: #086c7b; font-weight: 700; }
 .leaderboard-pagination { display: flex; align-items: center; justify-content: center; gap: 16px; margin-top: 22px; }
 .leaderboard-explanation { font-size: 13px; line-height: 1.8; margin-top: 20px; }
+.review-matched {display:block;color:var(--text-faint);font-size:11px;}
+.problem-link .my-review-badge {color:var(--green);font-size:11px;}
+.review-contribution {font-size:13px;color:var(--text-soft);}
+.reviewer-table th:first-child {width:46%;}
 @media (max-width: 600px) {
   .leaderboard-panel { padding: 16px; }
   .leaderboard-table th, .leaderboard-table td { padding: 12px 5px; font-size: 13px; }
@@ -6324,3 +6328,15 @@ textarea:read-only {
   .leaderboard-rank { min-width: 24px; height: 28px; }
   .contact-card dl > div { grid-template-columns: minmax(60px, 1fr) minmax(0, 2fr); }
 }
+.email-notification-options { display: grid; gap: .8rem; margin-block: 1rem; }
+.email-notification-options .checkbox-label { display:flex; align-items:center; gap:.6rem; }
+.email-notification-options input[type="checkbox"] { width:1rem; height:1rem; flex-shrink:0; }
+.ai-draft-import { margin-block:1rem; padding:1rem; border:1px solid var(--border-color,#cbd5e1); border-radius:1rem; }
+.ai-draft-import textarea { width:100%; resize:vertical; min-height:10rem; }
+.ai-draft-import pre { white-space:pre-wrap; overflow-wrap:anywhere; }
+.ai-draft-import summary { cursor:pointer; }
+.ai-draft-import .tag-picker-menu { position:static; margin-top:.5rem; }
+.review-counts { display:grid; gap:.2rem; margin-top:.4rem; color:var(--muted,#526871); font-size:.75rem; white-space:normal; min-width:9rem; }
+.guide-screenshot { margin:0 0 2rem; }
+.guide-screenshot img { width:100%; height:auto; border:1px solid var(--border-color,#cbd5e1); border-radius:1rem; }
+.guide-screenshot figcaption { color:var(--muted,#526871); margin-top:.5rem; font-size:.85rem; }

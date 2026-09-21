@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import type {ReviewerLeaderboardQuery,ReviewerLeaderboardResponse,ReviewerStatistics} from '@urmotiv/contracts';
+import {memoryReviewerStatistics,emptyReviewerStatistics} from './reviewer-statistics';
 import { builtinRoleDefinitions, type DatabaseExecutor } from "@urmotiv/database";
 import type { CorePermission, PermissionGrant, ProblemTag, ReviewSuggestionField, LeaderboardQuery, LeaderboardResponse, LinkedIdentity } from "@urmotiv/contracts";
 import type {
@@ -99,6 +101,8 @@ export interface DataStore {
   changeAccountPassword(input: AccountPasswordChange): Promise<boolean>;
   consumeAccountAction(input: AccountActionConsumption): Promise<AccountActionResult | undefined>;
   listLeaderboard(query: LeaderboardQuery): Promise<LeaderboardResponse>;
+  listReviewerLeaderboard(query:ReviewerLeaderboardQuery):Promise<ReviewerLeaderboardResponse>;
+  getReviewerStatistics(userId:string):Promise<ReviewerStatistics>;
   getUser(userId: string): Promise<StoredUser | undefined>;
   listUsers(): Promise<StoredUser[]>;
   getPrimaryEmail(userId: string): Promise<{ readonly address: string; readonly verified: boolean } | undefined>;
@@ -368,6 +372,8 @@ function sortProblems(problems: StoredProblem[], sort: ProblemListFilters["sort"
 }
 
 export class InMemoryDataStore implements DataStore {
+  public async listReviewerLeaderboard(query:ReviewerLeaderboardQuery):Promise<ReviewerLeaderboardResponse>{const rows=memoryReviewerStatistics(this.users.values(),this.problems,this.reviews.values()).sort((a,b)=>(query.sort==='accuracy'?(b.accuracy??-1)-(a.accuracy??-1)||b.decided-a.decided:0)||b.reviewed-a.reviewed||a.id.localeCompare(b.id,'en',{numeric:true}));return {items:rows.slice((query.page-1)*query.pageSize,query.page*query.pageSize),total:rows.length,page:query.page,pageSize:query.pageSize};}
+  public async getReviewerStatistics(userId:string):Promise<ReviewerStatistics>{const row=memoryReviewerStatistics(this.users.values(),this.problems,this.reviews.values()).find(row=>row.id===userId);return row?{reviewed:row.reviewed,decided:row.decided,matched:row.matched,accuracy:row.accuracy}:emptyReviewerStatistics();}
   private readonly users = new Map<string, StoredUser>();
   private readonly baselineGrants = new Map<string, PermissionGrant[]>();
   private readonly permissionDeltas = new Map<string, UserPermissionDelta>();
@@ -1221,12 +1227,19 @@ export class InMemoryDataStore implements DataStore {
         return false;
       }
 
+      if(filters.reviewByMe!==undefined){const reviewed=[...this.reviews.values()].some(review=>review.problemId===problem.id&&review.reviewerId===visibility.viewerId&&review.expectedRound===problem.reviewRound&&review.source==='human');if(filters.reviewByMe==='unreviewed'?(reviewed||problem.status!=='pending_review'):!reviewed)return false;}
+
       return search.length === 0 || problem.title.toLocaleLowerCase().includes(search);
     });
     const total = visible.length;
     const start = (filters.page - 1) * filters.pageSize;
     const items = sortProblems(visible, filters.sort).slice(start, start + filters.pageSize).map(copy);
-    return { items, total };
+    const reviewCounts=Object.fromEntries(items.map(p=>{
+      const count={approve:0,reject:0,requestChanges:0,ai:0};
+      for(const review of this.reviews.values())if(review.problemId===p.id&&review.expectedRound===p.reviewRound){if(review.source!=='human')count.ai++;else if(review.verdict==='request_changes')count.requestChanges++;else count[review.verdict]++;}
+      return [p.id,count];
+    }));
+    return {items,total,reviewedIds:items.filter(problem=>[...this.reviews.values()].some(review=>review.problemId===problem.id&&review.reviewerId===visibility.viewerId&&review.expectedRound===problem.reviewRound&&review.source==='human')).map(problem=>problem.id),reviewCounts};
   }
 
   public async replaceProblem(

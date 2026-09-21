@@ -1,5 +1,8 @@
 import {
+  aiDraftAvailabilitySchema,aiDraftJobSchema,
+  emailNotificationPreferencesSchema,type EmailNotificationPreferences,
   announcementListSchema,
+  reviewerLeaderboardResponseSchema,reviewerStatisticsSchema,type ReviewerLeaderboardQuery,
   fermataLogsSchema,
   type AnnouncementInput,
   backupSettingsViewSchema,
@@ -192,6 +195,12 @@ function apiBaseUrl(): string {
   const configured = import.meta.env.VITE_API_BASE_URL?.trim();
   return (configured || "/api/v1").replace(/\/$/, "");
 }
+
+export const getEmailNotifications=()=>request('/me/email-notifications',{method:'GET'},emailNotificationPreferencesSchema);
+export const getAiDraftAvailability=()=>request('/ai-drafts/availability',{method:'GET'},aiDraftAvailabilitySchema);
+export const startAiDraft=(text:string)=>request('/ai-drafts',json({text}),aiDraftJobSchema);
+export const getAiDraft=(id:string)=>request(`/ai-drafts/${encodeURIComponent(id)}`,{method:'GET'},aiDraftJobSchema);
+export const saveEmailNotifications=(input:EmailNotificationPreferences)=>request('/me/email-notifications',{...json(input),method:'PUT'},emailNotificationPreferencesSchema);
 
 function demoFallbackEnabled(): boolean {
   return import.meta.env.VITE_DEMO_FALLBACK === "true";
@@ -844,6 +853,8 @@ export function getLeaderboard(query: LeaderboardQuery): Promise<LeaderboardResp
   const params = new URLSearchParams({ sort: query.sort, page: String(query.page), pageSize: String(query.pageSize) });
   return request(`/leaderboard?${params}`, { method: "GET" }, leaderboardResponseSchema);
 }
+export function getReviewerLeaderboard(query:ReviewerLeaderboardQuery){return request(`/leaderboard/reviewers?${new URLSearchParams({sort:query.sort,page:String(query.page),pageSize:String(query.pageSize)})}`,{method:'GET'},reviewerLeaderboardResponseSchema);}
+export function getMyReviewStatistics(){return request('/me/review-statistics',{method:'GET'},reviewerStatisticsSchema);}
 
 export function getProblem(id: string): Promise<Problem> {
   return fallback(

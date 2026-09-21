@@ -359,7 +359,7 @@ export const problemListItemSchema = problemSchema.pick({
   importBatch: true,
   importSource: true,
   externalReviewEnabled: true
-});
+}).extend({myReviewed:z.boolean().optional(),reviewCounts:z.object({approve:z.number().int().nonnegative(),reject:z.number().int().nonnegative(),requestChanges:z.number().int().nonnegative(),ai:z.number().int().nonnegative()}).strict().optional()});
 
 export type ProblemListItem = z.infer<typeof problemListItemSchema>;
 
@@ -382,7 +382,8 @@ export const problemListQuerySchema = z.object({
   sort: z.enum(["updated_desc", "updated_asc", "difficulty_asc", "difficulty_desc"]).default("updated_desc"),
   origin: z.string().trim().max(100).optional(),
   batch: z.string().trim().max(200).optional(),
-  source: z.string().trim().max(200).optional()
+  source: z.string().trim().max(200).optional(),
+  reviewer: z.enum(["me","unreviewed"]).optional()
 });
 export type ProblemListQuery = z.infer<typeof problemListQuerySchema>;
 

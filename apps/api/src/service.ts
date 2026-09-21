@@ -386,10 +386,11 @@ export class ProblemService {
       ...(query.type === undefined ? {} : { type: query.type }),
       ...(query.origin === undefined ? {} : { origin: query.origin }),
       ...(query.batch === undefined ? {} : { batch: query.batch }),
-      ...(query.source === undefined ? {} : { source: query.source })
+      ...(query.source === undefined ? {} : { source: query.source }),
+      ...(query.reviewer === undefined ? {} : {reviewByMe:query.reviewer==='me'?'reviewed' as const:'unreviewed' as const})
     };
     const page = await this.store.listVisibleProblems(filters, visibility);
-    const items = await Promise.all(page.items.map((problem) => this.toListItem(problem, user)));
+    const items = await Promise.all(page.items.map(async(problem) => ({...await this.toListItem(problem,user),myReviewed:page.reviewedIds?.includes(problem.id)??false,reviewCounts:page.reviewCounts?.[problem.id]??{approve:0,reject:0,requestChanges:0,ai:0}})));
     return {
       items,
       total: page.total,
