@@ -5,6 +5,7 @@ export const corePermissions = [
   "user.impersonate",
   "user.permission.manage",
   "system.manage",
+  "announcement.manage",
   "plugin.manage",
   "service_account.manage",
   "tag.manage",
@@ -38,6 +39,7 @@ export const corePermissions = [
 export type CorePermission = (typeof corePermissions)[number];
 
 export const robotHardDeniedPermissions = [
+  "announcement.manage",
   "user.delete",
   "user.impersonate",
   "user.permission.manage",

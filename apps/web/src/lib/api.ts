@@ -1,4 +1,7 @@
 import {
+  announcementListSchema,
+  fermataLogsSchema,
+  type AnnouncementInput,
   backupSettingsViewSchema,
   backupListSchema,
   backupJobSchema,
@@ -1108,3 +1111,9 @@ export function getExportJob(jobId: string): Promise<ExportJobView> {
 export function exportDownloadUrl(jobId: string): string {
   return `${apiBaseUrl()}/transfer/exports/${encodeURIComponent(jobId)}/download`;
 }
+
+export function listAnnouncements(page=1,manage=false,popup=false){return request(`${manage?"/admin":""}/announcements?page=${page}&pageSize=20${popup?"&popup=1":""}`,{method:"GET"},announcementListSchema);}
+export function saveAnnouncement(input:AnnouncementInput,id?:string,expectedRevision?:number){return request('/admin/announcements'+(id?'/'+encodeURIComponent(id):''),{...json({...input,...(id?{expectedRevision}:{})}),method:id?'PUT':'POST'},z.object({id:z.string().uuid()}).strict());}
+export function readAnnouncement(id:string,revision:number){return request(`/announcements/${encodeURIComponent(id)}/read`,json({revision}),z.object({ok:z.literal(true)}).strict());}
+export function announcementRoles(){return request('/admin/announcements/roles',{method:'GET'},z.object({items:z.array(z.object({id:z.string().uuid(),name:z.string()}))}));}
+export function getFermataLogs(level='all'){return request('/admin/fermata/logs?level='+encodeURIComponent(level),{method:'GET'},fermataLogsSchema);}

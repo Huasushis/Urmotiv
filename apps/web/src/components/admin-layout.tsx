@@ -63,6 +63,7 @@ export function canOpenAdmin(session: SessionUser): boolean {
     session.canManageProblemStatuses === true ||
     session.canManageOAuth === true ||
     session.permissions.includes("user.create")
+    || session.permissions.includes("announcement.manage")
   );
 }
 
@@ -107,6 +108,7 @@ export function adminNavigationGroups(session: SessionUser): AdminNavigationGrou
     {
       label: "系统",
       items: [
+        ...(session.accountType==='human'&&session.permissions.includes('announcement.manage')?[{to:'/admin/announcements',label:'公告管理'}]:[]),
         ...(canManageSystem ? [{ to: "/admin/settings", label: "常规设置" }] : []),
         ...(canManageSystem && session.isRoot ? [{ to: "/admin/backups", label: "备份与恢复" }] : []),
         ...(canManageOAuth ? [{ to: "/admin/oauth", label: "统一身份认证" }] : []),

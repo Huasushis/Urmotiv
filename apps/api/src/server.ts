@@ -62,6 +62,7 @@ import { assertAdminBootstrapReadyForServer } from "./bootstrap-admin";
 import {BackupService} from "./backup/service";
 import {PostgresBackupEngine} from "./backup/postgres";
 import {RestoreMaintenance} from "./backup/routes";
+import {AnnouncementService} from "./announcement-service";
 
 const appOptions = readServerOptions(process.env);
 const authenticationOptions = readServerAuthenticationOptions(process.env);
@@ -224,6 +225,7 @@ try {
   });
 
   const app = await createApp({
+    announcements:new AnnouncementService(database),
     ...(backup?{backup,backupMaintenance}:{}),
     ...appOptions,
     ...authenticationOptions,

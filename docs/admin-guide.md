@@ -147,6 +147,10 @@ docker compose --env-file /secure/path/urmotiv.env exec -T api pnpm --filter @ur
 
 ## `/admin` 管理面板
 
+「公告管理」需要 `announcement.manage`，可单独授予真人。公告默认面向注册不超过 30 天的新人，天数可设 1–365；也可选择所有登录用户或指定权限组。支持置顶、未读弹窗、草稿与发布，取消发布再保存即可撤回。修改后成为新版本，已读用户可看到新的提醒；公告正文可用 Markdown 链接 `/guide?role=author`、`member`、`leader`、`admin`。
+
+Fermata 插件的管理页提供「运行日志」，需真人同时有 `plugin.manage` 和 `system.manage`。可筛选 INFO/WARN/ERROR，默认手动刷新，可开启每 10 秒刷新。只显示安全运行事件、阶段、耗时和错误码，最多返回 200 条；重启后清空，不包含题面、题解、秘密和模型原文。旧服务不支持日志接口时会明确报错，需同步升级独立 Fermata 服务。
+
 登录后访问 `/admin`，服务端会再次检查 `plugin.manage` 和 `system.manage` 或相应管理权限：
 
 - **插件**：查看内置插件状态、版本、声明的密钥是否已配置，并提交启用/停用/设置更新。可填写「项目链接」导向插件仓库，清空后隐藏；这只是外部链接，不会从地址安装或执行代码。每次更新使用当前 `settingsRevision`；冲突时刷新后重试。密钥只显示“已配置”标记，不会回显完整值或任何字符。

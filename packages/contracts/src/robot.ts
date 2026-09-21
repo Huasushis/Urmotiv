@@ -155,6 +155,12 @@ export const fermataHealthSchema = z
 
 export type FermataHealth = z.infer<typeof fermataHealthSchema>;
 
+export const fermataLogsSchema=z.object({
+  startedAt:z.string().datetime(),
+  items:z.array(z.object({id:z.number().int().positive(),time:z.string().datetime(),level:z.enum(['INFO','WARN','ERROR']),message:z.string().max(200),errorCode:z.string().max(100).nullable(),details:z.record(z.string(),z.union([z.number(),z.boolean()]))}).strict()).max(200)
+}).strict();
+export type FermataLogs=z.infer<typeof fermataLogsSchema>;
+
 const fermataConnectionUrlSchema = z.string().trim().url().max(2_000).refine(value => {
   try {
     const url = new URL(value);

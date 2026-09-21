@@ -4,6 +4,7 @@ export function SiteFooter() {
   return (
     <footer className="site-footer">
       <span>用 Urmotiv 编写下一道好题</span>
+      <a href="/guide">使用文档</a>
       <a
         href="https://github.com/Huasushis/Urmotiv"
         target="_blank"

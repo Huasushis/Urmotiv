@@ -5,6 +5,8 @@ import cors from "@fastify/cors";
 import { registerAccountSecurityRoutes } from "./account-security-routes";
 import {registerBackupRoutes,type RestoreMaintenance} from "./backup/routes";
 import type {BackupService} from "./backup/service";
+import type {AnnouncementService} from "./announcement-service";
+import {registerAnnouncementRoutes} from "./announcement-routes";
 import { leaderboardQuerySchema, leaderboardResponseSchema, userContactSchema, linkedIdentitiesResponseSchema, manageIdentityInputSchema, unlinkIdentityInputSchema } from "@urmotiv/contracts";
 import {
   adminSettingsQuerySchema,
@@ -207,6 +209,7 @@ export interface ProblemFilePartsOptions {
 }
 
 export interface ApiAppOptions {
+  announcements?: AnnouncementService;
   backup?: BackupService;
   backupMaintenance?: RestoreMaintenance;
   store?: DataStore;
@@ -1103,6 +1106,11 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     clearSession: reply => { reply.clearCookie(sessionCookieName, { path: "/" }); }
   });
 
+  registerAnnouncementRoutes(app,{...(options.announcements?{service:options.announcements}:{}),userId:async(request,manage)=>{
+    const user=await requireUser(request);
+    if(user.accountType!=="human"||(manage&&!hasPermission(user,"announcement.manage",{},dependencies.now())))throw notFound();
+    return user.id;
+  }});
   registerBackupRoutes(app,{...(options.backup ? {service:options.backup} : {}),requireRoot:async(request,password)=>{
     const current=await currentSession(request);
     if(!current)throw unauthorized();
@@ -1768,6 +1776,11 @@ export async function createApp(options: ApiAppOptions = {}): Promise<FastifyIns
     await requirePluginManager(request);
     const snapshot = await dependencies.fermataControl.getSettings();
     return snapshot;
+  });
+  app.get('/api/v1/admin/fermata/logs',async(request,reply)=>{
+    reply.header('cache-control','private, no-store');await requirePluginManager(request);
+    const{level}=z.object({level:z.enum(['all','INFO','WARN','ERROR']).default('all')}).strict().parse(request.query);
+    return dependencies.fermataControl.getLogs(level);
   });
 
   app.put("/api/v1/admin/fermata/settings", async (request, reply) => {

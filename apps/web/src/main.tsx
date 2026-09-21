@@ -16,6 +16,8 @@ import { AccountActionPage, PasswordRecoveryPage } from "./pages/account-recover
 import { PageLoadBoundary } from "./components/page-load-boundary";
 
 const loaders = {
+  guide:()=>import('./pages/guide-page'),
+  announcements:()=>import('./pages/announcements-page'),
   backup: () => import("./pages/backup-page"),
   admin: () => import("./pages/admin-page"),
   create: () => import("./pages/create-problem-page"),
@@ -28,6 +30,8 @@ const loaders = {
   permissions: () => import("./pages/admin-permissions-page")
 };
 const AdminPage=lazy(()=>loaders.admin().then(m=>({default:m.AdminPage})));
+const GuidePage=lazy(()=>loaders.guide().then(m=>({default:m.GuidePage})));
+const AnnouncementsPage=lazy(()=>loaders.announcements().then(m=>({default:m.AnnouncementsPage})));
 const BackupPage=lazy(()=>loaders.backup().then(m=>({default:m.BackupPage})));
 const CreateProblemPage=lazy(()=>loaders.create().then(m=>({default:m.CreateProblemPage})));
 const ContestPage=lazy(()=>loaders.contest().then(m=>({default:m.ContestPage})));
@@ -39,6 +43,8 @@ const AdminSectionPage=lazy(()=>loaders.section().then(m=>({default:m.AdminSecti
 const AdminPermissionsPage=lazy(()=>loaders.permissions().then(m=>({default:m.AdminPermissionsPage})));
 
 function loadRoute(path:string):Promise<unknown>|undefined {
+  if(path==='/guide')return loaders.guide();
+  if(path==='/notifications'||path==='/admin/announcements')return loaders.announcements();
   if(path==='/admin/backups')return loaders.backup();
   if(path==='/problems/new')return loaders.create();
   if(/^\/problems\/[^/]+$/.test(path))return loaders.workspace();
@@ -80,6 +86,7 @@ function App() {
   if (location.pathname === "/leaderboard" && !session.data?.user) {
     return <LeaderboardPage publicView />;
   }
+  if(location.pathname==='/guide'&&!session.data?.user)return <Suspense fallback={<p role="status">正在读取文档…</p>}><GuidePage/></Suspense>;
 
   if (session.isLoading) {
     return <div className="centered-message">正在确认登录状态…</div>;
@@ -126,6 +133,9 @@ function App() {
         <Route path="/contests" element={<ContestPage />} />
         <Route path="/transfer" element={<TransferPage />} />
         <Route path="/profile" element={<ProfilePage />} />
+        <Route path="/guide" element={<GuidePage/>} />
+        <Route path="/notifications" element={<AnnouncementsPage session={sessionData.user}/>} />
+        <Route path="/admin/announcements" element={<AnnouncementsPage session={sessionData.user} manage/>} />
         <Route path="/leaderboard" element={<LeaderboardPage />} />
         <Route path="/admin/accounts" element={<BatchAccountPage />} />
         <Route path="/admin/problems" element={<ProblemListPage managementSession={sessionData.user} />} />

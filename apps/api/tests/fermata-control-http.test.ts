@@ -121,6 +121,23 @@ async function setupFermataPlugin(
 }
 
 describe("Fermata 管理 HTTP 接口", () => {
+  it('日志代理复用管理员权限，拒绝机器人、原文扩展字段和上游失败',async()=>{
+    const manager=createUser('logs-manager','human',[grant('plugin.manage'),grant('system.manage')]);
+    const ordinary=createUser('logs-ordinary','human',[]);
+    const robot=createUser('logs-robot','robot',[grant('plugin.manage'),grant('system.manage')]);
+    const data={startedAt:'2026-09-21T00:00:00.000Z',items:[{id:1,time:'2026-09-21T00:00:01.000Z',level:'ERROR',message:'领取任务失败',errorCode:'UNEXPECTED_ERROR',details:{statusCode:503}}]};
+    const fetch=vi.fn<FermataFetch>(async()=>new Response(JSON.stringify(data),{status:200}));
+    const app=await createApp({store:new InMemoryDataStore([manager,ordinary,robot],demoTags),demoAuthEnabled:true,demoUserIds:[manager.id,ordinary.id,robot.id],pluginHost:makeConfiguredHost(),fermataFetch:fetch});openApps.push(app);
+    const cookie=await setupFermataPlugin(app,manager);
+    for(const user of[ordinary,robot]){const denied=await login(app,user.id);expect((await app.inject({url:'/api/v1/admin/fermata/logs',headers:{cookie:denied}})).statusCode).toBe(404);}
+    expect(fetch).not.toHaveBeenCalled();
+    const result=await app.inject({url:'/api/v1/admin/fermata/logs?level=ERROR',headers:{cookie}});expect(result.statusCode).toBe(200);expect(result.json()).toEqual(data);expect(result.headers['cache-control']).toContain('no-store');
+    expect(String(fetch.mock.calls[0]?.[0])).toContain('/api/v1/logs?level=ERROR');
+    fetch.mockImplementationOnce(async()=>new Response(JSON.stringify({...data,rawOutput:'synthetic-secret'}),{status:200}));
+    const malformed=await app.inject({url:'/api/v1/admin/fermata/logs',headers:{cookie}});expect(malformed.statusCode).toBe(502);expect(malformed.body).not.toContain('synthetic-secret');
+    fetch.mockImplementationOnce(async()=>new Response('synthetic-secret',{status:500}));
+    const failed=await app.inject({url:'/api/v1/admin/fermata/logs',headers:{cookie}});expect(failed.statusCode).toBe(502);expect(failed.body).not.toContain('synthetic-secret');
+  });
   it("有权限的管理员能读取 Fermata 健康状态", async () => {
     const manager = createUser("fermata-manager", "human", [
   grant("plugin.manage"),

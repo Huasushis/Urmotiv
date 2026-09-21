@@ -94,6 +94,10 @@ export class FermataControlService {
       throw translateFermataError(error);
     }
   }
+  public async getLogs(level='all',signal?:AbortSignal){
+    const client=await this.#createClient();
+    try{return await client.getLogs(level,signal);}catch(error){throw translateFermataError(error);}
+  }
 
   public async getSettings(signal?: AbortSignal): Promise<FermataSettingsSnapshot> {
     const client = await this.#createClient();

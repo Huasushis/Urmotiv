@@ -9,6 +9,7 @@ interface PermissionText {
 }
 
 const permissionText = {
+  "announcement.manage": {displayName:"管理公告",description:"发布、撤回和编辑公告，设置置顶、弹窗及接收人群。"},
   "auth.login": { displayName: "登录系统", description: "允许账号登录并使用系统。" },
   "user.create": { displayName: "创建账号", description: "允许创建一个或一批账号。" },
   "user.delete": { displayName: "停用账号", description: "允许停用或删除普通账号。" },
@@ -70,7 +71,7 @@ const permissionText = {
   },
   "problem.frozen.edit": {
     displayName: "紧急修改冻结内容",
-    description: "允许在填写原因后修改已冻结的名称、基础题面或基础题解。"
+    description: "允许在填写原因后修改已冻结的基础题面或基础题解；题目名称不冻结。"
   },
   "problem.access.grant": {
     displayName: "设置单题访问权",

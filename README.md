@@ -4,6 +4,8 @@
 
 面向算法竞赛命题团队的协作工作台。从一份题稿出发，完成共同审阅、组题、归档与题目包交付。
 
+打开站点的 `/guide` 可按投稿人、命题组成员、组长、管理员阅读简体中文使用文档。导航栏提供文档与通知入口；公告可指定新人或权限组、置顶并弹窗提醒。新建题目支持下载 Markdown 模板，填写后上传识别、预览确认再创建草稿。
+
 [入门部署](docs/getting-started.md) · [使用指南](docs/user-guide.md) · [管理员指南](docs/admin-guide.md) · [插件开发](docs/plugin-development.md) · [报告问题](https://github.com/Huasushis/Urmotiv/issues)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-087e94.svg)](LICENSE)

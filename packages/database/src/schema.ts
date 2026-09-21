@@ -32,6 +32,19 @@ export const bytea = customType<{ data: Uint8Array }>({
 });
 
 export type JsonObject = Record<string, unknown>;
+
+export const announcements = pgTable("announcements",{
+  id:uuid("id").primaryKey(),title:text("title").notNull(),body:text("body").notNull(),
+  audience:text("audience").notNull(),roleIds:jsonb("role_ids").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  newcomerDays:integer("newcomer_days").notNull().default(30),pinned:boolean("pinned").notNull().default(false),
+  popup:boolean("popup").notNull().default(true),published:boolean("published").notNull().default(false),revision:integer("revision").notNull().default(1),
+  createdByUserId:bigint("created_by_user_id",{mode:"bigint"}).notNull().references(()=>users.id),
+  createdAt:timestamp("created_at",{withTimezone:true}).notNull().defaultNow(),updatedAt:timestamp("updated_at",{withTimezone:true}).notNull().defaultNow()
+});
+export const announcementReads=pgTable("announcement_reads",{
+  announcementId:uuid("announcement_id").notNull().references(()=>announcements.id,{onDelete:"cascade"}),
+  userId:bigint("user_id",{mode:"bigint"}).notNull().references(()=>users.id),revision:integer("revision").notNull(),readAt:timestamp("read_at",{withTimezone:true}).notNull().defaultNow()
+},table=>[primaryKey({columns:[table.announcementId,table.userId]})]);
 export type JsonValue = boolean | number | string | null | JsonObject | JsonValue[];
 
 const emptyObject = sql`'{}'::jsonb`;

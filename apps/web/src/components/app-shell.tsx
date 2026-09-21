@@ -12,15 +12,16 @@ import {
   UserRound,
   X
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { NavLink } from "react-router-dom";
+import { NavLink, useLocation } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import type { SessionResponse } from "@urmotiv/contracts";
 import { avatarUrlFor, logout } from "../lib/api";
 import { clearProblemDrafts } from "../lib/client-security";
 import { canOpenAdmin } from "./admin-layout";
 import { BrandMark } from "./brand-mark";
+import {NotificationButton} from "./notification-button";
 
 type AppShellProps = {
   session: NonNullable<SessionResponse["user"]>;
@@ -89,6 +90,16 @@ function HeaderAvatar({ user }: { user: NonNullable<SessionResponse["user"]> }) 
 export function AppShell({ session, identity, demoEnabled, children }: AppShellProps) {
   const { items: navItems, showManagement } = buildNavItems(session);
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
+  const menuRef=useRef<HTMLDetailsElement>(null);
+  const location=useLocation();
+  useEffect(()=>{if(menuRef.current)menuRef.current.open=false;},[location.pathname,location.search]);
+  useEffect(()=>{
+    const close=(event:Event)=>{if(menuRef.current&&!menuRef.current.contains(event.target as Node))menuRef.current.open=false;};
+    const escape=(event:KeyboardEvent)=>{if(event.key==="Escape"&&menuRef.current?.open){menuRef.current.open=false;menuRef.current.querySelector("summary")?.focus();}};
+    const blur=()=>{if(menuRef.current)menuRef.current.open=false;};
+    document.addEventListener("pointerdown",close);document.addEventListener("focusin",close);document.addEventListener("keydown",escape);window.addEventListener("blur",blur);
+    return()=>{document.removeEventListener("pointerdown",close);document.removeEventListener("focusin",close);document.removeEventListener("keydown",escape);window.removeEventListener("blur",blur);};
+  },[]);
   const client = useQueryClient();
   const signOut = useMutation({
     mutationFn: logout,
@@ -144,7 +155,8 @@ export function AppShell({ session, identity, demoEnabled, children }: AppShellP
               </NavLink>
             ) : null}
           </nav>
-          <details className="user-menu">
+          {session.accountType==='human'?<NotificationButton key={session.id} userId={session.id}/>:null}
+          <details className="user-menu" ref={menuRef}>
             <summary aria-label="打开账号菜单">
               <HeaderAvatar user={session} />
               <span className="user-menu-name">{session.nickname}</span>

@@ -160,6 +160,10 @@ USTC 登录以提供方 + gid/id 找账号；学校提供的用户名、姓名�
 
 ## 组题方案路由
 
+公告接口：`GET /api/v1/announcements` 只返回对当前真人账号发布的内容、总数与未读数，支持 `page`、`pageSize` 和 `popup=1`；`POST /api/v1/announcements/:id/read` 提交 `{revision}`，不接受其他用户编号。`GET/POST /api/v1/admin/announcements`、`PUT /api/v1/admin/announcements/:id` 和 `GET /api/v1/admin/announcements/roles` 要求 `announcement.manage` 且非机器人。更新携带 `expectedRevision`，撤回用 `published: false`；未知或受众外公告不能通过已读接口探测。
+
+`GET /api/v1/admin/fermata/logs?level=all` 代理独立服务的受限运行日志，要求真人同时拥有插件与系统管理权限。级别可选 all/INFO/WARN/ERROR，至多 200 条，不返回上游原始错误内容或秘密；Fermata 不可用时明确返回错误，不伪装为空日志。
+
 完整站点备份另提供 `GET /api/v1/admin/backups`（状态）、`PUT /api/v1/admin/backups/settings`（验证后保存）、`GET /api/v1/admin/backups/files`（远端列表）、`POST /api/v1/admin/backups/run` 与 `POST /api/v1/admin/backups/restore`。仅直接登录的 root 真人且仍拥有 `system.manage` 可访问；恢复还校验当前 root 密码和确认文本，机器人令牌不能调用。启动操作返回 202 和 `job`，随后从状态接口读取结果。配置使用 `expectedRevision`，密钥不回显；具体请求类型见 `packages/contracts/src/backup.ts`，操作流程见[管理员指南](admin-guide.md#网页完整备份)。
 
 | 方法与路径 | 说明 |

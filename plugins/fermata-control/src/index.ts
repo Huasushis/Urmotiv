@@ -1,5 +1,6 @@
 import {
   fermataHealthSchema,
+  fermataLogsSchema,
   fermataPublicSettingsResponseSchema,
   updateFermataPublicSettingsInputSchema,
   type FermataHealth,
@@ -64,6 +65,10 @@ export class FermataControlClient {
 
   public getHealth(signal?: AbortSignal): Promise<FermataHealth> {
     return this.request("health", { method: "GET" }, fermataHealthSchema, signal);
+  }
+  public getLogs(level='all',signal?:AbortSignal){
+    const value=z.enum(['all','INFO','WARN','ERROR']).parse(level);
+    return this.request(`logs?level=${value}&limit=200`,{method:'GET'},fermataLogsSchema,signal);
   }
 
   public getSettings(signal?: AbortSignal): Promise<FermataSettingsSnapshot> {

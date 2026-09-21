@@ -218,6 +218,7 @@
       "when": 1789930800000,
       "tag": "0030_plugin_project_url",
       "breakpoints": true
-    }
+    },
+    {"idx":31,"version":"7","when":1790000000000,"tag":"0031_announcements","breakpoints":true}
   ]
 }

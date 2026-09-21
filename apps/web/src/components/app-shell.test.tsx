@@ -61,6 +61,18 @@ async function waitFor(assertion: () => void): Promise<void> {
   throw latestError;
 }
 
+it("账号菜单点击外部、焦点离开和 Escape 关闭，菜单内焦点不误关闭",()=>{
+  const view=mount(new QueryClient(),<AppShell session={session} demoEnabled={false}><button>外部按钮</button></AppShell>);
+  const menu=view.querySelector('details')!;
+  menu.open=true;
+  act(()=>view.querySelector('.user-menu a')!.dispatchEvent(new FocusEvent('focusin',{bubbles:true})));
+  expect(menu.open).toBe(true);
+  act(()=>view.querySelector('main button')!.dispatchEvent(new Event('pointerdown',{bubbles:true})));
+  expect(menu.open).toBe(false);
+  menu.open=true;act(()=>document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})));expect(menu.open).toBe(false);
+  menu.open=true;act(()=>view.querySelector('main button')!.dispatchEvent(new FocusEvent('focusin',{bubbles:true})));expect(menu.open).toBe(false);
+});
+
 afterEach(() => {
   if (root !== undefined) {
     act(() => root?.unmount());

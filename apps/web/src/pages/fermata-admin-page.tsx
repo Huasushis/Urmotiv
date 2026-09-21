@@ -12,6 +12,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import type { FermataPublicSettings, SessionUser } from "@urmotiv/contracts";
 import { AdminLayout } from "../components/admin-layout";
+import {FermataLogs} from '../components/fermata-logs';
 import {
   ApiError,
   getFermataHealth,
@@ -290,6 +291,7 @@ function FermataControlPanel({ session }: { session: SessionUser }) {
           {wake.isError ? <p className="inline-error" role="alert">{message(wake.error)}</p> : null}
         </section>
       ) : null}
+      <FermataLogs userId={session.id}/>
     </AdminLayout>
   );
 }
