@@ -8,6 +8,8 @@ import {
 } from "../src/ai-draft";
 import type { TrustedPluginHost } from "../src/plugin-host";
 import { createApp } from "../src/app";
+import {InMemoryDataStore} from '../src/repository';
+import type {StoredUser} from '../src/domain';
 const empty = () =>
   Object.fromEntries(
     Object.keys(extractionSchema.shape).map((key) => [key, []]),
@@ -167,7 +169,7 @@ it("模型流式接口使用配置的模型和 max，不设输出 token 截断�
     );
   }
 });
-it("API 匿名、机器人和无创建权限拒绝；插件未配置不能启动", async () => {
+it("API 匿名拒绝；插件未配置不能启动", async () => {
   const app = await createApp({ demoAuthEnabled: true });
   try {
     expect(
@@ -207,4 +209,17 @@ it("API 匿名、机器人和无创建权限拒绝；插件未配置不能启动
   } finally {
     await app.close();
   }
+});
+
+it('机器人即使有创建权也不能发起模型请求，无创建权和明确拒绝的真人也不可用',async()=>{
+  const users:StoredUser[]=['limited','robot','denied'].map(id=>({id,nickname:'合成权限测试',accountType:id==='robot'?'robot':'human',disabled:false,isRoot:false,roles:[],grants:[{permission:'auth.login',effect:'allow',scope:'global'},...(id==='limited'?[]:[{permission:'problem.create' as const,effect:'allow' as const,scope:'global' as const}]),...(id==='denied'?[{permission:'problem.create' as const,effect:'deny' as const,scope:'global' as const}]:[])]}));
+  const store=new InMemoryDataStore(users,[]),app=await createApp({store});
+  try{
+    for(const user of users){
+      const session=await store.createSession(user.id,new Date(Date.now()+60000).toISOString());const headers={cookie:`urmotiv_session=${session.id}`,origin:'http://localhost:5173'};
+      expect((await app.inject({url:'/api/v1/ai-drafts/availability',headers})).statusCode).toBe(404);
+      expect((await app.inject({method:'POST',url:'/api/v1/ai-drafts',headers,payload:{text:'合成文本'}})).statusCode).toBe(404);
+      expect((await app.inject({url:'/api/v1/ai-drafts/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',headers})).statusCode).toBe(404);
+    }
+  }finally{await app.close();}
 });
