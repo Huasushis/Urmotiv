@@ -308,3 +308,14 @@ ANKLANG_SOURCE_DIR=/path/to/anklang \
 - `expectedRevision`、`expectedRound`、`expectedUpdatedAt`、任务摘要和幂等键是并发保护的一部分；收到 `409` 时刷新资源并重新计算请求，不能盲目重放旧正文。
 - 插件清单的 `apiVersion` 当前为字符串 `"1"`；插件自己的版本使用三段数字形式。Anklang 上游查询有自己的 `"1"`/`"2"` 服务版本，不能当作 Urmotiv API 版本。
 - 完整的权限作用域、私有资源掩码和题目包限制分别见[权限参考](permissions.md)和[题目包参考](problem-package.md)。
+## 审题统计、邮件偏好与 AI 快速建题
+
+- `GET /api/v1/leaderboard/reviewers?sort=reviewed|accuracy&page=1&pageSize=30`：公开昵称和去重统计，不返回题目或审核原文。
+- `GET /api/v1/me/review-statistics`：当前账号审题汇总。
+- 题目列表查询 `reviewer=me|unreviewed`：当前轮次本人已审，或待审且本人未审；仍按原题目可见性筛选。列表项 `myReviewed` 与 `reviewCounts` 供直接展示，数量按本轮有效意见记录，不代替终审规则。
+- `GET/PUT /api/v1/me/email-notifications`：当前真人账号的 `{newReview, approved, rejected}` 三个布尔值，默认全部为真。不能传其他账号编号，写入要求同源会话。
+- `GET /api/v1/ai-drafts/availability`：插件是否配置可用。
+- `POST /api/v1/ai-drafts`：提交 `{text}`，返回 202 和任务编号。
+- `GET /api/v1/ai-drafts/:id`：仅创建人且仍有创建权限可读，返回 running/complete/failed。完成结果仅供预览，用户确认后沿用普通创建题目接口生成草稿。
+
+配置、容量与统计口径见[功能说明](reviewer-notifications-ai-draft.md)。
