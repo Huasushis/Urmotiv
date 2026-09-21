@@ -181,7 +181,7 @@ export function GuidePage() {
         ))}
       </nav>
       <article className="guide-content">
-        <figure className="guide-screenshot"><a href={`/guide/${selected.id}.jpg`} target="_blank" rel="noreferrer"><img src={`/guide/${selected.id}.jpg`} alt={`${selected.name}操作入口（合成演示数据）`} loading="lazy"/></a><figcaption>合成演示界面，点击查看大图。具体按钮取决于账号权限。</figcaption></figure>
+        <figure className="guide-screenshot"><a href={`/help-assets/${selected.id}.jpg`} target="_blank" rel="noreferrer"><img src={`/help-assets/${selected.id}.jpg`} alt={`${selected.name}操作入口（合成演示数据）`} loading="lazy"/></a><figcaption>合成演示界面，点击查看大图。具体按钮取决于账号权限。</figcaption></figure>
         <MarkdownPreview value={selected.body} />
       </article>
       <details className="guide-format">

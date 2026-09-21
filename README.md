@@ -25,9 +25,9 @@ Urmotiv 不执行选手代码。AI 审题和原题检索分别由独立的 [Ferm
 
 截图来自真实界面的合成演示数据，不包含私有题库。标志是一句长短相间的节奏：一个动机经过重复、变化与推敲，成为完整的题目和比赛。
 
-![投稿入口：模板填表、基础题面和题解](apps/web/public/guide/author.jpg)
+![投稿入口：模板填表、基础题面和题解](apps/web/public/help-assets/author.jpg)
 
-![审题列表：当前轮次意见数量与本人未审筛选](apps/web/public/guide/member.jpg)
+![审题列表：当前轮次意见数量与本人未审筛选](apps/web/public/help-assets/member.jpg)
 
 站内「使用文档」按投稿人、命题组成员、组长和管理员分别提供步骤与界面图。启用 AI 快速建题插件后，还可粘贴整段材料，按原文提取并确认创建草稿；模型密钥只保存在服务端。
 

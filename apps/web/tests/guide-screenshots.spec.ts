@@ -11,7 +11,7 @@ test("指南插图只取本机合成演示站点，四类入口可操作", async
     ["leader", "/contests", "组题"],
     ["admin", "/admin/announcements", "公告管理"],
   ] as const;
-  const directory = resolve("public/guide");
+  const directory = resolve("public/help-assets");
   if (
     process.env.UPDATE_GUIDE_IMAGES === "1" &&
     info.project.name === "desktop-chromium"
