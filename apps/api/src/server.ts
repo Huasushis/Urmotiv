@@ -135,6 +135,7 @@ try {
   pluginHostReference = pluginHost;
   const problemFormatAdapters = new TrustedProblemFormatAdapterCatalog(pluginHost);
   const store = new DatabaseDataStore(database);
+  const reviewEmail = new ReviewEmailService(database, store);
   const serviceAccountTokens = new DatabaseServiceAccountTokenStore(database);
   const problemFileStore = new ProblemFileStore(database);
   const problemService = new ProblemService(store);
@@ -226,7 +227,7 @@ try {
   });
 
   const app = await createApp({
-    reviewEmail:new ReviewEmailService(database,store),
+    reviewEmail,
     announcements:new AnnouncementService(database),
     ...(backup?{backup,backupMaintenance}:{}),
     ...appOptions,
@@ -261,6 +262,7 @@ try {
   });
   void packageWorker.run();
   app.addHook("onClose", async () => {
+    await reviewEmail.stop();
     await backup?.close();
     await packageWorker.stop().catch(() => undefined);
     await packageQueue.close().catch(() => undefined);

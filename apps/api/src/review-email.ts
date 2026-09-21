@@ -83,7 +83,7 @@ export class ReviewEmailService {
           );
         return row;
       });
-      if (!item) return;
+      if (!item) break;
       let outcome: "sent" | "skipped" | "failed" = "skipped";
       try {
         const user = await this.store.getUser(item.userId);
