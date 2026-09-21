@@ -14,7 +14,7 @@
   "dependencies": {
     "@tanstack/react-query": "latest",
     "@urmotiv/contracts": "workspace:*",
-    "katex": "latest",
+    "katex": "0.16.47",
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
@@ -23,6 +23,8 @@
     "rehype-katex": "latest",
     "remark-gfm": "latest",
     "remark-math": "latest",
+    "remark-parse": "11.0.0",
+    "unified": "11.0.5",
     "zod": "latest"
   },
   "devDependencies": {

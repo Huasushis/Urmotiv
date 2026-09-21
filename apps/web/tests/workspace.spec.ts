@@ -499,20 +499,21 @@ test("评价公开字段、本人修改和状态联动在桌面与手机上保�
   await page.goto(`/problems/${problemId}?tab=reviews`);
   await expect(page.getByRole("heading", { name: "提交我的评价" })).toBeVisible();
   await page.getByLabel("结论").selectOption("request_changes");
-  await page.getByLabel("主要改进点").fill("请补充负数输入的说明。");
+  await page.getByRole('textbox',{name:'主要改进点',exact:true}).fill("请补充**负数输入**的说明。\\(x_i^2\\)");
   const initialSubmit = page.getByRole("button", { name: "提交审核意见" });
   await expect(initialSubmit).toBeDisabled();
   await page.getByLabel("原创性（必填）").selectOption("3");
-  await page.getByLabel("公开评论（可选）").fill("负数输入的处理方式需要向作者说明。");
-  await page.getByLabel("仅审题人可见备注（可选）").fill("内部复核备注，不向作者公开。");
+  await page.getByRole('textbox',{name:'公开评论（可选）',exact:true}).fill("负数输入的处理方式需要向作者说明。");
+  await page.getByRole('textbox',{name:'仅审题人可见备注（可选）',exact:true}).fill("内部复核备注，不向作者公开。");
   await expect(initialSubmit).toBeEnabled();
   await initialSubmit.click();
   await expect(page.getByText("我的评价 · 人工审核")).toBeVisible();
-  await expect(page.locator(".review-item").getByText("请补充负数输入的说明。")).toBeVisible();
+  await expect(page.locator(".review-item strong").filter({hasText:'负数输入'})).toBeVisible();
+  await expect(page.locator('.review-item .katex')).toHaveCount(1);
 
   await loginAs(page, /投稿人/);
   await page.goto(`/problems/${problemId}?tab=reviews`);
-  await expect(page.getByText("请补充负数输入的说明。")).toBeVisible();
+  await expect(page.locator(".review-item strong").filter({hasText:'负数输入'})).toBeVisible();
   await expect(page.getByText("负数输入的处理方式需要向作者说明。")).toBeVisible();
   await expect(page.getByText("内部复核备注，不向作者公开。")).toHaveCount(0);
   await expect(page.locator(".review-form")).toHaveCount(0);
@@ -520,10 +521,10 @@ test("评价公开字段、本人修改和状态联动在桌面与手机上保�
   await loginAs(page, /审题人/);
   await page.goto(`/problems/${problemId}?tab=reviews`);
   await expect(page.getByRole("heading", { name: "修改我的评价" })).toBeVisible();
-  await expect(page.getByLabel("主要改进点")).toHaveValue("请补充负数输入的说明。");
+  await expect(page.getByRole('textbox',{name:'主要改进点',exact:true})).toHaveValue("请补充**负数输入**的说明。\\(x_i^2\\)");
   await expect(page.getByLabel("原创性（必填）")).toHaveValue("3");
   await page.getByLabel("结论").selectOption("reject");
-  await page.getByLabel("主要改进点").fill("题面缺少必要约束，暂不通过。");
+  await page.getByRole('textbox',{name:'主要改进点',exact:true}).fill("题面缺少必要约束，暂不通过。");
   await page.getByRole("button", { name: "保存修改" }).click();
 
   await expect(page.locator(".review-summary").getByText("审核不通过")).toBeVisible();

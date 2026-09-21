@@ -1561,14 +1561,14 @@ export function ReviewTab({
                     ))}
                   </div>
                 ) : null}
-                <p>{review.improvements}</p>
+                <MarkdownPreview value={review.improvements} problemId={problem.id} />
                 {review.publicComment ? (
                   <div className="review-public-comment">
                     <strong>公开评论</strong>
-                    <p>{review.publicComment}</p>
+                    <MarkdownPreview value={review.publicComment} problemId={problem.id} />
                   </div>
                 ) : null}
-                {review.privateNote ? <p className="private-note"><LockKeyhole size={14} />{review.privateNote}</p> : null}
+                {review.privateNote ? <div className="private-note"><LockKeyhole size={14} /><MarkdownPreview value={review.privateNote} problemId={problem.id} /></div> : null}
                 <footer>{dateTime(review.updatedAt)}</footer>
               </article>
             );
@@ -1622,13 +1622,9 @@ export function ReviewTab({
               />
               {tags.isError ? <small>知识点暂时无法读取，原有选择会继续保留。</small> : null}
             </div>
-            <label className="field"><span>主要改进点</span><textarea rows={6} value={improvements} onChange={(e) => setImprovements(e.target.value)} placeholder="说明需要修改的内容；如果通过，说明判断依据。" /></label>
-            <label className="field">
-              <span>公开评论（可选）</span>
-              <textarea rows={3} value={publicComment} onChange={(event) => setPublicComment(event.target.value)} />
-              <small>所有能查看题目的人都能看到，请不要填写只供审题人查看的内容。</small>
-            </label>
-            <label className="field"><span>仅审题人可见备注（可选）</span><textarea rows={3} value={privateNote} onChange={(e) => setPrivateNote(e.target.value)} /></label>
+            <MarkdownEditor label="主要改进点" value={improvements} onChange={setImprovements} problemId={problem.id} minRows={6} />
+            <MarkdownEditor label="公开评论（可选）" value={publicComment} onChange={setPublicComment} problemId={problem.id} minRows={3} helper="所有能查看题目的人都能看到，请不要填写内部备注。" />
+            <MarkdownEditor label="仅审题人可见备注（可选）" value={privateNote} onChange={setPrivateNote} problemId={problem.id} minRows={3} />
             {submit.error ? <p className="form-error">{submit.error.message}</p> : null}
             <button
               className="primary-button"

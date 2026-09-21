@@ -23,6 +23,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { useQuery } from "@tanstack/react-query";
 import { listProblemFiles, problemFileReferenceUrl } from "../lib/api";
+import {normalizeMathDelimiters} from "../lib/markdown-math";
 
 type MarkdownEditorProps = {
   label: string;
@@ -72,7 +73,7 @@ export function MarkdownPreview({ value, problemId }: { value: string; problemId
           }
         }}
       >
-        {value}
+        {normalizeMathDelimiters(value)}
       </ReactMarkdown>
     </div>
   );
@@ -355,6 +356,7 @@ export function MarkdownEditor({
       <div className={`editor-columns mode-${mode}`}>
         <div className="editor-input-pane">
           <textarea
+            aria-label={label}
             ref={textAreaRef}
             value={value}
             onChange={(event) => commitChange(event.target.value)}

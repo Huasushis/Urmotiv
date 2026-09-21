@@ -6,6 +6,8 @@ import type { ProblemType } from "@urmotiv/contracts";
 import { MarkdownEditor } from "../components/markdown-editor";
 import { TagPicker } from "../components/tag-picker";
 import { createProblem, getSession, listTags } from "../lib/api";
+import {ProblemTemplateImport} from '../components/problem-template-import';
+import type {ParsedProblemTemplate} from '../lib/problem-template';
 
 export function CreateProblemPage() {
   const navigate = useNavigate();
@@ -23,6 +25,7 @@ export function CreateProblemPage() {
   const [externalReviewEnabled, setExternalReviewEnabled] = useState(true);
   const [basicStatement, setBasicStatement] = useState("");
   const [basicSolution, setBasicSolution] = useState("");
+  const [template,setTemplate]=useState<ParsedProblemTemplate|null>(null);
 
   const create = useMutation({
     mutationFn: createProblem,
@@ -42,17 +45,18 @@ export function CreateProblemPage() {
       thinkingLevel: thinkingLevel ? Number(thinkingLevel) as 1 | 2 | 3 | 4 | 5 : null,
       codingLevel: codingLevel ? Number(codingLevel) as 1 | 2 | 3 | 4 | 5 : null,
       content: {
-        basicStatement,
-        basicSolution,
         background: "",
         statement: "",
         inputFormat: "",
         outputFormat: "",
         constraints: "",
         solution: "",
-        hints: ""
+        hints: "",
+        ...template?.content,
+        basicStatement,
+        basicSolution
       },
-      samples: [],
+      samples: template?.samples??[],
       judgeConfig: null
     });
   };
@@ -85,6 +89,8 @@ export function CreateProblemPage() {
         <FilePlus2 className="page-heading-icon" size={32} aria-hidden="true" />
       </div>
 
+      <ProblemTemplateImport onApply={value=>{if((title||basicStatement||basicSolution||template)&&!window.confirm('用模板替换当前题名、内容和样例？类型、知识点和难度保持不变。'))return;setTitle(value.title);setBasicStatement(value.content.basicStatement);setBasicSolution(value.content.basicSolution??'');setTemplate(value);}}/>
+      {template?<p className="notice-line">已带入模板中的正式内容与 {template.samples.length} 组样例，创建后可逐项编辑。</p>:null}
       <div className="form-section">
         <div className="section-heading">
           <span>01</span>

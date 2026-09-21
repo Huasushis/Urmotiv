@@ -229,7 +229,7 @@ function fieldControl(
   const field = [...view.querySelectorAll("label")].find(
     (candidate) => candidate.querySelector("span")?.textContent === label
   );
-  const control = field?.querySelector("input, select, textarea");
+  const control = field?.querySelector("input, select, textarea") ?? [...view.querySelectorAll("textarea")].find(item=>item.getAttribute("aria-label")===label);
   if (
     !(control instanceof HTMLInputElement) &&
     !(control instanceof HTMLSelectElement) &&
