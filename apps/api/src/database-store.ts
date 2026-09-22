@@ -2669,7 +2669,7 @@ export class DatabaseDataStore implements DataStore {
     `);
 
     const order =
-      filters.sort === "updated_desc"
+      filters.sort === 'id_asc' ? sql`problem.id ASC` : filters.sort === 'id_desc' ? sql`problem.id DESC` : filters.sort === "updated_desc"
         ? sql`problem.updated_at DESC, problem.id DESC`
         : filters.sort === "updated_asc"
           ? sql`problem.updated_at ASC, problem.id ASC`

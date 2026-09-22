@@ -90,6 +90,18 @@ afterEach(() => {
 });
 
 describe("Markdown 图片预览", () => {
+  it("代码高亮保留原文，未知语言降级，代码中的 HTML 与公式不执行", () => {
+    const view = document.createElement('div');
+    const code = 'const value = "<script>alert(1)</script>";\n// \\(x_i\\)';
+    view.innerHTML = renderToStaticMarkup(<MarkdownPreview value={'```javascript\n' + code + '\n```\n\n```unknown-language\n<script>alert(2)</script>\n```\n\n\\(x_i^2\\)'} />);
+    expect(view.querySelector('code.language-javascript')?.textContent).toBe(code + '\n');
+    expect(view.querySelector('.hljs-keyword')?.textContent).toBe('const');
+    expect(view.querySelector('code.language-unknown-language')?.textContent).toBe('<script>alert(2)</script>\n');
+    expect(view.querySelector('script')).toBeNull();
+    expect(view.querySelector('pre .katex')).toBeNull();
+    expect(view.querySelectorAll('.katex')).toHaveLength(1);
+  });
+
   it("导入包相对图片只解析当前题目允许读取的题面资源", async () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const file = { id: "7293643f-8197-449c-b48b-f674ab0b3772", category: "statement_image" as const,

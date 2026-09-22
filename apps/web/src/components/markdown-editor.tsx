@@ -14,11 +14,13 @@ import {
 import {
   type ClipboardEvent as ReactClipboardEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  useLayoutEffect,
   useRef,
   useState
 } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
+import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { useQuery } from "@tanstack/react-query";
@@ -60,7 +62,7 @@ export function MarkdownPreview({ value, problemId }: { value: string; problemId
     <div className="markdown-body">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeKatex]}
+        rehypePlugins={[[rehypeHighlight,{detect:false,ignoreMissing:true}],rehypeKatex]}
         components={{
           img: ({ src, alt }) => {
             const controlledFile = isControlledProblemFileSource(src, problemId);
@@ -111,6 +113,28 @@ export function MarkdownEditor({
   const [uploadingImage, setUploadingImage] = useState(false);
   const [imageUploadError, setImageUploadError] = useState<string | null>(null);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
+  const columnsRef=useRef<HTMLDivElement>(null);
+  const previewRef=useRef<HTMLDivElement>(null);
+  useLayoutEffect(()=>{
+    const textarea=textAreaRef.current,columns=columnsRef.current,preview=previewRef.current;
+    if(!textarea||!columns||!preview)return;
+    let frame=0,lastWidth=0;
+    const resize=()=>{
+      if(!textarea.getClientRects().length)return;
+      textarea.style.height='0px';
+      const ownHeight=textarea.scrollHeight;
+      const previewVisible=preview.getClientRects().length>0;
+      const style=getComputedStyle(preview);
+      const contentHeight=previewVisible?(preview.firstElementChild?.getBoundingClientRect().height??0)+parseFloat(style.paddingTop)+parseFloat(style.paddingBottom):0;
+      textarea.style.height=Math.ceil(Math.max(ownHeight,contentHeight,parseFloat(getComputedStyle(textarea).minHeight)||0))+'px';
+    };
+    const schedule=()=>{cancelAnimationFrame(frame);frame=requestAnimationFrame(resize);};
+    resize();
+    const observer=typeof ResizeObserver==='undefined'?null:new ResizeObserver(entries=>{for(const entry of entries){if(entry.target===columns){if(entry.contentRect.width===lastWidth)continue;lastWidth=entry.contentRect.width;}schedule();}});
+    observer?.observe(columns);if(preview.firstElementChild)observer?.observe(preview.firstElementChild);
+    preview.addEventListener('load',schedule,true);document.fonts?.ready.then(schedule);
+    return()=>{observer?.disconnect();preview.removeEventListener('load',schedule,true);cancelAnimationFrame(frame);};
+  },[value,mode,minRows]);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const imageUploadPendingRef = useRef(false);
   const undoStackRef = useRef<EditorSnapshot[]>([]);
@@ -353,7 +377,7 @@ export function MarkdownEditor({
           预览
         </button>
       </div>
-      <div className={`editor-columns mode-${mode}`}>
+      <div ref={columnsRef} className={`editor-columns mode-${mode}`}>
         <div className="editor-input-pane">
           <textarea
             aria-label={label}
@@ -368,7 +392,7 @@ export function MarkdownEditor({
             spellCheck="false"
           />
         </div>
-        <div className="editor-preview-pane" aria-label={`${label} 预览`}>
+        <div ref={previewRef} className="editor-preview-pane" aria-label={`${label} 预览`}>
           <MarkdownPreview value={value} problemId={problemId} />
         </div>
       </div>

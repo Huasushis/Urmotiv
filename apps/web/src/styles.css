@@ -1392,7 +1392,8 @@ textarea:read-only {
   font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
   font-size: 13px;
   line-height: 1.7;
-  resize: vertical;
+  resize: none;
+  overflow-y: hidden;
 }
 
 .editor-preview-pane {
@@ -1445,6 +1446,14 @@ textarea:read-only {
   font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
   font-size: 0.9em;
 }
+
+.markdown-body .hljs { color:#233b45; background:transparent; }
+.markdown-body .hljs-keyword,.markdown-body .hljs-selector-tag,.markdown-body .hljs-literal {color:#8756a2;font-weight:600;}
+.markdown-body .hljs-string,.markdown-body .hljs-regexp,.markdown-body .hljs-addition {color:#0b756a;}
+.markdown-body .hljs-number,.markdown-body .hljs-symbol,.markdown-body .hljs-attr {color:#a65a20;}
+.markdown-body .hljs-title,.markdown-body .hljs-built_in,.markdown-body .hljs-type {color:#086c99;}
+.markdown-body .hljs-comment,.markdown-body .hljs-quote {color:#64756f;font-style:italic;}
+.markdown-body .hljs-meta,.markdown-body .hljs-deletion {color:#ad4057;}
 
 .markdown-body img {
   max-width: 100%;

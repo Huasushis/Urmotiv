@@ -346,6 +346,7 @@ function copy<T>(value: T): T {
 
 function sortProblems(problems: StoredProblem[], sort: ProblemListFilters["sort"]): StoredProblem[] {
   return problems.sort((left, right) => {
+    if(sort==='id_asc'||sort==='id_desc')return (sort==='id_asc'?1:-1)*left.id.localeCompare(right.id,'en',{numeric:true});
     if (sort === "updated_desc") {
       return right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id);
     }

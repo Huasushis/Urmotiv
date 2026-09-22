@@ -106,7 +106,7 @@ export interface ProblemListFilters {
   batch?: string;
   source?: string;
   reviewByMe?: "reviewed"|"unreviewed";
-  sort: "updated_desc" | "updated_asc" | "difficulty_asc" | "difficulty_desc";
+  sort: "updated_desc" | "updated_asc" | "difficulty_asc" | "difficulty_desc" | "id_asc" | "id_desc";
 }
 
 export interface VisibleProblemPage {

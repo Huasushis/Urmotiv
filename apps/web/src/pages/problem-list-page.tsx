@@ -265,6 +265,8 @@ export function ProblemListPage({
         <span>排序</span>
         <select value={sort} onChange={(event) => updateQuery("sort", event.target.value)}>
           <option value="updated_desc">最近更新</option>
+          <option value="id_desc">创建顺序：新题在前（题号降序）</option>
+          <option value="id_asc">创建顺序：旧题在前（题号升序）</option>
           <option value="updated_asc">最早更新</option>
           <option value="difficulty_asc">难度从低到高</option>
           <option value="difficulty_desc">难度从高到低</option>

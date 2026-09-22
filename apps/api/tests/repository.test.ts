@@ -60,6 +60,20 @@ function review(): StoredReview {
 }
 
 describe("内存存储事务", () => {
+  it("创建顺序按题号数值排序，分页总数不包含无权草稿", async () => {
+    const users = createDemoUsers();
+    const store = new InMemoryDataStore(users, demoTags);
+    const author = users.find(user => user.id === 'author')!;
+    for (const id of ['2', '10', '9007199254740992', '9007199254740993']) await store.createProblem({...pendingProblem(), id, status:'draft'});
+    await store.createProblem({...pendingProblem(),id:'9',ownerId:'other-author',status:'draft'});
+    const filters={page:1,pageSize:10,search:'',owner:'all' as const};
+    for(const sort of ['id_asc','id_desc'] as const){
+      const result=await store.listVisibleProblems({...filters,sort},createProblemVisibility(author));
+      const ids=['2','10','9007199254740992','9007199254740993'];
+      expect(result.items.map(item=>item.id)).toEqual(sort==='id_asc'?ids:ids.reverse());
+      expect(result.total).toBe(4);
+    }
+  });
   it("题目状态冲突时不保留同一事务写入的审核意见", async () => {
     const users = createDemoUsers();
     const store = new InMemoryDataStore(users, demoTags);

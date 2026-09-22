@@ -379,7 +379,7 @@ export const problemListQuerySchema = z.object({
   status: problemStatusSchema.optional(),
   type: problemTypeSchema.optional(),
   owner: z.enum(["me", "all"]).default("all"),
-  sort: z.enum(["updated_desc", "updated_asc", "difficulty_asc", "difficulty_desc"]).default("updated_desc"),
+  sort: z.enum(["updated_desc", "updated_asc", "difficulty_asc", "difficulty_desc", "id_asc", "id_desc"]).default("updated_desc"),
   origin: z.string().trim().max(100).optional(),
   batch: z.string().trim().max(200).optional(),
   source: z.string().trim().max(200).optional(),

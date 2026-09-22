@@ -20,6 +20,7 @@
     "react-dom": "latest",
     "react-markdown": "latest",
     "react-router-dom": "latest",
+    "rehype-highlight": "7.0.2",
     "rehype-katex": "latest",
     "remark-gfm": "latest",
     "remark-math": "latest",
