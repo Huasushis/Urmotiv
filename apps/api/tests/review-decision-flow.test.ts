@@ -1650,6 +1650,20 @@ describe("可配置审核决定流程", () => {
     }));
   });
 
+  it('作者可将不通过的题目撤回为草稿，保留旧决定、拒绝越权和过期修订，再提交新一轮',async()=>{
+    const {app}=await makeApp();const author=await login(app,'author'),reviewer=await login(app,'reviewer'),leader=await login(app,'leader');
+    const pending=await submitProblem(app,author,await createDraft(app,author));
+    const decision=await app.inject({method:'POST',url:`/api/v1/problems/${pending.id}/review-decision`,headers:{cookie:leader,origin},payload:{expectedRound:pending.reviewRound,expectedRevision:pending.revision,decision:'reject',reason:'合成拒绝结果'}});
+    expect(decision.statusCode).toBe(200);
+    const rejected=(await app.inject({url:`/api/v1/problems/${pending.id}`,headers:{cookie:author}})).json();
+    expect(rejected.capabilities.canWithdraw).toBe(true);
+    expect((await withdraw(app,reviewer,rejected,'非本人')).statusCode).toBe(403);
+    expect((await withdraw(app,author,{id:rejected.id,revision:rejected.revision-1},'过期修订')).statusCode).toBe(409);
+    const withdrawn=await withdraw(app,author,rejected,'先撤回整理');expect(withdrawn.statusCode).toBe(200);expect(withdrawn.json().status).toBe('draft');
+    const history=await app.inject({url:`/api/v1/problems/${pending.id}/reviews`,headers:{cookie:leader}});expect(history.json()).toMatchObject({status:'rejected',decisionSource:'manual',decisionReason:'合成拒绝结果'});
+    const resubmitted=await submitProblem(app,author,withdrawn.json());expect(resubmitted.reviewRound).toBe(pending.reviewRound+1);
+  });
+
   it("最终决定者可以撤回他人的待审题目，普通审题人不能撤回", async () => {
     const { app } = await makeApp();
     const authorCookie = await login(app, "author");

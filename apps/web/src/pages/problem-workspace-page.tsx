@@ -398,7 +398,7 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
 
   const canSubmit = working.capabilities.canSubmit && (working.status === "draft" || working.status === "rejected");
   const canWithdraw =
-    working.capabilities.canWithdraw && (working.status === "pending_review" || working.status === "approved");
+    working.capabilities.canWithdraw && working.status !== "draft";
   const saveText = {
     saved: "已保存",
     dirty: "有未保存修改",
@@ -464,7 +464,7 @@ export function ProblemWorkspacePage({ currentUserId }: { currentUserId: string 
               onClick={() => statusAction.mutate("withdraw")}
             >
               <RotateCcw size={16} aria-hidden="true" />
-              {working.status === "approved" ? "撤回修改" : "撤回投稿"}
+              撤回为草稿
             </button>
           ) : null}
           {working.capabilities.canDelete === true ? (

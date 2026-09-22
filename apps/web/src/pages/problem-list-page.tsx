@@ -20,7 +20,7 @@ import type {
 } from "@urmotiv/contracts";
 import { AdminLayout } from "../components/admin-layout";
 import { SearchInput } from "../components/search-input";
-import { batchChangeProblemStatus, getSession, listProblems, listTags, getMyReviewStatistics } from "../lib/api";
+import { batchChangeProblemStatus, getSession, listProblems, listTags, getMyReviewStatistics, withdrawProblem } from "../lib/api";
 import { dateTime, difficultyText, statusText, statusTone, typeText } from "../lib/presentation";
 
 type ProblemListPageProps = {
@@ -40,7 +40,7 @@ function canApplyAction(action: BatchProblemStatusAction, problem: ProblemListIt
   if (!problem.capabilities.canChangeStatus) return false;
   if (action === "submit") return problem.status === "draft" || problem.status === "rejected";
   if (action === "withdraw") {
-    return problem.status === "pending_review" || problem.status === "approved";
+    return problem.status !== "draft";
   }
   return problem.status === "pending_review";
 }
@@ -58,6 +58,7 @@ export function ProblemListPage({
   const [reason, setReason] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
   const [batchResult, setBatchResult] = useState<BatchProblemStatusResponse | null>(null);
+  const withdrawal=useMutation({mutationFn:(problem:ProblemListItem)=>withdrawProblem(problem.id,problem.revision),onSuccess:async()=>{await queryClient.invalidateQueries({queryKey:['problems']});await queryClient.invalidateQueries({queryKey:['problem']});}});
   const search = searchParams.get("search") ?? "";
   const status = (searchParams.get("status") as ProblemStatus | "") || "";
   const type = (searchParams.get("type") as ProblemType | "") || "";
@@ -346,6 +347,7 @@ export function ProblemListPage({
     <>
       {filters}
       {managementToolbar}
+      {withdrawal.error?<p role="alert" className="inline-error">{withdrawal.error.message}</p>:null}
       {problems.isError ? (
         <div className="inline-error" role="alert">
           <strong>题目列表加载失败</strong>
@@ -427,6 +429,7 @@ export function ProblemListPage({
                       <span>{Object.values(problem.reviewCounts).some(count=>count>0)?`人工：通过 ${problem.reviewCounts.approve} · 不通过 ${problem.reviewCounts.reject} · 需修改 ${problem.reviewCounts.requestChanges}`:'暂无审核'}</span>
                       {problem.reviewCounts.ai>0?<span>AI 意见 {problem.reviewCounts.ai}</span>:null}
                     </small>:null}
+                    {problem.owner.id===currentSession?.id&&problem.capabilities.canWithdraw?<button type="button" className="secondary-button compact-button withdraw-list-button" disabled={withdrawal.isPending} onClick={()=>{if(window.confirm('撤回为草稿？已有审核记录会保留，再次提交会开始新一轮审核。'))withdrawal.mutate(problem);}}>撤回为草稿</button>:null}
                   </td>
                   <td data-label="类型">{typeText[problem.type]}</td>
                   <td data-label="知识点">

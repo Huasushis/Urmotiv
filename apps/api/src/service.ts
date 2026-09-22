@@ -1158,8 +1158,8 @@ export class ProblemService {
       if (!isOwner && !canChangeStatus) {
         throw forbidden();
       }
-      if (current.status !== "pending_review" && current.status !== "approved") {
-        throw conflict("只有待审核或已通过的题目可以撤回修改。");
+      if (current.status !== "pending_review" && current.status !== "approved" && current.status !== "rejected") {
+        throw conflict("只有已经提交过审核的题目可以撤回为草稿。");
       }
       this.assertExpectedRevision(current, expectedRevision);
 
@@ -1937,7 +1937,7 @@ export class ProblemService {
       (problem.status === "draft" || problem.status === "rejected") &&
       canEdit;
     const canWithdraw =
-      (problem.status === "pending_review" || problem.status === "approved") &&
+      (problem.status === "pending_review" || problem.status === "approved" || problem.status === "rejected") &&
       ((isOwner && canEdit) || canChangeStatus);
 
     return {

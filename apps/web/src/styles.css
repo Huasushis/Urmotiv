@@ -6340,3 +6340,4 @@ textarea:read-only {
 .guide-screenshot { margin:0 0 2rem; }
 .guide-screenshot img { width:100%; height:auto; border:1px solid var(--border-color,#cbd5e1); border-radius:1rem; }
 .guide-screenshot figcaption { color:var(--muted,#526871); margin-top:.5rem; font-size:.85rem; }
+.withdraw-list-button { margin-top:.5rem; }

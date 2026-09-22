@@ -1,6 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
 const reuseExistingServer = process.env.PLAYWRIGHT_REUSE_EXISTING_SERVER === "1";
+const apiPort=process.env.URMOTIV_API_PORT??'3000';
 export default defineConfig({
   testDir: "./tests",
   outputDir: "./test-results",
@@ -9,7 +10,7 @@ export default defineConfig({
     {
       command: "sh ../api/dev-e2e.sh",
       cwd: "../api",
-      url: "http://127.0.0.1:3000/api/v1/health",
+      url: `http://127.0.0.1:${apiPort}/api/v1/health`,
       reuseExistingServer,
       timeout: 120_000,
       stdout: "pipe",
