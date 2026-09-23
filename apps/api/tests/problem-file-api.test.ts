@@ -134,6 +134,7 @@ interface UploadOptions {
   readonly originalName: string;
   readonly mediaType?: string;
   readonly replaceExisting?: boolean;
+  readonly replaceFileId?: string;
   readonly bindJudgeProgram?: boolean;
   readonly content?: string | Buffer | Readable;
 }
@@ -154,6 +155,7 @@ async function uploadFile(
   if (options.replaceExisting === true) {
     query.set("replaceExisting", "true");
   }
+  if(options.replaceFileId)query.set('replaceFileId',options.replaceFileId);
   if (options.bindJudgeProgram === true) {
     query.set("bindJudgeProgram", "true");
   }
@@ -174,6 +176,39 @@ async function countFiles(directory: string): Promise<number> {
 }
 
 describe("题目文件接口", () => {
+  it('作者可编辑自己的标程，替换语言保留旧版本，越权及版本冲突不覆盖',async()=>{
+    const {app,database,metadata}=await makeFileApp();
+    const author=await login(app,databaseDemoUserIds.author),member=await login(app,databaseDemoUserIds.member),reviewer=await login(app,databaseDemoUserIds.reviewer);
+    const draft=await createDraft(app,author);
+    const first=await uploadFile(app,author,draft.id,{expectedRevision:draft.revision,category:'standard_solution',logicalPath:'solutions/std/std.cpp',originalName:'std.cpp',content:'int main() { return 0; }\n'});
+    expect(first.statusCode).toBe(200);const saved=first.json();
+    const [old]=await database.query<{id:string}>(sql`SELECT id::text FROM problem_revisions WHERE problem_id=${draft.id} AND revision=${saved.revision}`);
+    const second=await uploadFile(app,author,draft.id,{expectedRevision:saved.revision,category:'standard_solution',logicalPath:'solutions/std/std.py',originalName:'std.py',replaceFileId:saved.item.id,content:'print(0)\n'});
+    expect(second.statusCode).toBe(200);const updated=second.json();
+    expect((await metadata.listRevisionFiles(old!.id)).map(f=>f.id)).toContain(saved.item.id);
+    const list=await app.inject({method:'GET',url:`/api/v1/problems/${draft.id}/files`,headers:{cookie:author}});
+    expect(list.json().items).toHaveLength(1);expect(list.json().items[0].originalName).toBe('std.py');
+    const read=await app.inject({method:'GET',url:`/api/v1/problems/${draft.id}/files/${updated.item.id}`,headers:{cookie:author}});expect(read.body).toBe('print(0)\n');
+    const stale=await uploadFile(app,author,draft.id,{expectedRevision:saved.revision,category:'standard_solution',logicalPath:'solutions/std/late.cpp',originalName:'late.cpp',replaceFileId:updated.item.id});expect(stale.statusCode).toBe(409);
+    const other=await createDraft(app,member);
+    expect((await uploadFile(app,author,other.id,{expectedRevision:1,category:'standard_solution',logicalPath:'solutions/std/x.cpp',originalName:'x.cpp'})).statusCode).toBe(404);
+    const denied=await app.inject({method:'DELETE',url:`/api/v1/problems/${draft.id}/files/${updated.item.id}`,headers:{cookie:reviewer,origin:localOrigin},payload:{expectedRevision:updated.revision}});expect(denied.statusCode).toBe(403);
+    await database.execute(sql`INSERT INTO permission_grants(id,subject_user_id,permission_name,effect,scope,granted_by_user_id,reason) VALUES(${randomUUID()}::uuid,${databaseDemoUserIds.author},'problem.testdata.read','deny','global',0,'合成权限检查')`);
+    expect((await app.inject({method:'GET',url:`/api/v1/problems/${draft.id}/files/${updated.item.id}`,headers:{cookie:author}})).statusCode).toBe(404);
+    await database.execute(sql`INSERT INTO permission_grants(id,subject_user_id,permission_name,effect,scope,granted_by_user_id,reason) VALUES(${randomUUID()}::uuid,${databaseDemoUserIds.author},'problem.testdata.write','deny','global',0,'合成权限检查')`);
+    expect((await uploadFile(app,author,draft.id,{expectedRevision:updated.revision,category:'standard_solution',logicalPath:'solutions/std/no.cpp',originalName:'no.cpp'})).statusCode).toBe(403);
+  });
+
+  it('附件删除拒绝过期版本，成功后当前下载失效；替换不能把内部文件改成公开文件',async()=>{
+    const {app}=await makeFileApp();const author=await login(app,databaseDemoUserIds.author),member=await login(app,databaseDemoUserIds.member);
+    const draft=await createDraft(app,author);
+    const hidden=(await uploadFile(app,member,draft.id,{expectedRevision:1,category:'internal_attachment',logicalPath:'internal/note.txt',originalName:'note.txt'})).json();
+    for(const replacement of [{replaceFileId:hidden.item.id},{replaceExisting:true}])expect((await uploadFile(app,author,draft.id,{expectedRevision:hidden.revision,category:'public_attachment',logicalPath:'internal/note.txt',originalName:'note.txt',...replacement})).statusCode).toBe(404);
+    const visible=(await uploadFile(app,author,draft.id,{expectedRevision:hidden.revision,category:'public_attachment',logicalPath:'attachments/wrong.txt',originalName:'wrong.txt'})).json();
+    const del=(revision:number)=>app.inject({method:'DELETE',url:`/api/v1/problems/${draft.id}/files/${visible.item.id}`,headers:{cookie:author,origin:localOrigin},payload:{expectedRevision:revision}});
+    expect((await del(1)).statusCode).toBe(409);expect((await del(visible.revision)).statusCode).toBe(200);
+    expect((await app.inject({method:'GET',url:`/api/v1/problems/${draft.id}/files/${visible.item.id}`,headers:{cookie:author}})).statusCode).toBe(404);
+  });
   it("按三种题型上传并绑定唯一的当前评测程序，刷新题目后仍返回绑定", async () => {
     const { app } = await makeFileApp();
     const author = await login(app, databaseDemoUserIds.author);
@@ -435,10 +470,8 @@ describe("题目文件接口", () => {
       headers: { cookie: member, origin: localOrigin },
       payload: { expectedRevision: replacementBody.revision }
     });
-    expect(removeBound.statusCode).toBe(422);
-    expect(removeBound.json()).toEqual({
-      error: expect.objectContaining({ code: "INVALID_JUDGE_PROGRAM_REFERENCE" })
-    });
+    expect(removeBound.statusCode).toBe(200);
+    expect(removeBound.json().revision).toBe(replacementBody.revision+1);
 
     const staleReplacement = await uploadFile(app, member, firstProblem.id, {
       expectedRevision: firstUpload.revision,
@@ -455,22 +488,15 @@ describe("题目文件接口", () => {
       headers: { cookie: member }
     });
     expect(refreshed.json()).toEqual(expect.objectContaining({
-      revision: replacementBody.revision,
-      judgeConfig: expect.objectContaining({
-        checker: { type: "special", source: "judge/checker/replacement.cpp" }
-      })
+      revision: replacementBody.revision+1,
+      judgeConfig: expect.not.objectContaining({checker:expect.anything()})
     }));
     const listed = await app.inject({
       method: "GET",
       url: `/api/v1/problems/${firstProblem.id}/files`,
       headers: { cookie: member }
     });
-    expect((listed.json() as { items: Array<{ id: string; logicalPath: string }> }).items).toEqual([
-      expect.objectContaining({
-        id: replacementBody.item.id,
-        logicalPath: "judge/checker/replacement.cpp"
-      })
-    ]);
+    expect((listed.json() as { items: Array<{ id: string; logicalPath: string }> }).items).toEqual([]);
     expect(await countFiles(objectsDirectory)).toBe(3);
   });
 

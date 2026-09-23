@@ -95,7 +95,7 @@ export function AiDraftImport({
           <p>
             {result.samples.length} 组样例；
             {result.standardSolution
-              ? "包含标程，将原样放入正式题解供后续整理。"
+              ? "包含标程，将独立保存到标准程序源码编辑区；代码围栏中的语言会自动识别，可在草稿中修改。"
               : "没有识别出标程。"}
           </p>
           <details>

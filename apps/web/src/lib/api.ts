@@ -188,6 +188,7 @@ export type ProblemFileUploadRequest = {
   logicalPath: string;
   position?: number;
   replaceExisting?: boolean;
+  replaceFileId?: string;
   bindJudgeProgram?: boolean;
 };
 
@@ -919,6 +920,7 @@ export function uploadProblemFile(
     replaceExisting: String(input.replaceExisting ?? false),
     bindJudgeProgram: String(input.bindJudgeProgram ?? false)
   });
+  if(input.replaceFileId)parameters.set('replaceFileId',input.replaceFileId);
   return request(
     `/problems/${encodeURIComponent(problemId)}/files?${parameters.toString()}`,
     {
@@ -937,6 +939,19 @@ export function problemFileReferenceUrl(problemId: string, fileId: string): stri
 
 export function problemFileDownloadUrl(problemId: string, fileId: string): string {
   return `${apiBaseUrl()}/problems/${encodeURIComponent(problemId)}/files/${encodeURIComponent(fileId)}`;
+}
+
+export function removeProblemFile(problemId:string,fileId:string,expectedRevision:number):Promise<{ok:true;revision:number}>{
+ return request(`/problems/${encodeURIComponent(problemId)}/files/${encodeURIComponent(fileId)}`,json({expectedRevision},'DELETE'),z.object({ok:z.literal(true),revision:z.number().int().positive()}).strict());
+}
+
+export async function readStandardProgram(problemId:string,fileId:string):Promise<string>{
+ const response=await fetch(problemFileDownloadUrl(problemId,fileId),{credentials:'include'});
+ if(!response.ok)throw new ApiError('无法读取标准程序，请刷新后检查权限。',response.status);
+ if(Number(response.headers.get('content-length')??0)>2_000_000)throw new Error('源码过大，请下载后查看。');
+ const buffer=await response.arrayBuffer();
+ if(buffer.byteLength>2_000_000)throw new Error('源码过大，请下载后查看。');
+ try{const text=new TextDecoder('utf-8',{fatal:true}).decode(buffer);if(text.includes('\0'))throw Error();return text;}catch{throw new Error('此文件不是 UTF-8 文本源码，请下载后检查编码。');}
 }
 
 export function submitProblem(id: string, expectedRevision: number): Promise<Problem> {

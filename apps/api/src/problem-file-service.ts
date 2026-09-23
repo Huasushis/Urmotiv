@@ -150,7 +150,7 @@ export class ProblemFileService {
     const revisionId = requireRevisionId(problem);
     const records = capabilities.canReadTestdata
       ? await this.#metadata.listRevisionFiles(revisionId)
-      : await this.#metadata.listRevisionFilesForCategories(revisionId, publicProblemFileCategories);
+      : await this.#metadata.listRevisionFilesForCategories(revisionId, capabilities.canReadStandardSolution ? [...publicProblemFileCategories, 'standard_solution'] : publicProblemFileCategories);
     return { items: records.map(toSummary) };
   }
 
@@ -168,10 +168,14 @@ export class ProblemFileService {
     if (!capabilities.canEdit) {
       throw forbidden();
     }
-    if (isInternalProblemFileCategory(input.category) && !capabilities.canWriteTestdata) {
+    if (isInternalProblemFileCategory(input.category) && !(input.category==='standard_solution' ? capabilities.canWriteStandardSolution : capabilities.canWriteTestdata)) {
       throw forbidden("上传测试数据或内部资料需要测试数据管理权限。");
     }
     const isJudgeProgram = judgeProgramCategorySet.has(input.category);
+    if(input.replaceFileId){
+      const previous=await this.#findVisibleFile({problem,capabilities},input.replaceFileId,'write');
+      if(previous.category!==input.category)throw notFound();
+    }
     if (isJudgeProgram !== input.bindJudgeProgram) {
       throw new ApiError(
         422,
@@ -258,9 +262,12 @@ export class ProblemFileService {
                 await this.#metadata.removeFileRelation(revisionId, existing.id, executor);
               }
             }
+          } else if(input.replaceFileId){
+            if(!await this.#metadata.removeFileRelation(revisionId,input.replaceFileId,executor))throw conflict('原文件已改变，请刷新后重试。');
           } else if (input.replaceExisting) {
             const existing = copied.find((record) => record.logicalPath === input.logicalPath);
             if (existing !== undefined) {
+              if(existing.category!==input.category)throw notFound();
               await this.#metadata.removeFileRelation(revisionId, existing.id, executor);
             }
           }
@@ -343,14 +350,14 @@ export class ProblemFileService {
       throw forbidden();
     }
     const record = await this.#findVisibleFile(access, fileId, "write");
-    if (isInternalProblemFileCategory(record.category) && !access.capabilities.canWriteTestdata) {
+    if (isInternalProblemFileCategory(record.category) && !(record.category==='standard_solution' ? access.capabilities.canWriteStandardSolution : access.capabilities.canWriteTestdata)) {
       throw forbidden("移除测试数据或内部资料需要测试数据管理权限。");
     }
 
     const updated = await this.#service.updateProblem(
       user,
       problemId,
-      { expectedRevision },
+      { expectedRevision, ...(judgeProgramReference(access.problem)?.logicalPath===record.logicalPath ? {judgeConfig:clearJudgeProgram(access.problem.judgeConfig)} : {}) },
       async (revisionId, executor) => {
         const removed = await this.#metadata.removeFileRelation(revisionId, fileId, executor);
         if (!removed) {
@@ -377,7 +384,9 @@ export class ProblemFileService {
         : access.capabilities.canReadTestdata || access.capabilities.canWriteTestdata;
     const records = canSeeInternal
       ? await this.#metadata.listRevisionFiles(revisionId)
-      : await this.#metadata.listRevisionFilesForCategories(revisionId, publicProblemFileCategories);
+      : await this.#metadata.listRevisionFilesForCategories(revisionId,
+        (mode==='read'?access.capabilities.canReadStandardSolution:access.capabilities.canReadStandardSolution||access.capabilities.canWriteStandardSolution)
+          ? [...publicProblemFileCategories,'standard_solution'] : publicProblemFileCategories);
     const record = records.find((candidate) => candidate.id === fileId);
     if (record === undefined) {
       throw notFound();
@@ -456,6 +465,13 @@ function judgeProgramReference(problem: StoredProblem): {
 interface ProblemFileAccessCapabilities {
   readonly canReadTestdata: boolean;
   readonly canWriteTestdata: boolean;
+  readonly canReadStandardSolution?: boolean | undefined;
+  readonly canWriteStandardSolution?: boolean | undefined;
+}
+
+function clearJudgeProgram(config:ProblemJudgeConfig|null|undefined):ProblemJudgeConfig{
+ const {checker:_checker,interactor:_interactor,answerChecker:_answerChecker,...rest}=baseJudgeConfig(config);
+ return rest;
 }
 
 const maximumConsecutiveEmptyDownloadChunks = 1024;

@@ -104,7 +104,9 @@ test("AI 提取预览保留代码和未分类原文，确认后创建可编辑�
     .then((r) => r.json());
   expect(problem.status).toBe("draft");
   expect(problem.content.basicStatement).toBe(result.content.basicStatement);
-  expect(problem.content.solution).toContain(result.standardSolution);
+  expect(problem.content.solution).not.toContain(result.standardSolution);
+  const files=await page.request.get(`/api/v1/problems/${problem.id}/files`).then(r=>r.json());
+  expect(files.items).toEqual(expect.arrayContaining([expect.objectContaining({category:'standard_solution',originalName:'std.cpp'})]));
   expect(problem.content.solution).toContain("剩余资料");
   expect(problem.content.hints).toBe("");
 });

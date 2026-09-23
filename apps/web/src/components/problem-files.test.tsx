@@ -6,7 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const api = vi.hoisted(() => ({
   listProblemFiles: vi.fn(),
-  uploadProblemFile: vi.fn()
+  uploadProblemFile: vi.fn(),
+  removeProblemFile: vi.fn()
 }));
 
 vi.mock("../lib/api", async (importOriginal) => {
@@ -17,6 +18,7 @@ vi.mock("../lib/api", async (importOriginal) => {
 import {
   bindJudgeProgramConfig,
   JudgeProgramPanel,
+  ProblemFilesPanel,
   judgeProgramCategoryForType
 } from "./problem-files";
 
@@ -120,6 +122,23 @@ afterEach(() => {
 });
 
 describe("评测程序上传与绑定", () => {
+  it('删除叉号需确认，失败保留附件且不伪造版本',async()=>{
+    const current=problem();current.capabilities.canReadTestdata=false;current.capabilities.canWriteTestdata=false;
+    const file={id:'11111111-1111-4111-8111-111111111111',category:'public_attachment',logicalPath:'attachments/x.txt',originalName:'x.txt',position:0,mediaType:'text/plain',byteSize:1,sha256:'a'.repeat(64),createdAt:timestamp};
+    api.listProblemFiles.mockResolvedValue({items:[file]});api.removeProblemFile.mockRejectedValue(new Error('版本冲突，请刷新'));
+    const confirm=vi.spyOn(window,'confirm').mockReturnValue(false),onRevisionChange=vi.fn();
+    const view=mount(<ProblemFilesPanel problem={current} onRevisionChange={onRevisionChange}/>);
+    await waitFor(()=>expect(view.querySelector('[aria-label="删除 x.txt"]')).not.toBeNull());
+    await act(async()=>view.querySelector<HTMLButtonElement>('[aria-label="删除 x.txt"]')!.click());expect(api.removeProblemFile).not.toHaveBeenCalled();
+    confirm.mockReturnValue(true);await act(async()=>view.querySelector<HTMLButtonElement>('[aria-label="删除 x.txt"]')!.click());
+    await waitFor(()=>expect(view.textContent).toContain('版本冲突'));expect(onRevisionChange).not.toHaveBeenCalled();expect(view.textContent).toContain('x.txt');
+    confirm.mockRestore();
+  });
+  it('只有阅读权限时附件没有删除入口',async()=>{
+    const current=problem();current.capabilities.canEdit=false;current.capabilities.canReadTestdata=false;current.capabilities.canWriteTestdata=false;
+    api.listProblemFiles.mockResolvedValue({items:[{id:'11111111-1111-4111-8111-111111111111',category:'public_attachment',logicalPath:'attachments/x.txt',originalName:'x.txt',position:0,mediaType:'text/plain',byteSize:1,sha256:'a'.repeat(64),createdAt:timestamp}]});
+    const view=mount(<ProblemFilesPanel problem={current}/>);await waitFor(()=>expect(view.textContent).toContain('x.txt'));expect(view.querySelector('[aria-label="删除 x.txt"]')).toBeNull();
+  });
   it("三种题型只生成各自的程序字段", () => {
     expect(judgeProgramCategoryForType("traditional")).toBe("checker");
     expect(judgeProgramCategoryForType("interactive")).toBe("interactor");

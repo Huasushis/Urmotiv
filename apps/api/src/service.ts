@@ -1932,6 +1932,12 @@ export class ProblemService {
     const isOwner = problem.ownerId === user.id;
     const canEdit = canEditProblem(user, problem, this.now());
     const canChangeStatus = hasPermission(user, "problem.status.change", target, this.now());
+    // 作者可维护自己的参考源码；既有内部资料明确拒绝仍优先，机器人不获得额外授权。
+    const sourceUser = isOwner && user.accountType === "human" ? {
+      ...user, grants: [...user.grants,
+        {permission:"problem.testdata.read" as const,effect:"allow" as const,scope:"own" as const},
+        {permission:"problem.testdata.write" as const,effect:"allow" as const,scope:"own" as const}]
+    } : user;
     const canSubmit =
       isOwner &&
       (problem.status === "draft" || problem.status === "rejected") &&
@@ -1957,6 +1963,8 @@ export class ProblemService {
       canConfigureExternalReview: this.canConfigureExternalReview(user, problem),
       canReadTestdata: hasPermission(user, "problem.testdata.read", target, this.now()),
       canWriteTestdata: hasPermission(user, "problem.testdata.write", target, this.now()),
+      canReadStandardSolution: hasPermission(sourceUser, "problem.testdata.read", target, this.now()),
+      canWriteStandardSolution: canEdit && hasPermission(sourceUser, "problem.testdata.write", target, this.now()),
       canExport: canExportProblem(user, problem, this.now()),
       canViewAccessLog: hasPermission(user, "problem.viewers.read", target, this.now()),
       canDelete:

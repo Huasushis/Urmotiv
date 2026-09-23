@@ -1460,6 +1460,13 @@ textarea:read-only {
   height: auto;
 }
 
+.standard-program-panel { margin: 1.5rem 0; padding: 1.25rem; border: 1px solid #cce1e5; border-radius: 12px; background: #f7fcfd; scroll-margin-top: 150px; }
+.standard-program-panel .inline-actions {justify-content:flex-start;}
+.standard-program-editor { min-width: 0; margin: 1rem 0; }
+.standard-program-editor .source-textarea { width: 100%; min-height: 20rem; font: 13px/1.65 "Cascadia Code", Consolas, monospace; tab-size: 4; white-space: pre; overflow: auto; }
+.standard-program-editor .inline-actions { margin-bottom: .75rem; }
+.standard-program-panel select { max-width: 100%; }
+
 .blocked-markdown-image {
   display: inline-flex;
   align-items: center;
@@ -1918,7 +1925,7 @@ textarea:read-only {
 .problem-file-list-heading,
 .problem-file-row {
   display: grid;
-  grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 2fr) auto auto;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 2fr) auto auto auto;
   align-items: center;
   gap: 12px;
   min-width: 0;
@@ -5655,7 +5662,7 @@ textarea:read-only {
   }
 
   .problem-file-row {
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto auto;
     gap: 7px 12px;
   }
 
@@ -5679,6 +5686,7 @@ textarea:read-only {
     grid-column: 2;
     grid-row: 2 / span 2;
   }
+  .problem-file-row .problem-file-remove {grid-column:3;grid-row:2 / span 2;}
 
   .editor-columns {
     display: block;

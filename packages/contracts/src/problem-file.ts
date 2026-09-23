@@ -153,6 +153,7 @@ export const uploadProblemFileInputSchema = z
     originalName: fileOriginalNameSchema,
     mediaType: mediaTypeSchema,
     replaceExisting: z.boolean().default(false),
+    replaceFileId: z.string().uuid().optional(),
     bindJudgeProgram: z.boolean().default(false)
   })
   .strict();
@@ -175,6 +176,7 @@ export const uploadProblemFileQuerySchema = z
       .enum(["true", "false"])
       .default("false")
       .transform((value) => value === "true"),
+    replaceFileId: z.string().uuid().optional(),
     bindJudgeProgram: z
       .enum(["true", "false"])
       .default("false")

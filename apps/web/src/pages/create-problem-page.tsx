@@ -1,16 +1,18 @@
 import { ArrowLeft, FilePlus2 } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import type { ProblemType,AiDraftResult } from "@urmotiv/contracts";
+import type { ProblemType,AiDraftResult,CreateProblemInput,Problem } from "@urmotiv/contracts";
 import { MarkdownEditor } from "../components/markdown-editor";
 import { TagPicker } from "../components/tag-picker";
-import { createProblem, getSession, listTags } from "../lib/api";
+import { createProblem, getSession, listTags, uploadProblemFile } from "../lib/api";
+import {StandardProgramEditor} from '../components/standard-program-editor';
+import {extractStandardProgram,sourceLanguages,type StandardProgram} from '../lib/standard-program';
 import {ProblemTemplateImport} from '../components/problem-template-import';
 import type {ParsedProblemTemplate} from '../lib/problem-template';
 import {AiDraftImport} from '../components/ai-draft-import';
 
-function extractedContent(value:AiDraftResult){return {...value.content,solution:[value.content.solution,value.standardSolution?'## 标程（原文）\n\n'+value.standardSolution:'',value.unclassified.trim()?'## 待整理的原文\n\n'+value.unclassified:''].filter(Boolean).join('\n\n')};}
+function extractedContent(value:AiDraftResult){return {...value.content,solution:[value.content.solution,value.unclassified.trim()?'## 待整理的原文\n\n'+value.unclassified:''].filter(Boolean).join('\n\n')};}
 
 export function CreateProblemPage() {
   const navigate = useNavigate();
@@ -29,9 +31,20 @@ export function CreateProblemPage() {
   const [basicStatement, setBasicStatement] = useState("");
   const [basicSolution, setBasicSolution] = useState("");
   const [template,setTemplate]=useState<ParsedProblemTemplate|null>(null);
+  const [standardProgram,setStandardProgram]=useState<StandardProgram>({source:'',language:'cpp'});
+  const createdDraft=useRef<Problem|null>(null);
 
   const create = useMutation({
-    mutationFn: createProblem,
+    mutationFn: async(input:CreateProblemInput&{standardProgram?:StandardProgram})=>{
+      const {standardProgram:source,...body}=input;
+      const problem=createdDraft.current??await createProblem(body);
+      createdDraft.current=problem;
+      if(source?.source.trim()){
+        const ext=sourceLanguages.find(language=>language.id===source.language)?.extension??'txt';
+        await uploadProblemFile(problem.id,{file:new File([source.source],`std.${ext}`,{type:'text/plain'}),category:'standard_solution',logicalPath:`solutions/std/std.${ext}`,expectedRevision:problem.revision});
+      }
+      return problem;
+    },
     onSuccess: (problem) => {
       client.invalidateQueries({ queryKey: ["problems"] });
       navigate(`/problems/${encodeURIComponent(problem.id)}`);
@@ -60,7 +73,8 @@ export function CreateProblemPage() {
         basicSolution
       },
       samples: template?.samples??[],
-      judgeConfig: null
+      judgeConfig: null,
+      standardProgram
     });
   };
 
@@ -93,9 +107,10 @@ export function CreateProblemPage() {
       </div>
 
       <ProblemTemplateImport onApply={value=>{if((title||basicStatement||basicSolution||template)&&!window.confirm('用模板替换当前题名、内容和样例？类型、知识点和难度保持不变。'))return;setTitle(value.title);setBasicStatement(value.content.basicStatement);setBasicSolution(value.content.basicSolution??'');setTemplate(value);}}/>
-      <AiDraftImport tags={tags.data?.items??[]} tagIds={tagIds} onTagsChange={setTagIds} creating={create.isPending} onCreate={value=>create.mutate({title:value.title,type,tagIds,externalReviewEnabled,codeforcesDifficulty:null,thinkingLevel:null,codingLevel:null,content:extractedContent(value),samples:value.samples,judgeConfig:null})} onApply={value=>{
+      <AiDraftImport tags={tags.data?.items??[]} tagIds={tagIds} onTagsChange={setTagIds} creating={create.isPending||!!createdDraft.current} onCreate={value=>{const source=extractStandardProgram(value.standardSolution);setStandardProgram(source);create.mutate({title:value.title,type,tagIds,externalReviewEnabled,codeforcesDifficulty:null,thinkingLevel:null,codingLevel:null,content:extractedContent(value),samples:value.samples,judgeConfig:null,standardProgram:source});}} onApply={value=>{
         if((title||basicStatement||basicSolution||template)&&!window.confirm('用识别内容替换当前题名、内容和样例？类型、知识点和难度保持不变。'))return;
         const content=extractedContent(value);
+        setStandardProgram(extractStandardProgram(value.standardSolution));
         setTitle(value.title);setBasicStatement(content.basicStatement);setBasicSolution(content.basicSolution??'');setTemplate({title:value.title,content,samples:value.samples});
       }}/>
       {template?<p className="notice-line">已带入模板中的正式内容与 {template.samples.length} 组样例，创建后可逐项编辑。</p>:null}
@@ -193,16 +208,17 @@ export function CreateProblemPage() {
         />
       </div>
 
-      {create.error ? <div className="inline-error">{create.error.message}</div> : null}
+      <StandardProgramEditor value={standardProgram} onChange={setStandardProgram} readOnly={create.isPending}/>
+      {create.error ? <div className="inline-error" role="alert">{create.error.message}{createdDraft.current?<p>草稿已经建立，标准程序还没保存。点击「重试保存标准程序」不会重复建题，也可以<Link to={`/problems/${createdDraft.current.id}?tab=solution`}>打开已创建草稿</Link>继续处理。</p>:null}</div> : null}
       <div className="sticky-form-actions">
         <span>创建后仍是草稿，不会直接进入审核。</span>
         <button
           className="primary-button"
           type="button"
-          disabled={!title.trim() || create.isPending}
+          disabled={(!title.trim()&&!createdDraft.current) || create.isPending}
           onClick={submit}
         >
-          {create.isPending ? "正在创建…" : "创建草稿"}
+          {create.isPending ? "正在创建…" : createdDraft.current?'重试保存标准程序':"创建草稿"}
         </button>
       </div>
     </section>

@@ -1,6 +1,7 @@
-import { Download, File as FileIcon, FileCode2, Image, Paperclip, Upload } from "lucide-react";
+import { Download, File as FileIcon, FileCode2, Image, Paperclip, Upload, X } from "lucide-react";
+import {StandardProgramPanel} from './standard-program-panel';
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useState } from "react";
 import type {
   JudgeProgramFileCategory,
   Problem,
@@ -12,6 +13,7 @@ import {
   problemFileDownloadUrl,
   problemFileReferenceUrl,
   uploadProblemFile,
+  removeProblemFile,
   type ProblemFileUploadResponse
 } from "../lib/api";
 
@@ -315,6 +317,8 @@ export function ProblemFilesPanel({
   onRevisionChange,
   onPendingChange
 }: ProblemFilesPanelProps) {
+  const client=useQueryClient();
+  const [removedSource,setRemovedSource]=useState('');
   const files = useQuery({
     queryKey: ["problem-files", problem.id, problem.revision],
     queryFn: () => listProblemFiles(problem.id)
@@ -324,7 +328,8 @@ export function ProblemFilesPanel({
     mutationFn: ({ file, category }: { file: File; category: ProblemFileCategory }) =>
       uploadFile(file, category)
   });
-  const busy = uploadsDisabled || upload.isPending;
+  const remove=useMutation({mutationFn:async(fileId:string)=>{onPendingChange?.(true);return removeProblemFile(problem.id,fileId,problem.revision);},onSuccess:(result,fileId)=>{if(files.data?.items.find(file=>file.id===fileId)?.category==='standard_solution')setRemovedSource(fileId);onRevisionChange?.(result.revision);void client.invalidateQueries({queryKey:['problem-files',problem.id]});void client.invalidateQueries({queryKey:['problem',problem.id]});},onSettled:()=>onPendingChange?.(false)});
+  const busy = uploadsDisabled || upload.isPending || remove.isPending;
 
   return (
     <section className="materials-section" aria-label="程序与附件">
@@ -350,15 +355,10 @@ export function ProblemFilesPanel({
           disabled={busy || !problem.capabilities.canEdit || !problem.capabilities.canWriteTestdata}
           onSelect={(file) => upload.mutate({ file, category: "internal_attachment" })}
         />
-        <FilePickerCard
-          title="标准程序"
-          description="用于核对答案，不会出现在公开题面"
-          icon={FileCode2}
-          buttonLabel="选择标准程序"
-          disabled={busy || !problem.capabilities.canEdit || !problem.capabilities.canWriteTestdata}
-          onSelect={(file) => upload.mutate({ file, category: "standard_solution" })}
-        />
       </div>
+
+      <StandardProgramPanel key={removedSource} problem={problem} files={(files.data?.items??[]).filter(file=>file.id!==removedSource)} disabled={busy} onRevisionChange={onRevisionChange} onPendingChange={onPendingChange}/>
+      {remove.error?<p role="alert" className="inline-error">{remove.error.message}</p>:null}
 
       {uploadsDisabled && !upload.isPending ? (
         <p className="file-help">请先等待题目正文保存完成，再选择文件。</p>
@@ -389,6 +389,7 @@ export function ProblemFilesPanel({
               <Download size={15} aria-hidden="true" />
               下载
             </a>
+            {problem.capabilities.canEdit&&(file.category==='statement_image'||file.category==='public_attachment'||(file.category==='standard_solution'?(problem.capabilities.canWriteStandardSolution??problem.capabilities.canWriteTestdata):problem.capabilities.canWriteTestdata))?<button className="icon-button danger-icon problem-file-remove" type="button" title="删除文件" aria-label={`删除 ${file.originalName}`} disabled={busy} onClick={()=>{if(window.confirm(`从当前题目删除「${file.originalName}」？旧版本仍保留。题面中的图片引用或测试数据路径需要同步检查。`))remove.mutate(file.id);}}><X size={17}/></button>:null}
           </div>
         ))}
       </div>

@@ -305,6 +305,8 @@ export const problemCapabilitiesSchema = z.object({
   canReadOwnerContact: z.boolean().optional(),
   canReadTestdata: z.boolean(),
   canWriteTestdata: z.boolean(),
+  canReadStandardSolution: z.boolean().optional(),
+  canWriteStandardSolution: z.boolean().optional(),
   canExport: z.boolean(),
   canViewAccessLog: z.boolean(),
   canDelete: z.boolean().optional()
