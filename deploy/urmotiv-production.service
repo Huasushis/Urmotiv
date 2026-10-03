@@ -1,0 +1,21 @@
+[Unit]
+Description=Urmotiv production application stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/root/urmotiv-production-20260919
+ExecStart=/bin/bash /root/urmotiv-production-20260919/urmotivctl start
+ExecStop=/bin/bash /root/urmotiv-production-20260919/urmotivctl stop
+TimeoutStartSec=300
+TimeoutStopSec=3700
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

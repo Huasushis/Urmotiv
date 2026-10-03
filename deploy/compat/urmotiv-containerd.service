@@ -1,0 +1,18 @@
+[Unit]
+Description=Container runtime for the existing Urmotiv Docker store
+After=local-fs.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/containerd --config /root/urmotiv-production-20260919/urmotiv-containerd.toml --root /var/lib/docker/containerd/daemon --state /run/urmotiv-containerd --address /run/urmotiv-containerd/containerd.sock
+Delegate=yes
+KillMode=process
+Restart=always
+RestartSec=5
+LimitNOFILE=infinity
+LimitNPROC=infinity
+TasksMax=infinity
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target

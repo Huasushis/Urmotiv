@@ -1,0 +1,2 @@
+version = 2
+disabled_plugins = ["io.containerd.grpc.v1.cri"]

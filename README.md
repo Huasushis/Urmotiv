@@ -83,6 +83,16 @@ bash scripts/deploy/validate-env.sh /绝对路径/urmotiv.env
 
 ## 启动
 
+**已部署服务器重启后恢复：** [生产启停与恢复手册](docs/production-operations.md)。当前 `kk` 上执行：
+
+```bash
+ssh kk
+sudo systemctl start urmotiv-production
+sudo /root/urmotiv-production-20260919/urmotivctl check
+```
+
+重启用 `sudo systemctl restart urmotiv-production`，停止用 `sudo systemctl stop urmotiv-production`；保留数据库和附件，不重新安装。`deploy/urmotivctl` 与 systemd unit 已随仓库提供。
+
 开发模式同时启动 API 和网页：
 
 ```bash

@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+action=${1:-help}
+if [[ $action == help || $action == --help ]]; then
+  echo '用法：./urmotivctl start|stop|restart|status|check'
+  echo '安装在生产 compose.yaml、urmotiv.env 旁边；只操作 urmotiv-production。'
+  echo 'start 恢复现有部署；restart 先等待 Fermata 在途任务；不构建、不升级、不清空数据。'
+  exit 0
+fi
+case "$action" in start|stop|restart|status|check) ;; *) echo '未知操作；运行 ./urmotivctl help' >&2; exit 64;; esac
+deployment=$(cd -- "${URMOTIV_DEPLOY_DIR:-$script_dir}" && pwd)
+project=${URMOTIV_PROJECT_NAME:-urmotiv-production}
+[[ $project =~ ^[a-z0-9][a-z0-9_-]*$ ]] || exit 64
+[[ -f $deployment/compose.yaml && -f $deployment/urmotiv.env ]] || { echo '缺少 compose.yaml 或 urmotiv.env；请在正式部署目录运行。' >&2; exit 1; }
+compose=(docker compose --project-name "$project" --project-directory "$deployment" --env-file "$deployment/urmotiv.env" -f "$deployment/compose.yaml")
+docker info >/dev/null 2>&1 || { echo 'Docker 未运行。systemd 主机先执行 sudo systemctl start docker，再重试。' >&2; exit 1; }
+services=(postgres redis minio api worker web fermata anklang)
+configured=$("${compose[@]}" config --services)
+for service in "${services[@]}"; do
+  [[ $'\n'$configured$'\n' == *$'\n'"$service"$'\n'* ]] || { echo "缺少服务 $service；本脚本针对完整的生产部署。" >&2; exit 1; }
+done
+fermata(){ "${compose[@]}" exec -T fermata node --input-type=module - "$1" < "$script_dir/fermata-maintenance.mjs"; }
+running(){ [[ -n $("${compose[@]}" ps --status running -q "$1") ]]; }
+verify_targets(){
+ local id label directory pid
+ while read -r id; do
+  [[ -n $id ]] || continue
+  label=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$id")
+  directory=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$id")
+  [[ $label == "$project" && $directory == "$deployment" ]] || { echo '容器归属与部署目录不一致，停止操作。' >&2; return 1; }
+  pid=$(docker inspect --format '{{.State.Pid}}' "$id")
+  if [[ $pid =~ ^[0-9]+$ ]] && ((pid>0));then
+   ps -o pid,ppid,args -p "$pid"
+   readlink "/proc/$pid/cwd"
+   docker top "$id" -eo pid,ppid,args
+  fi
+ done < <("${compose[@]}" ps -a -q)
+}
+check(){
+ local service id state failed=0
+ for service in "${services[@]}"; do
+  id=$("${compose[@]}" ps -a -q "$service")
+  if [[ -z $id ]]; then echo "$service: 缺少容器";failed=1;continue;fi
+  state=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$id")
+  echo "$service: $state"
+  [[ $state == 'running healthy' || $state == 'running no-healthcheck' ]] || failed=1
+ done
+ local url
+ for url in http://127.0.0.1:8080/api/v1/health/ready http://127.0.0.1:3010/ready http://127.0.0.1:8730/api/v1/ready; do
+  if curl --noproxy '*' --fail --silent --show-error --connect-timeout 3 --max-time 15 --output /dev/null "$url"; then echo "$url: 正常";else failed=1;fi
+ done
+ if running fermata;then fermata status || failed=1;else failed=1;fi
+ return "$failed"
+}
+start(){
+ "${compose[@]}" up -d --no-build --pull never --wait --wait-timeout 180 "${services[@]}"
+ local attempt resumed=false
+ for attempt in 1 2 3 4 5; do
+  if fermata resume;then resumed=true;break;fi
+  sleep 3
+ done
+ [[ $resumed == true ]] || return 1
+ check
+}
+stop(){
+ verify_targets
+ if running fermata;then
+  fermata drain
+  local limit=${URMOTIV_DRAIN_TIMEOUT:-3600} elapsed=0 code
+  [[ $limit =~ ^[1-9][0-9]*$ ]] || { echo 'URMOTIV_DRAIN_TIMEOUT 必须是正整数秒数。' >&2;return 1; }
+  echo '已暂停领取新题，等待在途审题结束；不会强制取消模型请求。'
+  while true;do
+   if fermata idle;then break;else code=$?;fi
+   [[ $code == 2 ]] || return 1
+   if ((elapsed>=limit));then echo '等待超时，容器未停止。使用 start 恢复领取，或稍后重试 stop/restart。' >&2;return 1;fi
+   sleep 5;elapsed=$((elapsed+5))
+   if ((elapsed%30==0));then echo "仍在等待审题完成，已等待 ${elapsed} 秒。";fi
+  done
+ fi
+ "${compose[@]}" stop -t 60 fermata worker web api anklang
+ "${compose[@]}" stop -t 60 minio redis postgres
+ echo '已停止本项目，容器和数据卷保留。'
+}
+case "$action" in
+ status) "${compose[@]}" ps -a;check;;
+ check) check;;
+ *)
+  exec 9>"$deployment/.urmotivctl.lock"
+  flock -n 9 || { echo '已有启停操作正在进行，请稍后再试。' >&2;exit 1; }
+  verify_targets
+  case "$action" in start) start;;stop) stop;;restart) stop;start;;esac
+  ;;
+esac

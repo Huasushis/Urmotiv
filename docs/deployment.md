@@ -1,5 +1,7 @@
 # 部署指南
 
+**已经部署过，只是服务器重启或站点停止？先看[生产启停与恢复手册](production-operations.md)。** 不要重新初始化数据库或运行旧导入脚本。本页主要说明首次部署和升级。
+
 本指南描述当前仓库的 Docker Compose 部署。Compose（用一个 YAML 文件编排多个容器的工具）包含 PostgreSQL、Redis、MinIO、迁移任务、API、异步 Worker 和 Web；Anklang、Fermata 作为显式 profile（可选服务组）启动。所有密码、令牌、外部服务地址和题目资料都放在 Git 之外。
 
 
